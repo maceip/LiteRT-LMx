@@ -30,6 +30,7 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "runtime/dpm/canonical_replay_catalog.h"
+#include "runtime/dpm/capsule_restore_evidence_binding.h"
 #include "runtime/dpm/dpm_event_log.h"
 #include "runtime/dpm/dpm_replay_mode.h"
 #include "runtime/dpm/engine_fresh_worker_contract.h"
@@ -1248,6 +1249,104 @@ absl::Status ValidateAdmissionForExactProfile(
   return absl::OkStatus();
 }
 
+bool HasSameStateWitnessAdmissionAuthority(
+    const AuthenticatedCapsuleRestoreStateWitnessAdmission& lhs,
+    const AuthenticatedCapsuleRestoreStateWitnessAdmission& rhs) {
+  return lhs.record.record_id == rhs.record.record_id &&
+         lhs.profile == rhs.profile && lhs.capability == rhs.capability &&
+         lhs.operational_coverage == rhs.operational_coverage &&
+         lhs.record.operational_coverage == lhs.operational_coverage &&
+         rhs.record.operational_coverage == rhs.operational_coverage;
+}
+
+absl::Status ValidateStateWitnessAdmissionForExactProfile(
+    const AuthenticatedCapsuleRestoreStateWitnessAdmission& admission,
+    const ExactLiteRtProfile& expected_profile) {
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(expected_profile));
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(admission.profile));
+  ABSL_RETURN_IF_ERROR(
+      ValidateSessionHandoffCapability(admission.capability));
+  ABSL_RETURN_IF_ERROR(
+      ValidateCapsuleRestoreStateWitnessAdmissionRecord(admission.record));
+  ABSL_RETURN_IF_ERROR(
+      ValidateCapsuleRestoreStateWitnessOperationalCoverage(
+          admission.operational_coverage));
+  ABSL_RETURN_IF_ERROR(
+      ValidateCapsuleRestoreStateWitnessOperationalContracts(
+          admission.operational_coverage));
+  ABSL_RETURN_IF_ERROR(
+      ValidateCapsuleRestoreStateWitnessAdmissionRecordForRuntime(
+          admission.record, admission.profile, admission.capability,
+          admission.operational_coverage.coverage_id));
+  ABSL_ASSIGN_OR_RETURN(
+      const CapsuleRestoreAuthorityV2 authority,
+      BuildCapsuleRestoreAuthorityV2(admission));
+  ABSL_RETURN_IF_ERROR(
+      ValidateCapsuleRestoreAuthorityV2ForAdmission(authority, admission));
+  const CapsuleRestoreStateWitnessOperationalCoverage& coverage =
+      admission.operational_coverage;
+  const CapsuleRestoreStateWitnessOperationalDomain& domain =
+      coverage.operational_domain;
+  if (admission.profile != expected_profile ||
+      admission.record.operational_coverage != coverage ||
+      coverage.runtime_derived_profile != expected_profile ||
+      coverage.runtime_derived_capability != admission.capability ||
+      coverage.runtime_derived_session_identity !=
+          expected_profile.session_identity ||
+      admission.capability.exact_profile_id != expected_profile.profile_id ||
+      admission.capability.session_identity !=
+          expected_profile.session_identity ||
+      admission.capability.backend != expected_profile.backend ||
+      domain.admitted_backend != expected_profile.backend ||
+      domain.resolved_session_config_hash !=
+          expected_profile.session_identity.inference_profile_hash) {
+    return absl::FailedPreconditionError(
+        "CapsuleRestore Coverage V2 authority does not agree with the exact "
+        "executor's immutable Engine-derived profile and operational "
+        "domain.");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateStateWitnessTransferDomain(
+    const ExactRegenerationExecutionInput& input,
+    const DPMCanonicalReplayRequest& request,
+    const AuthenticatedCapsuleRestoreStateWitnessAdmission& admission) {
+  const CapsuleRestoreStateWitnessOperationalDomain& domain =
+      admission.operational_coverage.operational_domain;
+  if (request.max_output_tokens == 0 ||
+      request.max_output_tokens > domain.maximum_output_tokens) {
+    return absl::FailedPreconditionError(
+        "Exact physical request exceeds the CapsuleRestore Coverage V2 "
+        "output-token domain.");
+  }
+  if (input.execution_plan.prefill_mode ==
+      FreshWorkerPrefillMode::kOwnPositionCapsuleDelta) {
+    if (input.durable_restore_options == nullptr ||
+        input.durable_restore_source == nullptr ||
+        input.durable_restore_options->key_id !=
+            domain.checkpoint_authentication_key_id ||
+        input.durable_restore_source->Size() == 0 ||
+        input.durable_restore_source->Size() >
+            kMaximumCapsuleRestoreCheckpointBytes) {
+      return absl::FailedPreconditionError(
+          "Exact restore transport is outside the CapsuleRestore Coverage V2 "
+          "durable checkpoint domain.");
+    }
+  }
+  if (input.execution_plan.capture_producing_capsule) {
+    if (input.staging_capture_options == nullptr ||
+        input.staging_capture_destination == nullptr ||
+        input.staging_capture_options->key_id !=
+            domain.checkpoint_authentication_key_id) {
+      return absl::FailedPreconditionError(
+          "Exact capture transport is outside the CapsuleRestore Coverage V2 "
+          "durable checkpoint domain.");
+    }
+  }
+  return absl::OkStatus();
+}
+
 absl::Status ValidateRequestForExactExecutorConfig(
     const DPMCanonicalReplayRequest& request,
     const ExactRegenerationExecutorConfig& config) {
@@ -1408,6 +1507,27 @@ ExactRegenerationExecutor::GetAuthenticatedCapsuleRestoreAdmission(
   return admission;
 }
 
+absl::StatusOr<AuthenticatedCapsuleRestoreStateWitnessAdmission>
+ExactRegenerationExecutor::
+    GetAuthenticatedCapsuleRestoreStateWitnessAdmission(
+        const CapsuleRestoreStateWitnessAdmissionBinding& binding) const {
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  ABSL_ASSIGN_OR_RETURN(const ExactLiteRtProfile current_executor_profile,
+                        ResolveCurrentProfile());
+  ABSL_ASSIGN_OR_RETURN(
+      AuthenticatedCapsuleRestoreStateWitnessAdmission admission,
+      ResolveAuthenticatedCapsuleRestoreStateWitnessAdmission(
+          engine_, resolved_session_config_, binding));
+  ABSL_RETURN_IF_ERROR(ValidateStateWitnessAdmissionForExactProfile(
+      admission, current_executor_profile));
+  if (current_executor_profile != derived_profile_) {
+    return absl::AbortedError(
+        "Engine-derived exact profile changed while resolving CapsuleRestore "
+        "Coverage V2 authority.");
+  }
+  return admission;
+}
+
 absl::Status ExactRegenerationExecutor::ValidateSupport() const {
   if (engine_ == nullptr || admission_repository_ == nullptr) {
     return absl::InvalidArgumentError(
@@ -1444,14 +1564,14 @@ absl::StatusOr<ExactRegenerationExecution> ExactRegenerationExecutor::Run(
                         ComputeFreshWorkerExecutionPlanHash(plan));
   return RunWithExecutionInput(
       request, ExactRegenerationExecutionInput{.execution_plan = plan}, true,
-      nullptr);
+      nullptr, nullptr);
 }
 
 absl::StatusOr<ExactRegenerationExecution>
 ExactRegenerationExecutor::RunPhysical(
     const DPMCanonicalReplayRequest& request,
     const ExactRegenerationExecutionInput& input) const {
-  return RunWithExecutionInput(request, input, false, nullptr);
+  return RunWithExecutionInput(request, input, false, nullptr, nullptr);
 }
 
 absl::StatusOr<ExactRegenerationExecution>
@@ -1460,7 +1580,18 @@ ExactRegenerationExecutor::RunPhysical(
     const ExactRegenerationExecutionInput& input,
     const CapsuleRestoreAdmissionBinding& capsule_restore_admission) const {
   return RunWithExecutionInput(request, input, false,
-                               &capsule_restore_admission);
+                               &capsule_restore_admission, nullptr);
+}
+
+absl::StatusOr<ExactRegenerationExecution>
+ExactRegenerationExecutor::RunPhysical(
+    const DPMCanonicalReplayRequest& request,
+    const ExactRegenerationExecutionInput& input,
+    const CapsuleRestoreStateWitnessAdmissionBinding&
+        capsule_restore_state_witness_admission) const {
+  return RunWithExecutionInput(
+      request, input, false, nullptr,
+      &capsule_restore_state_witness_admission);
 }
 
 absl::StatusOr<ExactRegenerationExecution>
@@ -1468,7 +1599,9 @@ ExactRegenerationExecutor::RunWithExecutionInput(
     const DPMCanonicalReplayRequest& request,
     const ExactRegenerationExecutionInput& input,
     bool capsule_free_convenience,
-    const CapsuleRestoreAdmissionBinding* capsule_restore_admission) const {
+    const CapsuleRestoreAdmissionBinding* capsule_restore_admission,
+    const CapsuleRestoreStateWitnessAdmissionBinding*
+        capsule_restore_state_witness_admission) const {
   // Reject cross-stage and cross-limit requests before touching the
   // repository and, critically, before any worker process is born.
   ABSL_RETURN_IF_ERROR(ValidateBoundRequest(request));
@@ -1503,7 +1636,14 @@ ExactRegenerationExecutor::RunWithExecutionInput(
         "Projection exact regeneration cannot restore or capture a session "
         "capsule.");
   }
-  if (transfers_capsule && capsule_restore_admission == nullptr) {
+  if (capsule_restore_admission != nullptr &&
+      capsule_restore_state_witness_admission != nullptr) {
+    return absl::InvalidArgumentError(
+        "Exact physical execution cannot combine CapsuleRestore Coverage V1 "
+        "and V2 authority.");
+  }
+  if (transfers_capsule && capsule_restore_admission == nullptr &&
+      capsule_restore_state_witness_admission == nullptr) {
     return absl::FailedPreconditionError(
         "Exact capsule restore/capture requires authenticated "
         "CapsuleRestore admission; physical transport alone is not "
@@ -1511,11 +1651,23 @@ ExactRegenerationExecutor::RunWithExecutionInput(
   }
   std::optional<AuthenticatedCapsuleRestoreAdmission>
       capsule_admission_before;
+  std::optional<AuthenticatedCapsuleRestoreStateWitnessAdmission>
+      state_witness_admission_before;
   if (capsule_restore_admission != nullptr) {
     ABSL_ASSIGN_OR_RETURN(
         capsule_admission_before,
         GetAuthenticatedCapsuleRestoreAdmission(
             *capsule_restore_admission));
+  }
+  if (capsule_restore_state_witness_admission != nullptr) {
+    ABSL_ASSIGN_OR_RETURN(
+        state_witness_admission_before,
+        GetAuthenticatedCapsuleRestoreStateWitnessAdmission(
+            *capsule_restore_state_witness_admission));
+    if (transfers_capsule) {
+      ABSL_RETURN_IF_ERROR(ValidateStateWitnessTransferDomain(
+          input, request, *state_witness_admission_before));
+    }
   }
   if (capsule_free_convenience &&
       (input.execution_plan.prefill_mode !=
@@ -1887,6 +2039,20 @@ ExactRegenerationExecutor::RunWithExecutionInput(
       return absl::AbortedError(
           "CapsuleRestore admission or Engine-derived capability changed "
           "during physical regeneration.");
+    }
+  }
+  if (state_witness_admission_before.has_value()) {
+    ABSL_ASSIGN_OR_RETURN(
+        const AuthenticatedCapsuleRestoreStateWitnessAdmission
+            state_witness_admission_after,
+        GetAuthenticatedCapsuleRestoreStateWitnessAdmission(
+            *capsule_restore_state_witness_admission));
+    if (!HasSameStateWitnessAdmissionAuthority(
+            state_witness_admission_after,
+            *state_witness_admission_before)) {
+      return absl::AbortedError(
+          "CapsuleRestore Coverage V2 admission or Engine-derived authority "
+          "changed during physical regeneration.");
     }
   }
 

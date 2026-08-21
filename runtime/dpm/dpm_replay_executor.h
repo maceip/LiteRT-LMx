@@ -331,6 +331,14 @@ class ExactRegenerationExecutor final {
   GetAuthenticatedCapsuleRestoreAdmission(
       const CapsuleRestoreAdmissionBinding& binding) const;
 
+  // Coverage V2 counterpart to the V1 accessor above. This re-resolves the
+  // same loaded Engine profile and capability and reauthenticates the complete
+  // state-witness admission record at each call; a coverage ID by itself is
+  // never returned or accepted as authority.
+  absl::StatusOr<AuthenticatedCapsuleRestoreStateWitnessAdmission>
+  GetAuthenticatedCapsuleRestoreStateWitnessAdmission(
+      const CapsuleRestoreStateWitnessAdmissionBinding& binding) const;
+
   absl::StatusOr<ExactRegenerationExecution> Run(
       const DPMCanonicalReplayRequest& request) const;
 
@@ -342,13 +350,24 @@ class ExactRegenerationExecutor final {
       const DPMCanonicalReplayRequest& request,
       const ExactRegenerationExecutionInput& input) const;
 
-  // The admitted overload is mandatory for restore or capture. The overload
-  // above remains available only for physical full-prefill without capsule
-  // transfer, preserving exact execution without checkpoint support.
+  // This Coverage V1 admitted overload is mandatory for a V1 restore or
+  // capture. The overload above remains available only for physical
+  // full-prefill without capsule transfer, preserving exact execution without
+  // checkpoint support.
   absl::StatusOr<ExactRegenerationExecution> RunPhysical(
       const DPMCanonicalReplayRequest& request,
       const ExactRegenerationExecutionInput& input,
       const CapsuleRestoreAdmissionBinding& capsule_restore_admission) const;
+
+  // Additive Coverage V2 path. The loaded runtime and repository supply one
+  // atomic state-witness authority; callers still must provide the concrete
+  // authenticated capsule transfer and per-operation evidence at higher DPM
+  // boundaries.
+  absl::StatusOr<ExactRegenerationExecution> RunPhysical(
+      const DPMCanonicalReplayRequest& request,
+      const ExactRegenerationExecutionInput& input,
+      const CapsuleRestoreStateWitnessAdmissionBinding&
+          capsule_restore_state_witness_admission) const;
 
  private:
   ExactRegenerationExecutor(
@@ -372,7 +391,9 @@ class ExactRegenerationExecutor final {
       const DPMCanonicalReplayRequest& request,
       const ExactRegenerationExecutionInput& input,
       bool capsule_free_convenience,
-      const CapsuleRestoreAdmissionBinding* capsule_restore_admission) const;
+      const CapsuleRestoreAdmissionBinding* capsule_restore_admission,
+      const CapsuleRestoreStateWitnessAdmissionBinding*
+          capsule_restore_state_witness_admission) const;
 
   const Engine* const engine_;
   const FreshWorkerProcessRunner worker_runner_;

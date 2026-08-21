@@ -148,6 +148,10 @@ struct DPMAgentReplayExecution {
   // no physical-session plan. Exact workers populate this after all cold runs
   // independently agree on the same derived plan.
   std::optional<DPMPreparedPrefillPlan> prepared_prefill_plan;
+  // WinnerReplay only: complete operational restore evidence retained from an
+  // actual live or explicitly rematerialized generation. Catalog-only hits
+  // and lost publication races can never synthesize this evidence.
+  std::optional<CapsuleRestoreEvidenceV3> capsule_restore_evidence_v3;
 };
 
 absl::Status ValidateDPMAgentReplayExecution(
@@ -172,6 +176,11 @@ struct ExactRegenerationDPMAgentPhysicalExecution {
   // a transient envelope hash as durable provenance.
   std::optional<SessionHandoffReauthenticationEvidence>
       run_zero_restore_reauthentication_evidence;
+  // Run zero's independently recomputed post-import witness. It remains
+  // distinct from the durable source endpoint and is present exactly for an
+  // own-position restore.
+  std::optional<SessionContinuationStateWitness>
+      run_zero_restored_state_witness;
   std::optional<FreshWorkerProducingCapsuleEvidence>
       run_zero_transient_producing_capsule_evidence;
   std::optional<FreshWorkerDurableProducingCapsuleEvidence>
@@ -206,6 +215,15 @@ class DPMAgentReplayRuntime {
   GetSessionHandoffCapability() const = 0;
   virtual absl::StatusOr<std::optional<CapsuleRestoreOperationalCoverage>>
   GetCapsuleRestoreOperationalCoverage() const = 0;
+  // Coverage V2 is returned atomically because record, profile, capability,
+  // operational domain, and qualification evidence are one authority. V1 and
+  // generation-only runtimes use the fail-closed empty default.
+  virtual absl::StatusOr<std::optional<
+      AuthenticatedCapsuleRestoreStateWitnessAdmission>>
+  GetAuthenticatedCapsuleRestoreStateWitnessAdmission() const {
+    return std::optional<
+        AuthenticatedCapsuleRestoreStateWitnessAdmission>();
+  }
   // Replay/generation capability is independent from CapsuleRestore. This
   // method must not reject a usable WinnerReplay runtime merely because the
   // loaded session cannot export a complete handoff.
@@ -289,6 +307,9 @@ class CanonicalWinnerDPMAgentRuntime final : public DPMAgentReplayRuntime {
   GetSessionHandoffCapability() const override;
   absl::StatusOr<std::optional<CapsuleRestoreOperationalCoverage>>
   GetCapsuleRestoreOperationalCoverage() const override;
+  absl::StatusOr<std::optional<
+      AuthenticatedCapsuleRestoreStateWitnessAdmission>>
+  GetAuthenticatedCapsuleRestoreStateWitnessAdmission() const override;
   absl::Status ValidateSupport() const override;
   absl::Status ValidateGenerationLimit(
       uint32_t max_output_tokens) const override;
@@ -327,6 +348,11 @@ class ExactRegenerationDPMAgentRuntime final : public DPMAgentReplayRuntime {
   Create(
       ExactRegenerationExecutor* exact_executor,
       CapsuleRestoreAdmissionBinding capsule_restore_admission);
+  static absl::StatusOr<std::unique_ptr<ExactRegenerationDPMAgentRuntime>>
+  Create(
+      ExactRegenerationExecutor* exact_executor,
+      CapsuleRestoreStateWitnessAdmissionBinding
+          capsule_restore_state_witness_admission);
 
   DPMReplayMode GetReplayMode() const override {
     return DPMReplayMode::kExactRegeneration;
@@ -346,6 +372,9 @@ class ExactRegenerationDPMAgentRuntime final : public DPMAgentReplayRuntime {
   GetSessionHandoffCapability() const override;
   absl::StatusOr<std::optional<CapsuleRestoreOperationalCoverage>>
   GetCapsuleRestoreOperationalCoverage() const override;
+  absl::StatusOr<std::optional<
+      AuthenticatedCapsuleRestoreStateWitnessAdmission>>
+  GetAuthenticatedCapsuleRestoreStateWitnessAdmission() const override;
   absl::Status ValidateSupport() const override;
   absl::Status ValidateGenerationLimit(
       uint32_t max_output_tokens) const override;
@@ -369,7 +398,11 @@ class ExactRegenerationDPMAgentRuntime final : public DPMAgentReplayRuntime {
       std::optional<Hash256> capsule_restore_admission_record_id,
       std::optional<SessionHandoffCapability> session_handoff_capability,
       std::optional<CapsuleRestoreOperationalCoverage>
-          capsule_restore_operational_coverage)
+          capsule_restore_operational_coverage,
+      std::optional<CapsuleRestoreStateWitnessAdmissionBinding>
+          capsule_restore_state_witness_admission,
+      std::optional<AuthenticatedCapsuleRestoreStateWitnessAdmission>
+          initial_capsule_restore_state_witness_admission)
       : exact_executor_(exact_executor),
         derived_profile_(std::move(derived_profile)),
         capsule_restore_admission_(std::move(capsule_restore_admission)),
@@ -377,10 +410,16 @@ class ExactRegenerationDPMAgentRuntime final : public DPMAgentReplayRuntime {
             capsule_restore_admission_record_id),
         session_handoff_capability_(std::move(session_handoff_capability)),
         capsule_restore_operational_coverage_(
-            std::move(capsule_restore_operational_coverage)) {}
+            std::move(capsule_restore_operational_coverage)),
+        capsule_restore_state_witness_admission_(
+            std::move(capsule_restore_state_witness_admission)),
+        initial_capsule_restore_state_witness_admission_(
+            std::move(initial_capsule_restore_state_witness_admission)) {}
 
   absl::StatusOr<AuthenticatedCapsuleRestoreAdmission>
   ResolveCurrentCapsuleRestoreAdmission() const;
+  absl::StatusOr<AuthenticatedCapsuleRestoreStateWitnessAdmission>
+  ResolveCurrentCapsuleRestoreStateWitnessAdmission() const;
 
   ExactRegenerationExecutor* const exact_executor_;
   const ExactLiteRtProfile derived_profile_;
@@ -391,6 +430,10 @@ class ExactRegenerationDPMAgentRuntime final : public DPMAgentReplayRuntime {
       session_handoff_capability_;
   const std::optional<CapsuleRestoreOperationalCoverage>
       capsule_restore_operational_coverage_;
+  const std::optional<CapsuleRestoreStateWitnessAdmissionBinding>
+      capsule_restore_state_witness_admission_;
+  const std::optional<AuthenticatedCapsuleRestoreStateWitnessAdmission>
+      initial_capsule_restore_state_witness_admission_;
 };
 
 }  // namespace litert::lm
