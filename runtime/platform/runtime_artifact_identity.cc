@@ -28,7 +28,6 @@
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
-#include "absl/strings/match.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "runtime/platform/hash/sha256_hasher.h"
@@ -48,7 +47,7 @@ namespace litert::lm {
 namespace {
 
 constexpr absl::string_view kRuntimeArtifactDomain =
-    "LITERT_LM_LOADED_RUNTIME_ARTIFACT_V2";
+    "LITERT_LM_LOADED_RUNTIME_ARTIFACT_V3";
 
 void HashU32(uint32_t value, Sha256Hasher* hasher) {
   std::array<char, 4> bytes;
@@ -493,19 +492,6 @@ absl::Status ValidateEmbeddedCodeSignature(const uint8_t* bytes, size_t size,
   return absl::OkStatus();
 }
 
-bool IsAppleSystemImagePath(absl::string_view path) {
-  constexpr std::array<absl::string_view, 4> kPrefixes = {
-      "/usr/lib/",
-      "/System/Library/",
-      "/System/Volumes/Preboot/Cryptexes/OS/usr/lib/",
-      "/System/Volumes/Preboot/Cryptexes/OS/System/Library/",
-  };
-  for (absl::string_view prefix : kPrefixes) {
-    if (absl::StartsWith(path, prefix)) return true;
-  }
-  return false;
-}
-
 absl::StatusOr<std::string> ReadSysctl(absl::string_view name) {
   const std::string nul_terminated_name(name);
   size_t size = 0;
@@ -903,67 +889,6 @@ absl::StatusOr<MeasuredImage> MeasureImage(const mach_header* image_header,
                        .has_digest = true};
 }
 
-absl::StatusOr<std::vector<Hash256>> MeasureRelevantImages(
-    uintptr_t runtime_anchor) {
-  for (int attempt = 0; attempt < 3; ++attempt) {
-    const uint32_t image_count = ::_dyld_image_count();
-    if (image_count == 0) {
-      return absl::FailedPreconditionError(
-          "dyld reported no loaded runtime images.");
-    }
-    std::vector<Hash256> digests;
-    digests.reserve(image_count);
-    std::vector<const mach_header*> image_headers;
-    image_headers.reserve(image_count);
-    std::vector<std::string> image_names;
-    image_names.reserve(image_count);
-    bool found_runtime_anchor = false;
-    for (uint32_t index = 0; index < image_count; ++index) {
-      const char* image_name = ::_dyld_get_image_name(index);
-      if (image_name == nullptr || image_name[0] == '\0') {
-        return absl::FailedPreconditionError(
-            "dyld reported a loaded image without a classification path.");
-      }
-      const mach_header* image_header = ::_dyld_get_image_header(index);
-      image_headers.push_back(image_header);
-      image_names.emplace_back(image_name);
-      ABSL_ASSIGN_OR_RETURN(
-          MeasuredImage measured,
-          MeasureImage(image_header, runtime_anchor,
-                       index == 0 ||
-                           !IsAppleSystemImagePath(image_names.back())));
-      found_runtime_anchor =
-          found_runtime_anchor || measured.contains_runtime_anchor;
-      if (measured.has_digest) {
-        digests.push_back(measured.digest);
-      }
-    }
-    if (::_dyld_image_count() != image_count) continue;
-    bool image_set_is_stable = true;
-    for (uint32_t index = 0; index < image_count; ++index) {
-      const char* image_name = ::_dyld_get_image_name(index);
-      if (::_dyld_get_image_header(index) != image_headers[index] ||
-          image_name == nullptr || image_names[index] != image_name) {
-        image_set_is_stable = false;
-        break;
-      }
-    }
-    if (!image_set_is_stable) continue;
-    if (!found_runtime_anchor) {
-      return absl::FailedPreconditionError(
-          "No measured loaded image contains the LiteRT runtime code anchor.");
-    }
-    if (digests.empty()) {
-      return absl::FailedPreconditionError(
-          "No loaded runtime/delegate image evidence was measured.");
-    }
-    std::sort(digests.begin(), digests.end());
-    return digests;
-  }
-  return absl::UnavailableError(
-      "Loaded runtime image set changed during identity measurement.");
-}
-
 absl::StatusOr<Hash256> MeasureImageContainingAnchor(uintptr_t code_anchor) {
   if (code_anchor == 0) {
     return absl::FailedPreconditionError(
@@ -1024,8 +949,13 @@ absl::StatusOr<Hash256> MeasureAppleCpuRuntimeArtifact(
     return absl::FailedPreconditionError(
         "Loaded CPU runtime profile lacks measurable evidence.");
   }
-  ABSL_ASSIGN_OR_RETURN(std::vector<Hash256> image_digests,
-                        MeasureRelevantImages(profile.runtime_code_anchor));
+  // Bind only the image that owns the live LiteRT dispatch function. The host
+  // executable and unrelated application/plugin images are not inference
+  // artifacts and must not make an otherwise identical fresh worker derive a
+  // different profile.
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 runtime_image_digest,
+      MeasureImageContainingAnchor(profile.runtime_code_anchor));
 
   constexpr std::array<absl::string_view, 7> kPlatformEvidence = {
       "kern.osversion", "kern.osrelease", "hw.model",     "hw.machine",
@@ -1035,12 +965,9 @@ absl::StatusOr<Hash256> MeasureAppleCpuRuntimeArtifact(
   HashFrame(kRuntimeArtifactDomain, &hasher);
   HashU32(static_cast<uint32_t>(profile.runtime_class), &hasher);
   HashFrame(profile.canonical_profile, &hasher);
-  HashU32(static_cast<uint32_t>(image_digests.size()), &hasher);
-  for (const Hash256& image_digest : image_digests) {
-    hasher.Update(absl::string_view(
-        reinterpret_cast<const char*>(image_digest.bytes.data()),
-        image_digest.bytes.size()));
-  }
+  hasher.Update(absl::string_view(
+      reinterpret_cast<const char*>(runtime_image_digest.bytes.data()),
+      runtime_image_digest.bytes.size()));
   for (absl::string_view name : kPlatformEvidence) {
     ABSL_ASSIGN_OR_RETURN(std::string value, ReadSysctl(name));
     HashFrame(name, &hasher);
@@ -1077,12 +1004,6 @@ absl::StatusOr<Hash256> MeasureAppleMetalRuntimeArtifact(
   ABSL_ASSIGN_OR_RETURN(
       const Hash256 accelerator_image_digest,
       MeasureImageContainingAnchor(metal.selected_accelerator_code_anchor));
-  // Also bind non-system libraries already loaded at compilation time. This
-  // covers ML Drift support images while the two anchored digests above prove
-  // which runtime and selected accelerator images are actually in use.
-  ABSL_ASSIGN_OR_RETURN(
-      std::vector<Hash256> dependency_image_digests,
-      MeasureRelevantImages(profile.runtime_code_anchor));
   ABSL_ASSIGN_OR_RETURN(
       std::string metal_device_identity,
       DeriveMacOsMetalDeviceIdentity(metal.metal_device,
@@ -1093,7 +1014,7 @@ absl::StatusOr<Hash256> MeasureAppleMetalRuntimeArtifact(
       "hw.cputype",     "hw.cpusubtype",  "hw.cpufamily",
   };
   Sha256Hasher hasher;
-  HashFrame("LITERT_LM_LOADED_METAL_RUNTIME_ARTIFACT_V1", &hasher);
+  HashFrame("LITERT_LM_LOADED_METAL_RUNTIME_ARTIFACT_V2", &hasher);
   HashU32(static_cast<uint32_t>(profile.runtime_class), &hasher);
   HashFrame(profile.canonical_profile, &hasher);
   HashFrame(metal.canonical_policy, &hasher);
@@ -1104,12 +1025,6 @@ absl::StatusOr<Hash256> MeasureAppleMetalRuntimeArtifact(
   hasher.Update(absl::string_view(
       reinterpret_cast<const char*>(accelerator_image_digest.bytes.data()),
       accelerator_image_digest.bytes.size()));
-  HashU32(static_cast<uint32_t>(dependency_image_digests.size()), &hasher);
-  for (const Hash256& image_digest : dependency_image_digests) {
-    hasher.Update(absl::string_view(
-        reinterpret_cast<const char*>(image_digest.bytes.data()),
-        image_digest.bytes.size()));
-  }
   for (absl::string_view name : kPlatformEvidence) {
     ABSL_ASSIGN_OR_RETURN(std::string value, ReadSysctl(name));
     HashFrame(name, &hasher);
