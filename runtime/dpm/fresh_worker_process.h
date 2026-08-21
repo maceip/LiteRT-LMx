@@ -24,6 +24,7 @@
 
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
+#include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
 #include "runtime/dpm/fresh_worker_protocol.h"
 #include "runtime/engine/session_handoff.h"
@@ -45,6 +46,15 @@ inline constexpr int kFreshWorkerAuthenticationFd = 198;
 // authentication completes.
 inline constexpr uint64_t kMaximumFreshWorkerCapsuleBytes =
     uint64_t{8} * 1024 * 1024 * 1024;
+
+// Public, versioned non-secret key IDs for the parent-derived transient
+// envelopes. They let durable evidence validators distinguish a live worker
+// witness from the caller's parent-only checkpoint key without exposing either
+// authentication key.
+inline constexpr absl::string_view kFreshWorkerTransientRestoreKeyId =
+    "litert-lmx-fresh-worker-restore-v3";
+inline constexpr absl::string_view kFreshWorkerTransientProducingKeyId =
+    "litert-lmx-fresh-worker-producing-v3";
 
 struct FreshWorkerProcessOptions {
   // Must be an absolute path to a regular executable. `arguments` excludes

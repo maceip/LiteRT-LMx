@@ -159,7 +159,7 @@ enum class ExactRegenerationCaptureRunPolicy : uint32_t {
 // worker_certification_hash binds the parent-measured executable image and
 // launch contract. This compact record does not duplicate model output bytes.
 struct ExactRegenerationRunEvidence {
-  static constexpr uint32_t kFormatVersion = 2;
+  static constexpr uint32_t kFormatVersion = 3;
 
   uint32_t format_version = kFormatVersion;
   Hash256 evidence_id;
@@ -173,6 +173,13 @@ struct ExactRegenerationRunEvidence {
   Hash256 launch_spec_hash;
   Hash256 output_evidence_hash;
   std::optional<Hash256> restored_checkpoint_id;
+  // Exact agent workers retain the runtime-derived physical prefill plan from
+  // their authenticated result. Projection workers carry neither this plan nor
+  // a restored-state witness. Restore workers retain their independently
+  // recomputed live-target witness; its envelope and witness IDs may differ
+  // across otherwise agreeing cold runs.
+  std::optional<DPMPreparedPrefillPlan> prepared_prefill_plan;
+  std::optional<SessionContinuationStateWitness> restored_state_witness;
   std::optional<FreshWorkerProducingCapsuleEvidence>
       transient_producing_capsule_evidence;
   std::optional<FreshWorkerDurableProducingCapsuleEvidence>
@@ -190,7 +197,7 @@ absl::Status ValidateExactRegenerationRunEvidence(
 // profile, certified worker, complete logical request, physical work
 // selection, and every independently authenticated process observation.
 struct ExactRegenerationRequestEvidence {
-  static constexpr uint32_t kFormatVersion = 2;
+  static constexpr uint32_t kFormatVersion = 3;
 
   uint32_t format_version = kFormatVersion;
   Hash256 evidence_id;
@@ -198,6 +205,7 @@ struct ExactRegenerationRequestEvidence {
   Hash256 worker_certification_hash;
   Hash256 profile_admission_record_id;
   SessionHandoffIdentity session_identity;
+  DPMReplayStage stage = DPMReplayStage::kProjection;
   Hash256 request_execution_id;
   Hash256 canonical_request_hash;
   Hash256 physical_execution_plan_hash;
@@ -211,6 +219,13 @@ struct ExactRegenerationRequestEvidence {
   uint32_t run_count = 0;
   std::string authentication_key_id;
   Hash256 consensus_output_evidence_hash;
+  // Present only for exact agent requests. These are the model-affecting
+  // prepared-prefill commitments on which every independent worker agreed.
+  // Per-run plan IDs and restored witness IDs remain intentionally distinct.
+  std::optional<Hash256> agent_logical_request_hash;
+  std::optional<Hash256> consensus_source_chunks_hash;
+  std::optional<Hash256> consensus_resolved_token_plan_hash;
+  std::optional<Hash256> consensus_shape_schedule_hash;
   std::vector<ExactRegenerationRunEvidence> runs;
 };
 
@@ -248,6 +263,11 @@ struct ExactRegenerationExecution {
   std::string canonical_output;
   std::string token_bytes;
   std::vector<FreshWorkerLogitFrameEvidence> logit_frames;
+
+  // Run zero's representative runtime-derived plan. It is exposed only after
+  // all cold runs agree on the source, resolved-token, shape, profile, and
+  // logical-request commitments. Projection execution leaves it absent.
+  std::optional<DPMPreparedPrefillPlan> prepared_prefill_plan;
 
   // Exposed only after every independent run has passed equality. Capsule
   // bytes remain in the caller-owned staging sink; this is authenticated

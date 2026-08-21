@@ -84,10 +84,6 @@ constexpr absl::string_view kCapsuleKeyDomain =
 constexpr absl::string_view kRestoreCapsuleDirection = "RESTORE_TO_WORKER";
 constexpr absl::string_view kProducingCapsuleDirection =
     "PRODUCING_FROM_WORKER";
-constexpr absl::string_view kRestoreCapsuleKeyId =
-    "litert-lmx-fresh-worker-restore-v3";
-constexpr absl::string_view kProducingCapsuleKeyId =
-    "litert-lmx-fresh-worker-producing-v3";
 constexpr uint64_t kCapsuleIoChunkBytes = uint64_t{1024} * 1024;
 
 bool IsZeroHash(const Hash256& hash) {
@@ -1811,13 +1807,13 @@ FreshWorkerProcessRunner::RunWithSessionHandoff(
           : std::nullopt;
   SessionHandoffOptions transient_restore_options = DeriveCapsuleOptions(
       transport_authentication, request_envelope_hash,
-      kRestoreCapsuleDirection, kRestoreCapsuleKeyId,
+      kRestoreCapsuleDirection, kFreshWorkerTransientRestoreKeyId,
       expected_session_identity);
   SecretEraser transient_restore_key_eraser(
       &transient_restore_options.authentication_key);
   SessionHandoffOptions transient_producing_options = DeriveCapsuleOptions(
       transport_authentication, request_envelope_hash,
-      kProducingCapsuleDirection, kProducingCapsuleKeyId,
+      kProducingCapsuleDirection, kFreshWorkerTransientProducingKeyId,
       expected_session_identity);
   if (request.execution_plan.capture_producing_capsule) {
     transient_producing_options.expected_identity =
@@ -2108,12 +2104,12 @@ absl::Status RunFreshWorkerOnce(
           : std::nullopt;
   SessionHandoffOptions transient_restore_options = DeriveCapsuleOptions(
       authentication, request_envelope_hash, kRestoreCapsuleDirection,
-      kRestoreCapsuleKeyId, expected_session_identity);
+      kFreshWorkerTransientRestoreKeyId, expected_session_identity);
   SecretEraser transient_restore_key_eraser(
       &transient_restore_options.authentication_key);
   SessionHandoffOptions transient_producing_options = DeriveCapsuleOptions(
       authentication, request_envelope_hash, kProducingCapsuleDirection,
-      kProducingCapsuleKeyId, expected_session_identity);
+      kFreshWorkerTransientProducingKeyId, expected_session_identity);
   SecretEraser transient_producing_key_eraser(
       &transient_producing_options.authentication_key);
 

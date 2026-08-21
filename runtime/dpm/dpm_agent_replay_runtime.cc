@@ -608,7 +608,11 @@ bool DurableCapsuleEvidenceEqual(
 absl::StatusOr<DPMAgentReplayExecution> BuildExactAgentReplayExecution(
     const ExactRegenerationExecution& exact,
     const ExactLiteRtProfile& expected_profile,
-    const Hash256& expected_request_hash, uint32_t max_output_tokens) {
+    const Hash256& expected_request_hash,
+    const Hash256& expected_logical_agent_request_hash,
+    const std::vector<DPMAgentGenerationRequest::PrefillChunk>&
+        expected_executed_source_chunks,
+    uint32_t max_output_tokens) {
   ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(expected_profile));
   ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(exact.derived_profile));
   if (exact.mode != DPMReplayMode::kExactRegeneration ||
@@ -620,6 +624,35 @@ absl::StatusOr<DPMAgentReplayExecution> BuildExactAgentReplayExecution(
   }
   ABSL_RETURN_IF_ERROR(
       ValidateExactRegenerationRequestEvidence(exact.request_evidence));
+  if (exact.request_evidence.stage != DPMReplayStage::kAgentDecision ||
+      !exact.prepared_prefill_plan.has_value() ||
+      !exact.request_evidence.agent_logical_request_hash.has_value() ||
+      !exact.request_evidence.consensus_source_chunks_hash.has_value() ||
+      !exact.request_evidence.consensus_resolved_token_plan_hash.has_value() ||
+      !exact.request_evidence.consensus_shape_schedule_hash.has_value()) {
+    return absl::DataLossError(
+        "Exact agent result lacks its cold-run prepared-prefill consensus.");
+  }
+  const DPMPreparedPrefillPlan& prepared_plan =
+      *exact.prepared_prefill_plan;
+  ABSL_RETURN_IF_ERROR(ValidateDPMPreparedPrefillPlan(prepared_plan));
+  ABSL_RETURN_IF_ERROR(ValidatePreparedPlanSourceBindings(
+      prepared_plan, expected_executed_source_chunks));
+  if (prepared_plan.session_identity != expected_profile.session_identity ||
+      prepared_plan.logical_agent_request_hash !=
+          expected_logical_agent_request_hash ||
+      *exact.request_evidence.agent_logical_request_hash !=
+          expected_logical_agent_request_hash ||
+      prepared_plan.canonical_source_chunks_hash !=
+          *exact.request_evidence.consensus_source_chunks_hash ||
+      prepared_plan.resolved_token_plan_hash !=
+          *exact.request_evidence.consensus_resolved_token_plan_hash ||
+      prepared_plan.shape_schedule_hash !=
+          *exact.request_evidence.consensus_shape_schedule_hash) {
+    return absl::FailedPreconditionError(
+        "Exact agent representative plan differs from its runtime, logical "
+        "request, raw source chunks, or cold-run consensus.");
+  }
   const Hash256 exact_output_evidence_hash =
       ComputeFreshWorkerOutputEvidenceHash(
           exact.canonical_output, exact.token_bytes, exact.logit_frames);
@@ -638,11 +671,13 @@ absl::StatusOr<DPMAgentReplayExecution> BuildExactAgentReplayExecution(
   }
   const ExactRegenerationRunEvidence& run_zero =
       exact.request_evidence.runs.front();
-  if (run_zero.durable_producing_capsule_evidence.has_value() !=
+  if (!run_zero.prepared_prefill_plan.has_value() ||
+      !(*run_zero.prepared_prefill_plan == prepared_plan) ||
+      run_zero.durable_producing_capsule_evidence.has_value() !=
       exact.durable_producing_capsule_evidence.has_value()) {
     return absl::DataLossError(
-        "Exact agent result omitted or invented run-zero durable capsule "
-        "evidence.");
+        "Exact agent result changed its run-zero prepared plan or durable "
+        "capsule evidence.");
   }
   if (exact.durable_producing_capsule_evidence.has_value() &&
       !DurableCapsuleEvidenceEqual(
@@ -680,6 +715,7 @@ absl::StatusOr<DPMAgentReplayExecution> BuildExactAgentReplayExecution(
       .exact_output_evidence_hash = exact_output_evidence_hash,
       .reused_canonical_winner = false,
       .producing_session_matches_output = false,
+      .prepared_prefill_plan = prepared_plan,
   };
   ABSL_RETURN_IF_ERROR(
       ValidateDPMAgentReplayExecution(execution, max_output_tokens));
@@ -1245,6 +1281,7 @@ absl::Status ValidateDPMAgentReplayExecution(
           IsZeroHash(*execution.exact_output_evidence_hash) ||
           execution.exact_token_bytes.empty() ||
           execution.exact_logit_frames.empty() ||
+          !execution.prepared_prefill_plan.has_value() ||
           execution.reused_canonical_winner ||
           execution.producing_session_matches_output) {
         return absl::DataLossError(
@@ -1296,6 +1333,8 @@ absl::Status ValidateExactRegenerationDPMAgentPhysicalExecution(
       ValidateExactRegenerationRequestEvidence(execution.request_evidence));
   if (execution.replay_execution.mode !=
           DPMReplayMode::kExactRegeneration ||
+      execution.request_evidence.stage !=
+          DPMReplayStage::kAgentDecision ||
       !execution.replay_execution.exact_profile_id.has_value() ||
       !execution.replay_execution.exact_profile_admission_record_id
            .has_value() ||
@@ -1323,6 +1362,26 @@ absl::Status ValidateExactRegenerationDPMAgentPhysicalExecution(
   }
   const ExactRegenerationRunEvidence& run_zero =
       execution.request_evidence.runs.front();
+  if (!execution.replay_execution.prepared_prefill_plan.has_value() ||
+      !run_zero.prepared_prefill_plan.has_value() ||
+      !(*execution.replay_execution.prepared_prefill_plan ==
+        *run_zero.prepared_prefill_plan) ||
+      !execution.request_evidence.consensus_source_chunks_hash.has_value() ||
+      !execution.request_evidence.consensus_resolved_token_plan_hash
+           .has_value() ||
+      !execution.request_evidence.consensus_shape_schedule_hash.has_value() ||
+      execution.replay_execution.prepared_prefill_plan
+              ->canonical_source_chunks_hash !=
+          *execution.request_evidence.consensus_source_chunks_hash ||
+      execution.replay_execution.prepared_prefill_plan
+              ->resolved_token_plan_hash !=
+          *execution.request_evidence.consensus_resolved_token_plan_hash ||
+      execution.replay_execution.prepared_prefill_plan->shape_schedule_hash !=
+          *execution.request_evidence.consensus_shape_schedule_hash) {
+    return absl::DataLossError(
+        "Exact agent physical execution changed its agreed prepared-prefill "
+        "plan.");
+  }
   if (execution.run_zero_transient_producing_capsule_evidence.has_value() !=
           run_zero.transient_producing_capsule_evidence.has_value() ||
       (execution.run_zero_transient_producing_capsule_evidence.has_value() &&
@@ -2093,6 +2152,8 @@ ExactRegenerationDPMAgentRuntime::Generate(
   }
   return BuildExactAgentReplayExecution(
       exact, derived_profile_, expected_request_hash,
+      logical_request.logical_agent_request_hash,
+      logical_request.full_canonical_prefill_chunks,
       logical_request.max_output_tokens);
 }
 
@@ -2228,6 +2289,10 @@ ExactRegenerationDPMAgentRuntime::GeneratePhysicalExact(
       DPMAgentReplayExecution replay_execution,
       BuildExactAgentReplayExecution(
           exact, derived_profile_, expected_request_hash,
+          logical_request.logical_agent_request_hash,
+          decoded_delta_request.has_value()
+              ? decoded_delta_request->canonical_delta_prefill_chunks
+              : logical_request.full_canonical_prefill_chunks,
           logical_request.max_output_tokens));
   const ExactRegenerationCaptureRunPolicy expected_capture_policy =
       input.execution_plan.capture_producing_capsule
