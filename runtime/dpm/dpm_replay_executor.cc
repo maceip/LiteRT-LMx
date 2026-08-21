@@ -20,6 +20,7 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -41,6 +42,12 @@ namespace {
 
 constexpr std::array<char, 8> kCanonicalRequestMagic = {'D', 'P', 'M', 'R',
                                                         'E', 'Q', '0', '2'};
+constexpr uint64_t kMaximumEvidenceKeyIdBytes = 256;
+constexpr uint64_t kMaximumEvidenceAuthenticationKeyBytes = 4096;
+constexpr absl::string_view kExactRegenerationRunEvidenceDomain =
+    "LITERT_LMX_EXACT_REGENERATION_RUN_EVIDENCE_SHA256_V1";
+constexpr absl::string_view kExactRegenerationRequestEvidenceDomain =
+    "LITERT_LMX_EXACT_REGENERATION_REQUEST_EVIDENCE_SHA256_V1";
 
 bool IsZeroHash(const Hash256& hash) {
   uint8_t combined = 0;
@@ -65,6 +72,329 @@ void AppendU64(uint64_t value, std::string* output) {
   for (int shift = 56; shift >= 0; shift -= 8) {
     output->push_back(static_cast<char>((value >> shift) & 0xff));
   }
+}
+
+void AppendHash(const Hash256& hash, std::string* output) {
+  output->append(reinterpret_cast<const char*>(hash.bytes.data()),
+                 hash.bytes.size());
+}
+
+void AppendIdentity(const SessionHandoffIdentity& identity,
+                    std::string* output) {
+  AppendHash(identity.model_artifact_hash, output);
+  AppendHash(identity.runtime_artifact_hash, output);
+  AppendHash(identity.inference_profile_hash, output);
+}
+
+void AppendString(absl::string_view value, std::string* output) {
+  AppendU32(static_cast<uint32_t>(value.size()), output);
+  output->append(value.data(), value.size());
+}
+
+void AppendOptionalHash(const std::optional<Hash256>& value,
+                        std::string* output) {
+  AppendU32(value.has_value() ? 1 : 0, output);
+  if (value.has_value()) AppendHash(*value, output);
+}
+
+bool IsCompleteIdentity(const SessionHandoffIdentity& identity) {
+  return !IsZeroHash(identity.model_artifact_hash) &&
+         !IsZeroHash(identity.runtime_artifact_hash) &&
+         !IsZeroHash(identity.inference_profile_hash);
+}
+
+absl::Status ValidateEvidenceKeyId(absl::string_view key_id) {
+  if (key_id.empty() || key_id.size() > kMaximumEvidenceKeyIdBytes ||
+      HasControlByte(key_id)) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration evidence authentication key ID is invalid.");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateHandoffOptionsForIdentity(
+    const SessionHandoffOptions& options,
+    const SessionHandoffIdentity& expected_identity) {
+  ABSL_RETURN_IF_ERROR(ValidateEvidenceKeyId(options.key_id));
+  if (options.authentication_key.size() < 32 ||
+      options.authentication_key.size() >
+          kMaximumEvidenceAuthenticationKeyBytes) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration handoff key must contain 32 to 4096 bytes.");
+  }
+  if (!options.expected_identity.has_value() ||
+      *options.expected_identity != expected_identity ||
+      !IsCompleteIdentity(*options.expected_identity)) {
+    return absl::FailedPreconditionError(
+        "Exact-regeneration handoff options do not assert the "
+        "Engine-derived session identity.");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateTransientCapsuleEvidence(
+    const FreshWorkerProducingCapsuleEvidence& evidence) {
+  if (!IsCompleteIdentity(evidence.session_identity) ||
+      evidence.transient_envelope_size == 0 ||
+      evidence.transient_envelope_size > kMaximumFreshWorkerCapsuleBytes ||
+      IsZeroHash(evidence.transient_envelope_hash) ||
+      IsZeroHash(evidence.output_evidence_hash)) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration transient capsule evidence is incomplete.");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateDurableCapsuleEvidence(
+    const FreshWorkerDurableProducingCapsuleEvidence& evidence) {
+  ABSL_RETURN_IF_ERROR(ValidateEvidenceKeyId(evidence.key_id));
+  if (!IsCompleteIdentity(evidence.session_identity) ||
+      evidence.envelope_size == 0 ||
+      evidence.envelope_size > kMaximumFreshWorkerCapsuleBytes ||
+      IsZeroHash(evidence.envelope_hash) ||
+      IsZeroHash(evidence.output_evidence_hash)) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration durable capsule evidence is incomplete.");
+  }
+  return absl::OkStatus();
+}
+
+void AppendTransientCapsuleEvidence(
+    const FreshWorkerProducingCapsuleEvidence& evidence,
+    std::string* output) {
+  AppendIdentity(evidence.session_identity, output);
+  AppendU64(evidence.transient_envelope_size, output);
+  AppendHash(evidence.transient_envelope_hash, output);
+  AppendHash(evidence.output_evidence_hash, output);
+}
+
+void AppendDurableCapsuleEvidence(
+    const FreshWorkerDurableProducingCapsuleEvidence& evidence,
+    std::string* output) {
+  AppendIdentity(evidence.session_identity, output);
+  AppendString(evidence.key_id, output);
+  AppendU64(evidence.envelope_size, output);
+  AppendHash(evidence.envelope_hash, output);
+  AppendHash(evidence.output_evidence_hash, output);
+}
+
+std::string EncodeExactRegenerationRunEvidenceFields(
+    const ExactRegenerationRunEvidence& evidence) {
+  std::string encoded;
+  AppendU32(evidence.format_version, &encoded);
+  AppendU32(evidence.run_index, &encoded);
+  AppendU64(static_cast<uint64_t>(evidence.process_id), &encoded);
+  AppendHash(evidence.challenge_nonce, &encoded);
+  AppendHash(evidence.worker_instance_nonce, &encoded);
+  AppendHash(evidence.request_envelope_hash, &encoded);
+  AppendHash(evidence.result_envelope_hash, &encoded);
+  AppendHash(evidence.launch_spec_hash, &encoded);
+  AppendHash(evidence.output_evidence_hash, &encoded);
+  AppendOptionalHash(evidence.restored_checkpoint_id, &encoded);
+  AppendU32(evidence.transient_producing_capsule_evidence.has_value() ? 1 : 0,
+            &encoded);
+  if (evidence.transient_producing_capsule_evidence.has_value()) {
+    AppendTransientCapsuleEvidence(
+        *evidence.transient_producing_capsule_evidence, &encoded);
+  }
+  AppendU32(evidence.durable_producing_capsule_evidence.has_value() ? 1 : 0,
+            &encoded);
+  if (evidence.durable_producing_capsule_evidence.has_value()) {
+    AppendDurableCapsuleEvidence(
+        *evidence.durable_producing_capsule_evidence, &encoded);
+  }
+  return encoded;
+}
+
+absl::Status ValidateExactRegenerationRunEvidenceFields(
+    const ExactRegenerationRunEvidence& evidence, bool require_evidence_id) {
+  if (evidence.format_version !=
+      ExactRegenerationRunEvidence::kFormatVersion) {
+    return absl::FailedPreconditionError(
+        "Exact-regeneration run-evidence version is unsupported.");
+  }
+  if (evidence.run_index >= kMaximumFreshWorkerRuns ||
+      evidence.process_id <= 0 || IsZeroHash(evidence.challenge_nonce) ||
+      IsZeroHash(evidence.worker_instance_nonce) ||
+      IsZeroHash(evidence.request_envelope_hash) ||
+      IsZeroHash(evidence.result_envelope_hash) ||
+      IsZeroHash(evidence.launch_spec_hash) ||
+      IsZeroHash(evidence.output_evidence_hash) ||
+      (require_evidence_id && IsZeroHash(evidence.evidence_id))) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration run evidence is incomplete.");
+  }
+  if (evidence.restored_checkpoint_id.has_value() &&
+      IsZeroHash(*evidence.restored_checkpoint_id)) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration restored checkpoint ID must be nonzero.");
+  }
+  if (evidence.transient_producing_capsule_evidence.has_value() !=
+      evidence.durable_producing_capsule_evidence.has_value()) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration capsule evidence requires both transient and "
+        "durable bindings.");
+  }
+  if (evidence.transient_producing_capsule_evidence.has_value()) {
+    const FreshWorkerProducingCapsuleEvidence& transient =
+        *evidence.transient_producing_capsule_evidence;
+    const FreshWorkerDurableProducingCapsuleEvidence& durable =
+        *evidence.durable_producing_capsule_evidence;
+    ABSL_RETURN_IF_ERROR(ValidateTransientCapsuleEvidence(transient));
+    ABSL_RETURN_IF_ERROR(ValidateDurableCapsuleEvidence(durable));
+    if (transient.session_identity != durable.session_identity ||
+        transient.output_evidence_hash != durable.output_evidence_hash) {
+      return absl::DataLossError(
+          "Transient and durable producing-capsule evidence disagree.");
+    }
+  }
+  return absl::OkStatus();
+}
+
+std::string EncodeExactRegenerationRequestEvidenceFields(
+    const ExactRegenerationRequestEvidence& evidence) {
+  std::string encoded;
+  AppendU32(evidence.format_version, &encoded);
+  AppendHash(evidence.exact_profile_id, &encoded);
+  AppendHash(evidence.profile_admission_record_id, &encoded);
+  AppendIdentity(evidence.session_identity, &encoded);
+  AppendHash(evidence.request_execution_id, &encoded);
+  AppendHash(evidence.canonical_request_hash, &encoded);
+  AppendHash(evidence.physical_execution_plan_hash, &encoded);
+  AppendU32(static_cast<uint32_t>(evidence.prefill_mode), &encoded);
+  AppendOptionalHash(evidence.restored_checkpoint_id, &encoded);
+  AppendU32(static_cast<uint32_t>(evidence.capture_run_policy), &encoded);
+  AppendU32(static_cast<uint32_t>(evidence.replay_isolation), &encoded);
+  AppendU32(evidence.run_count, &encoded);
+  AppendString(evidence.authentication_key_id, &encoded);
+  AppendHash(evidence.consensus_output_evidence_hash, &encoded);
+  AppendU32(static_cast<uint32_t>(evidence.runs.size()), &encoded);
+  for (const ExactRegenerationRunEvidence& run : evidence.runs) {
+    // The enclosing ID commits both the nested canonical ID and every nested
+    // field, so an implementation cannot substitute an unchecked digest.
+    AppendHash(run.evidence_id, &encoded);
+    encoded.append(EncodeExactRegenerationRunEvidenceFields(run));
+  }
+  return encoded;
+}
+
+absl::Status ValidateExactRegenerationRequestEvidenceFields(
+    const ExactRegenerationRequestEvidence& evidence,
+    bool require_evidence_id) {
+  if (evidence.format_version !=
+      ExactRegenerationRequestEvidence::kFormatVersion) {
+    return absl::FailedPreconditionError(
+        "Exact-regeneration request-evidence version is unsupported.");
+  }
+  if (IsZeroHash(evidence.exact_profile_id) ||
+      IsZeroHash(evidence.profile_admission_record_id) ||
+      !IsCompleteIdentity(evidence.session_identity) ||
+      IsZeroHash(evidence.request_execution_id) ||
+      IsZeroHash(evidence.canonical_request_hash) ||
+      IsZeroHash(evidence.physical_execution_plan_hash) ||
+      IsZeroHash(evidence.consensus_output_evidence_hash) ||
+      (require_evidence_id && IsZeroHash(evidence.evidence_id))) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration request evidence is incomplete.");
+  }
+  ABSL_RETURN_IF_ERROR(
+      ValidateEvidenceKeyId(evidence.authentication_key_id));
+  if (evidence.run_count < 2 ||
+      evidence.run_count > kMaximumFreshWorkerRuns ||
+      evidence.runs.size() != evidence.run_count) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration request evidence has an invalid run count.");
+  }
+  switch (evidence.prefill_mode) {
+    case FreshWorkerPrefillMode::kFullCanonicalPrefill:
+      if (evidence.restored_checkpoint_id.has_value()) {
+        return absl::InvalidArgumentError(
+            "Full-prefill request evidence cannot claim a restore.");
+      }
+      break;
+    case FreshWorkerPrefillMode::kOwnPositionCapsuleDelta:
+      if (!evidence.restored_checkpoint_id.has_value() ||
+          IsZeroHash(*evidence.restored_checkpoint_id)) {
+        return absl::InvalidArgumentError(
+            "Delta request evidence requires a restored checkpoint.");
+      }
+      break;
+    default:
+      return absl::InvalidArgumentError(
+          "Exact-regeneration request evidence has an unknown prefill mode.");
+  }
+  if (evidence.capture_run_policy !=
+          ExactRegenerationCaptureRunPolicy::kNoCapture &&
+      evidence.capture_run_policy !=
+          ExactRegenerationCaptureRunPolicy::kRunZeroOnly) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration request evidence has an unknown capture policy.");
+  }
+  if (evidence.replay_isolation !=
+      FreshWorkerReplayIsolation::kEmptyCatalogs) {
+    return absl::FailedPreconditionError(
+        "Exact-regeneration evidence lacks empty-catalog isolation.");
+  }
+
+  std::set<int64_t> process_ids;
+  std::set<Hash256> physical_nonces = {evidence.request_execution_id};
+  std::set<Hash256> request_envelopes;
+  std::set<Hash256> result_envelopes;
+  std::set<Hash256> run_evidence_ids;
+  Hash256 common_launch_spec_hash;
+  for (uint32_t index = 0; index < evidence.run_count; ++index) {
+    const ExactRegenerationRunEvidence& run = evidence.runs[index];
+    ABSL_RETURN_IF_ERROR(ValidateExactRegenerationRunEvidence(run));
+    if (run.run_index != index ||
+        run.output_evidence_hash !=
+            evidence.consensus_output_evidence_hash ||
+        run.restored_checkpoint_id != evidence.restored_checkpoint_id) {
+      return absl::DataLossError(
+          "Exact-regeneration run evidence disagrees with its request.");
+    }
+    if (!process_ids.insert(run.process_id).second ||
+        !physical_nonces.insert(run.challenge_nonce).second ||
+        !physical_nonces.insert(run.worker_instance_nonce).second ||
+        !request_envelopes.insert(run.request_envelope_hash).second ||
+        !result_envelopes.insert(run.result_envelope_hash).second ||
+        !run_evidence_ids.insert(run.evidence_id).second) {
+      return absl::FailedPreconditionError(
+          "Exact-regeneration evidence reused physical-run provenance.");
+    }
+    if (index == 0) {
+      common_launch_spec_hash = run.launch_spec_hash;
+    } else if (run.launch_spec_hash != common_launch_spec_hash) {
+      return absl::FailedPreconditionError(
+          "Exact-regeneration runs used different launch specifications.");
+    }
+    const bool should_capture =
+        index == 0 && evidence.capture_run_policy ==
+                          ExactRegenerationCaptureRunPolicy::kRunZeroOnly;
+    if (run.transient_producing_capsule_evidence.has_value() !=
+            should_capture ||
+        run.durable_producing_capsule_evidence.has_value() !=
+            should_capture) {
+      return absl::DataLossError(
+          "Exact-regeneration run evidence violates run-zero-only capture.");
+    }
+    if (should_capture) {
+      const FreshWorkerProducingCapsuleEvidence& transient =
+          *run.transient_producing_capsule_evidence;
+      const FreshWorkerDurableProducingCapsuleEvidence& durable =
+          *run.durable_producing_capsule_evidence;
+      if (transient.session_identity != evidence.session_identity ||
+          durable.session_identity != evidence.session_identity ||
+          transient.output_evidence_hash !=
+              evidence.consensus_output_evidence_hash ||
+          durable.output_evidence_hash !=
+              evidence.consensus_output_evidence_hash) {
+        return absl::DataLossError(
+            "Run-zero capsule does not bind the consensus output and "
+            "Engine-derived session identity.");
+      }
+    }
+  }
+  return absl::OkStatus();
 }
 
 class Reader {
@@ -139,32 +469,53 @@ absl::Status ValidateWinnerForKey(const CanonicalReplayWinner& winner,
   return absl::OkStatus();
 }
 
-absl::Status ValidateExactExecutionRecord(
-    const ExactProfileAdmissionRecord& record,
-    const ExactLiteRtProfile& profile,
-    const ExactProfileQualificationSpec& qualification_spec,
-    const FreshWorkerAuthentication& authentication) {
+}  // namespace
+
+absl::StatusOr<Hash256> ComputeExactRegenerationRunEvidenceId(
+    const ExactRegenerationRunEvidence& evidence) {
   ABSL_RETURN_IF_ERROR(
-      ValidateExactProfileAdmissionRecordForProfile(record, profile));
-  if (record.independent_run_count !=
-          qualification_spec.independent_run_count ||
-      record.qualification_request_hash !=
-          ComputeExactProfileQualificationRequestHash(profile,
-                                                      qualification_spec) ||
-      record.request_payload_size !=
-          qualification_spec.canonical_request_payload.size() ||
-      record.request_payload_hash !=
-          Sha256(qualification_spec.canonical_request_payload) ||
-      record.authentication_key_id != authentication.key_id ||
-      record.replay_isolation != FreshWorkerReplayIsolation::kEmptyCatalogs) {
+      ValidateExactRegenerationRunEvidenceFields(evidence, false));
+  Sha256Hasher hasher;
+  hasher.Update(kExactRegenerationRunEvidenceDomain);
+  hasher.Update(EncodeExactRegenerationRunEvidenceFields(evidence));
+  return hasher.Finalize();
+}
+
+absl::Status ValidateExactRegenerationRunEvidence(
+    const ExactRegenerationRunEvidence& evidence) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactRegenerationRunEvidenceFields(evidence, true));
+  ABSL_ASSIGN_OR_RETURN(const Hash256 expected_id,
+                        ComputeExactRegenerationRunEvidenceId(evidence));
+  if (evidence.evidence_id != expected_id) {
     return absl::DataLossError(
-        "Fresh exact execution evidence does not bind the resolved request "
-        "and profile.");
+        "Exact-regeneration run-evidence ID is not canonical.");
   }
   return absl::OkStatus();
 }
 
-}  // namespace
+absl::StatusOr<Hash256> ComputeExactRegenerationRequestEvidenceId(
+    const ExactRegenerationRequestEvidence& evidence) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactRegenerationRequestEvidenceFields(evidence, false));
+  Sha256Hasher hasher;
+  hasher.Update(kExactRegenerationRequestEvidenceDomain);
+  hasher.Update(EncodeExactRegenerationRequestEvidenceFields(evidence));
+  return hasher.Finalize();
+}
+
+absl::Status ValidateExactRegenerationRequestEvidence(
+    const ExactRegenerationRequestEvidence& evidence) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactRegenerationRequestEvidenceFields(evidence, true));
+  ABSL_ASSIGN_OR_RETURN(const Hash256 expected_id,
+                        ComputeExactRegenerationRequestEvidenceId(evidence));
+  if (evidence.evidence_id != expected_id) {
+    return absl::DataLossError(
+        "Exact-regeneration request-evidence ID is not canonical.");
+  }
+  return absl::OkStatus();
+}
 
 absl::Status ValidateDPMCanonicalReplayRequest(
     const DPMCanonicalReplayRequest& request) {
@@ -388,6 +739,124 @@ struct ResolvedExactExecutorProfile {
   ExactLiteRtProfile profile;
 };
 
+absl::Status ValidateLogitFramesMatchExactProfile(
+    const ExactLiteRtProfile& profile,
+    const std::vector<FreshWorkerLogitFrameEvidence>& frames) {
+  FreshWorkerLogitElementType expected_type =
+      FreshWorkerLogitElementType::kUnsupported;
+  uint32_t expected_width = 0;
+  switch (profile.logits_frame.element_type) {
+    case ExactLiteRtLogitsElementType::kFloat16:
+      expected_type = FreshWorkerLogitElementType::kFloat16;
+      expected_width = 2;
+      break;
+    case ExactLiteRtLogitsElementType::kFloat32:
+      expected_type = FreshWorkerLogitElementType::kFloat32;
+      expected_width = 4;
+      break;
+    case ExactLiteRtLogitsElementType::kUnsupported:
+      return absl::FailedPreconditionError(
+          "Engine-derived exact profile has unsupported logits.");
+    default:
+      return absl::FailedPreconditionError(
+          "Engine-derived exact profile has an unknown logits type.");
+  }
+  if (frames.empty()) {
+    return absl::FailedPreconditionError(
+        "Exact regeneration returned no logits evidence.");
+  }
+  for (const FreshWorkerLogitFrameEvidence& frame : frames) {
+    ABSL_RETURN_IF_ERROR(ValidateFreshWorkerLogitFrameEvidence(frame));
+    if (frame.element_type != expected_type ||
+        frame.element_byte_width != expected_width ||
+        frame.batch_size != profile.logits_frame.batch_size ||
+        frame.sequence_size != profile.logits_frame.sequence_size ||
+        frame.vocabulary_size != profile.logits_frame.vocabulary_size ||
+        frame.byte_count != profile.logits_frame.byte_count) {
+      return absl::FailedPreconditionError(
+          "Fresh-worker logits evidence differs from the Engine-derived "
+          "exact profile.");
+    }
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<Hash256> GenerateUniqueExecutionNonce(
+    std::set<Hash256>* allocated) {
+  if (allocated == nullptr) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration nonce set is missing.");
+  }
+  for (int attempt = 0; attempt < 16; ++attempt) {
+    ABSL_ASSIGN_OR_RETURN(const Hash256 nonce, GenerateFreshWorkerNonce());
+    if (allocated->insert(nonce).second) return nonce;
+  }
+  return absl::InternalError(
+      "The OS random source repeatedly returned a reused exact-run nonce.");
+}
+
+absl::Status ValidateExactExecutionInput(
+    const ExactRegenerationExecutionInput& input,
+    const Hash256& canonical_request_hash,
+    const ExactLiteRtProfile& profile) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateFreshWorkerExecutionPlan(input.execution_plan));
+  if (input.execution_plan.logical_replay_request_hash !=
+      canonical_request_hash) {
+    return absl::FailedPreconditionError(
+        "Physical execution plan is not bound to the canonical request.");
+  }
+  const bool has_restore_source = input.durable_restore_source != nullptr;
+  const bool has_restore_options = input.durable_restore_options != nullptr;
+  const bool has_capture_destination =
+      input.staging_capture_destination != nullptr;
+  const bool has_capture_options =
+      input.staging_capture_options != nullptr;
+  if (has_restore_source != has_restore_options ||
+      has_capture_destination != has_capture_options) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration handoff sources, sinks, and options require "
+        "complete pointer pairs.");
+  }
+  if (has_capture_destination !=
+      input.execution_plan.capture_producing_capsule) {
+    return absl::InvalidArgumentError(
+        "Physical execution capture transfer disagrees with its plan.");
+  }
+  switch (input.execution_plan.prefill_mode) {
+    case FreshWorkerPrefillMode::kFullCanonicalPrefill:
+      if (has_restore_source) {
+        return absl::InvalidArgumentError(
+            "Full-prefill exact regeneration cannot receive a restore "
+            "capsule.");
+      }
+      break;
+    case FreshWorkerPrefillMode::kOwnPositionCapsuleDelta:
+      if (!has_restore_source ||
+          input.execution_plan.session_identity != profile.session_identity) {
+        return absl::FailedPreconditionError(
+            "Delta exact regeneration requires a restore bound to the "
+            "Engine-derived session identity.");
+      }
+      if (input.durable_restore_source->Size() !=
+          input.execution_plan.restore_durable_envelope_size) {
+        return absl::DataLossError(
+            "Durable restore size differs from the physical plan.");
+      }
+      ABSL_RETURN_IF_ERROR(ValidateHandoffOptionsForIdentity(
+          *input.durable_restore_options, profile.session_identity));
+      break;
+    default:
+      return absl::InvalidArgumentError(
+          "Physical execution plan has an unknown prefill mode.");
+  }
+  if (has_capture_options) {
+    ABSL_RETURN_IF_ERROR(ValidateHandoffOptionsForIdentity(
+        *input.staging_capture_options, profile.session_identity));
+  }
+  return absl::OkStatus();
+}
+
 absl::Status ValidateExactExecutorConfig(
     const Engine* engine,
     const ExactProfileAdmissionRepository* admission_repository,
@@ -556,11 +1025,17 @@ ExactRegenerationExecutor::GetDerivedProfile() const {
   return ResolveCurrentProfile();
 }
 
-ExactProfileQualificationSpec
-ExactRegenerationExecutor::MakeQualificationSpec(
-    absl::string_view encoded_request) const {
-  return MakeExactQualificationSpec(resolved_session_config_, config_,
-                                    encoded_request);
+absl::StatusOr<Hash256>
+ExactRegenerationExecutor::GetProfileAdmissionRecordId() const {
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  ABSL_ASSIGN_OR_RETURN(const ExactLiteRtProfile profile,
+                        ResolveCurrentProfile());
+  ABSL_ASSIGN_OR_RETURN(
+      const ExactProfileAdmissionRecord admission,
+      admission_repository_->Get(profile, config_.authentication));
+  ABSL_RETURN_IF_ERROR(ValidateAdmissionForExactProfile(
+      admission, profile, config_.authentication));
+  return admission.record_id;
 }
 
 absl::Status ExactRegenerationExecutor::ValidateSupport() const {
@@ -582,44 +1057,310 @@ absl::Status ExactRegenerationExecutor::ValidateSupport() const {
 
 absl::StatusOr<ExactRegenerationExecution> ExactRegenerationExecutor::Run(
     const DPMCanonicalReplayRequest& request) const {
-  // Reject cross-stage and cross-limit requests before ValidateSupport can
-  // touch the repository and, critically, before any worker process is born.
+  // The convenience path is deliberately canonical full prefill with no
+  // capsule transfer. It still uses the request-scoped evidence path and N
+  // new processes; it does not reuse profile-admission output as execution.
+  ABSL_RETURN_IF_ERROR(ValidateBoundRequest(request));
+  ABSL_ASSIGN_OR_RETURN(const Hash256 request_hash,
+                        ComputeDPMCanonicalReplayRequestHash(request));
+  FreshWorkerExecutionPlan plan;
+  plan.logical_replay_request_hash = request_hash;
+  ABSL_ASSIGN_OR_RETURN(plan.plan_hash,
+                        ComputeFreshWorkerExecutionPlanHash(plan));
+  return RunWithExecutionInput(
+      request, ExactRegenerationExecutionInput{.execution_plan = plan}, true);
+}
+
+absl::StatusOr<ExactRegenerationExecution>
+ExactRegenerationExecutor::RunPhysical(
+    const DPMCanonicalReplayRequest& request,
+    const ExactRegenerationExecutionInput& input) const {
+  return RunWithExecutionInput(request, input, false);
+}
+
+absl::StatusOr<ExactRegenerationExecution>
+ExactRegenerationExecutor::RunWithExecutionInput(
+    const DPMCanonicalReplayRequest& request,
+    const ExactRegenerationExecutionInput& input,
+    bool capsule_free_convenience) const {
+  // Reject cross-stage and cross-limit requests before touching the
+  // repository and, critically, before any worker process is born.
   ABSL_RETURN_IF_ERROR(ValidateBoundRequest(request));
   ABSL_RETURN_IF_ERROR(ValidateSupport());
   ABSL_ASSIGN_OR_RETURN(const ExactLiteRtProfile profile_before,
                         ResolveCurrentProfile());
   ABSL_ASSIGN_OR_RETURN(
-      const ExactProfileAdmissionRecord admission,
+      const ExactProfileAdmissionRecord admission_before,
       admission_repository_->Get(profile_before, config_.authentication));
+  ABSL_RETURN_IF_ERROR(ValidateAdmissionForExactProfile(
+      admission_before, profile_before, config_.authentication));
   ABSL_ASSIGN_OR_RETURN(const std::string encoded_request,
                         EncodeDPMCanonicalReplayRequest(request));
   ABSL_ASSIGN_OR_RETURN(const Hash256 request_hash,
                         ComputeDPMCanonicalReplayRequestHash(request));
-  const ExactProfileQualificationSpec qualification_spec =
-      MakeQualificationSpec(encoded_request);
-  ABSL_RETURN_IF_ERROR(ValidateAdmissionForExactProfile(
-      admission, profile_before, config_.authentication));
+  if (request_hash != Sha256(encoded_request)) {
+    return absl::InternalError(
+        "Canonical replay request hash disagrees with its encoded bytes.");
+  }
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactExecutionInput(input, request_hash, profile_before));
+  if (capsule_free_convenience &&
+      (input.execution_plan.prefill_mode !=
+           FreshWorkerPrefillMode::kFullCanonicalPrefill ||
+       input.execution_plan.capture_producing_capsule ||
+       input.durable_restore_source != nullptr ||
+       input.durable_restore_options != nullptr ||
+       input.staging_capture_destination != nullptr ||
+       input.staging_capture_options != nullptr)) {
+    return absl::InvalidArgumentError(
+        "Capsule-free exact execution accepts only full prefill without "
+        "capture.");
+  }
 
-  ExactProfileQualifier qualifier(engine_, &worker_runner_);
-  ABSL_ASSIGN_OR_RETURN(
-      ExactProfileAdmissionRecord cold_run,
-      qualifier.Qualify(qualification_spec, config_.authentication));
-  ABSL_RETURN_IF_ERROR(ValidateExactExecutionRecord(
-      cold_run, profile_before, qualification_spec, config_.authentication));
+  std::set<Hash256> allocated_nonces;
+  ABSL_ASSIGN_OR_RETURN(const Hash256 request_execution_id,
+                        GenerateUniqueExecutionNonce(&allocated_nonces));
+  std::set<int64_t> process_ids;
+  std::set<Hash256> request_envelope_hashes;
+  std::set<Hash256> result_envelope_hashes;
+  Hash256 common_launch_spec_hash;
+  Hash256 consensus_output_hash;
+  std::string consensus_output;
+  std::string consensus_token_bytes;
+  std::vector<FreshWorkerLogitFrameEvidence> consensus_logit_frames;
+  std::vector<ExactRegenerationRunEvidence> run_evidence;
+  run_evidence.reserve(config_.independent_run_count);
+  std::optional<FreshWorkerDurableProducingCapsuleEvidence>
+      successful_staged_capsule;
+
+  for (uint32_t run_index = 0;
+       run_index < config_.independent_run_count; ++run_index) {
+    ABSL_ASSIGN_OR_RETURN(const Hash256 challenge,
+                          GenerateUniqueExecutionNonce(&allocated_nonces));
+    const bool capture_this_run =
+        input.execution_plan.capture_producing_capsule && run_index == 0;
+    FreshWorkerExecutionPlan run_plan = input.execution_plan;
+    run_plan.capture_producing_capsule = capture_this_run;
+    // Capture is explicitly excluded from the model-affecting plan hash.
+    // Every run must otherwise consume the identical caller-validated plan.
+    ABSL_RETURN_IF_ERROR(ValidateFreshWorkerExecutionPlan(run_plan));
+    if (run_plan.plan_hash != input.execution_plan.plan_hash) {
+      return absl::InternalError(
+          "Run-zero capture changed the model-affecting execution plan.");
+    }
+    FreshWorkerRequest worker_request;
+    worker_request.exact_profile_hash = profile_before.profile_id;
+    worker_request.qualification_id = request_execution_id;
+    worker_request.run_index = run_index;
+    worker_request.run_count = config_.independent_run_count;
+    worker_request.challenge_nonce = challenge;
+    worker_request.request_payload = encoded_request;
+    worker_request.execution_plan = run_plan;
+    ABSL_RETURN_IF_ERROR(ValidateFreshWorkerRequest(worker_request));
+
+    FreshWorkerProcessObservation observation;
+    if (capsule_free_convenience) {
+      ABSL_ASSIGN_OR_RETURN(
+          observation,
+          worker_runner_.Run(worker_request, config_.authentication));
+    } else {
+      FreshWorkerSessionHandoffTransfer transfer;
+      transfer.durable_restore_source = input.durable_restore_source;
+      transfer.durable_restore_options = input.durable_restore_options;
+      if (capture_this_run) {
+        transfer.durable_capture_destination =
+            input.staging_capture_destination;
+        transfer.durable_capture_options = input.staging_capture_options;
+      }
+      ABSL_ASSIGN_OR_RETURN(
+          observation, worker_runner_.RunWithSessionHandoff(
+                           worker_request, config_.authentication, transfer));
+    }
+    ABSL_RETURN_IF_ERROR(
+        ValidateFreshWorkerResultForRequest(observation.result,
+                                            worker_request));
+    if (observation.result.status_code != absl::StatusCode::kOk) {
+      return absl::Status(observation.result.status_code,
+                          observation.result.status_message);
+    }
+    if (observation.result.exact_profile_hash != profile_before.profile_id ||
+        observation.result.qualification_id != request_execution_id ||
+        observation.result.run_index != run_index ||
+        observation.result.run_count != config_.independent_run_count ||
+        observation.result.challenge_nonce != challenge ||
+        observation.result.execution_plan_hash !=
+            input.execution_plan.plan_hash ||
+        observation.result.request_envelope_hash !=
+            observation.request_envelope_hash ||
+        observation.result.restored_checkpoint_id !=
+            input.execution_plan.restore_checkpoint_id) {
+      return absl::UnauthenticatedError(
+          "Fresh-worker observation is not bound to this physical exact "
+          "execution.");
+    }
+    if (observation.result.replay_isolation !=
+        FreshWorkerReplayIsolation::kEmptyCatalogs) {
+      return absl::FailedPreconditionError(
+          "Physical exact execution lacks empty-catalog isolation.");
+    }
+    ABSL_RETURN_IF_ERROR(ValidateLogitFramesMatchExactProfile(
+        profile_before, observation.result.logit_frames));
+    if (observation.process_id <= 0 ||
+        !process_ids.insert(observation.process_id).second) {
+      return absl::FailedPreconditionError(
+          "Physical exact execution did not use unique fresh processes.");
+    }
+    if (!allocated_nonces.insert(
+             observation.result.worker_instance_nonce).second ||
+        !request_envelope_hashes.insert(
+             observation.request_envelope_hash).second ||
+        !result_envelope_hashes.insert(
+             observation.result_envelope_hash).second) {
+      return absl::FailedPreconditionError(
+          "Physical exact execution reused authenticated run provenance.");
+    }
+    if (IsZeroHash(observation.request_envelope_hash) ||
+        IsZeroHash(observation.result_envelope_hash) ||
+        IsZeroHash(observation.launch_spec_hash) ||
+        IsZeroHash(observation.result.worker_instance_nonce)) {
+      return absl::DataLossError(
+          "Physical exact execution omitted process provenance.");
+    }
+    if (run_index == 0) {
+      common_launch_spec_hash = observation.launch_spec_hash;
+    } else if (observation.launch_spec_hash != common_launch_spec_hash) {
+      return absl::FailedPreconditionError(
+          "Physical exact execution changed its worker launch "
+          "specification.");
+    }
+
+    const Hash256 output_hash = ComputeFreshWorkerOutputEvidenceHash(
+        observation.result.canonical_output, observation.result.token_bytes,
+        observation.result.logit_frames);
+    if (IsZeroHash(output_hash)) {
+      return absl::InternalError(
+          "Physical exact execution produced a zero output-evidence hash.");
+    }
+    if (run_index == 0) {
+      consensus_output_hash = output_hash;
+      consensus_output = observation.result.canonical_output;
+      consensus_token_bytes = observation.result.token_bytes;
+      consensus_logit_frames = observation.result.logit_frames;
+    } else if (observation.result.canonical_output != consensus_output ||
+               observation.result.token_bytes != consensus_token_bytes ||
+               observation.result.logit_frames != consensus_logit_frames ||
+               output_hash != consensus_output_hash) {
+      return absl::FailedPreconditionError(
+          "Independent physical runs produced different canonical output, "
+          "DPMTOK01 bytes, or ordered full-logits hashes.");
+    }
+
+    if (observation.result.producing_capsule_evidence.has_value() !=
+            capture_this_run ||
+        observation.durable_producing_capsule_evidence.has_value() !=
+            capture_this_run) {
+      return absl::DataLossError(
+          "Physical exact execution violated run-zero-only capsule capture.");
+    }
+    if (capture_this_run) {
+      const FreshWorkerProducingCapsuleEvidence& transient =
+          *observation.result.producing_capsule_evidence;
+      const FreshWorkerDurableProducingCapsuleEvidence& durable =
+          *observation.durable_producing_capsule_evidence;
+      ABSL_RETURN_IF_ERROR(ValidateTransientCapsuleEvidence(transient));
+      ABSL_RETURN_IF_ERROR(ValidateDurableCapsuleEvidence(durable));
+      if (transient.session_identity != profile_before.session_identity ||
+          durable.session_identity != profile_before.session_identity ||
+          transient.output_evidence_hash != output_hash ||
+          durable.output_evidence_hash != output_hash ||
+          transient.session_identity != durable.session_identity ||
+          durable.key_id != input.staging_capture_options->key_id) {
+        return absl::DataLossError(
+            "Run-zero producing capsule does not bind the consensus output, "
+            "durable key, and Engine-derived session identity.");
+      }
+      successful_staged_capsule = durable;
+    }
+
+    ExactRegenerationRunEvidence evidence{
+        .run_index = run_index,
+        .process_id = observation.process_id,
+        .challenge_nonce = challenge,
+        .worker_instance_nonce =
+            observation.result.worker_instance_nonce,
+        .request_envelope_hash = observation.request_envelope_hash,
+        .result_envelope_hash = observation.result_envelope_hash,
+        .launch_spec_hash = observation.launch_spec_hash,
+        .output_evidence_hash = output_hash,
+        .restored_checkpoint_id =
+            observation.result.restored_checkpoint_id,
+        .transient_producing_capsule_evidence =
+            observation.result.producing_capsule_evidence,
+        .durable_producing_capsule_evidence =
+            observation.durable_producing_capsule_evidence,
+    };
+    ABSL_ASSIGN_OR_RETURN(
+        evidence.evidence_id,
+        ComputeExactRegenerationRunEvidenceId(evidence));
+    ABSL_RETURN_IF_ERROR(ValidateExactRegenerationRunEvidence(evidence));
+    run_evidence.push_back(std::move(evidence));
+  }
+
   ABSL_ASSIGN_OR_RETURN(const ExactLiteRtProfile profile_after,
                         ResolveCurrentProfile());
   if (profile_after != profile_before) {
     return absl::AbortedError(
-        "Engine-derived exact profile changed during cold regeneration.");
+        "Engine-derived exact profile changed during physical "
+        "regeneration.");
   }
+  ABSL_ASSIGN_OR_RETURN(
+      const ExactProfileAdmissionRecord admission_after,
+      admission_repository_->Get(profile_after, config_.authentication));
+  ABSL_RETURN_IF_ERROR(ValidateAdmissionForExactProfile(
+      admission_after, profile_after, config_.authentication));
+  if (admission_after.record_id != admission_before.record_id) {
+    return absl::AbortedError(
+        "Exact-profile admission changed during physical regeneration.");
+  }
+
+  ExactRegenerationRequestEvidence request_evidence{
+      .exact_profile_id = profile_before.profile_id,
+      .profile_admission_record_id = admission_before.record_id,
+      .session_identity = profile_before.session_identity,
+      .request_execution_id = request_execution_id,
+      .canonical_request_hash = request_hash,
+      .physical_execution_plan_hash = input.execution_plan.plan_hash,
+      .prefill_mode = input.execution_plan.prefill_mode,
+      .restored_checkpoint_id = input.execution_plan.restore_checkpoint_id,
+      .capture_run_policy =
+          input.execution_plan.capture_producing_capsule
+              ? ExactRegenerationCaptureRunPolicy::kRunZeroOnly
+              : ExactRegenerationCaptureRunPolicy::kNoCapture,
+      .replay_isolation = FreshWorkerReplayIsolation::kEmptyCatalogs,
+      .run_count = config_.independent_run_count,
+      .authentication_key_id = config_.authentication.key_id,
+      .consensus_output_evidence_hash = consensus_output_hash,
+      .runs = std::move(run_evidence),
+  };
+  ABSL_ASSIGN_OR_RETURN(
+      request_evidence.evidence_id,
+      ComputeExactRegenerationRequestEvidenceId(request_evidence));
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactRegenerationRequestEvidence(request_evidence));
+
+  // A capture sink may already contain staging bytes, but neither their
+  // authenticated metadata nor a successful result escapes until every run
+  // and the post-run profile/admission checks have passed.
   return ExactRegenerationExecution{
       .derived_profile = profile_before,
       .canonical_request_hash = request_hash,
-      .profile_admission_record_id = admission.record_id,
-      .cold_run_evidence = cold_run,
-      .canonical_output = cold_run.canonical_output,
-      .token_bytes = cold_run.token_bytes,
-      .logit_frames = cold_run.logit_frames,
+      .profile_admission_record_id = admission_before.record_id,
+      .request_evidence = std::move(request_evidence),
+      .canonical_output = std::move(consensus_output),
+      .token_bytes = std::move(consensus_token_bytes),
+      .logit_frames = std::move(consensus_logit_frames),
+      .durable_producing_capsule_evidence =
+          std::move(successful_staged_capsule),
   };
 }
 

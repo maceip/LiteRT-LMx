@@ -66,7 +66,7 @@ struct DPMProjectionReplayExecution {
   DPMReplayMode mode = DPMReplayMode::kCanonicalWinnerReplay;
   Hash256 replay_request_hash;
   // WinnerReplay uses the authenticated winner's deterministic candidate
-  // binding. ExactRegeneration uses the fresh cold-run record ID. Callers must
+  // binding. ExactRegeneration uses the fresh request-evidence ID. Callers must
   // interpret this field together with `mode`; the former is never
   // independent-regeneration evidence.
   Hash256 execution_evidence_hash;

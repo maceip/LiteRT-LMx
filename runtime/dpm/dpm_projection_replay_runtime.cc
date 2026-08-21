@@ -635,24 +635,44 @@ ExactRegenerationDPMProjectionRuntime::Generate(
         "Exact projection result came from another request or exact "
         "profile.");
   }
-  ABSL_RETURN_IF_ERROR(ValidateExactProfileAdmissionRecordForProfile(
-      exact.cold_run_evidence, exact.derived_profile));
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactRegenerationRequestEvidence(exact.request_evidence));
+  const Hash256 exact_output_evidence_hash =
+      ComputeFreshWorkerOutputEvidenceHash(
+          exact.canonical_output, exact.token_bytes, exact.logit_frames);
+  if (exact.request_evidence.exact_profile_id !=
+          exact.derived_profile.profile_id ||
+      exact.request_evidence.profile_admission_record_id !=
+          exact.profile_admission_record_id ||
+      exact.request_evidence.session_identity !=
+          exact.derived_profile.session_identity ||
+      exact.request_evidence.canonical_request_hash !=
+          exact.canonical_request_hash ||
+      exact.request_evidence.prefill_mode !=
+          FreshWorkerPrefillMode::kFullCanonicalPrefill ||
+      exact.request_evidence.restored_checkpoint_id.has_value() ||
+      exact.request_evidence.capture_run_policy !=
+          ExactRegenerationCaptureRunPolicy::kNoCapture ||
+      exact.request_evidence.consensus_output_evidence_hash !=
+          exact_output_evidence_hash ||
+      exact.durable_producing_capsule_evidence.has_value()) {
+    return absl::DataLossError(
+        "Exact projection request evidence disagrees with the returned "
+        "full-prefill execution.");
+  }
   ABSL_ASSIGN_OR_RETURN(
       const std::string verified,
       CanonicalizeDPMProjectionOutput(exact.canonical_output,
                                       request.source_event_count, config_));
   if (verified != exact.canonical_output ||
-      IsZeroHash(exact.cold_run_evidence.record_id) ||
-      exact.cold_run_evidence.canonical_output != exact.canonical_output ||
-      exact.cold_run_evidence.token_bytes != exact.token_bytes ||
-      exact.cold_run_evidence.logit_frames != exact.logit_frames) {
+      IsZeroHash(exact.request_evidence.evidence_id)) {
     return absl::DataLossError(
         "Exact projection worker output is not canonical evidence.");
   }
   DPMProjectionReplayExecution execution{
       .mode = DPMReplayMode::kExactRegeneration,
       .replay_request_hash = exact.canonical_request_hash,
-      .execution_evidence_hash = exact.cold_run_evidence.record_id,
+      .execution_evidence_hash = exact.request_evidence.evidence_id,
       .exact_profile_id = derived_profile_.profile_id,
       .exact_profile_admission_record_id =
           exact.profile_admission_record_id,

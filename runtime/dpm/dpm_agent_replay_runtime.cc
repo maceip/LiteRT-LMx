@@ -459,6 +459,95 @@ DPMCanonicalReplayRequest MakeReplayRequest(std::string encoded,
   };
 }
 
+bool DurableCapsuleEvidenceEqual(
+    const FreshWorkerDurableProducingCapsuleEvidence& left,
+    const FreshWorkerDurableProducingCapsuleEvidence& right) {
+  return left.session_identity == right.session_identity &&
+         left.key_id == right.key_id &&
+         left.envelope_size == right.envelope_size &&
+         left.envelope_hash == right.envelope_hash &&
+         left.output_evidence_hash == right.output_evidence_hash;
+}
+
+absl::StatusOr<DPMAgentReplayExecution> BuildExactAgentReplayExecution(
+    const ExactRegenerationExecution& exact,
+    const ExactLiteRtProfile& expected_profile,
+    const Hash256& expected_request_hash, uint32_t max_output_tokens) {
+  if (exact.mode != DPMReplayMode::kExactRegeneration ||
+      exact.derived_profile != expected_profile ||
+      exact.canonical_request_hash != expected_request_hash ||
+      IsZeroHash(exact.profile_admission_record_id)) {
+    return absl::FailedPreconditionError(
+        "Exact agent result came from another request or Engine profile.");
+  }
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactRegenerationRequestEvidence(exact.request_evidence));
+  const Hash256 exact_output_evidence_hash =
+      ComputeFreshWorkerOutputEvidenceHash(
+          exact.canonical_output, exact.token_bytes, exact.logit_frames);
+  if (exact.request_evidence.exact_profile_id !=
+          exact.derived_profile.profile_id ||
+      exact.request_evidence.profile_admission_record_id !=
+          exact.profile_admission_record_id ||
+      exact.request_evidence.session_identity !=
+          exact.derived_profile.session_identity ||
+      exact.request_evidence.canonical_request_hash !=
+          exact.canonical_request_hash ||
+      exact.request_evidence.consensus_output_evidence_hash !=
+          exact_output_evidence_hash) {
+    return absl::DataLossError(
+        "Exact agent request evidence and returned output disagree.");
+  }
+  const ExactRegenerationRunEvidence& run_zero =
+      exact.request_evidence.runs.front();
+  if (run_zero.durable_producing_capsule_evidence.has_value() !=
+      exact.durable_producing_capsule_evidence.has_value()) {
+    return absl::DataLossError(
+        "Exact agent result omitted or invented run-zero durable capsule "
+        "evidence.");
+  }
+  if (exact.durable_producing_capsule_evidence.has_value() &&
+      !DurableCapsuleEvidenceEqual(
+          *run_zero.durable_producing_capsule_evidence,
+          *exact.durable_producing_capsule_evidence)) {
+    return absl::DataLossError(
+        "Exact agent run-zero and returned durable capsule evidence "
+        "disagree.");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      const DPMAgentDecisionEnvelope envelope,
+      DecodeDPMAgentDecisionEnvelope(exact.canonical_output));
+  if (envelope.canonical_token_bytes != exact.token_bytes) {
+    return absl::DataLossError(
+        "Exact agent decision envelope and worker token evidence disagree.");
+  }
+  ABSL_ASSIGN_OR_RETURN(const std::vector<int32_t> exact_ids,
+                        DecodeFreshWorkerTokenIds(exact.token_bytes));
+  if (IsZeroHash(exact_output_evidence_hash)) {
+    return absl::InternalError(
+        "Exact agent could not bind its output evidence.");
+  }
+  std::vector<int> decision_ids(exact_ids.begin(), exact_ids.end());
+  DPMAgentReplayExecution execution{
+      .mode = DPMReplayMode::kExactRegeneration,
+      .replay_request_hash = exact.canonical_request_hash,
+      .execution_evidence_hash = exact.request_evidence.evidence_id,
+      .exact_profile_id = exact.derived_profile.profile_id,
+      .exact_profile_admission_record_id =
+          exact.profile_admission_record_id,
+      .decision_output = envelope.decision_output,
+      .decision_token_ids = std::move(decision_ids),
+      .exact_token_bytes = exact.token_bytes,
+      .exact_logit_frames = exact.logit_frames,
+      .exact_output_evidence_hash = exact_output_evidence_hash,
+      .reused_canonical_winner = false,
+      .producing_session_matches_output = false,
+  };
+  ABSL_RETURN_IF_ERROR(
+      ValidateDPMAgentReplayExecution(execution, max_output_tokens));
+  return execution;
+}
+
 }  // namespace
 
 absl::Status ValidateDPMAgentExecutionRequest(
@@ -1054,6 +1143,76 @@ absl::Status ValidateDPMAgentReplayExecution(
   return absl::OkStatus();
 }
 
+absl::Status ValidateExactRegenerationDPMAgentPhysicalExecution(
+    const ExactRegenerationDPMAgentPhysicalExecution& execution,
+    uint32_t max_output_tokens) {
+  ABSL_RETURN_IF_ERROR(ValidateDPMAgentReplayExecution(
+      execution.replay_execution, max_output_tokens));
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactRegenerationRequestEvidence(execution.request_evidence));
+  if (execution.replay_execution.mode !=
+          DPMReplayMode::kExactRegeneration ||
+      !execution.replay_execution.exact_profile_id.has_value() ||
+      !execution.replay_execution.exact_profile_admission_record_id
+           .has_value() ||
+      !execution.replay_execution.exact_output_evidence_hash.has_value() ||
+      execution.replay_execution.execution_evidence_hash !=
+          execution.request_evidence.evidence_id ||
+      execution.replay_execution.replay_request_hash !=
+          execution.request_evidence.canonical_request_hash ||
+      *execution.replay_execution.exact_profile_id !=
+          execution.request_evidence.exact_profile_id ||
+      *execution.replay_execution.exact_profile_admission_record_id !=
+          execution.request_evidence.profile_admission_record_id ||
+      *execution.replay_execution.exact_output_evidence_hash !=
+          execution.request_evidence.consensus_output_evidence_hash ||
+      execution.physical_execution_plan_hash !=
+          execution.request_evidence.physical_execution_plan_hash ||
+      execution.prefill_mode != execution.request_evidence.prefill_mode ||
+      execution.restored_checkpoint_id !=
+          execution.request_evidence.restored_checkpoint_id ||
+      execution.capture_run_policy !=
+          execution.request_evidence.capture_run_policy) {
+    return absl::DataLossError(
+        "Exact agent physical execution disagrees with its request "
+        "evidence.");
+  }
+  const ExactRegenerationRunEvidence& run_zero =
+      execution.request_evidence.runs.front();
+  if (execution.run_zero_transient_producing_capsule_evidence.has_value() !=
+          run_zero.transient_producing_capsule_evidence.has_value() ||
+      (execution.run_zero_transient_producing_capsule_evidence.has_value() &&
+       !(*execution.run_zero_transient_producing_capsule_evidence ==
+         *run_zero.transient_producing_capsule_evidence))) {
+    return absl::DataLossError(
+        "Exact agent physical execution changed run-zero transient capsule "
+        "evidence.");
+  }
+  if (execution.durable_producing_capsule_evidence.has_value() !=
+      run_zero.durable_producing_capsule_evidence.has_value()) {
+    return absl::DataLossError(
+        "Exact agent physical execution omitted or invented durable capsule "
+        "evidence.");
+  }
+  if (execution.durable_producing_capsule_evidence.has_value() &&
+      !DurableCapsuleEvidenceEqual(
+          *execution.durable_producing_capsule_evidence,
+          *run_zero.durable_producing_capsule_evidence)) {
+    return absl::DataLossError(
+        "Exact agent physical execution changed durable capsule evidence.");
+  }
+  const bool captured =
+      execution.capture_run_policy ==
+      ExactRegenerationCaptureRunPolicy::kRunZeroOnly;
+  if (execution.run_zero_transient_producing_capsule_evidence.has_value() !=
+          captured ||
+      execution.durable_producing_capsule_evidence.has_value() != captured) {
+    return absl::DataLossError(
+        "Exact agent physical execution violates run-zero-only capture.");
+  }
+  return absl::OkStatus();
+}
+
 absl::StatusOr<std::unique_ptr<CanonicalWinnerDPMAgentRuntime>>
 CanonicalWinnerDPMAgentRuntime::Create(
     DPMAgentRuntime* inference_runtime,
@@ -1074,6 +1233,12 @@ CanonicalWinnerDPMAgentRuntime::Create(
 
 absl::StatusOr<std::optional<Hash256>>
 CanonicalWinnerDPMAgentRuntime::GetExactProfileId() const {
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  return std::optional<Hash256>();
+}
+
+absl::StatusOr<std::optional<Hash256>>
+CanonicalWinnerDPMAgentRuntime::GetExactProfileAdmissionRecordId() const {
   ABSL_RETURN_IF_ERROR(ValidateSupport());
   return std::optional<Hash256>();
 }
@@ -1248,6 +1413,19 @@ ExactRegenerationDPMAgentRuntime::GetExactProfileId() const {
   return std::optional<Hash256>(derived_profile_.profile_id);
 }
 
+absl::StatusOr<std::optional<Hash256>>
+ExactRegenerationDPMAgentRuntime::GetExactProfileAdmissionRecordId() const {
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 admission_id,
+      exact_executor_->GetProfileAdmissionRecordId());
+  if (IsZeroHash(admission_id)) {
+    return absl::DataLossError(
+        "Exact agent admission repository returned a zero record ID.");
+  }
+  return std::optional<Hash256>(admission_id);
+}
+
 absl::Status ExactRegenerationDPMAgentRuntime::ValidateSupport() const {
   if (exact_executor_ == nullptr) {
     return absl::InvalidArgumentError(
@@ -1289,18 +1467,16 @@ absl::Status ExactRegenerationDPMAgentRuntime::ValidateGenerationLimit(
 absl::Status
 ExactRegenerationDPMAgentRuntime::ValidateSessionHandoffSupport() const {
   ABSL_RETURN_IF_ERROR(ValidateSupport());
-  return absl::UnimplementedError(
-      "Exact agent CapsuleRestore requires an authenticated producing-session "
-      "envelope returned by the fresh worker; parent-session substitution is "
-      "forbidden.");
+  return absl::FailedPreconditionError(
+      "Exact agent physical capsule transport requires a separate admitted "
+      "CapsuleRestore profile before DPMEngine may enable checkpoints.");
 }
 
 absl::StatusOr<std::unique_ptr<Engine::Session>>
 ExactRegenerationDPMAgentRuntime::CreateSession() {
   return absl::UnimplementedError(
-      "Exact agent producing sessions live in fresh workers; parent capsule "
-      "import is unavailable until the worker returns an authenticated "
-      "producing-session envelope.");
+      "Exact agent sessions live in fresh workers; use GeneratePhysicalExact "
+      "instead of manufacturing a parent producing session.");
 }
 
 absl::StatusOr<DPMAgentReplayExecution>
@@ -1333,57 +1509,104 @@ ExactRegenerationDPMAgentRuntime::Generate(
   ABSL_ASSIGN_OR_RETURN(
       ExactRegenerationExecution exact,
       exact_executor_->Run(replay_request));
-  if (exact.mode != DPMReplayMode::kExactRegeneration ||
-      exact.derived_profile != derived_profile_ ||
-      exact.canonical_request_hash != expected_request_hash ||
-      IsZeroHash(exact.profile_admission_record_id) ||
-      IsZeroHash(exact.cold_run_evidence.record_id)) {
-    return absl::FailedPreconditionError(
-        "Exact agent result came from another request or Engine profile.");
-  }
-  ABSL_RETURN_IF_ERROR(ValidateExactProfileAdmissionRecordForProfile(
-      exact.cold_run_evidence, exact.derived_profile));
-  if (exact.cold_run_evidence.canonical_output != exact.canonical_output ||
-      exact.cold_run_evidence.token_bytes != exact.token_bytes ||
-      exact.cold_run_evidence.logit_frames != exact.logit_frames) {
+  if (exact.request_evidence.prefill_mode !=
+          FreshWorkerPrefillMode::kFullCanonicalPrefill ||
+      exact.request_evidence.restored_checkpoint_id.has_value() ||
+      exact.request_evidence.capture_run_policy !=
+          ExactRegenerationCaptureRunPolicy::kNoCapture ||
+      exact.durable_producing_capsule_evidence.has_value()) {
     return absl::DataLossError(
-        "Exact agent cold-run record and returned output evidence disagree.");
+        "Exact agent convenience execution was not full prefill without "
+        "capture.");
+  }
+  return BuildExactAgentReplayExecution(
+      exact, derived_profile_, expected_request_hash,
+      logical_request.max_output_tokens);
+}
+
+absl::StatusOr<ExactRegenerationDPMAgentPhysicalExecution>
+ExactRegenerationDPMAgentRuntime::GeneratePhysicalExact(
+    const DPMAgentExecutionRequest& logical_request,
+    const ExactRegenerationExecutionInput& input) {
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  ABSL_RETURN_IF_ERROR(ValidateDPMAgentExecutionRequest(logical_request));
+  ABSL_RETURN_IF_ERROR(
+      ValidateGenerationLimit(logical_request.max_output_tokens));
+  ABSL_ASSIGN_OR_RETURN(std::string encoded,
+                        EncodeDPMAgentExecutionRequest(logical_request));
+  const DPMCanonicalReplayRequest replay_request =
+      MakeReplayRequest(std::move(encoded),
+                        logical_request.max_output_tokens);
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 expected_request_hash,
+      ComputeDPMCanonicalReplayRequestHash(replay_request));
+  ABSL_RETURN_IF_ERROR(
+      ValidateFreshWorkerExecutionPlan(input.execution_plan));
+  if (input.execution_plan.logical_replay_request_hash !=
+      expected_request_hash) {
+    return absl::FailedPreconditionError(
+        "Exact agent physical plan is not bound to its complete logical "
+        "request.");
+  }
+  switch (input.execution_plan.prefill_mode) {
+    case FreshWorkerPrefillMode::kFullCanonicalPrefill:
+      break;
+    case FreshWorkerPrefillMode::kOwnPositionCapsuleDelta: {
+      ABSL_ASSIGN_OR_RETURN(
+          const DPMAgentDeltaExecutionRequest delta_request,
+          DecodeDPMAgentDeltaExecutionRequest(
+              input.execution_plan.canonical_execution_payload));
+      ABSL_RETURN_IF_ERROR(ValidateDPMAgentDeltaExecutionBinding(
+          logical_request, input.execution_plan, delta_request));
+      break;
+    }
+    default:
+      return absl::InvalidArgumentError(
+          "Exact agent physical plan has an unknown prefill mode.");
   }
   ABSL_ASSIGN_OR_RETURN(
-      const DPMAgentDecisionEnvelope envelope,
-      DecodeDPMAgentDecisionEnvelope(exact.canonical_output));
-  if (envelope.canonical_token_bytes != exact.token_bytes) {
+      ExactRegenerationExecution exact,
+      exact_executor_->RunPhysical(replay_request, input));
+  ABSL_ASSIGN_OR_RETURN(
+      DPMAgentReplayExecution replay_execution,
+      BuildExactAgentReplayExecution(
+          exact, derived_profile_, expected_request_hash,
+          logical_request.max_output_tokens));
+  const ExactRegenerationCaptureRunPolicy expected_capture_policy =
+      input.execution_plan.capture_producing_capsule
+          ? ExactRegenerationCaptureRunPolicy::kRunZeroOnly
+          : ExactRegenerationCaptureRunPolicy::kNoCapture;
+  if (exact.request_evidence.physical_execution_plan_hash !=
+          input.execution_plan.plan_hash ||
+      exact.request_evidence.prefill_mode !=
+          input.execution_plan.prefill_mode ||
+      exact.request_evidence.restored_checkpoint_id !=
+          input.execution_plan.restore_checkpoint_id ||
+      exact.request_evidence.capture_run_policy !=
+          expected_capture_policy) {
     return absl::DataLossError(
-        "Exact agent decision envelope and worker token evidence disagree.");
+        "Exact agent worker evidence changed the selected physical plan.");
   }
-  ABSL_ASSIGN_OR_RETURN(const std::vector<int32_t> exact_ids,
-                        DecodeFreshWorkerTokenIds(exact.token_bytes));
-  const Hash256 exact_output_evidence_hash =
-      ComputeFreshWorkerOutputEvidenceHash(
-          exact.canonical_output, exact.token_bytes, exact.logit_frames);
-  if (IsZeroHash(exact_output_evidence_hash)) {
-    return absl::InternalError(
-        "Exact agent could not bind its output evidence.");
-  }
-  std::vector<int> decision_ids(exact_ids.begin(), exact_ids.end());
-  DPMAgentReplayExecution execution{
-      .mode = DPMReplayMode::kExactRegeneration,
-      .replay_request_hash = exact.canonical_request_hash,
-      .execution_evidence_hash = exact.cold_run_evidence.record_id,
-      .exact_profile_id = exact.derived_profile.profile_id,
-      .exact_profile_admission_record_id =
-          exact.profile_admission_record_id,
-      .decision_output = envelope.decision_output,
-      .decision_token_ids = std::move(decision_ids),
-      .exact_token_bytes = exact.token_bytes,
-      .exact_logit_frames = exact.logit_frames,
-      .exact_output_evidence_hash = exact_output_evidence_hash,
-      .reused_canonical_winner = false,
-      .producing_session_matches_output = false,
+  const ExactRegenerationRunEvidence& run_zero =
+      exact.request_evidence.runs.front();
+  ExactRegenerationDPMAgentPhysicalExecution physical{
+      .replay_execution = std::move(replay_execution),
+      .request_evidence = exact.request_evidence,
+      .physical_execution_plan_hash =
+          exact.request_evidence.physical_execution_plan_hash,
+      .prefill_mode = exact.request_evidence.prefill_mode,
+      .restored_checkpoint_id =
+          exact.request_evidence.restored_checkpoint_id,
+      .capture_run_policy = exact.request_evidence.capture_run_policy,
+      .run_zero_transient_producing_capsule_evidence =
+          run_zero.transient_producing_capsule_evidence,
+      .durable_producing_capsule_evidence =
+          exact.durable_producing_capsule_evidence,
   };
-  ABSL_RETURN_IF_ERROR(ValidateDPMAgentReplayExecution(
-      execution, logical_request.max_output_tokens));
-  return execution;
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactRegenerationDPMAgentPhysicalExecution(
+          physical, logical_request.max_output_tokens));
+  return physical;
 }
 
 }  // namespace litert::lm

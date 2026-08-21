@@ -34,6 +34,7 @@
 #include "runtime/engine/exact_litert_profile.h"
 #include "runtime/engine/session_handoff.h"
 #include "runtime/platform/hash/hasher.h"
+#include "runtime/util/byte_stream.h"
 
 namespace litert::lm {
 
@@ -142,6 +143,91 @@ struct ExactRegenerationExecutorConfig {
   uint32_t independent_run_count = 2;
 };
 
+// Capture is deliberately a request-scoped physical-execution policy rather
+// than part of the model-affecting execution-plan hash. When capture is
+// requested, only run zero may export a producing capsule; the remaining
+// independent runs must reproduce the same output without exporting state.
+enum class ExactRegenerationCaptureRunPolicy : uint32_t {
+  kNoCapture = 1,
+  kRunZeroOnly = 2,
+};
+
+// Canonical evidence for one authenticated fresh-process observation. The
+// evidence ID is SHA-256 over every field below except evidence_id itself.
+// Envelope hashes bind the complete HMAC-authenticated request and result;
+// this compact record does not duplicate their model output bytes.
+struct ExactRegenerationRunEvidence {
+  static constexpr uint32_t kFormatVersion = 1;
+
+  uint32_t format_version = kFormatVersion;
+  Hash256 evidence_id;
+  uint32_t run_index = 0;
+  int64_t process_id = -1;
+  Hash256 challenge_nonce;
+  Hash256 worker_instance_nonce;
+  Hash256 request_envelope_hash;
+  Hash256 result_envelope_hash;
+  Hash256 launch_spec_hash;
+  Hash256 output_evidence_hash;
+  std::optional<Hash256> restored_checkpoint_id;
+  std::optional<FreshWorkerProducingCapsuleEvidence>
+      transient_producing_capsule_evidence;
+  std::optional<FreshWorkerDurableProducingCapsuleEvidence>
+      durable_producing_capsule_evidence;
+};
+
+absl::StatusOr<Hash256> ComputeExactRegenerationRunEvidenceId(
+    const ExactRegenerationRunEvidence& evidence);
+absl::Status ValidateExactRegenerationRunEvidence(
+    const ExactRegenerationRunEvidence& evidence);
+
+// Request-scoped equality evidence. Unlike ExactProfileAdmissionRecord, this
+// object is never inserted into the durable profile-admission repository and
+// cannot qualify another request. Its canonical ID binds the admitted exact
+// profile, complete logical request, physical work selection, and every
+// independently authenticated process observation.
+struct ExactRegenerationRequestEvidence {
+  static constexpr uint32_t kFormatVersion = 1;
+
+  uint32_t format_version = kFormatVersion;
+  Hash256 evidence_id;
+  Hash256 exact_profile_id;
+  Hash256 profile_admission_record_id;
+  SessionHandoffIdentity session_identity;
+  Hash256 request_execution_id;
+  Hash256 canonical_request_hash;
+  Hash256 physical_execution_plan_hash;
+  FreshWorkerPrefillMode prefill_mode =
+      FreshWorkerPrefillMode::kFullCanonicalPrefill;
+  std::optional<Hash256> restored_checkpoint_id;
+  ExactRegenerationCaptureRunPolicy capture_run_policy =
+      ExactRegenerationCaptureRunPolicy::kNoCapture;
+  FreshWorkerReplayIsolation replay_isolation =
+      FreshWorkerReplayIsolation::kEmptyCatalogs;
+  uint32_t run_count = 0;
+  std::string authentication_key_id;
+  Hash256 consensus_output_evidence_hash;
+  std::vector<ExactRegenerationRunEvidence> runs;
+};
+
+absl::StatusOr<Hash256> ComputeExactRegenerationRequestEvidenceId(
+    const ExactRegenerationRequestEvidence& evidence);
+absl::Status ValidateExactRegenerationRequestEvidence(
+    const ExactRegenerationRequestEvidence& evidence);
+
+// Complete physical execution input. Delta plans require both restore
+// pointers; capture plans require both staging pointers. A staging sink must
+// be initially empty, transactional, and unpublished: the caller must discard
+// all appended bytes if RunPhysical fails and may promote them create-once
+// only after success. Restore and staging storage must not alias.
+struct ExactRegenerationExecutionInput {
+  FreshWorkerExecutionPlan execution_plan;
+  const ByteSource* durable_restore_source = nullptr;
+  const SessionHandoffOptions* durable_restore_options = nullptr;
+  ByteSink* staging_capture_destination = nullptr;
+  const SessionHandoffOptions* staging_capture_options = nullptr;
+};
+
 struct ExactRegenerationExecution {
   DPMReplayMode mode = DPMReplayMode::kExactRegeneration;
   ExactLiteRtProfile derived_profile;
@@ -154,10 +240,16 @@ struct ExactRegenerationExecution {
   // Fresh, non-catalog equality evidence for this exact request. It is not
   // inserted into the profile-admission repository and cannot become a
   // publish-once winner by accident.
-  ExactProfileAdmissionRecord cold_run_evidence;
+  ExactRegenerationRequestEvidence request_evidence;
   std::string canonical_output;
   std::string token_bytes;
   std::vector<FreshWorkerLogitFrameEvidence> logit_frames;
+
+  // Exposed only after every independent run has passed equality. Capsule
+  // bytes remain in the caller-owned staging sink; this is authenticated
+  // metadata for promoting that sink transactionally.
+  std::optional<FreshWorkerDurableProducingCapsuleEvidence>
+      durable_producing_capsule_evidence;
 };
 
 // Catalog-free cold-process comparison. This type deliberately has no catalog
@@ -196,8 +288,21 @@ class ExactRegenerationExecutor final {
   // imply that a particular product request regenerated exactly.
   absl::StatusOr<ExactLiteRtProfile> GetDerivedProfile() const;
 
+  // Re-resolves the Engine profile and re-authenticates the durable admission
+  // repository entry. This lets a parent validate an old exact checkpoint
+  // descriptor before spawning any restored worker.
+  absl::StatusOr<Hash256> GetProfileAdmissionRecordId() const;
+
   absl::StatusOr<ExactRegenerationExecution> Run(
       const DPMCanonicalReplayRequest& request) const;
+
+  // Executes the caller-selected validated full-prefill or own-position
+  // delta plan through the concrete session-capable process boundary. There
+  // is no implicit full-prefill fallback. Every restored run consumes the
+  // same caller-owned durable source; only run zero may capture.
+  absl::StatusOr<ExactRegenerationExecution> RunPhysical(
+      const DPMCanonicalReplayRequest& request,
+      const ExactRegenerationExecutionInput& input) const;
 
  private:
   ExactRegenerationExecutor(
@@ -216,8 +321,10 @@ class ExactRegenerationExecutor final {
   absl::Status ValidateBoundRequest(
       const DPMCanonicalReplayRequest& request) const;
   absl::StatusOr<ExactLiteRtProfile> ResolveCurrentProfile() const;
-  ExactProfileQualificationSpec MakeQualificationSpec(
-      absl::string_view encoded_request) const;
+  absl::StatusOr<ExactRegenerationExecution> RunWithExecutionInput(
+      const DPMCanonicalReplayRequest& request,
+      const ExactRegenerationExecutionInput& input,
+      bool capsule_free_convenience) const;
 
   const Engine* const engine_;
   const FreshWorkerProcessRunner worker_runner_;

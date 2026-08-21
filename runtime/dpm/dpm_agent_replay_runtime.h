@@ -123,7 +123,7 @@ struct DPMAgentReplayExecution {
   Hash256 replay_request_hash;
   // WinnerReplay carries the deterministic binding authenticated in its
   // create-once catalog. ExactRegeneration carries the fresh per-request
-  // cold-run record ID. The former is not independent-run evidence.
+  // physical-run evidence ID. The former is not independent-run evidence.
   Hash256 execution_evidence_hash;
   std::optional<Hash256> exact_profile_id;
   std::optional<Hash256> exact_profile_admission_record_id;
@@ -133,7 +133,7 @@ struct DPMAgentReplayExecution {
   std::vector<FreshWorkerLogitFrameEvidence> exact_logit_frames;
   // Present only for ExactRegeneration. This binds the canonical decision
   // envelope, DPMTOK01 bytes, and the complete ordered logits-frame evidence;
-  // it is distinct from both profile admission and the cold-run record ID.
+  // it is distinct from both profile admission and the request-evidence ID.
   std::optional<Hash256> exact_output_evidence_hash;
   bool reused_canonical_winner = false;
 
@@ -147,6 +147,29 @@ struct DPMAgentReplayExecution {
 absl::Status ValidateDPMAgentReplayExecution(
     const DPMAgentReplayExecution& execution, uint32_t max_output_tokens);
 
+// Exact worker execution plus the complete request-scoped physical evidence
+// needed by DPMEngine to construct a checkpoint descriptor and receipt. No
+// parent Engine::Session is implied: capsule bytes remain in the caller-owned
+// staging sink represented by the durable evidence below.
+struct ExactRegenerationDPMAgentPhysicalExecution {
+  DPMAgentReplayExecution replay_execution;
+  ExactRegenerationRequestEvidence request_evidence;
+  Hash256 physical_execution_plan_hash;
+  FreshWorkerPrefillMode prefill_mode =
+      FreshWorkerPrefillMode::kFullCanonicalPrefill;
+  std::optional<Hash256> restored_checkpoint_id;
+  ExactRegenerationCaptureRunPolicy capture_run_policy =
+      ExactRegenerationCaptureRunPolicy::kNoCapture;
+  std::optional<FreshWorkerProducingCapsuleEvidence>
+      run_zero_transient_producing_capsule_evidence;
+  std::optional<FreshWorkerDurableProducingCapsuleEvidence>
+      durable_producing_capsule_evidence;
+};
+
+absl::Status ValidateExactRegenerationDPMAgentPhysicalExecution(
+    const ExactRegenerationDPMAgentPhysicalExecution& execution,
+    uint32_t max_output_tokens);
+
 // Product-level agent execution. Each instance has one immutable replay mode;
 // callers cannot switch a shared object between replay and exact authority.
 class DPMAgentReplayRuntime {
@@ -155,6 +178,10 @@ class DPMAgentReplayRuntime {
   virtual DPMReplayMode GetReplayMode() const = 0;
   virtual const SessionHandoffIdentity& GetSessionHandoffIdentity() const = 0;
   virtual absl::StatusOr<std::optional<Hash256>> GetExactProfileId() const = 0;
+  // Re-authenticated durable admission ID for validating exact checkpoint
+  // provenance before worker launch. WinnerReplay returns nullopt.
+  virtual absl::StatusOr<std::optional<Hash256>>
+  GetExactProfileAdmissionRecordId() const = 0;
   // Replay/generation capability is independent from CapsuleRestore. This
   // method must not reject a usable WinnerReplay runtime merely because the
   // loaded session cannot export a complete handoff.
@@ -167,13 +194,14 @@ class DPMAgentReplayRuntime {
       uint32_t max_output_tokens) const = 0;
 
   // Optional, separately admitted CapsuleRestore capability. DPMEngine calls
-  // this only when checkpoint restore or capture is enabled. Exact agent
-  // execution currently fails here because its producing session is isolated
-  // in a worker and no authenticated capsule is returned to the parent.
+  // this only when checkpoint restore or capture is enabled. The exact agent
+  // has an authenticated physical transport below, but still fails this
+  // general gate until DPMEngine supplies the separate CapsuleRestore
+  // admission required for the selected profile/checkpoint codec.
   virtual absl::Status ValidateSessionHandoffSupport() const = 0;
 
   // WinnerReplay needs a parent session for optional checkpoint restore and a
-  // newly published producing capsule. ExactRegeneration currently returns
+  // newly published producing capsule. ExactRegeneration returns
   // Unimplemented here because its producing session lives in the worker; it
   // must not manufacture a matching parent session.
   virtual absl::StatusOr<std::unique_ptr<Engine::Session>> CreateSession() = 0;
@@ -186,6 +214,16 @@ class DPMAgentReplayRuntime {
       Engine::Session* producing_session,
       const DPMAgentGenerationRequest& execution_request,
       const DPMAgentExecutionRequest& logical_request) = 0;
+
+  // Exact-only fresh-process full/delta/capture entry point. WinnerReplay
+  // leaves this unavailable; it continues to use its live parent Session.
+  virtual absl::StatusOr<ExactRegenerationDPMAgentPhysicalExecution>
+  GeneratePhysicalExact(
+      const DPMAgentExecutionRequest&,
+      const ExactRegenerationExecutionInput&) {
+    return absl::UnimplementedError(
+        "This DPM agent runtime has no physical exact-worker path.");
+  }
 };
 
 class CanonicalWinnerDPMAgentRuntime final : public DPMAgentReplayRuntime {
@@ -201,6 +239,8 @@ class CanonicalWinnerDPMAgentRuntime final : public DPMAgentReplayRuntime {
     return runtime_identity_;
   }
   absl::StatusOr<std::optional<Hash256>> GetExactProfileId() const override;
+  absl::StatusOr<std::optional<Hash256>>
+  GetExactProfileAdmissionRecordId() const override;
   absl::Status ValidateSupport() const override;
   absl::Status ValidateGenerationLimit(
       uint32_t max_output_tokens) const override;
@@ -237,6 +277,8 @@ class ExactRegenerationDPMAgentRuntime final : public DPMAgentReplayRuntime {
     return derived_profile_.session_identity;
   }
   absl::StatusOr<std::optional<Hash256>> GetExactProfileId() const override;
+  absl::StatusOr<std::optional<Hash256>>
+  GetExactProfileAdmissionRecordId() const override;
   absl::Status ValidateSupport() const override;
   absl::Status ValidateGenerationLimit(
       uint32_t max_output_tokens) const override;
@@ -246,6 +288,10 @@ class ExactRegenerationDPMAgentRuntime final : public DPMAgentReplayRuntime {
       Engine::Session* producing_session,
       const DPMAgentGenerationRequest& execution_request,
       const DPMAgentExecutionRequest& logical_request) override;
+  absl::StatusOr<ExactRegenerationDPMAgentPhysicalExecution>
+  GeneratePhysicalExact(
+      const DPMAgentExecutionRequest& logical_request,
+      const ExactRegenerationExecutionInput& input) override;
 
  private:
   ExactRegenerationDPMAgentRuntime(
