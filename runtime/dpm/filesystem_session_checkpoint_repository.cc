@@ -446,6 +446,15 @@ void AppendOptionalHash(const std::optional<Hash256>& hash,
   if (hash.has_value()) AppendHash(*hash, output);
 }
 
+void AppendPreparedPrefillWorkBinding(
+    const DPMPreparedPrefillWorkBinding& binding, std::string* output) {
+  AppendU32(static_cast<uint32_t>(binding.start_kind), output);
+  AppendHash(binding.plan_id, output);
+  AppendHash(binding.canonical_source_chunks_hash, output);
+  AppendHash(binding.resolved_token_plan_hash, output);
+  AppendHash(binding.shape_schedule_hash, output);
+}
+
 class CanonicalReader {
  public:
   explicit CanonicalReader(absl::string_view bytes) : bytes_(bytes) {}
@@ -560,6 +569,8 @@ absl::StatusOr<std::string> EncodeStoredDescriptor(
   if (descriptor.format_version ==
           DPMSessionCheckpointDescriptor::kPreviousFormatVersion ||
       descriptor.format_version ==
+          DPMSessionCheckpointDescriptor::kCoverageV1FormatVersion ||
+      descriptor.format_version ==
           DPMSessionCheckpointDescriptor::kFormatVersion) {
     bytes.push_back(static_cast<char>(descriptor.replay_mode));
     bytes.push_back(static_cast<char>(descriptor.capture_origin));
@@ -567,12 +578,16 @@ absl::StatusOr<std::string> EncodeStoredDescriptor(
     AppendOptionalHash(descriptor.exact_profile_id, &bytes);
     AppendHash(descriptor.exact_profile_admission_record_id, &bytes);
     if (descriptor.format_version ==
-        DPMSessionCheckpointDescriptor::kFormatVersion) {
+            DPMSessionCheckpointDescriptor::kCoverageV1FormatVersion ||
+        descriptor.format_version ==
+            DPMSessionCheckpointDescriptor::kFormatVersion) {
       AppendHash(descriptor.capsule_restore_capability_id, &bytes);
     }
     AppendHash(descriptor.capsule_restore_admission_record_id, &bytes);
     if (descriptor.format_version ==
-        DPMSessionCheckpointDescriptor::kFormatVersion) {
+            DPMSessionCheckpointDescriptor::kCoverageV1FormatVersion ||
+        descriptor.format_version ==
+            DPMSessionCheckpointDescriptor::kFormatVersion) {
       AppendHash(descriptor.capsule_restore_coverage_id, &bytes);
     }
     AppendHash(descriptor.exact_request_execution_evidence_id, &bytes);
@@ -590,6 +605,14 @@ absl::StatusOr<std::string> EncodeStoredDescriptor(
       AppendU64(provenance.transient_envelope_size, &bytes);
       AppendHash(provenance.transient_envelope_hash, &bytes);
       AppendHash(provenance.output_evidence_hash, &bytes);
+    }
+    if (descriptor.format_version ==
+        DPMSessionCheckpointDescriptor::kFormatVersion) {
+      // Version 4 retains the complete stored version 3 sequence above and
+      // appends only its Coverage V2 tail.
+      AppendHash(descriptor.capsule_capture_plan_hash, &bytes);
+      AppendPreparedPrefillWorkBinding(descriptor.prepared_prefill_work,
+                                       &bytes);
     }
   }
   if (bytes.size() > kMaxStoredDescriptorBytes) {
@@ -652,6 +675,7 @@ absl::StatusOr<DPMSessionCheckpointDescriptor> DecodeStoredDescriptor(
       break;
 
     case DPMSessionCheckpointDescriptor::kPreviousFormatVersion:
+    case DPMSessionCheckpointDescriptor::kCoverageV1FormatVersion:
     case DPMSessionCheckpointDescriptor::kFormatVersion: {
       uint8_t replay_mode;
       ABSL_ASSIGN_OR_RETURN(replay_mode, reader.ReadU8());
@@ -667,14 +691,18 @@ absl::StatusOr<DPMSessionCheckpointDescriptor> DecodeStoredDescriptor(
       ABSL_ASSIGN_OR_RETURN(descriptor.exact_profile_admission_record_id,
                             reader.ReadHash());
       if (descriptor.format_version ==
-          DPMSessionCheckpointDescriptor::kFormatVersion) {
+              DPMSessionCheckpointDescriptor::kCoverageV1FormatVersion ||
+          descriptor.format_version ==
+              DPMSessionCheckpointDescriptor::kFormatVersion) {
         ABSL_ASSIGN_OR_RETURN(descriptor.capsule_restore_capability_id,
                               reader.ReadHash());
       }
       ABSL_ASSIGN_OR_RETURN(descriptor.capsule_restore_admission_record_id,
                             reader.ReadHash());
       if (descriptor.format_version ==
-          DPMSessionCheckpointDescriptor::kFormatVersion) {
+              DPMSessionCheckpointDescriptor::kCoverageV1FormatVersion ||
+          descriptor.format_version ==
+              DPMSessionCheckpointDescriptor::kFormatVersion) {
         ABSL_ASSIGN_OR_RETURN(descriptor.capsule_restore_coverage_id,
                               reader.ReadHash());
       }
@@ -711,6 +739,26 @@ absl::StatusOr<DPMSessionCheckpointDescriptor> DecodeStoredDescriptor(
         ABSL_ASSIGN_OR_RETURN(provenance.output_evidence_hash,
                               reader.ReadHash());
         descriptor.worker_provenance = std::move(provenance);
+      }
+      if (descriptor.format_version ==
+          DPMSessionCheckpointDescriptor::kFormatVersion) {
+        ABSL_ASSIGN_OR_RETURN(descriptor.capsule_capture_plan_hash,
+                              reader.ReadHash());
+        uint32_t prepared_start_kind;
+        ABSL_ASSIGN_OR_RETURN(prepared_start_kind, reader.ReadU32());
+        descriptor.prepared_prefill_work.start_kind =
+            static_cast<DPMPreparedPrefillStartKind>(prepared_start_kind);
+        ABSL_ASSIGN_OR_RETURN(descriptor.prepared_prefill_work.plan_id,
+                              reader.ReadHash());
+        ABSL_ASSIGN_OR_RETURN(
+            descriptor.prepared_prefill_work.canonical_source_chunks_hash,
+            reader.ReadHash());
+        ABSL_ASSIGN_OR_RETURN(
+            descriptor.prepared_prefill_work.resolved_token_plan_hash,
+            reader.ReadHash());
+        ABSL_ASSIGN_OR_RETURN(
+            descriptor.prepared_prefill_work.shape_schedule_hash,
+            reader.ReadHash());
       }
       break;
     }

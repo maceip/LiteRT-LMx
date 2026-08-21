@@ -21,6 +21,7 @@
 
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
+#include "runtime/dpm/dpm_prepared_prefill_plan.h"
 #include "runtime/dpm/dpm_replay_mode.h"
 #include "runtime/engine/session_handoff.h"
 #include "runtime/platform/hash/hasher.h"
@@ -65,13 +66,60 @@ struct DPMExactWorkerCheckpointProvenance {
   Hash256 output_evidence_hash;
 };
 
+// Compact durable binding to one runtime-derived physical prefill plan. The
+// plan ID commits the complete concrete plan and its run-local starting-state
+// witness. The remaining hashes are repeated deliberately: they are the
+// model-affecting source, token/call/segment, and batch-one shape commitments
+// that independent exact workers can compare without equating their
+// transport-specific witness IDs.
+struct DPMPreparedPrefillWorkBinding {
+  DPMPreparedPrefillStartKind start_kind =
+      DPMPreparedPrefillStartKind::kFreshSession;
+  Hash256 plan_id;
+  Hash256 canonical_source_chunks_hash;
+  Hash256 resolved_token_plan_hash;
+  Hash256 shape_schedule_hash;
+
+  bool operator==(const DPMPreparedPrefillWorkBinding& other) const {
+    return start_kind == other.start_kind && plan_id == other.plan_id &&
+           canonical_source_chunks_hash ==
+               other.canonical_source_chunks_hash &&
+           resolved_token_plan_hash == other.resolved_token_plan_hash &&
+           shape_schedule_hash == other.shape_schedule_hash;
+  }
+  bool operator!=(const DPMPreparedPrefillWorkBinding& other) const {
+    return !(*this == other);
+  }
+};
+
+// Receipt-only join between a newly published checkpoint's acyclic capture
+// plan and the evidence produced after the checkpoint ID became known. The
+// descriptor commits capture_plan_hash but intentionally cannot contain
+// capture_evidence_id: that evidence ID commits the descriptor/checkpoint ID.
+struct DPMCheckpointCaptureEvidenceBinding {
+  Hash256 capture_plan_hash;
+  Hash256 capture_evidence_id;
+
+  bool operator==(const DPMCheckpointCaptureEvidenceBinding& other) const {
+    return capture_plan_hash == other.capture_plan_hash &&
+           capture_evidence_id == other.capture_evidence_id;
+  }
+  bool operator!=(const DPMCheckpointCaptureEvidenceBinding& other) const {
+    return !(*this == other);
+  }
+};
+
+absl::Status ValidateDPMPreparedPrefillWorkBinding(
+    const DPMPreparedPrefillWorkBinding& binding);
+
 // The descriptor is content addressed independently of the envelope. It binds
 // a disposable KV cache to the exact raw-log prefix and DPM artifacts that
 // produced it. A matching model/profile alone is intentionally insufficient.
 struct DPMSessionCheckpointDescriptor {
   static constexpr uint32_t kLegacyFormatVersion = 1;
   static constexpr uint32_t kPreviousFormatVersion = 2;
-  static constexpr uint32_t kFormatVersion = 3;
+  static constexpr uint32_t kCoverageV1FormatVersion = 3;
+  static constexpr uint32_t kFormatVersion = 4;
 
   uint32_t format_version = kFormatVersion;
   Hash256 descriptor_id;
@@ -132,6 +180,14 @@ struct DPMSessionCheckpointDescriptor {
   Hash256 execution_plan_hash;
   Hash256 exact_output_evidence_hash;
   std::optional<DPMExactWorkerCheckpointProvenance> worker_provenance;
+
+  // Version 4 Coverage V2 provenance. The capture-plan hash is safe in the
+  // descriptor because CapsuleCapturePlanV2 deliberately excludes the child
+  // checkpoint and evidence IDs. The later authoritative receipt joins this
+  // plan and descriptor ID to the capture evidence ID. Older descriptor
+  // versions require these fields to remain canonical defaults.
+  Hash256 capsule_capture_plan_hash;
+  DPMPreparedPrefillWorkBinding prepared_prefill_work;
 };
 
 struct DPMSessionCheckpointArtifact {

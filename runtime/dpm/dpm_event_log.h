@@ -51,7 +51,8 @@ inline constexpr size_t kMaximumDPMCanonicalAgentInputBytes =
 struct DPMTurnReceipt {
   static constexpr uint32_t kLegacyFormatVersion = 3;
   static constexpr uint32_t kPreviousFormatVersion = 4;
-  static constexpr uint32_t kFormatVersion = 5;
+  static constexpr uint32_t kCoverageV1FormatVersion = 5;
+  static constexpr uint32_t kFormatVersion = 6;
 
   uint32_t format_version = kFormatVersion;
   std::string operation_id;
@@ -142,6 +143,27 @@ struct DPMTurnReceipt {
   // durable descriptor -> receipt.
   std::optional<DPMExactWorkerCheckpointProvenance>
       agent_exact_worker_checkpoint_provenance;
+
+  // Version 6 Coverage V2 evidence. These fields are appended only after the
+  // complete version 5 durable encoding. Prepared work is mode-neutral: an
+  // exact worker and a live WinnerReplay producer both bind the runtime-derived
+  // call/segment and shape plan, while a catalog-only WinnerReplay result has no
+  // physical plan to claim.
+  std::optional<DPMPreparedPrefillWorkBinding> agent_prepared_prefill_work;
+
+  // Present exactly when session_checkpoint_id is present. The plan hash can be
+  // committed by the descriptor without a cycle; the evidence ID is known only
+  // after that descriptor/checkpoint ID exists and is therefore receipt-only.
+  std::optional<DPMCheckpointCaptureEvidenceBinding>
+      published_checkpoint_capture;
+
+  // Present exactly when restored_from_session_checkpoint_id is present. The
+  // first ID selects the exact source-capture evidence from disposable storage;
+  // the second binds the actual post-import target witness and delta start for
+  // this operation. Neither repository presence nor a coverage ID authorizes a
+  // restore by itself.
+  std::optional<Hash256> restored_checkpoint_capture_evidence_id;
+  std::optional<Hash256> agent_capsule_restore_evidence_id;
 };
 
 struct DPMEvent {

@@ -39,6 +39,11 @@ constexpr std::array<char, 8> kDescriptorV2Magic = {'D', 'P', 'M', 'K',
 // admission provenance. Older hash domains remain immutable.
 constexpr std::array<char, 8> kDescriptorV3Magic = {'D', 'P', 'M', 'K',
                                                      'V', '0', '0', '3'};
+// Version 4 appends the acyclic Coverage V2 capture-plan and prepared-work
+// binding under a new content-addressing domain. Versions 1 through 3 remain
+// immutable published contracts.
+constexpr std::array<char, 8> kDescriptorV4Magic = {'D', 'P', 'M', 'K',
+                                                     'V', '0', '0', '4'};
 constexpr uint64_t kMaximumCheckpointCapsuleBytes =
     uint64_t{8} * 1024 * 1024 * 1024;
 
@@ -101,6 +106,22 @@ bool HasNoCapsuleRestoreProvenance(
   return IsZeroHash(descriptor.capsule_restore_capability_id) &&
          IsZeroHash(descriptor.capsule_restore_admission_record_id) &&
          IsZeroHash(descriptor.capsule_restore_coverage_id);
+}
+
+bool HasDefaultPreparedPrefillWorkBinding(
+    const DPMPreparedPrefillWorkBinding& binding) {
+  return binding.start_kind == DPMPreparedPrefillStartKind::kFreshSession &&
+         IsZeroHash(binding.plan_id) &&
+         IsZeroHash(binding.canonical_source_chunks_hash) &&
+         IsZeroHash(binding.resolved_token_plan_hash) &&
+         IsZeroHash(binding.shape_schedule_hash);
+}
+
+bool HasNoCoverageV2Fields(
+    const DPMSessionCheckpointDescriptor& descriptor) {
+  return IsZeroHash(descriptor.capsule_capture_plan_hash) &&
+         HasDefaultPreparedPrefillWorkBinding(
+             descriptor.prepared_prefill_work);
 }
 
 absl::Status ValidateCommonDescriptorFields(
@@ -190,15 +211,17 @@ absl::Status ValidateDescriptorFields(
               DPMCheckpointCaptureOrigin::kLiveParentSession ||
           descriptor.restored_from_checkpoint_id.has_value() ||
           !HasNoExactRegenerationFields(descriptor) ||
-          !HasNoCapsuleRestoreProvenance(descriptor)) {
+          !HasNoCapsuleRestoreProvenance(descriptor) ||
+          !HasNoCoverageV2Fields(descriptor)) {
         return absl::InvalidArgumentError(
             "Legacy DPM checkpoint descriptors are inferred "
-            "WinnerReplay/live-parent artifacts and cannot carry version 2 "
+            "WinnerReplay/live-parent artifacts and cannot carry newer "
             "provenance.");
       }
       return absl::OkStatus();
 
     case DPMSessionCheckpointDescriptor::kPreviousFormatVersion:
+    case DPMSessionCheckpointDescriptor::kCoverageV1FormatVersion:
     case DPMSessionCheckpointDescriptor::kFormatVersion:
       break;
 
@@ -226,8 +249,48 @@ absl::Status ValidateDescriptorFields(
              IsZeroHash(descriptor.capsule_restore_admission_record_id) ||
              IsZeroHash(descriptor.capsule_restore_coverage_id)) {
     return absl::InvalidArgumentError(
-        "Version 3 DPM checkpoints require complete CapsuleRestore "
+        "Version 3+ DPM checkpoints require complete CapsuleRestore "
         "capability, admission, and operational-coverage provenance.");
+  }
+
+  const bool is_coverage_v2 =
+      descriptor.format_version ==
+      DPMSessionCheckpointDescriptor::kFormatVersion;
+  if (!is_coverage_v2) {
+    if (!HasNoCoverageV2Fields(descriptor)) {
+      return absl::InvalidArgumentError(
+          "DPM checkpoint versions before 4 cannot carry Coverage V2 "
+          "capture-plan or prepared-prefill provenance.");
+    }
+  } else {
+    if (IsZeroHash(descriptor.capsule_capture_plan_hash)) {
+      return absl::InvalidArgumentError(
+          "Version 4 DPM checkpoint is missing its Coverage V2 capture-plan "
+          "hash.");
+    }
+    ABSL_RETURN_IF_ERROR(ValidateDPMPreparedPrefillWorkBinding(
+        descriptor.prepared_prefill_work));
+    if (descriptor.capsule_capture_plan_hash ==
+            descriptor.prepared_prefill_work.plan_id ||
+        descriptor.capsule_capture_plan_hash ==
+            descriptor.prepared_prefill_work.canonical_source_chunks_hash ||
+        descriptor.capsule_capture_plan_hash ==
+            descriptor.prepared_prefill_work.resolved_token_plan_hash ||
+        descriptor.capsule_capture_plan_hash ==
+            descriptor.prepared_prefill_work.shape_schedule_hash) {
+      return absl::InvalidArgumentError(
+          "Version 4 DPM checkpoint substituted prepared-work evidence for "
+          "its capture-plan hash.");
+    }
+    const bool restored = descriptor.restored_from_checkpoint_id.has_value();
+    if ((restored && descriptor.prepared_prefill_work.start_kind !=
+                         DPMPreparedPrefillStartKind::kOwnPositionRestore) ||
+        (!restored && descriptor.prepared_prefill_work.start_kind !=
+                          DPMPreparedPrefillStartKind::kFreshSession)) {
+      return absl::InvalidArgumentError(
+          "Version 4 DPM checkpoint prepared work disagrees with its "
+          "restored-parent provenance.");
+    }
   }
 
   ABSL_RETURN_IF_ERROR(ValidateDPMReplayMode(descriptor.replay_mode));
@@ -279,12 +342,26 @@ absl::Status ValidateDescriptorFields(
                 "A full-prefill exact checkpoint cannot claim a restored "
                 "checkpoint.");
           }
+          if (is_coverage_v2 &&
+              descriptor.prepared_prefill_work.start_kind !=
+                  DPMPreparedPrefillStartKind::kFreshSession) {
+            return absl::InvalidArgumentError(
+                "Exact full-prefill checkpoint has non-fresh Coverage V2 "
+                "prepared work.");
+          }
           break;
         case DPMCheckpointWorkerPrefillMode::kOwnPositionCapsuleDelta:
           if (!descriptor.restored_from_checkpoint_id.has_value()) {
             return absl::InvalidArgumentError(
                 "An own-position exact checkpoint requires its restored "
                 "checkpoint ID.");
+          }
+          if (is_coverage_v2 &&
+              descriptor.prepared_prefill_work.start_kind !=
+                  DPMPreparedPrefillStartKind::kOwnPositionRestore) {
+            return absl::InvalidArgumentError(
+                "Exact delta checkpoint has non-restore Coverage V2 "
+                "prepared work.");
           }
           break;
         case DPMCheckpointWorkerPrefillMode::kNone:
@@ -305,6 +382,15 @@ absl::Status AppendOptionalHash(const std::optional<Hash256>& value,
   output->push_back(value.has_value() ? '\1' : '\0');
   if (value.has_value()) AppendHash(*value, output);
   return absl::OkStatus();
+}
+
+void AppendPreparedPrefillWorkBinding(
+    const DPMPreparedPrefillWorkBinding& binding, std::string* output) {
+  AppendU32(static_cast<uint32_t>(binding.start_kind), output);
+  AppendHash(binding.plan_id, output);
+  AppendHash(binding.canonical_source_chunks_hash, output);
+  AppendHash(binding.resolved_token_plan_hash, output);
+  AppendHash(binding.shape_schedule_hash, output);
 }
 
 absl::StatusOr<std::string> EncodeDescriptorV1ForHash(
@@ -438,18 +524,79 @@ absl::StatusOr<std::string> EncodeDescriptorV3ForHash(
   return bytes;
 }
 
+absl::StatusOr<std::string> EncodeDescriptorV4ForHash(
+    const DPMSessionCheckpointDescriptor& descriptor) {
+  // Keep the complete version 3 field order intact, then append only the
+  // Coverage V2 tail under the independent DPMKV004 hash domain.
+  std::string bytes;
+  bytes.reserve(1096 + descriptor.log_id.size() + descriptor.key_id.size());
+  bytes.append(kDescriptorV4Magic.data(), kDescriptorV4Magic.size());
+  AppendU32(descriptor.format_version, &bytes);
+  ABSL_RETURN_IF_ERROR(AppendString(descriptor.log_id, &bytes));
+  bytes.push_back(static_cast<char>(descriptor.stage));
+  AppendU64(descriptor.source_event_count, &bytes);
+  AppendHash(descriptor.source_prefix_hash, &bytes);
+  AppendU64(descriptor.response_event_index, &bytes);
+  AppendHash(descriptor.projection_request_hash, &bytes);
+  AppendHash(descriptor.projection_manifest_hash, &bytes);
+  AppendHash(descriptor.correction_digest, &bytes);
+  AppendHash(descriptor.agent_request_hash, &bytes);
+  AppendHash(descriptor.agent_transcript_hash, &bytes);
+  AppendHash(descriptor.session_identity.model_artifact_hash, &bytes);
+  AppendHash(descriptor.session_identity.runtime_artifact_hash, &bytes);
+  AppendHash(descriptor.session_identity.inference_profile_hash, &bytes);
+  ABSL_RETURN_IF_ERROR(AppendString(descriptor.key_id, &bytes));
+  AppendHash(descriptor.envelope_hash, &bytes);
+  AppendU64(descriptor.envelope_size, &bytes);
+  AppendI64(descriptor.created_unix_micros, &bytes);
+
+  bytes.push_back(static_cast<char>(descriptor.replay_mode));
+  bytes.push_back(static_cast<char>(descriptor.capture_origin));
+  ABSL_RETURN_IF_ERROR(
+      AppendOptionalHash(descriptor.restored_from_checkpoint_id, &bytes));
+  ABSL_RETURN_IF_ERROR(
+      AppendOptionalHash(descriptor.exact_profile_id, &bytes));
+  AppendHash(descriptor.exact_profile_admission_record_id, &bytes);
+  AppendHash(descriptor.capsule_restore_capability_id, &bytes);
+  AppendHash(descriptor.capsule_restore_admission_record_id, &bytes);
+  AppendHash(descriptor.capsule_restore_coverage_id, &bytes);
+  AppendHash(descriptor.exact_request_execution_evidence_id, &bytes);
+  bytes.push_back(static_cast<char>(descriptor.worker_prefill_mode));
+  AppendHash(descriptor.execution_plan_hash, &bytes);
+  AppendHash(descriptor.exact_output_evidence_hash, &bytes);
+  bytes.push_back(descriptor.worker_provenance.has_value() ? '\1' : '\0');
+  if (descriptor.worker_provenance.has_value()) {
+    const DPMExactWorkerCheckpointProvenance& provenance =
+        *descriptor.worker_provenance;
+    AppendU32(provenance.run_index, &bytes);
+    AppendHash(provenance.execution_plan_hash, &bytes);
+    AppendHash(provenance.request_envelope_hash, &bytes);
+    AppendHash(provenance.result_envelope_hash, &bytes);
+    AppendU64(provenance.transient_envelope_size, &bytes);
+    AppendHash(provenance.transient_envelope_hash, &bytes);
+    AppendHash(provenance.output_evidence_hash, &bytes);
+  }
+
+  AppendHash(descriptor.capsule_capture_plan_hash, &bytes);
+  AppendPreparedPrefillWorkBinding(descriptor.prepared_prefill_work, &bytes);
+  return bytes;
+}
+
 absl::StatusOr<std::string> EncodeDescriptorForHash(
     const DPMSessionCheckpointDescriptor& descriptor) {
   ABSL_RETURN_IF_ERROR(ValidateDescriptorFields(descriptor));
-  if (descriptor.format_version ==
-      DPMSessionCheckpointDescriptor::kLegacyFormatVersion) {
-    return EncodeDescriptorV1ForHash(descriptor);
+  switch (descriptor.format_version) {
+    case DPMSessionCheckpointDescriptor::kLegacyFormatVersion:
+      return EncodeDescriptorV1ForHash(descriptor);
+    case DPMSessionCheckpointDescriptor::kPreviousFormatVersion:
+      return EncodeDescriptorV2ForHash(descriptor);
+    case DPMSessionCheckpointDescriptor::kCoverageV1FormatVersion:
+      return EncodeDescriptorV3ForHash(descriptor);
+    case DPMSessionCheckpointDescriptor::kFormatVersion:
+      return EncodeDescriptorV4ForHash(descriptor);
   }
-  if (descriptor.format_version ==
-      DPMSessionCheckpointDescriptor::kPreviousFormatVersion) {
-    return EncodeDescriptorV2ForHash(descriptor);
-  }
-  return EncodeDescriptorV3ForHash(descriptor);
+  return absl::InternalError(
+      "Validated DPM checkpoint descriptor lost its version dispatch.");
 }
 
 Hash256 Sha256(absl::string_view bytes) {
@@ -459,6 +606,37 @@ Hash256 Sha256(absl::string_view bytes) {
 }
 
 }  // namespace
+
+absl::Status ValidateDPMPreparedPrefillWorkBinding(
+    const DPMPreparedPrefillWorkBinding& binding) {
+  switch (binding.start_kind) {
+    case DPMPreparedPrefillStartKind::kFreshSession:
+    case DPMPreparedPrefillStartKind::kOwnPositionRestore:
+      break;
+    default:
+      return absl::InvalidArgumentError(
+          "DPM prepared-prefill work binding has an unsupported start kind.");
+  }
+  if (IsZeroHash(binding.plan_id) ||
+      IsZeroHash(binding.canonical_source_chunks_hash) ||
+      IsZeroHash(binding.resolved_token_plan_hash) ||
+      IsZeroHash(binding.shape_schedule_hash)) {
+    return absl::InvalidArgumentError(
+        "DPM prepared-prefill work binding is incomplete.");
+  }
+  if (binding.plan_id == binding.canonical_source_chunks_hash ||
+      binding.plan_id == binding.resolved_token_plan_hash ||
+      binding.plan_id == binding.shape_schedule_hash ||
+      binding.canonical_source_chunks_hash ==
+          binding.resolved_token_plan_hash ||
+      binding.canonical_source_chunks_hash == binding.shape_schedule_hash ||
+      binding.resolved_token_plan_hash == binding.shape_schedule_hash) {
+    return absl::InvalidArgumentError(
+        "DPM prepared-prefill work binding substitutes one hash domain for "
+        "another.");
+  }
+  return absl::OkStatus();
+}
 
 absl::StatusOr<Hash256> ComputeDPMSessionCheckpointId(
     const DPMSessionCheckpointDescriptor& descriptor) {

@@ -307,6 +307,15 @@ void AppendHash(const Hash256& hash, std::string* output) {
                  hash.bytes.size());
 }
 
+void AppendPreparedPrefillWorkBinding(
+    const DPMPreparedPrefillWorkBinding& binding, std::string* output) {
+  AppendU32(static_cast<uint32_t>(binding.start_kind), output);
+  AppendHash(binding.plan_id, output);
+  AppendHash(binding.canonical_source_chunks_hash, output);
+  AppendHash(binding.resolved_token_plan_hash, output);
+  AppendHash(binding.shape_schedule_hash, output);
+}
+
 uint64_t DecodeU64(const char* bytes) {
   uint64_t value = 0;
   for (int i = 0; i < 8; ++i) {
@@ -320,6 +329,42 @@ bool IsZeroHash(const Hash256& hash) {
     if (byte != 0) return false;
   }
   return true;
+}
+
+bool IsSupportedTurnReceiptVersion(uint32_t format_version) {
+  switch (format_version) {
+    case DPMTurnReceipt::kLegacyFormatVersion:
+    case DPMTurnReceipt::kPreviousFormatVersion:
+    case DPMTurnReceipt::kCoverageV1FormatVersion:
+    case DPMTurnReceipt::kFormatVersion:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool HasVersionFourReceiptFields(uint32_t format_version) {
+  switch (format_version) {
+    case DPMTurnReceipt::kPreviousFormatVersion:
+    case DPMTurnReceipt::kCoverageV1FormatVersion:
+    case DPMTurnReceipt::kFormatVersion:
+      return true;
+    case DPMTurnReceipt::kLegacyFormatVersion:
+    default:
+      return false;
+  }
+}
+
+bool HasVersionFiveReceiptFields(uint32_t format_version) {
+  switch (format_version) {
+    case DPMTurnReceipt::kCoverageV1FormatVersion:
+    case DPMTurnReceipt::kFormatVersion:
+      return true;
+    case DPMTurnReceipt::kLegacyFormatVersion:
+    case DPMTurnReceipt::kPreviousFormatVersion:
+    default:
+      return false;
+  }
 }
 
 bool ContainsControlByte(absl::string_view text) {
@@ -690,9 +735,7 @@ absl::Status ValidateEvent(const DPMEvent& event,
         "DPM model event requires a turn receipt.");
   }
   const DPMTurnReceipt& receipt = *event.turn_receipt;
-  if (receipt.format_version != DPMTurnReceipt::kLegacyFormatVersion &&
-      receipt.format_version != DPMTurnReceipt::kPreviousFormatVersion &&
-      receipt.format_version != DPMTurnReceipt::kFormatVersion) {
+  if (!IsSupportedTurnReceiptVersion(receipt.format_version)) {
     return absl::FailedPreconditionError(
         "Unsupported DPM turn receipt format version.");
   }
@@ -882,8 +925,7 @@ absl::StatusOr<std::string> EncodeEventCanonical(const DPMEvent& event) {
   if (receipt.session_checkpoint_id.has_value()) {
     AppendHash(*receipt.session_checkpoint_id, &bytes);
   }
-  if (receipt.format_version == DPMTurnReceipt::kPreviousFormatVersion ||
-      receipt.format_version == DPMTurnReceipt::kFormatVersion) {
+  if (HasVersionFourReceiptFields(receipt.format_version)) {
     bytes.push_back(
         receipt.restored_from_session_checkpoint_id.has_value() ? 1 : 0);
     if (receipt.restored_from_session_checkpoint_id.has_value()) {
@@ -911,7 +953,7 @@ absl::StatusOr<std::string> EncodeEventCanonical(const DPMEvent& event) {
       AppendHash(provenance.transient_envelope_hash, &bytes);
       AppendHash(provenance.output_evidence_hash, &bytes);
     }
-    if (receipt.format_version == DPMTurnReceipt::kFormatVersion) {
+    if (HasVersionFiveReceiptFields(receipt.format_version)) {
       bytes.push_back(
           receipt.agent_capsule_restore_capability_id.has_value() ? 1 : 0);
       if (receipt.agent_capsule_restore_capability_id.has_value()) {
@@ -921,6 +963,31 @@ absl::StatusOr<std::string> EncodeEventCanonical(const DPMEvent& event) {
           receipt.agent_capsule_restore_coverage_id.has_value() ? 1 : 0);
       if (receipt.agent_capsule_restore_coverage_id.has_value()) {
         AppendHash(*receipt.agent_capsule_restore_coverage_id, &bytes);
+      }
+    }
+    if (receipt.format_version == DPMTurnReceipt::kFormatVersion) {
+      bytes.push_back(receipt.agent_prepared_prefill_work.has_value() ? 1 : 0);
+      if (receipt.agent_prepared_prefill_work.has_value()) {
+        AppendPreparedPrefillWorkBinding(
+            *receipt.agent_prepared_prefill_work, &bytes);
+      }
+      bytes.push_back(receipt.published_checkpoint_capture.has_value() ? 1
+                                                                      : 0);
+      if (receipt.published_checkpoint_capture.has_value()) {
+        AppendHash(receipt.published_checkpoint_capture->capture_plan_hash,
+                   &bytes);
+        AppendHash(receipt.published_checkpoint_capture->capture_evidence_id,
+                   &bytes);
+      }
+      bytes.push_back(
+          receipt.restored_checkpoint_capture_evidence_id.has_value() ? 1 : 0);
+      if (receipt.restored_checkpoint_capture_evidence_id.has_value()) {
+        AppendHash(*receipt.restored_checkpoint_capture_evidence_id, &bytes);
+      }
+      bytes.push_back(
+          receipt.agent_capsule_restore_evidence_id.has_value() ? 1 : 0);
+      if (receipt.agent_capsule_restore_evidence_id.has_value()) {
+        AppendHash(*receipt.agent_capsule_restore_evidence_id, &bytes);
       }
     }
   }
@@ -957,9 +1024,7 @@ absl::StatusOr<DPMEvent> DecodeEventCanonical(absl::string_view bytes) {
   if (has_receipt == 1) {
     DPMTurnReceipt receipt;
     ABSL_ASSIGN_OR_RETURN(receipt.format_version, reader.ReadU32());
-    if (receipt.format_version != DPMTurnReceipt::kLegacyFormatVersion &&
-        receipt.format_version != DPMTurnReceipt::kPreviousFormatVersion &&
-        receipt.format_version != DPMTurnReceipt::kFormatVersion) {
+    if (!IsSupportedTurnReceiptVersion(receipt.format_version)) {
       return absl::FailedPreconditionError(
           "Unsupported canonical DPM turn receipt version.");
     }
@@ -1057,8 +1122,7 @@ absl::StatusOr<DPMEvent> DecodeEventCanonical(absl::string_view bytes) {
       ABSL_ASSIGN_OR_RETURN(Hash256 checkpoint_id, reader.ReadHash());
       receipt.session_checkpoint_id = checkpoint_id;
     }
-    if (receipt.format_version == DPMTurnReceipt::kPreviousFormatVersion ||
-        receipt.format_version == DPMTurnReceipt::kFormatVersion) {
+    if (HasVersionFourReceiptFields(receipt.format_version)) {
       ABSL_ASSIGN_OR_RETURN(uint8_t has_restored_checkpoint, reader.ReadU8());
       if (has_restored_checkpoint > 1) {
         return absl::DataLossError(
@@ -1114,7 +1178,7 @@ absl::StatusOr<DPMEvent> DecodeEventCanonical(absl::string_view bytes) {
                               reader.ReadHash());
         receipt.agent_exact_worker_checkpoint_provenance = provenance;
       }
-      if (receipt.format_version == DPMTurnReceipt::kFormatVersion) {
+      if (HasVersionFiveReceiptFields(receipt.format_version)) {
         ABSL_ASSIGN_OR_RETURN(uint8_t has_capsule_restore_capability,
                               reader.ReadU8());
         if (has_capsule_restore_capability > 1) {
@@ -1138,6 +1202,69 @@ absl::StatusOr<DPMEvent> DecodeEventCanonical(absl::string_view bytes) {
                                 reader.ReadHash());
           receipt.agent_capsule_restore_coverage_id =
               capsule_restore_coverage;
+        }
+      }
+      if (receipt.format_version == DPMTurnReceipt::kFormatVersion) {
+        ABSL_ASSIGN_OR_RETURN(uint8_t has_prepared_prefill_work,
+                              reader.ReadU8());
+        if (has_prepared_prefill_work > 1) {
+          return absl::DataLossError(
+              "Non-canonical DPM prepared-prefill-work-presence flag.");
+        }
+        if (has_prepared_prefill_work == 1) {
+          DPMPreparedPrefillWorkBinding binding;
+          ABSL_ASSIGN_OR_RETURN(uint32_t start_kind, reader.ReadU32());
+          binding.start_kind =
+              static_cast<DPMPreparedPrefillStartKind>(start_kind);
+          ABSL_ASSIGN_OR_RETURN(binding.plan_id, reader.ReadHash());
+          ABSL_ASSIGN_OR_RETURN(binding.canonical_source_chunks_hash,
+                                reader.ReadHash());
+          ABSL_ASSIGN_OR_RETURN(binding.resolved_token_plan_hash,
+                                reader.ReadHash());
+          ABSL_ASSIGN_OR_RETURN(binding.shape_schedule_hash,
+                                reader.ReadHash());
+          receipt.agent_prepared_prefill_work = binding;
+        }
+
+        ABSL_ASSIGN_OR_RETURN(uint8_t has_published_checkpoint_capture,
+                              reader.ReadU8());
+        if (has_published_checkpoint_capture > 1) {
+          return absl::DataLossError(
+              "Non-canonical DPM checkpoint-capture-evidence-presence flag.");
+        }
+        if (has_published_checkpoint_capture == 1) {
+          DPMCheckpointCaptureEvidenceBinding binding;
+          ABSL_ASSIGN_OR_RETURN(binding.capture_plan_hash, reader.ReadHash());
+          ABSL_ASSIGN_OR_RETURN(binding.capture_evidence_id,
+                                reader.ReadHash());
+          receipt.published_checkpoint_capture = binding;
+        }
+
+        ABSL_ASSIGN_OR_RETURN(
+            uint8_t has_restored_checkpoint_capture_evidence,
+            reader.ReadU8());
+        if (has_restored_checkpoint_capture_evidence > 1) {
+          return absl::DataLossError(
+              "Non-canonical DPM restored-checkpoint-capture-evidence-presence "
+              "flag.");
+        }
+        if (has_restored_checkpoint_capture_evidence == 1) {
+          ABSL_ASSIGN_OR_RETURN(Hash256 capture_evidence_id,
+                                reader.ReadHash());
+          receipt.restored_checkpoint_capture_evidence_id =
+              capture_evidence_id;
+        }
+
+        ABSL_ASSIGN_OR_RETURN(uint8_t has_capsule_restore_evidence,
+                              reader.ReadU8());
+        if (has_capsule_restore_evidence > 1) {
+          return absl::DataLossError(
+              "Non-canonical DPM capsule-restore-evidence-presence flag.");
+        }
+        if (has_capsule_restore_evidence == 1) {
+          ABSL_ASSIGN_OR_RETURN(Hash256 restore_evidence_id,
+                                reader.ReadHash());
+          receipt.agent_capsule_restore_evidence_id = restore_evidence_id;
         }
       }
     }

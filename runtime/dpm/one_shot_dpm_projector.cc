@@ -213,6 +213,7 @@ OneShotDPMProjector::SelectNewestCompatibleBaseline(
     const DPMTurnReceipt& receipt = *event->turn_receipt;
     if ((receipt.format_version != DPMTurnReceipt::kLegacyFormatVersion &&
          receipt.format_version != DPMTurnReceipt::kPreviousFormatVersion &&
+         receipt.format_version != DPMTurnReceipt::kCoverageV1FormatVersion &&
          receipt.format_version != DPMTurnReceipt::kFormatVersion) ||
         receipt.operation_id.empty() ||
         event->index >= authoritative_request.log.events.size() ||
