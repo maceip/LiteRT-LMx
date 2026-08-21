@@ -1,0 +1,25 @@
+--- absl/base/BUILD.bazel	2026-06-27 08:14:31.724528886 -0700
++++ absl/base/BUILD.bazel	2026-06-27 08:15:49.510594939 -0700
+@@ -577,10 +577,6 @@
+     ],
+     copts = ABSL_DEFAULT_COPTS,
+     linkopts = ABSL_DEFAULT_LINKOPTS,
+-    visibility = [
+-        "//absl:__subpackages__",
+-        "//absl:friends",
+-    ],
+     deps = [
+         ":base",
+         ":config",
+
+--- absl/crc/internal/crc32_x86_arm_combined_simd.h	2026-06-01 11:50:32.000000000 -0700
++++ absl/crc/internal/crc32_x86_arm_combined_simd.h	2026-06-27 07:55:48.069248592 -0700
+@@ -39,7 +39,7 @@
+ 
+ // MSVC AVX (/arch:AVX) implies SSE 4.2 and PCLMULQDQ.
+ #include <intrin.h>
+-#define ABSL_CRC_INTERNAL_HAVE_X86_SIMD
++// #define ABSL_CRC_INTERNAL_HAVE_X86_SIMD
+ 
+ #elif defined(__aarch64__) && defined(__LITTLE_ENDIAN__) &&                 \
+     defined(__ARM_FEATURE_CRC32) && defined(ABSL_INTERNAL_HAVE_ARM_NEON) && \

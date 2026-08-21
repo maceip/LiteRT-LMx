@@ -1,0 +1,165 @@
+# Copyright 2026 The ODML Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit tests for the LiteRT-LM import command."""
+
+import importlib
+import os
+from unittest import mock
+
+from absl.testing import absltest
+import click
+from click.testing import CliRunner
+
+from litert_lm_cli import cli_helpers
+from litert_lm_cli import huggingface_download
+from litert_lm_cli import model
+
+# Import 'import' subcommand dynamically to bypass Python keyword restriction.
+import_cmd = importlib.import_module(
+    "litert_lm_cli.commands.import"
+)
+
+
+class ImportTest(absltest.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    self.temp_dir = self.create_tempdir()
+    # Mock Model to use temp dir
+    self.mock_model = mock.MagicMock()
+    self.mock_model.model_path = os.path.join(
+        self.temp_dir.full_path, "model.litertlm"
+    )
+
+    self.mock_from_model_id = self.enter_context(
+        mock.patch.object(
+            model.Model,
+            "from_model_id",
+            return_value=self.mock_model,
+            autospec=True,
+        )
+    )
+
+  @mock.patch.object(cli_helpers, "resolve_model_file", autospec=True)
+  @mock.patch.object(
+      huggingface_download, "download_from_huggingface", autospec=True
+  )
+  def test_import_hf_success(self, mock_download, mock_resolve):
+    mock_resolve.return_value = "model2.litertlm"
+    fake_source = os.path.join(self.temp_dir.full_path, "fake_source")
+    with open(fake_source, "w") as f:
+      f.write("fake content")
+    mock_download.return_value = fake_source
+
+    runner = CliRunner()
+    result = runner.invoke(
+        import_cmd.import_model,
+        ["--from-huggingface-repo", "org/repo"],
+    )
+
+    self.assertEqual(result.exit_code, 0)
+    mock_resolve.assert_called_once_with("org/repo", None)
+    mock_download.assert_called_once_with(
+        repo_id="org/repo", filename="model2.litertlm", token=None
+    )
+    self.assertTrue(os.path.exists(self.mock_model.model_path))
+    with open(self.mock_model.model_path, "r") as f:
+      self.assertEqual(f.read(), "fake content")
+
+  @mock.patch.object(cli_helpers, "resolve_model_file", autospec=True)
+  def test_import_resolve_error(self, mock_resolve):
+    mock_resolve.side_effect = click.ClickException("Resolve failed")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        import_cmd.import_model,
+        ["--from-huggingface-repo", "org/repo"],
+    )
+
+    self.assertNotEqual(result.exit_code, 0)
+    self.assertIn("Resolve failed", result.output)
+    mock_resolve.assert_called_once()
+
+  @mock.patch.object(cli_helpers, "resolve_model_file", autospec=True)
+  def test_import_resolve_abort(self, mock_resolve):
+    mock_resolve.side_effect = click.Abort()
+
+    runner = CliRunner()
+    result = runner.invoke(
+        import_cmd.import_model,
+        ["--from-huggingface-repo", "org/repo"],
+    )
+
+    self.assertNotEqual(result.exit_code, 0)
+    mock_resolve.assert_called_once()
+
+  @mock.patch.object(cli_helpers, "resolve_model_file", autospec=True)
+  @mock.patch.object(
+      huggingface_download, "download_from_huggingface", autospec=True
+  )
+  def test_import_hf_with_model_file(self, mock_download, mock_resolve):
+    mock_resolve.return_value = "model2.litertlm"
+    fake_source = os.path.join(self.temp_dir.full_path, "fake_source")
+    with open(fake_source, "w") as f:
+      f.write("fake content")
+    mock_download.return_value = fake_source
+
+    runner = CliRunner()
+    result = runner.invoke(
+        import_cmd.import_model,
+        ["--from-huggingface-repo", "org/repo", "model2.litertlm"],
+    )
+
+    self.assertEqual(result.exit_code, 0)
+    mock_resolve.assert_not_called()
+    mock_download.assert_called_once_with(
+        repo_id="org/repo", filename="model2.litertlm", token=None
+    )
+    self.assertTrue(os.path.exists(self.mock_model.model_path))
+    with open(self.mock_model.model_path, "r") as f:
+      self.assertEqual(f.read(), "fake content")
+
+  @mock.patch.object(cli_helpers, "resolve_model_file", autospec=True)
+  @mock.patch.object(
+      huggingface_download, "download_from_huggingface", autospec=True
+  )
+  def test_import_hf_with_model_file_and_import_as_model_id(
+      self, mock_download, mock_resolve
+  ):
+    mock_resolve.return_value = "model2.litertlm"
+    fake_source = os.path.join(self.temp_dir.full_path, "fake_source")
+    with open(fake_source, "w") as f:
+      f.write("fake content")
+    mock_download.return_value = fake_source
+
+    runner = CliRunner()
+    result = runner.invoke(
+        import_cmd.import_model,
+        ["--from-huggingface-repo", "org/repo", "model2.litertlm", "custom-id"],
+    )
+
+    self.assertEqual(result.exit_code, 0)
+    mock_resolve.assert_not_called()
+    mock_download.assert_called_once_with(
+        repo_id="org/repo", filename="model2.litertlm", token=None
+    )
+    self.mock_from_model_id.assert_called_once_with("custom-id")
+    self.assertTrue(os.path.exists(self.mock_model.model_path))
+    with open(self.mock_model.model_path, "r") as f:
+      self.assertEqual(f.read(), "fake content")
+
+
+if __name__ == "__main__":
+  absltest.main()

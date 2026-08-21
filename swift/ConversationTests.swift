@@ -1,0 +1,530 @@
+// Copyright 2026 The ODML Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import XCTest
+
+@testable import LiteRTLM
+
+/// Returns the full path to a test data resource.
+func testDataPath(forResource resource: String) -> String {
+  guard let testSrcdir = ProcessInfo.processInfo.environment["TEST_SRCDIR"] else {
+    fatalError("TEST_SRCDIR not set.")
+  }
+  return "\(testSrcdir)/\(resource)"
+}
+
+class ConversationTests: XCTestCase {
+
+  var engine: Engine!
+
+  override func setUp() async throws {
+    try await super.setUp()
+    let modelResource =
+      + "runtime/testdata/test_lm.litertlm"
+    let modelPath = testDataPath(forResource: modelResource)
+    ExperimentalFlags.optIntoExperimentalAPIs()
+    ExperimentalFlags.enableBenchmark = true
+    ExperimentalFlags.visualTokenBudget = 10
+    let engineConfig = try EngineConfig(
+      modelPath: modelPath, maxNumTokens: 10, cacheDir: NSTemporaryDirectory())
+    engine = Engine(engineConfig: engineConfig)
+    try await engine.initialize()
+  }
+
+  func testCreateConversationWithSystemMessageWithoutSamplerConfig() async throws {
+    let config = ConversationConfig(
+      systemMessage: Message("You are a helpful assistant."))
+
+    let conversation = try await self.engine.createConversation(with: config)
+    XCTAssertTrue(conversation.isAlive)
+  }
+
+  func testConversationConfigSystemMessageSerialization() throws {
+    let config = ConversationConfig(
+      systemMessage: Message("Talk like a pirate", role: .system))
+
+    guard let systemMessage = config.systemMessage else {
+      XCTFail("systemMessage should not be nil")
+      return
+    }
+
+    let contentsJsonStr = try systemMessage.contents.jsonString
+
+    // Validate it results in the expected "flat" content JSON
+    guard let data = contentsJsonStr.data(using: String.Encoding.utf8),
+      let arr = try JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+    else {
+      XCTFail("Should be a flat JSON array")
+      return
+    }
+
+    XCTAssertEqual(arr.count, 1)
+    XCTAssertEqual(arr[0]["type"] as? String, "text")
+    XCTAssertEqual(arr[0]["text"] as? String, "Talk like a pirate")
+    XCTAssertNil(arr[0]["role"])
+  }
+
+  func testCreateConversationWithoutSystemMessageAndSamplerConfig() async throws {
+    let conversation = try await self.engine.createConversation()
+    XCTAssertTrue(conversation.isAlive)
+  }
+
+  func testCreateConversationWithSamplerConfigAndSystemMessage() async throws {
+    let config = ConversationConfig(
+      systemMessage: Message("You are a helpful assistant."),
+      samplerConfig: try SamplerConfig(topK: 10, topP: 0.5, temperature: 0.5, seed: 123))
+    let conversation = try await self.engine.createConversation(with: config)
+    XCTAssertTrue(conversation.isAlive)
+  }
+
+  func testCreateConversationWithSamplerConfigWithoutSystemMessage() async throws {
+    let config = ConversationConfig(
+      samplerConfig: try SamplerConfig(topK: 10, topP: 0.5, temperature: 0.5, seed: 123))
+    let conversation = try await self.engine.createConversation(with: config)
+    XCTAssertTrue(conversation.isAlive)
+  }
+
+  func testSendMessageReturnsMessage() async throws {
+    let conversation = try await self.engine.createConversation(with: ConversationConfig())
+    XCTAssertTrue(conversation.isAlive)
+
+    let response = try await conversation.sendMessage(Message("Hello"))
+    XCTAssertEqual(response.contents.count, 1)
+    switch response.contents[0] {
+    case .text(let text):
+      XCTAssertFalse(text.isEmpty)
+    default:
+      XCTFail("Response should be text but received \(response.contents[0])")
+    }
+  }
+
+  func testSendMessageStream() async throws {
+    let conversation = try await self.engine.createConversation(with: ConversationConfig())
+    XCTAssertTrue(conversation.isAlive)
+
+    let message = Message("How are you")
+    var accumulatedText = ""
+    var chunkCount = 0
+
+    for try await chunk in conversation.sendMessageStream(message) {
+      chunkCount += 1
+      accumulatedText += chunk.toString
+    }
+    XCTAssertEqual(chunkCount, 6)
+    XCTAssertEqual(accumulatedText, "stöstöstöstöstö mengenal")
+
+  }
+
+  func testSendMessageStreamAndCancel() async throws {
+    let conversation = try await self.engine.createConversation(with: ConversationConfig())
+    XCTAssertTrue(conversation.isAlive)
+
+    let message = Message("Hello")
+    var accumulatedText = ""
+    var chunkCount = 0
+    var didReceiveError: Error?
+
+    let stream = conversation.sendMessageStream(message)
+
+    try conversation.cancel()
+
+    do {
+      for try await chunk in stream {
+        chunkCount += 1
+        accumulatedText += chunk.toString
+      }
+      XCTFail("Stream should have thrown an error.")
+    } catch {
+      didReceiveError = error
+    }
+
+    XCTAssertNotNil(didReceiveError, "Stream should throw an error when cancelled.")
+    if let error = didReceiveError as? LiteRTLMError,
+      case .conversation(let conversationError) = error,
+      case .invalidResponse(let details) = conversationError
+    {
+      XCTAssertTrue(
+        details.contains("CANCELLED"),
+        "Error details should contain 'CANCELLED', but was: \(details)")
+    } else {
+      XCTFail(
+        "Expected LiteRTLMError.conversation(.invalidResponse(...)) containing 'CANCELLED', but got: \(String(describing: didReceiveError))"
+      )
+    }
+  }
+
+  func testBenchmarkInfoOnEmptyConversation() async throws {
+    let conversation = try await self.engine.createConversation(with: ConversationConfig())
+    XCTAssertTrue(conversation.isAlive)
+
+    // No messages are sent in the conversation, so all the benchmark values should be 0.
+    let benchmarkInfo = try conversation.getBenchmarkInfo()
+    XCTAssertEqual(benchmarkInfo.lastPrefillTokenCount, 0)
+    XCTAssertEqual(benchmarkInfo.lastDecodeTokenCount, 0)
+  }
+
+  func testBenchmarkInfoOnNonEmptyConversation() async throws {
+    let conversation = try await self.engine.createConversation(with: ConversationConfig())
+    XCTAssertTrue(conversation.isAlive)
+    let _ = try await conversation.sendMessage(Message("Hello World"))
+    let benchmarkInfo = try conversation.getBenchmarkInfo()
+    XCTAssertGreaterThan(benchmarkInfo.lastPrefillTokenCount, 0)
+    XCTAssertGreaterThan(benchmarkInfo.lastDecodeTokenCount, 0)
+  }
+
+  func testConversationGetTokenCountSucceeds() async throws {
+    let conversation = try await self.engine.createConversation(with: ConversationConfig())
+    XCTAssertTrue(conversation.isAlive)
+    XCTAssertEqual(try conversation.getTokenCount(), 0)
+
+    let _ = try await conversation.sendMessage(Message("How are you"))
+    XCTAssertEqual(try conversation.getTokenCount(), 10)
+  }
+
+  func testSendMessageWithExtraContextReturnsMessage() async throws {
+    let conversation = try await self.engine.createConversation(with: ConversationConfig())
+    XCTAssertTrue(conversation.isAlive)
+
+    let extraContext: [String: Any] = ["key": "value"]
+    let response = try await conversation.sendMessage(
+      Message("How are you"), extraContext: extraContext)
+
+    XCTAssertEqual(response.contents.count, 1)
+    switch response.contents[0] {
+    case .text(let text):
+      XCTAssertFalse(text.isEmpty)
+    default:
+      XCTFail("Response should be text but received \(response.contents[0])")
+    }
+  }
+
+  func testSendMessageStreamWithExtraContext() async throws {
+    let conversation = try await self.engine.createConversation(with: ConversationConfig())
+    XCTAssertTrue(conversation.isAlive)
+
+    let message = Message("How are you")
+    let extraContext: [String: Any] = ["key": "value"]
+    var accumulatedText = ""
+    var chunkCount = 0
+
+    for try await chunk in conversation.sendMessageStream(message, extraContext: extraContext) {
+      chunkCount += 1
+      accumulatedText += chunk.toString
+    }
+
+    XCTAssertGreaterThan(chunkCount, 0)
+    XCTAssertFalse(accumulatedText.isEmpty)
+  }
+
+  func testCreateConversationWithInitialMessages() async throws {
+    let config = ConversationConfig(
+      initialMessages: [
+        Message("Hello", role: .user),
+        Message("Hi there!", role: .model),
+      ]
+    )
+
+    let conversation = try await self.engine.createConversation(with: config)
+    XCTAssertTrue(conversation.isAlive)
+
+    let response = try await conversation.sendMessage(Message("How are you?"))
+    XCTAssertFalse(response.contents.isEmpty)
+  }
+
+  func testCreateConversationWithBothSystemMessageAndInitialSystemMessageFails() async throws {
+    let config = ConversationConfig(
+      systemMessage: Message("You are a helpful assistant."),
+      initialMessages: [
+        Message("Hello", role: .system),
+        Message("Hi there!", role: .model),
+      ]
+    )
+
+    do {
+      let _ = try await self.engine.createConversation(with: config)
+      XCTFail("Should have thrown error for multiple system messages")
+    } catch let error as LiteRTLMError {
+      XCTAssertEqual(error, LiteRTLMError.config(.multipleSystemMessages))
+    } catch {
+      XCTFail("Unexpected error: \(error)")
+    }
+  }
+
+  func testCreateConversationWithMultipleInitialSystemMessagesFails() async throws {
+    let config = ConversationConfig(
+      initialMessages: [
+        Message("Hello", role: .system),
+        Message("Hi there!", role: .system),
+      ]
+    )
+
+    do {
+      let _ = try await self.engine.createConversation(with: config)
+      XCTFail("Should have thrown error for multiple system messages")
+    } catch let error as LiteRTLMError {
+      XCTAssertEqual(error, LiteRTLMError.config(.multipleSystemMessages))
+    } catch {
+      XCTFail("Unexpected error: \(error)")
+    }
+  }
+
+  func testCreateConversationWithSingleInitialSystemMessageSucceeds() async throws {
+    let config = ConversationConfig(
+      initialMessages: [
+        Message("You are a helpful assistant.", role: .system),
+        Message("Hello", role: .user),
+      ]
+    )
+
+    let conversation = try await self.engine.createConversation(with: config)
+    XCTAssertTrue(conversation.isAlive)
+  }
+
+  func testRenderMessageIntoString() async throws {
+    let conversation = try await self.engine.createConversation(with: ConversationConfig())
+    XCTAssertTrue(conversation.isAlive)
+
+    let rendered = try conversation.renderMessageIntoString(Message("Hello world", role: .user))
+    XCTAssertFalse(rendered.isEmpty)
+    XCTAssertTrue(rendered.contains("Hello world"))
+  }
+
+  func testRenderPrefaceIntoString() async throws {
+    let config = ConversationConfig(
+      initialMessages: [Message("You are a helpful assistant", role: .system)]
+    )
+    let conversation = try await self.engine.createConversation(with: config)
+    XCTAssertTrue(conversation.isAlive)
+
+    let rendered = try conversation.renderPrefaceIntoString()
+    XCTAssertFalse(rendered.isEmpty)
+    XCTAssertTrue(rendered.contains("You are a helpful assistant"))
+  }
+
+  func testSendMessageWithRepetitionPenalty() async throws {
+    let conversation = try await self.engine.createConversation(with: ConversationConfig())
+    XCTAssertTrue(conversation.isAlive)
+
+    let response = try await conversation.sendMessage(
+      Message("Hello"),
+      repetitionPenaltyConfig: RepetitionPenaltyConfig(
+        repetitionPenalty: 2.0, presencePenalty: 0.6, frequencyPenalty: 0.6, windowSize: 10)
+    )
+    XCTAssertFalse(response.contents.isEmpty)
+  }
+
+  func testSendStreamMessageWithRepetitionPenalty() async throws {
+    let conversation = try await self.engine.createConversation(with: ConversationConfig())
+    XCTAssertTrue(conversation.isAlive)
+
+    let message = Message("Hello")
+    var chunkCount = 0
+
+    for try await _ in conversation.sendMessageStream(
+      message,
+      repetitionPenaltyConfig: RepetitionPenaltyConfig(
+        repetitionPenalty: 2.0, presencePenalty: 0.6, frequencyPenalty: 0.6, windowSize: 10)
+    ) {
+      chunkCount += 1
+    }
+    XCTAssertGreaterThan(chunkCount, 0)
+  }
+
+  func testSendMessageWithNoRepeatNgram() async throws {
+    let conversation = try await self.engine.createConversation(with: ConversationConfig())
+    XCTAssertTrue(conversation.isAlive)
+
+    let response = try await conversation.sendMessage(
+      Message("Hello"),
+      noRepeatNgramConfig: NoRepeatNgramConfig(noRepeatNgramSize: 5, windowSize: 10)
+    )
+    XCTAssertFalse(response.contents.isEmpty)
+  }
+
+  func testSendStreamMessageWithNoRepeatNgram() async throws {
+    let conversation = try await self.engine.createConversation(with: ConversationConfig())
+    XCTAssertTrue(conversation.isAlive)
+
+    let message = Message("Hello")
+    var chunkCount = 0
+
+    for try await _ in conversation.sendMessageStream(
+      message,
+      noRepeatNgramConfig: NoRepeatNgramConfig(noRepeatNgramSize: 5, windowSize: 10)
+    ) {
+      chunkCount += 1
+    }
+    XCTAssertGreaterThan(chunkCount, 0)
+  }
+
+  func testSendMessageWithSuppressTokens() async throws {
+    let conversation = try await self.engine.createConversation(with: ConversationConfig())
+    XCTAssertTrue(conversation.isAlive)
+
+    let response = try await conversation.sendMessage(
+      Message("Hello"),
+      suppressTokensConfig: SuppressTokensConfig(suppressTokens: [1, 2, 3])
+    )
+    XCTAssertFalse(response.contents.isEmpty)
+  }
+
+  func testSendStreamMessageWithSuppressTokens() async throws {
+    let conversation = try await self.engine.createConversation(with: ConversationConfig())
+    XCTAssertTrue(conversation.isAlive)
+
+    let message = Message("Hello")
+    var chunkCount = 0
+
+    for try await _ in conversation.sendMessageStream(
+      message,
+      suppressTokensConfig: SuppressTokensConfig(suppressTokens: [1, 2, 3])
+    ) {
+      chunkCount += 1
+    }
+    XCTAssertGreaterThan(chunkCount, 0)
+  }
+
+  func testCreateConversationWithThinkingConfig() async throws {
+    let config = ConversationConfig(
+      thinkingConfig: ThinkingConfig(enableThinking: true, thinkingTokenBudget: 32)
+    )
+    let conversation = try await self.engine.createConversation(with: config)
+    XCTAssertTrue(conversation.isAlive)
+  }
+
+  func testSendMessageWithThinkingConfig() async throws {
+    let conversation = try await self.engine.createConversation(with: ConversationConfig())
+    XCTAssertTrue(conversation.isAlive)
+
+    let response = try await conversation.sendMessage(
+      Message("Hello"),
+      thinkingConfig: ThinkingConfig(enableThinking: true, thinkingTokenBudget: 32)
+    )
+    XCTAssertFalse(response.contents.isEmpty)
+  }
+
+  func testSendMessageStreamWithThinkingConfig() async throws {
+    let conversation = try await self.engine.createConversation(with: ConversationConfig())
+    XCTAssertTrue(conversation.isAlive)
+
+    let message = Message("Hello")
+    var chunkCount = 0
+
+    for try await _ in conversation.sendMessageStream(
+      message,
+      thinkingConfig: ThinkingConfig(enableThinking: true, thinkingTokenBudget: 32)
+    ) {
+      chunkCount += 1
+    }
+    XCTAssertGreaterThan(chunkCount, 0)
+  }
+
+  func testResponseFormatCreation() throws {
+    let schemaStr = "{\"type\": \"object\"}"
+    let formatFromString = try ResponseFormat.json(schema: schemaStr)
+    XCTAssertEqual(formatFromString.type, .jsonObject)
+    XCTAssertEqual(formatFromString.schemaOrPattern, schemaStr)
+
+    let schemaMap: [String: Any] = ["type": "object"]
+    let formatFromMap = try ResponseFormat.json(schema: schemaMap)
+    XCTAssertEqual(formatFromMap.type, .jsonObject)
+    XCTAssertTrue(formatFromMap.schemaOrPattern.contains("type"))
+
+    let regexPattern = "[0-9]{3}"
+    let formatRegex = ResponseFormat.regex(pattern: regexPattern)
+    XCTAssertEqual(formatRegex.type, .regex)
+    XCTAssertEqual(formatRegex.schemaOrPattern, regexPattern)
+  }
+
+  func testResponseFormatInvalidJsonSchemaThrows() throws {
+    let invalidSchema = "{invalid_json: true"
+    do {
+      _ = try ResponseFormat.json(schema: invalidSchema)
+      XCTFail("Expected invalidJsonSchema error to be thrown")
+    } catch let error as LiteRTLMError {
+      XCTAssertEqual(error, LiteRTLMError.config(.invalidJsonSchema(invalidSchema)))
+    }
+  }
+
+  func testSendMessageWithoutEnableResponseFormatThrows() async throws {
+    let conversation = try await self.engine.createConversation(with: ConversationConfig())
+    XCTAssertTrue(conversation.isAlive)
+
+    do {
+      _ = try await conversation.sendMessage(
+        Message("Hello"),
+        responseFormat: ResponseFormat.regex(pattern: "[0-9]{3}")
+      )
+      XCTFail("Expected responseFormatNotEnabled error to be thrown")
+    } catch let error as LiteRTLMError {
+      XCTAssertEqual(error, LiteRTLMError.conversation(.responseFormatNotEnabled))
+    }
+  }
+
+  func testSendMessageStreamWithoutEnableResponseFormatThrows() async throws {
+    let conversation = try await self.engine.createConversation(with: ConversationConfig())
+    XCTAssertTrue(conversation.isAlive)
+
+    let message = Message("Hello")
+    let stream = conversation.sendMessageStream(
+      message,
+      responseFormat: ResponseFormat.regex(pattern: "[0-9]{3}")
+    )
+
+    do {
+      for try await _ in stream {
+        XCTFail("Expected responseFormatNotEnabled error, but got a chunk")
+      }
+      XCTFail("Expected responseFormatNotEnabled error to be thrown")
+    } catch let error as LiteRTLMError {
+      XCTAssertEqual(error, LiteRTLMError.conversation(.responseFormatNotEnabled))
+    }
+  }
+
+  func testSendMessageWithResponseFormatRegex() async throws {
+    let config = ConversationConfig(enableResponseFormat: true)
+    let conversation = try await self.engine.createConversation(with: config)
+    XCTAssertTrue(conversation.isAlive)
+
+    let response = try await conversation.sendMessage(
+      Message("What is 1+1?"),
+      responseFormat: ResponseFormat.regex(pattern: "aiedge")
+    )
+    XCTAssertFalse(response.contents.isEmpty)
+  }
+
+  func testConversationTeardownAndEngineRetentionDoesNotCrash() async throws {
+    let modelResource =
+      + "runtime/testdata/test_lm.litertlm"
+    var localEngine: Engine? = Engine(
+      engineConfig: try EngineConfig(
+        modelPath: testDataPath(forResource: modelResource),
+        maxNumTokens: 10,
+        cacheDir: NSTemporaryDirectory()
+      )
+    )
+    try await localEngine?.initialize()
+    var localConversation: Conversation? = try await localEngine?.createConversation()
+    XCTAssertTrue(localConversation?.isAlive == true)
+
+    // Release local reference to localEngine.
+    // Because localConversation holds a strong reference to localEngine, localEngine will remain alive.
+    localEngine = nil
+    XCTAssertTrue(localConversation?.isAlive == true)
+
+    // Releasing localConversation triggers Conversation.deinit, which sets handle = nil before litert_lm_conversation_delete,
+    // and then releases localEngine, triggering Engine.deinit, setting handle = nil before litert_lm_engine_delete without crashing.
+    localConversation = nil
+  }
+}

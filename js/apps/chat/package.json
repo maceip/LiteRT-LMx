@@ -1,0 +1,29 @@
+{
+  "name": "litertlm_web_demo",
+  "version": "1.0.0",
+  "description": "Interactive chat demo for LiteRT-LM on WebGPU",
+  "main": "index.js",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite",
+    "test": "node --loader=ts-node/esm ./node_modules/jasmine/bin/jasmine.js --config=test/support/jasmine.json"
+  },
+  "type": "module",
+  "dependencies": {
+    "@litert-lm/core": "0.12.1",
+    "highlight.js": "^11.11.1",
+    "katex": "^0.16.28",
+    "lit": "^3.3.3",
+    "marked": "^18.0.4",
+    "marked-highlight": "^2.2.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/jasmine": "^6.0.0",
+    "@webgpu/types": "^0.1.69",
+    "jasmine": "^6.2.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.3",
+    "vite": "^6.4.2"
+  }
+}
