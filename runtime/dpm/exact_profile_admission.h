@@ -32,11 +32,8 @@
 namespace litert::lm {
 
 enum class ExactProfileAdmissionEvidenceKind : uint32_t {
-  // Narrow statement valid only when this record was produced by the
-  // product-owned concrete process runner/Engine adapter: the recorded
-  // independently spawned processes produced equal bytes for this one
-  // canonical qualification request. The serialized enum cannot prove which
-  // FreshWorkerRunner implementation produced it.
+  // The product-owned qualifier accepts only FreshWorkerProcessRunner and
+  // binds its immutable executable certification into every observation.
   kIndependentColdRunEquality = 1,
 };
 
@@ -57,17 +54,18 @@ struct ExactProfileAdmissionRunEvidence {
   Hash256 worker_instance_nonce;
   Hash256 request_envelope_hash;
   Hash256 result_envelope_hash;
+  Hash256 worker_certification_hash;
   Hash256 launch_spec_hash;
   Hash256 output_evidence_hash;
 };
 
-// Durable record of observed equality. It does not prove that its producer used
-// the concrete process runner, and it does not claim that unobserved prompts,
-// another profile, or a future software/hardware environment will be
-// deterministic. The product admission surface must control record production;
-// consumers must key lookups by the complete Engine-derived profile.
+// Durable record of observed equality from the concrete certified process
+// runner. It does not claim that unobserved prompts, another profile, or a
+// future software/hardware environment will be deterministic. Consumers must
+// key lookups by the complete Engine-derived profile and require the currently
+// certified worker digest to equal worker_certification_hash.
 struct ExactProfileAdmissionRecord {
-  static constexpr uint32_t kFormatVersion = 2;
+  static constexpr uint32_t kFormatVersion = 3;
 
   uint32_t format_version = kFormatVersion;
   Hash256 record_id;
@@ -76,6 +74,7 @@ struct ExactProfileAdmissionRecord {
   FreshWorkerReplayIsolation replay_isolation =
       FreshWorkerReplayIsolation::kEmptyCatalogs;
   Hash256 exact_profile_hash;
+  Hash256 worker_certification_hash;
   Hash256 qualification_id;
   Hash256 qualification_request_hash;
   Hash256 request_payload_hash;
@@ -98,9 +97,10 @@ struct ExactProfileAdmissionRecord {
   std::vector<FreshWorkerLogitFrameEvidence> logit_frames;
 };
 
-Hash256 ComputeExactProfileQualificationRequestHash(
+absl::StatusOr<Hash256> ComputeExactProfileQualificationRequestHash(
     const ExactLiteRtProfile& derived_profile,
-    const ExactProfileQualificationSpec& spec);
+    const ExactProfileQualificationSpec& spec,
+    const Hash256& worker_certification_hash);
 absl::StatusOr<Hash256> ComputeExactProfileAdmissionRecordId(
     const ExactProfileAdmissionRecord& record);
 absl::Status ValidateExactProfileAdmissionRecord(
@@ -125,29 +125,35 @@ class ExactProfileAdmissionRepository {
  public:
   virtual ~ExactProfileAdmissionRepository() = default;
 
-  // Create-once by exact profile. Identical re-publication is idempotent;
-  // conflicting evidence for the same profile fails closed.
+  virtual absl::StatusOr<ExactProfileAdmissionRecord> Get(
+      const ExactLiteRtProfile& runtime_derived_profile,
+      const Hash256& worker_certification_hash,
+      const FreshWorkerAuthentication& authentication) const = 0;
+
+ private:
+  friend class ExactProfileQualifier;
+
+  // Only the concrete-runner ExactProfileQualifier can publish through the
+  // product repository interface. Identical re-publication is idempotent;
+  // conflicting evidence for the same profile and worker certification fails
+  // closed. Keeping this virtual write authority private prevents ordinary
+  // repository callers from bypassing cold-process observation.
   virtual absl::Status PutIfAbsent(
       const ExactProfileAdmissionRecord& record,
       const FreshWorkerAuthentication& authentication) = 0;
-  virtual absl::StatusOr<ExactProfileAdmissionRecord> Get(
-      const ExactLiteRtProfile& runtime_derived_profile,
-      const FreshWorkerAuthentication& authentication) const = 0;
 };
 
 class ExactProfileQualifier {
  public:
   ExactProfileQualifier(const Engine* authoritative_engine,
-                        const FreshWorkerRunner* runner)
+                        const FreshWorkerProcessRunner* runner)
       : authoritative_engine_(authoritative_engine), runner_(runner) {}
 
-  // Runs N serial observations. With the concrete product-owned
-  // FreshWorkerProcessRunner and worker Engine adapter, these are cold OS
-  // processes; an injected FreshWorkerRunner is only a contract seam and must
-  // never be surfaced as cold-process proof. Serial execution avoids concurrent
-  // serving shape/batch effects and makes every concrete observation an
-  // isolated batch-1 qualification attempt controlled by the worker
-  // integration.
+  // Runs N serial observations through the concrete product-owned process
+  // runner. There is no polymorphic runner seam capable of minting durable
+  // cold-process evidence. Serial execution avoids concurrent serving
+  // shape/batch effects and makes every observation an isolated batch-1
+  // qualification attempt controlled by the worker integration.
   // The returned evidence is not durable admission until PutIfAbsent succeeds;
   // consumers of ExactRegeneration must resolve admission through a repository.
   absl::StatusOr<ExactProfileAdmissionRecord> Qualify(
@@ -161,7 +167,7 @@ class ExactProfileQualifier {
 
  private:
   const Engine* authoritative_engine_;
-  const FreshWorkerRunner* runner_;
+  const FreshWorkerProcessRunner* runner_;
 };
 
 }  // namespace litert::lm

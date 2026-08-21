@@ -15,7 +15,10 @@
 #ifndef THIRD_PARTY_ODML_LITERT_LM_RUNTIME_DPM_ENGINE_FRESH_WORKER_ADAPTER_H_
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_DPM_ENGINE_FRESH_WORKER_ADAPTER_H_
 
+#include <utility>
+
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/statusor.h"  // from @com_google_absl
 #include "runtime/dpm/engine_fresh_worker_contract.h"
 #include "runtime/engine/engine_settings.h"
 
@@ -41,6 +44,43 @@ namespace litert::lm {
 // FreshWorkerProcessRunner and exact-profile admission own that independently
 // observed process boundary.
 absl::Status RunEngineFreshWorkerOnce(
+    EngineSettings fixed_engine_settings);
+
+// Narrow product dispatch object for a worker executable's main routine. It
+// takes ownership of already assembled EngineSettings, exposes no settings
+// accessor or mutation surface, validates the fixed exact-worker subset at
+// creation, and can be consumed exactly once. This is source wiring, not a
+// second runtime or a binary target.
+class EngineFreshWorkerEntrypoint final {
+ public:
+  static absl::StatusOr<EngineFreshWorkerEntrypoint> Create(
+      EngineSettings fixed_engine_settings);
+
+  EngineFreshWorkerEntrypoint(EngineFreshWorkerEntrypoint&&) = default;
+  EngineFreshWorkerEntrypoint& operator=(EngineFreshWorkerEntrypoint&&) =
+      delete;
+  EngineFreshWorkerEntrypoint(const EngineFreshWorkerEntrypoint&) = delete;
+  EngineFreshWorkerEntrypoint& operator=(
+      const EngineFreshWorkerEntrypoint&) = delete;
+
+  absl::Status Run() &&;
+
+ private:
+  explicit EngineFreshWorkerEntrypoint(
+      EngineSettings fixed_engine_settings)
+      : fixed_engine_settings_(std::move(fixed_engine_settings)) {}
+
+  EngineSettings fixed_engine_settings_;
+  bool consumed_ = false;
+};
+
+// One-call dispatch for a worker main after it has assembled its product-fixed
+// settings. This constructs the immutable entrypoint above and immediately
+// consumes it; it does not parse argv, environment variables, or request bytes
+// before sealing those settings. Product packaging remains responsible for
+// making the measured worker executable invoke this dispatch; the parent-side
+// adapter-version label is not semantic proof that it does.
+absl::Status DispatchEngineFreshWorkerProcess(
     EngineSettings fixed_engine_settings);
 
 }  // namespace litert::lm

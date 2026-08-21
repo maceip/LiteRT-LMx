@@ -51,12 +51,9 @@
 #include "absl/time/time.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
 #include "runtime/core/session_handoff_codec.h"
+#include "runtime/dpm/engine_fresh_worker_contract.h"
 #include "runtime/platform/hash/hmac_sha256.h"
 #include "runtime/platform/hash/sha256_hasher.h"
-
-#if defined(__APPLE__) || defined(__linux__) || defined(__unix__)
-extern char** environ;
-#endif
 
 namespace litert::lm {
 namespace {
@@ -77,7 +74,9 @@ constexpr uint64_t kMaximumFailureMessageBytes = 4096;
 constexpr absl::Duration kMaximumWorkerTimeout = absl::Hours(1);
 constexpr absl::Duration kMaximumTerminationGrace = absl::Seconds(5);
 constexpr absl::string_view kLaunchSpecDomain =
-    "LITERT_LMX_FRESH_WORKER_LAUNCH_SPEC_SHA256_V1";
+    "LITERT_LMX_FRESH_WORKER_LAUNCH_SPEC_SHA256_V2";
+constexpr absl::string_view kWorkerCertificationDomain =
+    "LITERT_LMX_FRESH_WORKER_CERTIFICATION_SHA256_V1";
 constexpr absl::string_view kTransportKeyDomain =
     "LITERT_LMX_FRESH_WORKER_PER_REQUEST_TRANSPORT_KEY_HMAC_SHA256_V2";
 constexpr absl::string_view kCapsuleKeyDomain =
@@ -154,26 +153,6 @@ class SecretEraser {
  private:
   std::string* secret_;
 };
-
-Hash256 HashLaunchSpec(absl::string_view executable_path,
-                       const std::vector<std::string>& arguments) {
-  Sha256Hasher hasher;
-  hasher.Update(kLaunchSpecDomain);
-  std::string length;
-  AppendU64(executable_path.size(), &length);
-  hasher.Update(length);
-  hasher.Update(executable_path);
-  length.clear();
-  AppendU32(static_cast<uint32_t>(arguments.size()), &length);
-  hasher.Update(length);
-  for (const std::string& argument : arguments) {
-    length.clear();
-    AppendU64(argument.size(), &length);
-    hasher.Update(length);
-    hasher.Update(argument);
-  }
-  return hasher.Finalize();
-}
 
 absl::Status ValidateProcessOptions(const FreshWorkerProcessOptions& options) {
   if (options.executable_path.empty() ||
@@ -434,6 +413,182 @@ absl::Status SetCloseOnExec(int fd) {
                                "Unable to mark worker pipe close-on-exec.");
   }
   return absl::OkStatus();
+}
+
+struct ExecutableInspection {
+  uint64_t device = 0;
+  uint64_t inode = 0;
+  uint64_t file_size = 0;
+  uint32_t file_mode = 0;
+  int64_t modification_time_seconds = 0;
+  int64_t modification_time_nanoseconds = 0;
+  int64_t status_change_time_seconds = 0;
+  int64_t status_change_time_nanoseconds = 0;
+  Hash256 image_hash;
+};
+
+ExecutableInspection InspectionFromStat(const struct stat& value) {
+  ExecutableInspection inspection;
+  inspection.device = static_cast<uint64_t>(value.st_dev);
+  inspection.inode = static_cast<uint64_t>(value.st_ino);
+  inspection.file_size = static_cast<uint64_t>(value.st_size);
+  inspection.file_mode = static_cast<uint32_t>(value.st_mode);
+#if defined(__APPLE__)
+  inspection.modification_time_seconds = value.st_mtimespec.tv_sec;
+  inspection.modification_time_nanoseconds = value.st_mtimespec.tv_nsec;
+  inspection.status_change_time_seconds = value.st_ctimespec.tv_sec;
+  inspection.status_change_time_nanoseconds = value.st_ctimespec.tv_nsec;
+#else
+  inspection.modification_time_seconds = value.st_mtim.tv_sec;
+  inspection.modification_time_nanoseconds = value.st_mtim.tv_nsec;
+  inspection.status_change_time_seconds = value.st_ctim.tv_sec;
+  inspection.status_change_time_nanoseconds = value.st_ctim.tv_nsec;
+#endif
+  return inspection;
+}
+
+bool SameExecutableMetadata(const ExecutableInspection& left,
+                            const ExecutableInspection& right) {
+  return left.device == right.device && left.inode == right.inode &&
+         left.file_size == right.file_size &&
+         left.file_mode == right.file_mode &&
+         left.modification_time_seconds == right.modification_time_seconds &&
+         left.modification_time_nanoseconds ==
+             right.modification_time_nanoseconds &&
+         left.status_change_time_seconds == right.status_change_time_seconds &&
+         left.status_change_time_nanoseconds ==
+             right.status_change_time_nanoseconds;
+}
+
+absl::StatusOr<ExecutableInspection> InspectExecutableImage(
+    absl::string_view canonical_path) {
+  int flags = O_RDONLY;
+#ifdef O_CLOEXEC
+  flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+  flags |= O_NOFOLLOW;
+#endif
+  int descriptor;
+  do {
+    descriptor = open(std::string(canonical_path).c_str(), flags);
+  } while (descriptor < 0 && errno == EINTR);
+  if (descriptor < 0) {
+    return absl::ErrnoToStatus(
+        errno, "Unable to open the certified fresh-worker executable.");
+  }
+  ScopedFd file(descriptor);
+#ifndef O_CLOEXEC
+  ABSL_RETURN_IF_ERROR(SetCloseOnExec(file.get()));
+#endif
+
+  struct stat before;
+  if (fstat(file.get(), &before) != 0) {
+    return absl::ErrnoToStatus(
+        errno, "Unable to inspect the fresh-worker executable.");
+  }
+  if (!S_ISREG(before.st_mode) || before.st_size < 0) {
+    return absl::FailedPreconditionError(
+        "Certified fresh-worker executable is not a regular file.");
+  }
+  if (access(std::string(canonical_path).c_str(), X_OK) != 0) {
+    return absl::ErrnoToStatus(
+        errno, "Certified fresh-worker image is not executable.");
+  }
+  const ExecutableInspection before_inspection = InspectionFromStat(before);
+
+  Sha256Hasher image_hasher;
+  std::array<char, 64 * 1024> buffer{};
+  uint64_t offset = 0;
+  while (offset < before_inspection.file_size) {
+    const uint64_t remaining = before_inspection.file_size - offset;
+    const size_t requested = static_cast<size_t>(
+        std::min<uint64_t>(remaining, buffer.size()));
+    if (offset >
+        static_cast<uint64_t>((std::numeric_limits<off_t>::max)())) {
+      return absl::ResourceExhaustedError(
+          "Fresh-worker executable offset is not representable.");
+    }
+    const ssize_t read_count =
+        pread(file.get(), buffer.data(), requested, static_cast<off_t>(offset));
+    if (read_count < 0 && errno == EINTR) continue;
+    if (read_count < 0) {
+      return absl::ErrnoToStatus(
+          errno, "Unable to hash the fresh-worker executable.");
+    }
+    if (read_count == 0) {
+      return absl::DataLossError(
+          "Fresh-worker executable changed while it was being hashed.");
+    }
+    image_hasher.Update(
+        absl::string_view(buffer.data(), static_cast<size_t>(read_count)));
+    offset += static_cast<uint64_t>(read_count);
+  }
+
+  struct stat after;
+  if (fstat(file.get(), &after) != 0) {
+    return absl::ErrnoToStatus(
+        errno, "Unable to re-inspect the fresh-worker executable.");
+  }
+  const ExecutableInspection after_inspection = InspectionFromStat(after);
+  if (!SameExecutableMetadata(before_inspection, after_inspection)) {
+    return absl::AbortedError(
+        "Fresh-worker executable changed while its certification was read.");
+  }
+
+  struct stat path_after;
+  if (lstat(std::string(canonical_path).c_str(), &path_after) != 0) {
+    return absl::ErrnoToStatus(
+        errno, "Unable to re-resolve the fresh-worker executable path.");
+  }
+  const ExecutableInspection path_inspection = InspectionFromStat(path_after);
+  if (S_ISLNK(path_after.st_mode) || !S_ISREG(path_after.st_mode) ||
+      !SameExecutableMetadata(after_inspection, path_inspection)) {
+    return absl::AbortedError(
+        "Fresh-worker executable path changed during certification.");
+  }
+
+  ExecutableInspection result = after_inspection;
+  result.image_hash = image_hasher.Finalize();
+  return result;
+}
+
+Hash256 ComputeWorkerCertificationHash(
+    absl::string_view canonical_path,
+    const std::vector<std::string>& canonical_arguments,
+    const ExecutableInspection& inspection,
+    FreshWorkerEnvironmentContract environment_contract,
+    absl::string_view engine_adapter_contract_version) {
+  Sha256Hasher hasher;
+  hasher.Update(kWorkerCertificationDomain);
+  std::string encoded;
+  AppendU32(FreshWorkerCertification::kFormatVersion, &encoded);
+  AppendU64(canonical_path.size(), &encoded);
+  encoded.append(canonical_path.data(), canonical_path.size());
+  AppendU32(static_cast<uint32_t>(canonical_arguments.size()), &encoded);
+  for (const std::string& argument : canonical_arguments) {
+    AppendU64(argument.size(), &encoded);
+    encoded.append(argument);
+  }
+  AppendHash(inspection.image_hash, &encoded);
+  AppendU64(inspection.device, &encoded);
+  AppendU64(inspection.inode, &encoded);
+  AppendU64(inspection.file_size, &encoded);
+  AppendU32(inspection.file_mode, &encoded);
+  AppendU64(static_cast<uint64_t>(inspection.modification_time_seconds),
+            &encoded);
+  AppendU64(static_cast<uint64_t>(inspection.modification_time_nanoseconds),
+            &encoded);
+  AppendU64(static_cast<uint64_t>(inspection.status_change_time_seconds),
+            &encoded);
+  AppendU64(static_cast<uint64_t>(inspection.status_change_time_nanoseconds),
+            &encoded);
+  AppendU32(static_cast<uint32_t>(environment_contract), &encoded);
+  AppendU64(engine_adapter_contract_version.size(), &encoded);
+  encoded.append(engine_adapter_contract_version.data(),
+                 engine_adapter_contract_version.size());
+  hasher.Update(encoded);
+  return hasher.Finalize();
 }
 
 // Private, unlinked storage used while a capsule is unauthenticated or carries
@@ -1249,8 +1404,7 @@ absl::Status AddDupAction(posix_spawn_file_actions_t* actions, int source,
 }
 
 absl::StatusOr<pid_t> SpawnWorker(
-    absl::string_view executable_path,
-    const std::vector<std::string>& arguments, int request_read_fd,
+    const FreshWorkerCertification& certification, int request_read_fd,
     int result_write_fd, int authentication_read_fd) {
   SpawnActions actions;
   SpawnAttributes attributes;
@@ -1291,20 +1445,30 @@ absl::StatusOr<pid_t> SpawnWorker(
         error, "Unable to configure fresh-worker signal mask.");
   }
 
-  std::string executable(executable_path);
+  std::string executable(certification.canonical_executable_path());
   std::vector<std::string> owned_arguments;
-  owned_arguments.reserve(arguments.size() + 1);
+  owned_arguments.reserve(certification.canonical_arguments().size() + 1);
   owned_arguments.push_back(executable);
-  owned_arguments.insert(owned_arguments.end(), arguments.begin(),
-                         arguments.end());
+  owned_arguments.insert(owned_arguments.end(),
+                         certification.canonical_arguments().begin(),
+                         certification.canonical_arguments().end());
   std::vector<char*> argv;
   argv.reserve(owned_arguments.size() + 1);
   for (std::string& argument : owned_arguments) argv.push_back(argument.data());
   argv.push_back(nullptr);
 
+  // Exact workers never inherit ambient process state. In particular, model
+  // selection, plugin search paths, precision flags, and backend toggles
+  // cannot be smuggled past the certified EngineSettings through env vars.
+  char* empty_environment[] = {nullptr};
+
   pid_t pid = -1;
+  // The runner brackets this path-based launch with complete image and stable
+  // identity checks. posix_spawn still resolves a pathname inside the OS; this
+  // is change detection, not an atomic fd-based assertion of the executed
+  // image.
   error = posix_spawn(&pid, executable.c_str(), actions.get(), attributes.get(),
-                      argv.data(), environ);
+                      argv.data(), empty_environment);
   if (error != 0) {
     return absl::ErrnoToStatus(error, "Unable to spawn fresh worker.");
   }
@@ -1361,15 +1525,140 @@ FreshWorkerResult MakeFailureResult(const FreshWorkerRequest& request,
 
 }  // namespace
 
+Hash256 ComputeFreshWorkerLaunchSpecHash(
+    const Hash256& worker_certification_hash) {
+  Sha256Hasher hasher;
+  hasher.Update(kLaunchSpecDomain);
+  std::string framing;
+  AppendU32(FreshWorkerCertification::kFormatVersion, &framing);
+  AppendHash(worker_certification_hash, &framing);
+  hasher.Update(framing);
+  return hasher.Finalize();
+}
+
+absl::StatusOr<FreshWorkerCertification> FreshWorkerCertification::Create(
+    const FreshWorkerProcessOptions& options) {
+  ABSL_RETURN_IF_ERROR(ValidateProcessOptions(options));
+#if defined(__APPLE__) || defined(__linux__) || defined(__unix__)
+  ABSL_ASSIGN_OR_RETURN(
+      const std::string canonical_path,
+      CanonicalExecutablePath(options.executable_path));
+  ABSL_ASSIGN_OR_RETURN(const ExecutableInspection inspection,
+                        InspectExecutableImage(canonical_path));
+
+  FreshWorkerCertification certification;
+  certification.canonical_executable_path_ = canonical_path;
+  certification.canonical_arguments_ = options.arguments;
+  certification.executable_image_hash_ = inspection.image_hash;
+  certification.device_ = inspection.device;
+  certification.inode_ = inspection.inode;
+  certification.file_size_ = inspection.file_size;
+  certification.file_mode_ = inspection.file_mode;
+  certification.modification_time_seconds_ =
+      inspection.modification_time_seconds;
+  certification.modification_time_nanoseconds_ =
+      inspection.modification_time_nanoseconds;
+  certification.status_change_time_seconds_ =
+      inspection.status_change_time_seconds;
+  certification.status_change_time_nanoseconds_ =
+      inspection.status_change_time_nanoseconds;
+  certification.environment_contract_ =
+      FreshWorkerEnvironmentContract::kEmpty;
+  // This is the product's expected adapter contract under local launcher and
+  // packaging trust. It contributes to versioned evidence but does not infer
+  // the executable's semantics from its bytes.
+  certification.engine_adapter_contract_version_.assign(
+      kEngineFreshWorkerAdapterContractVersion.data(),
+      kEngineFreshWorkerAdapterContractVersion.size());
+  certification.certification_hash_ = ComputeWorkerCertificationHash(
+      certification.canonical_executable_path_,
+      certification.canonical_arguments_, inspection,
+      certification.environment_contract_,
+      certification.engine_adapter_contract_version_);
+  if (IsZeroHash(certification.executable_image_hash_) ||
+      IsZeroHash(certification.certification_hash_)) {
+    return absl::InternalError(
+        "Fresh-worker certification produced an empty digest.");
+  }
+  return certification;
+#else
+  return absl::UnimplementedError(
+      "Fresh-worker executable certification is not implemented on this "
+      "platform.");
+#endif
+}
+
+absl::Status FreshWorkerCertification::ValidateExecutableImage() const {
+#if defined(__APPLE__) || defined(__linux__) || defined(__unix__)
+  if (format_version_ != kFormatVersion ||
+      canonical_executable_path_.empty() ||
+      environment_contract_ != FreshWorkerEnvironmentContract::kEmpty ||
+      absl::string_view(engine_adapter_contract_version_) !=
+          kEngineFreshWorkerAdapterContractVersion ||
+      IsZeroHash(executable_image_hash_) || IsZeroHash(certification_hash_)) {
+    return absl::FailedPreconditionError(
+        "Fresh-worker certification contract is incomplete or unsupported.");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      const std::string current_canonical_path,
+      CanonicalExecutablePath(canonical_executable_path_));
+  if (current_canonical_path != canonical_executable_path_) {
+    return absl::AbortedError(
+        "Fresh-worker executable canonical path changed after certification.");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      const ExecutableInspection current,
+      InspectExecutableImage(canonical_executable_path_));
+  if (current.device != device_ || current.inode != inode_ ||
+      current.file_size != file_size_ || current.file_mode != file_mode_ ||
+      current.modification_time_seconds != modification_time_seconds_ ||
+      current.modification_time_nanoseconds !=
+          modification_time_nanoseconds_ ||
+      current.status_change_time_seconds != status_change_time_seconds_ ||
+      current.status_change_time_nanoseconds !=
+          status_change_time_nanoseconds_ ||
+      current.image_hash != executable_image_hash_) {
+    return absl::AbortedError(
+        "Fresh-worker executable image or stable file identity changed after "
+        "certification.");
+  }
+  const Hash256 expected_certification_hash = ComputeWorkerCertificationHash(
+      canonical_executable_path_, canonical_arguments_, current,
+      environment_contract_, engine_adapter_contract_version_);
+  if (expected_certification_hash != certification_hash_) {
+    return absl::DataLossError(
+        "Fresh-worker certification digest is internally inconsistent.");
+  }
+  return absl::OkStatus();
+#else
+  return absl::UnimplementedError(
+      "Fresh-worker executable certification is not implemented on this "
+      "platform.");
+#endif
+}
+
+absl::StatusOr<FreshWorkerProcessRunner> FreshWorkerProcessRunner::Create(
+    FreshWorkerProcessOptions options) {
+  ABSL_ASSIGN_OR_RETURN(FreshWorkerCertification certification,
+                        FreshWorkerCertification::Create(options));
+  options.executable_path = certification.canonical_executable_path();
+  options.arguments = certification.canonical_arguments();
+  return FreshWorkerProcessRunner(std::move(options),
+                                  std::move(certification));
+}
+
 FreshWorkerProcessRunner::FreshWorkerProcessRunner(
-    FreshWorkerProcessOptions options)
-    : options_(std::move(options)) {}
+    FreshWorkerProcessOptions options,
+    FreshWorkerCertification certification)
+    : options_(std::move(options)),
+      certification_(std::move(certification)) {}
 
 absl::StatusOr<FreshWorkerProcessObservation> FreshWorkerProcessRunner::Run(
     const FreshWorkerRequest& request,
     const FreshWorkerAuthentication& authentication) const {
 #if defined(__APPLE__) || defined(__linux__) || defined(__unix__)
   ABSL_RETURN_IF_ERROR(ValidateProcessOptions(options_));
+  ABSL_RETURN_IF_ERROR(certification_.ValidateExecutableImage());
   ABSL_RETURN_IF_ERROR(ValidateFreshWorkerRequest(request));
   if (request.execution_plan.prefill_mode !=
           FreshWorkerPrefillMode::kFullCanonicalPrefill ||
@@ -1379,9 +1668,6 @@ absl::StatusOr<FreshWorkerProcessObservation> FreshWorkerProcessRunner::Run(
         "capsules; use the authenticated capsule-stream path.");
   }
   ABSL_RETURN_IF_ERROR(ValidateFreshWorkerAuthentication(authentication));
-  ABSL_ASSIGN_OR_RETURN(
-      const std::string executable_path,
-      CanonicalExecutablePath(options_.executable_path));
   ABSL_ASSIGN_OR_RETURN(
       FreshWorkerAuthentication transport_authentication,
       DeriveTransportAuthentication(authentication, request));
@@ -1408,9 +1694,10 @@ absl::StatusOr<FreshWorkerProcessObservation> FreshWorkerProcessRunner::Run(
   }
   ABSL_ASSIGN_OR_RETURN(
       const pid_t pid,
-      SpawnWorker(executable_path, options_.arguments, request_pipe.read.get(),
+      SpawnWorker(certification_, request_pipe.read.get(),
                   result_pipe.write.get(), authentication_pipe.read.get()));
   ChildGuard child(pid, options_.termination_grace);
+  ABSL_RETURN_IF_ERROR(certification_.ValidateExecutableImage());
   request_pipe.read.Reset();
   result_pipe.write.Reset();
   authentication_pipe.read.Reset();
@@ -1442,6 +1729,7 @@ absl::StatusOr<FreshWorkerProcessObservation> FreshWorkerProcessRunner::Run(
   ABSL_RETURN_IF_ERROR(ExpectEofWithDeadline(result_pipe.read.get(), control));
   result_pipe.read.Reset();
   ABSL_ASSIGN_OR_RETURN(const int process_status, child.Wait(control));
+  ABSL_RETURN_IF_ERROR(certification_.ValidateExecutableImage());
   if (!WIFEXITED(process_status) || WEXITSTATUS(process_status) != 0) {
     return absl::DataLossError(
         "Fresh worker did not exit successfully after its capsule-free "
@@ -1468,7 +1756,9 @@ absl::StatusOr<FreshWorkerProcessObservation> FreshWorkerProcessRunner::Run(
       .process_id = static_cast<int64_t>(pid),
       .request_envelope_hash = request_envelope_hash,
       .result_envelope_hash = HashFreshWorkerEnvelope(result_envelope),
-      .launch_spec_hash = HashLaunchSpec(executable_path, options_.arguments)};
+      .worker_certification_hash = certification_.certification_hash(),
+      .launch_spec_hash = ComputeFreshWorkerLaunchSpecHash(
+          certification_.certification_hash())};
 #else
   return absl::UnimplementedError(
       "Fresh-worker process isolation is not implemented on this platform.");
@@ -1482,12 +1772,10 @@ FreshWorkerProcessRunner::RunWithSessionHandoff(
     const FreshWorkerSessionHandoffTransfer& transfer) const {
 #if defined(__APPLE__) || defined(__linux__) || defined(__unix__)
   ABSL_RETURN_IF_ERROR(ValidateProcessOptions(options_));
+  ABSL_RETURN_IF_ERROR(certification_.ValidateExecutableImage());
   ABSL_RETURN_IF_ERROR(ValidateFreshWorkerRequest(request));
   ABSL_RETURN_IF_ERROR(ValidateFreshWorkerAuthentication(authentication));
   ABSL_RETURN_IF_ERROR(ValidateSessionHandoffTransfer(request, transfer));
-  ABSL_ASSIGN_OR_RETURN(
-      const std::string executable_path,
-      CanonicalExecutablePath(options_.executable_path));
   ABSL_ASSIGN_OR_RETURN(
       FreshWorkerAuthentication transport_authentication,
       DeriveTransportAuthentication(authentication, request));
@@ -1577,9 +1865,10 @@ FreshWorkerProcessRunner::RunWithSessionHandoff(
   }
   ABSL_ASSIGN_OR_RETURN(
       const pid_t pid,
-      SpawnWorker(executable_path, options_.arguments, request_pipe.read.get(),
+      SpawnWorker(certification_, request_pipe.read.get(),
                   result_pipe.write.get(), authentication_pipe.read.get()));
   ChildGuard child(pid, options_.termination_grace);
+  ABSL_RETURN_IF_ERROR(certification_.ValidateExecutableImage());
   request_pipe.read.Reset();
   result_pipe.write.Reset();
   authentication_pipe.read.Reset();
@@ -1620,6 +1909,7 @@ FreshWorkerProcessRunner::RunWithSessionHandoff(
   ABSL_RETURN_IF_ERROR(ExpectEofWithDeadline(result_pipe.read.get(), control));
   result_pipe.read.Reset();
   ABSL_ASSIGN_OR_RETURN(const int process_status, child.Wait(control));
+  ABSL_RETURN_IF_ERROR(certification_.ValidateExecutableImage());
   if (!WIFEXITED(process_status) || WEXITSTATUS(process_status) != 0) {
     return absl::DataLossError(
         "Fresh worker did not exit successfully after its response and "
@@ -1704,7 +1994,9 @@ FreshWorkerProcessRunner::RunWithSessionHandoff(
       .process_id = static_cast<int64_t>(pid),
       .request_envelope_hash = request_envelope_hash,
       .result_envelope_hash = HashFreshWorkerEnvelope(result_envelope),
-      .launch_spec_hash = HashLaunchSpec(executable_path, options_.arguments),
+      .worker_certification_hash = certification_.certification_hash(),
+      .launch_spec_hash = ComputeFreshWorkerLaunchSpecHash(
+          certification_.certification_hash()),
       .durable_producing_capsule_evidence =
           std::move(durable_capsule_evidence)};
 #else

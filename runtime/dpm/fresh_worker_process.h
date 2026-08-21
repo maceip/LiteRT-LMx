@@ -59,6 +59,91 @@ struct FreshWorkerProcessOptions {
   std::function<bool()> cancellation_requested;
 };
 
+enum class FreshWorkerEnvironmentContract : uint32_t {
+  // Exact workers receive an environment containing only the terminating
+  // null pointer. Model paths, delegate choices, settings, keys, and mode
+  // selectors therefore cannot arrive through ambient process state.
+  kEmpty = 1,
+};
+
+// Immutable parent-derived measurement of the configured worker executable.
+// The executable image hash covers every file byte (including an embedded
+// Mach-O code-signature blob when present). File metadata is additionally
+// committed so replacing an executable with byte-identical but independently
+// installed storage still creates a different certification object. This does
+// not validate a platform code signature or prove that the measured bytes
+// implement the locally asserted Engine-adapter contract.
+class FreshWorkerCertification final {
+ public:
+  static constexpr uint32_t kFormatVersion = 1;
+
+  FreshWorkerCertification(const FreshWorkerCertification&) = default;
+  FreshWorkerCertification(FreshWorkerCertification&&) = default;
+  FreshWorkerCertification& operator=(const FreshWorkerCertification&) =
+      delete;
+  FreshWorkerCertification& operator=(FreshWorkerCertification&&) = delete;
+
+  static absl::StatusOr<FreshWorkerCertification> Create(
+      const FreshWorkerProcessOptions& options);
+
+  uint32_t format_version() const { return format_version_; }
+  const std::string& canonical_executable_path() const {
+    return canonical_executable_path_;
+  }
+  const std::vector<std::string>& canonical_arguments() const {
+    return canonical_arguments_;
+  }
+  const Hash256& executable_image_hash() const {
+    return executable_image_hash_;
+  }
+  FreshWorkerEnvironmentContract environment_contract() const {
+    return environment_contract_;
+  }
+  const std::string& engine_adapter_contract_version() const {
+    return engine_adapter_contract_version_;
+  }
+  const Hash256& certification_hash() const { return certification_hash_; }
+
+  // Reopens the canonical path without following a final symlink, rehashes
+  // the complete image, and requires every committed file-identity field to
+  // remain unchanged. This detects path/image drift around path-based spawn;
+  // it is not an fd-based attestation of the exact image executed by the OS.
+  absl::Status ValidateExecutableImage() const;
+
+ private:
+  friend class FreshWorkerProcessRunner;
+
+  FreshWorkerCertification() = default;
+
+  // Canonicalized POSIX identity and timestamps captured from one open file
+  // descriptor before and after hashing. Kept private because consumers must
+  // compare the complete certification digest rather than cherry-pick weaker
+  // metadata fields.
+  uint64_t device_ = 0;
+  uint64_t inode_ = 0;
+  uint64_t file_size_ = 0;
+  uint32_t file_mode_ = 0;
+  int64_t modification_time_seconds_ = 0;
+  int64_t modification_time_nanoseconds_ = 0;
+  int64_t status_change_time_seconds_ = 0;
+  int64_t status_change_time_nanoseconds_ = 0;
+
+  uint32_t format_version_ = kFormatVersion;
+  std::string canonical_executable_path_;
+  std::vector<std::string> canonical_arguments_;
+  Hash256 executable_image_hash_;
+  FreshWorkerEnvironmentContract environment_contract_ =
+      FreshWorkerEnvironmentContract::kEmpty;
+  std::string engine_adapter_contract_version_;
+  Hash256 certification_hash_;
+};
+
+// Domain-separated launch identity used by durable evidence. Keeping this
+// derivation public lets admission and per-request validators prove that a
+// serialized launch hash actually commits its worker certification digest.
+Hash256 ComputeFreshWorkerLaunchSpecHash(
+    const Hash256& worker_certification_hash);
+
 // Parent-only durable inputs and outputs for the session-capable process
 // boundary. Durable keys are used solely in the parent and never enter the
 // worker authentication prelude, request envelope, command line, or
@@ -101,9 +186,13 @@ struct FreshWorkerProcessObservation {
   Hash256 request_envelope_hash;
   Hash256 result_envelope_hash;
 
-  // Hash of the canonical executable path plus exact argv bytes. It is launch
-  // routing evidence only, not a substitute for executable/delegate digests in
-  // the derived ExactLiteRtProfile.
+  // Parent-derived immutable certification of the exact executable image,
+  // stable file identity, argv, empty environment contract, and Engine adapter
+  // version label. The launch-spec hash explicitly commits this digest. The
+  // adapter label is a local configuration assertion, and neither digest is a
+  // substitute for the loaded model/delegate/profile identity derived inside
+  // the worker.
+  Hash256 worker_certification_hash;
   Hash256 launch_spec_hash;
 
   // Present only after a requested producing capsule has been authenticated,
@@ -113,33 +202,31 @@ struct FreshWorkerProcessObservation {
       durable_producing_capsule_evidence;
 };
 
-class FreshWorkerRunner {
- public:
-  virtual ~FreshWorkerRunner() = default;
-  // Contract seam for orchestration and fault injection. Implementations other
-  // than FreshWorkerProcessRunner do not, by this interface alone, prove a new
-  // OS process, authenticated IPC, or empty replay catalogs. A product exact
-  // path must own the concrete process runner rather than accept an arbitrary
-  // caller-supplied implementation.
-  virtual absl::StatusOr<FreshWorkerProcessObservation> Run(
-      const FreshWorkerRequest& request,
-      const FreshWorkerAuthentication& authentication) const = 0;
-};
-
 // Spawns one new OS process for every Run call, derives a request-specific
 // transport HMAC key from the supplied durable key, writes one bounded request
 // plus an explicit capsule/zero frame, accepts the matching response pair, and
 // requires clean process exit. Only the derived transport key enters the
 // worker. It never reuses a process and never invokes a command shell.
-class FreshWorkerProcessRunner final : public FreshWorkerRunner {
+class FreshWorkerProcessRunner final {
  public:
-  explicit FreshWorkerProcessRunner(FreshWorkerProcessOptions options);
+  // Resolves and hashes the worker executable once. Construction fails unless
+  // the path is canonical, non-symlink, regular, executable, and stable across
+  // the complete image read. Every Run revalidates the same image immediately
+  // before spawn, immediately after spawn, and after process exit. These
+  // checks detect a changed stable path/image but do not make path-based
+  // posix_spawn equivalent to fd-based exec attestation.
+  static absl::StatusOr<FreshWorkerProcessRunner> Create(
+      FreshWorkerProcessOptions options);
+
+  const FreshWorkerCertification& certification() const {
+    return certification_;
+  }
 
   absl::StatusOr<FreshWorkerProcessObservation> Run(
       const FreshWorkerRequest& request,
-      const FreshWorkerAuthentication& authentication) const override;
+      const FreshWorkerAuthentication& authentication) const;
 
-  // Concrete session-capable process boundary. The ordinary virtual Run path
+  // Concrete session-capable process boundary. The ordinary Run path
   // intentionally remains full-prefill and capsule-free for exact-profile
   // admission. This path sends one bounded request frame followed by one
   // separately bounded transient capsule frame (which may be empty), and
@@ -151,7 +238,11 @@ class FreshWorkerProcessRunner final : public FreshWorkerRunner {
       const FreshWorkerSessionHandoffTransfer& transfer) const;
 
  private:
+  FreshWorkerProcessRunner(FreshWorkerProcessOptions options,
+                           FreshWorkerCertification certification);
+
   FreshWorkerProcessOptions options_;
+  const FreshWorkerCertification certification_;
 };
 
 // Output plus the profile digest derived by the engine loaded inside this

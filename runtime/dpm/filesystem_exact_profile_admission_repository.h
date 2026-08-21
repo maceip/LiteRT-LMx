@@ -24,9 +24,10 @@
 
 namespace litert::lm {
 
-// Durable create-once store keyed only by the complete derived exact-profile
-// digest. Every read authenticates and structurally validates the whole record;
-// a missing, truncated, conflicting, or wrong-key record fails closed.
+// Durable create-once store keyed by the complete derived exact-profile digest
+// and the parent-measured worker-certification digest. Every read authenticates
+// and structurally validates the whole record; a missing, truncated,
+// conflicting, or wrong-key record fails closed.
 class FilesystemExactProfileAdmissionRepository final
     : public ExactProfileAdmissionRepository {
  public:
@@ -34,14 +35,15 @@ class FilesystemExactProfileAdmissionRepository final
       std::unique_ptr<FilesystemExactProfileAdmissionRepository>>
   Create(std::filesystem::path directory);
 
-  absl::Status PutIfAbsent(
-      const ExactProfileAdmissionRecord& record,
-      const FreshWorkerAuthentication& authentication) override;
   absl::StatusOr<ExactProfileAdmissionRecord> Get(
       const ExactLiteRtProfile& runtime_derived_profile,
+      const Hash256& worker_certification_hash,
       const FreshWorkerAuthentication& authentication) const override;
 
  private:
+  absl::Status PutIfAbsent(
+      const ExactProfileAdmissionRecord& record,
+      const FreshWorkerAuthentication& authentication) override;
   explicit FilesystemExactProfileAdmissionRepository(
       std::filesystem::path directory);
   absl::Status Initialize();

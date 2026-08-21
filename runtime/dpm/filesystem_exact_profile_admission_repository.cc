@@ -43,6 +43,13 @@ namespace {
 constexpr uint64_t kMaximumStoredAdmissionBytes =
     kMaximumFreshWorkerEnvelopeBytes;
 
+bool IsZeroHash(const Hash256& hash) {
+  for (uint8_t byte : hash.bytes) {
+    if (byte != 0) return false;
+  }
+  return true;
+}
+
 int ExtraOpenFlags() {
   int flags = 0;
 #ifdef O_CLOEXEC
@@ -371,9 +378,11 @@ absl::StatusOr<std::pair<ScopedFd, std::filesystem::path>> CreateTempFile(
 }
 
 std::filesystem::path RecordPath(const std::filesystem::path& directory,
-                                 const Hash256& exact_profile_hash) {
-  return directory /
-         absl::StrCat(exact_profile_hash.ToHex(), ".admission");
+                                 const Hash256& exact_profile_hash,
+                                 const Hash256& worker_certification_hash) {
+  return directory / absl::StrCat(exact_profile_hash.ToHex(), ".",
+                                  worker_certification_hash.ToHex(),
+                                  ".admission");
 }
 
 }  // namespace
@@ -381,10 +390,12 @@ std::filesystem::path RecordPath(const std::filesystem::path& directory,
 FilesystemExactProfileAdmissionRepository::
     FilesystemExactProfileAdmissionRepository(std::filesystem::path root)
     : root_(std::move(root)),
-      // Admission v2 binds the authenticated full-prefill execution plan and
-      // worker protocol v2. Keep it in a disjoint create-once namespace so a
-      // disposable v1 admission can never block or masquerade as v2 proof.
-      directory_(root_ / "exact-profile-admission" / "v2"),
+      // Admission v3 additionally binds the certified executable image, stable
+      // file identity, canonical argv, empty environment, and Engine adapter
+      // contract-version label. Keep it in a disjoint create-once namespace so
+      // older records can never block or masquerade as certified cold-process
+      // evidence.
+      directory_(root_ / "exact-profile-admission" / "v3"),
       records_directory_(directory_ / "records"),
       lock_path_(directory_ / "repository.lock") {}
 
@@ -433,7 +444,8 @@ absl::Status FilesystemExactProfileAdmissionRepository::PutIfAbsent(
                                                           authentication));
   ABSL_ASSIGN_OR_RETURN(ScopedFileLock lock, AcquireLock(lock_path_, true));
   const std::filesystem::path final_path =
-      RecordPath(records_directory_, record.exact_profile_hash);
+      RecordPath(records_directory_, record.exact_profile_hash,
+                 record.worker_certification_hash);
 
   std::error_code exists_error;
   if (std::filesystem::exists(final_path, exists_error)) {
@@ -446,12 +458,16 @@ absl::Status FilesystemExactProfileAdmissionRepository::PutIfAbsent(
     ABSL_ASSIGN_OR_RETURN(
         const ExactProfileAdmissionRecord existing_record,
         DecodeExactProfileAdmissionRecord(existing, authentication));
-    if (existing_record.exact_profile_hash != record.exact_profile_hash) {
+    if (existing_record.exact_profile_hash != record.exact_profile_hash ||
+        existing_record.worker_certification_hash !=
+            record.worker_certification_hash) {
       return absl::DataLossError(
-          "Existing admission is stored under the wrong exact profile.");
+          "Existing admission is stored under the wrong exact profile or "
+          "worker certification.");
     }
     return absl::AlreadyExistsError(
-        "Conflicting admission already exists for this exact profile.");
+        "Conflicting admission already exists for this exact profile and "
+        "worker certification.");
   }
   if (exists_error) {
     return absl::FailedPreconditionError(
@@ -460,7 +476,11 @@ absl::Status FilesystemExactProfileAdmissionRepository::PutIfAbsent(
 
   ABSL_ASSIGN_OR_RETURN(auto temporary,
                         CreateTempFile(records_directory_,
-                                       record.exact_profile_hash.ToHex()));
+                                       absl::StrCat(
+                                           record.exact_profile_hash.ToHex(),
+                                           ".",
+                                           record.worker_certification_hash
+                                               .ToHex())));
   ScopedFd temp_fd = std::move(temporary.first);
   const std::filesystem::path temp_path = std::move(temporary.second);
   const auto remove_temp = [&temp_path]() {
@@ -501,12 +521,16 @@ absl::Status FilesystemExactProfileAdmissionRepository::PutIfAbsent(
       ABSL_ASSIGN_OR_RETURN(
           const ExactProfileAdmissionRecord existing_record,
           DecodeExactProfileAdmissionRecord(existing, authentication));
-      if (existing_record.exact_profile_hash != record.exact_profile_hash) {
+      if (existing_record.exact_profile_hash != record.exact_profile_hash ||
+          existing_record.worker_certification_hash !=
+              record.worker_certification_hash) {
         return absl::DataLossError(
-            "Concurrent admission is stored under the wrong exact profile.");
+            "Concurrent admission is stored under the wrong exact profile or "
+            "worker certification.");
       }
       return absl::AlreadyExistsError(
-          "Conflicting admission was concurrently published for this profile.");
+          "Conflicting admission was concurrently published for this profile "
+          "and worker certification.");
     }
     return absl::ErrnoToStatus(
         saved_errno, "Unable to publish exact-profile admission record.");
@@ -519,25 +543,31 @@ absl::Status FilesystemExactProfileAdmissionRepository::PutIfAbsent(
 absl::StatusOr<ExactProfileAdmissionRecord>
 FilesystemExactProfileAdmissionRepository::Get(
     const ExactLiteRtProfile& runtime_derived_profile,
+    const Hash256& worker_certification_hash,
     const FreshWorkerAuthentication& authentication) const {
-  const Hash256& exact_profile_hash = runtime_derived_profile.profile_id;
-  bool all_zero = true;
-  for (uint8_t byte : exact_profile_hash.bytes) all_zero &= byte == 0;
-  if (all_zero) {
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(runtime_derived_profile));
+  if (IsZeroHash(worker_certification_hash)) {
     return absl::InvalidArgumentError(
-        "Exact-profile admission lookup requires a nonzero profile digest.");
+        "Exact-profile admission lookup requires a worker certification.");
   }
+  const Hash256& exact_profile_hash = runtime_derived_profile.profile_id;
   ABSL_RETURN_IF_ERROR(
       ValidateRepositoryTree(root_, directory_, records_directory_));
   ABSL_ASSIGN_OR_RETURN(ScopedFileLock lock, AcquireLock(lock_path_, false));
   const std::filesystem::path path =
-      RecordPath(records_directory_, exact_profile_hash);
+      RecordPath(records_directory_, exact_profile_hash,
+                 worker_certification_hash);
   ABSL_ASSIGN_OR_RETURN(const std::string bytes, ReadWholeFile(path));
   ABSL_ASSIGN_OR_RETURN(
       ExactProfileAdmissionRecord record,
       DecodeExactProfileAdmissionRecord(bytes, authentication));
   ABSL_RETURN_IF_ERROR(ValidateExactProfileAdmissionRecordForProfile(
       record, runtime_derived_profile));
+  if (record.worker_certification_hash != worker_certification_hash) {
+    return absl::DataLossError(
+        "Exact-profile admission is stored under the wrong worker "
+        "certification.");
+  }
   return record;
 }
 

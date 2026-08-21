@@ -45,9 +45,9 @@ constexpr std::array<char, 8> kCanonicalRequestMagic = {'D', 'P', 'M', 'R',
 constexpr uint64_t kMaximumEvidenceKeyIdBytes = 256;
 constexpr uint64_t kMaximumEvidenceAuthenticationKeyBytes = 4096;
 constexpr absl::string_view kExactRegenerationRunEvidenceDomain =
-    "LITERT_LMX_EXACT_REGENERATION_RUN_EVIDENCE_SHA256_V1";
+    "LITERT_LMX_EXACT_REGENERATION_RUN_EVIDENCE_SHA256_V2";
 constexpr absl::string_view kExactRegenerationRequestEvidenceDomain =
-    "LITERT_LMX_EXACT_REGENERATION_REQUEST_EVIDENCE_SHA256_V1";
+    "LITERT_LMX_EXACT_REGENERATION_REQUEST_EVIDENCE_SHA256_V2";
 
 bool IsZeroHash(const Hash256& hash) {
   uint8_t combined = 0;
@@ -188,6 +188,7 @@ std::string EncodeExactRegenerationRunEvidenceFields(
   AppendHash(evidence.worker_instance_nonce, &encoded);
   AppendHash(evidence.request_envelope_hash, &encoded);
   AppendHash(evidence.result_envelope_hash, &encoded);
+  AppendHash(evidence.worker_certification_hash, &encoded);
   AppendHash(evidence.launch_spec_hash, &encoded);
   AppendHash(evidence.output_evidence_hash, &encoded);
   AppendOptionalHash(evidence.restored_checkpoint_id, &encoded);
@@ -218,7 +219,9 @@ absl::Status ValidateExactRegenerationRunEvidenceFields(
       IsZeroHash(evidence.worker_instance_nonce) ||
       IsZeroHash(evidence.request_envelope_hash) ||
       IsZeroHash(evidence.result_envelope_hash) ||
-      IsZeroHash(evidence.launch_spec_hash) ||
+      IsZeroHash(evidence.worker_certification_hash) ||
+      evidence.launch_spec_hash != ComputeFreshWorkerLaunchSpecHash(
+                                       evidence.worker_certification_hash) ||
       IsZeroHash(evidence.output_evidence_hash) ||
       (require_evidence_id && IsZeroHash(evidence.evidence_id))) {
     return absl::InvalidArgumentError(
@@ -256,6 +259,7 @@ std::string EncodeExactRegenerationRequestEvidenceFields(
   std::string encoded;
   AppendU32(evidence.format_version, &encoded);
   AppendHash(evidence.exact_profile_id, &encoded);
+  AppendHash(evidence.worker_certification_hash, &encoded);
   AppendHash(evidence.profile_admission_record_id, &encoded);
   AppendIdentity(evidence.session_identity, &encoded);
   AppendHash(evidence.request_execution_id, &encoded);
@@ -287,6 +291,7 @@ absl::Status ValidateExactRegenerationRequestEvidenceFields(
         "Exact-regeneration request-evidence version is unsupported.");
   }
   if (IsZeroHash(evidence.exact_profile_id) ||
+      IsZeroHash(evidence.worker_certification_hash) ||
       IsZeroHash(evidence.profile_admission_record_id) ||
       !IsCompleteIdentity(evidence.session_identity) ||
       IsZeroHash(evidence.request_execution_id) ||
@@ -346,6 +351,8 @@ absl::Status ValidateExactRegenerationRequestEvidenceFields(
     const ExactRegenerationRunEvidence& run = evidence.runs[index];
     ABSL_RETURN_IF_ERROR(ValidateExactRegenerationRunEvidence(run));
     if (run.run_index != index ||
+        run.worker_certification_hash !=
+            evidence.worker_certification_hash ||
         run.output_evidence_hash !=
             evidence.consensus_output_evidence_hash ||
         run.restored_checkpoint_id != evidence.restored_checkpoint_id) {
@@ -742,6 +749,7 @@ struct ResolvedExactExecutorProfile {
 absl::Status ValidateLogitFramesMatchExactProfile(
     const ExactLiteRtProfile& profile,
     const std::vector<FreshWorkerLogitFrameEvidence>& frames) {
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(profile));
   FreshWorkerLogitElementType expected_type =
       FreshWorkerLogitElementType::kUnsupported;
   uint32_t expected_width = 0;
@@ -799,6 +807,7 @@ absl::Status ValidateExactExecutionInput(
     const ExactRegenerationExecutionInput& input,
     const Hash256& canonical_request_hash,
     const ExactLiteRtProfile& profile) {
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(profile));
   ABSL_RETURN_IF_ERROR(
       ValidateFreshWorkerExecutionPlan(input.execution_plan));
   if (input.execution_plan.logical_replay_request_hash !=
@@ -900,6 +909,7 @@ absl::StatusOr<ResolvedExactExecutorProfile> ResolveExactExecutorProfile(
       ExactLiteRtProfile profile,
       engine->ResolveExactLiteRtProfile(session_config,
                                         config.profile_assertion));
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(profile));
   return ResolvedExactExecutorProfile{
       .session_config = std::move(session_config),
       .profile = std::move(profile),
@@ -909,15 +919,18 @@ absl::StatusOr<ResolvedExactExecutorProfile> ResolveExactExecutorProfile(
 absl::Status ValidateAdmissionForExactProfile(
     const ExactProfileAdmissionRecord& admission,
     const ExactLiteRtProfile& profile,
-    const FreshWorkerAuthentication& authentication) {
+    const FreshWorkerAuthentication& authentication,
+    const Hash256& worker_certification_hash) {
   ABSL_RETURN_IF_ERROR(
       ValidateExactProfileAdmissionRecordForProfile(admission, profile));
   if (admission.authentication_key_id != authentication.key_id ||
+      admission.worker_certification_hash != worker_certification_hash ||
+      IsZeroHash(worker_certification_hash) ||
       admission.replay_isolation !=
           FreshWorkerReplayIsolation::kEmptyCatalogs) {
     return absl::FailedPreconditionError(
         "Authenticated admission does not match the Engine-derived exact "
-        "profile and empty-catalog contract.");
+        "profile, certified worker, and empty-catalog contract.");
   }
   return absl::OkStatus();
 }
@@ -965,7 +978,9 @@ ExactRegenerationExecutor::QualifyAndAdmit(
   ABSL_ASSIGN_OR_RETURN(
       const std::string encoded_request,
       EncodeDPMCanonicalReplayRequest(qualification_request));
-  FreshWorkerProcessRunner worker_runner(config.worker_process);
+  ABSL_ASSIGN_OR_RETURN(
+      FreshWorkerProcessRunner worker_runner,
+      FreshWorkerProcessRunner::Create(config.worker_process));
   ExactProfileQualifier qualifier(engine, &worker_runner);
   ABSL_ASSIGN_OR_RETURN(
       ExactProfileAdmissionRecord admission,
@@ -974,7 +989,8 @@ ExactRegenerationExecutor::QualifyAndAdmit(
                                      encoded_request),
           config.authentication, admission_repository));
   ABSL_RETURN_IF_ERROR(ValidateAdmissionForExactProfile(
-      admission, resolved.profile, config.authentication));
+      admission, resolved.profile, config.authentication,
+      worker_runner.certification().certification_hash()));
   return admission;
 }
 
@@ -988,13 +1004,21 @@ ExactRegenerationExecutor::Create(
   ABSL_ASSIGN_OR_RETURN(ResolvedExactExecutorProfile resolved,
                         ResolveExactExecutorProfile(engine, config));
   ABSL_ASSIGN_OR_RETURN(
+      FreshWorkerProcessRunner worker_runner,
+      FreshWorkerProcessRunner::Create(config.worker_process));
+  ABSL_ASSIGN_OR_RETURN(
       const ExactProfileAdmissionRecord admission,
-      admission_repository->Get(resolved.profile, config.authentication));
+      admission_repository->Get(
+          resolved.profile,
+          worker_runner.certification().certification_hash(),
+          config.authentication));
   ABSL_RETURN_IF_ERROR(ValidateAdmissionForExactProfile(
-      admission, resolved.profile, config.authentication));
+      admission, resolved.profile, config.authentication,
+      worker_runner.certification().certification_hash()));
   return std::unique_ptr<ExactRegenerationExecutor>(
       new ExactRegenerationExecutor(
           engine, admission_repository, std::move(config),
+          std::move(worker_runner),
           std::move(resolved.session_config), std::move(resolved.profile)));
 }
 
@@ -1013,6 +1037,8 @@ ExactRegenerationExecutor::ResolveCurrentProfile() const {
       ExactLiteRtProfile current,
       engine_->ResolveExactLiteRtProfile(resolved_session_config_,
                                          config_.profile_assertion));
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(current));
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(derived_profile_));
   if (current != derived_profile_) {
     return absl::FailedPreconditionError(
         "Engine-derived exact profile changed after executor construction.");
@@ -1032,9 +1058,12 @@ ExactRegenerationExecutor::GetProfileAdmissionRecordId() const {
                         ResolveCurrentProfile());
   ABSL_ASSIGN_OR_RETURN(
       const ExactProfileAdmissionRecord admission,
-      admission_repository_->Get(profile, config_.authentication));
+      admission_repository_->Get(
+          profile, worker_runner_.certification().certification_hash(),
+          config_.authentication));
   ABSL_RETURN_IF_ERROR(ValidateAdmissionForExactProfile(
-      admission, profile, config_.authentication));
+      admission, profile, config_.authentication,
+      worker_runner_.certification().certification_hash()));
   return admission.record_id;
 }
 
@@ -1125,13 +1154,18 @@ absl::Status ExactRegenerationExecutor::ValidateSupport() const {
   }
   ABSL_RETURN_IF_ERROR(
       ValidateExactExecutorConfig(engine_, admission_repository_, config_));
+  ABSL_RETURN_IF_ERROR(
+      worker_runner_.certification().ValidateExecutableImage());
   ABSL_ASSIGN_OR_RETURN(const ExactLiteRtProfile profile,
                         ResolveCurrentProfile());
   ABSL_ASSIGN_OR_RETURN(
       const ExactProfileAdmissionRecord admission,
-      admission_repository_->Get(profile, config_.authentication));
-  return ValidateAdmissionForExactProfile(admission, profile,
-                                          config_.authentication);
+      admission_repository_->Get(
+          profile, worker_runner_.certification().certification_hash(),
+          config_.authentication));
+  return ValidateAdmissionForExactProfile(
+      admission, profile, config_.authentication,
+      worker_runner_.certification().certification_hash());
 }
 
 absl::StatusOr<ExactRegenerationExecution> ExactRegenerationExecutor::Run(
@@ -1183,9 +1217,13 @@ ExactRegenerationExecutor::RunWithExecutionInput(
                         ResolveCurrentProfile());
   ABSL_ASSIGN_OR_RETURN(
       const ExactProfileAdmissionRecord admission_before,
-      admission_repository_->Get(profile_before, config_.authentication));
+      admission_repository_->Get(
+          profile_before,
+          worker_runner_.certification().certification_hash(),
+          config_.authentication));
   ABSL_RETURN_IF_ERROR(ValidateAdmissionForExactProfile(
-      admission_before, profile_before, config_.authentication));
+      admission_before, profile_before, config_.authentication,
+      worker_runner_.certification().certification_hash()));
   ABSL_ASSIGN_OR_RETURN(const std::string encoded_request,
                         EncodeDPMCanonicalReplayRequest(request));
   ABSL_ASSIGN_OR_RETURN(const Hash256 request_hash,
@@ -1233,6 +1271,8 @@ ExactRegenerationExecutor::RunWithExecutionInput(
   std::set<int64_t> process_ids;
   std::set<Hash256> request_envelope_hashes;
   std::set<Hash256> result_envelope_hashes;
+  const Hash256 worker_certification_hash =
+      worker_runner_.certification().certification_hash();
   Hash256 common_launch_spec_hash;
   Hash256 consensus_output_hash;
   std::string consensus_output;
@@ -1294,6 +1334,8 @@ ExactRegenerationExecutor::RunWithExecutionInput(
                           observation.result.status_message);
     }
     if (observation.result.exact_profile_hash != profile_before.profile_id ||
+        observation.worker_certification_hash !=
+            worker_certification_hash ||
         observation.result.qualification_id != request_execution_id ||
         observation.result.run_index != run_index ||
         observation.result.run_count != config_.independent_run_count ||
@@ -1331,7 +1373,9 @@ ExactRegenerationExecutor::RunWithExecutionInput(
     }
     if (IsZeroHash(observation.request_envelope_hash) ||
         IsZeroHash(observation.result_envelope_hash) ||
-        IsZeroHash(observation.launch_spec_hash) ||
+        IsZeroHash(observation.worker_certification_hash) ||
+        observation.launch_spec_hash != ComputeFreshWorkerLaunchSpecHash(
+                                            worker_certification_hash) ||
         IsZeroHash(observation.result.worker_instance_nonce)) {
       return absl::DataLossError(
           "Physical exact execution omitted process provenance.");
@@ -1400,6 +1444,8 @@ ExactRegenerationExecutor::RunWithExecutionInput(
             observation.result.worker_instance_nonce,
         .request_envelope_hash = observation.request_envelope_hash,
         .result_envelope_hash = observation.result_envelope_hash,
+        .worker_certification_hash =
+            observation.worker_certification_hash,
         .launch_spec_hash = observation.launch_spec_hash,
         .output_evidence_hash = output_hash,
         .restored_checkpoint_id =
@@ -1425,9 +1471,13 @@ ExactRegenerationExecutor::RunWithExecutionInput(
   }
   ABSL_ASSIGN_OR_RETURN(
       const ExactProfileAdmissionRecord admission_after,
-      admission_repository_->Get(profile_after, config_.authentication));
+      admission_repository_->Get(
+          profile_after,
+          worker_runner_.certification().certification_hash(),
+          config_.authentication));
   ABSL_RETURN_IF_ERROR(ValidateAdmissionForExactProfile(
-      admission_after, profile_after, config_.authentication));
+      admission_after, profile_after, config_.authentication,
+      worker_runner_.certification().certification_hash()));
   if (admission_after.record_id != admission_before.record_id) {
     return absl::AbortedError(
         "Exact-profile admission changed during physical regeneration.");
@@ -1450,6 +1500,7 @@ ExactRegenerationExecutor::RunWithExecutionInput(
 
   ExactRegenerationRequestEvidence request_evidence{
       .exact_profile_id = profile_before.profile_id,
+      .worker_certification_hash = worker_certification_hash,
       .profile_admission_record_id = admission_before.record_id,
       .session_identity = profile_before.session_identity,
       .request_execution_id = request_execution_id,

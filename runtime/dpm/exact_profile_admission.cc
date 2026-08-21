@@ -37,18 +37,18 @@ namespace litert::lm {
 namespace {
 
 constexpr std::array<char, 8> kAdmissionMagic = {'D', 'P', 'M', 'A', 'D', 'M',
-                                                  '0', '2'};
-constexpr uint32_t kAdmissionEnvelopeVersion = 2;
+                                                  '0', '3'};
+constexpr uint32_t kAdmissionEnvelopeVersion = 3;
 constexpr uint64_t kMaximumAdmissionEnvelopeBytes =
     kMaximumFreshWorkerEnvelopeBytes;
 constexpr uint64_t kAdmissionEnvelopeFixedBytes = 8 + 4 + 4 + 8 + 32;
 constexpr uint64_t kMaximumAdmissionKeyIdBytes = 256;
 constexpr absl::string_view kQualificationRequestDomain =
-    "LITERT_LMX_EXACT_PROFILE_QUALIFICATION_REQUEST_SHA256_V2";
+    "LITERT_LMX_EXACT_PROFILE_QUALIFICATION_REQUEST_SHA256_V3";
 constexpr absl::string_view kAdmissionRecordDomain =
-    "LITERT_LMX_EXACT_PROFILE_ADMISSION_RECORD_SHA256_V2";
+    "LITERT_LMX_EXACT_PROFILE_ADMISSION_RECORD_SHA256_V3";
 constexpr absl::string_view kAdmissionMacDomain =
-    "LITERT_LMX_EXACT_PROFILE_ADMISSION_HMAC_SHA256_V2";
+    "LITERT_LMX_EXACT_PROFILE_ADMISSION_HMAC_SHA256_V3";
 
 bool IsZeroHash(const Hash256& hash) {
   uint8_t combined = 0;
@@ -104,12 +104,14 @@ void HashValue(const Hash256& hash, Sha256Hasher* hasher) {
 }
 
 Hash256 ComputeQualificationRequestHashFromDigest(
-    const Hash256& exact_profile_hash, uint32_t run_count,
+    const Hash256& exact_profile_hash,
+    const Hash256& worker_certification_hash, uint32_t run_count,
     const Hash256& request_payload_hash, uint64_t request_payload_size) {
   Sha256Hasher hasher;
   hasher.Update(kQualificationRequestDomain);
   HashU32(ExactProfileAdmissionRecord::kFormatVersion, &hasher);
   HashValue(exact_profile_hash, &hasher);
+  HashValue(worker_certification_hash, &hasher);
   HashU32(run_count, &hasher);
   HashU64(request_payload_size, &hasher);
   HashValue(request_payload_hash, &hasher);
@@ -134,15 +136,16 @@ absl::StatusOr<FreshWorkerExecutionPlan> MakeAdmissionExecutionPlan(
 
 std::string EncodeRecordFields(const ExactProfileAdmissionRecord& record) {
   std::string body;
-  body.reserve(4 + 32 * 9 + 4 * 5 + 8 * 3 +
+  body.reserve(4 + 32 * 11 + 4 * 5 + 8 * 3 +
                record.authentication_key_id.size() +
-               record.runs.size() * (4 + 8 + 32 * 6) +
+               record.runs.size() * (4 + 8 + 32 * 7) +
                record.token_bytes.size() +
                record.logit_frames.size() * (5 * 4 + 8 + 32));
   AppendU32(record.format_version, &body);
   AppendU32(static_cast<uint32_t>(record.evidence_kind), &body);
   AppendU32(static_cast<uint32_t>(record.replay_isolation), &body);
   AppendHash(record.exact_profile_hash, &body);
+  AppendHash(record.worker_certification_hash, &body);
   AppendHash(record.qualification_id, &body);
   AppendHash(record.qualification_request_hash, &body);
   AppendHash(record.request_payload_hash, &body);
@@ -161,6 +164,7 @@ std::string EncodeRecordFields(const ExactProfileAdmissionRecord& record) {
     AppendHash(run.worker_instance_nonce, &body);
     AppendHash(run.request_envelope_hash, &body);
     AppendHash(run.result_envelope_hash, &body);
+    AppendHash(run.worker_certification_hash, &body);
     AppendHash(run.launch_spec_hash, &body);
     AppendHash(run.output_evidence_hash, &body);
   }
@@ -193,6 +197,7 @@ absl::Status ValidateAdmissionRecordFields(
         "Exact-profile admission record version or evidence kind is unsupported.");
   }
   if (IsZeroHash(record.exact_profile_hash) ||
+      IsZeroHash(record.worker_certification_hash) ||
       IsZeroHash(record.qualification_id) ||
       IsZeroHash(record.qualification_request_hash) ||
       IsZeroHash(record.request_payload_hash) ||
@@ -218,7 +223,8 @@ absl::Status ValidateAdmissionRecordFields(
   }
   const Hash256 expected_request_hash =
       ComputeQualificationRequestHashFromDigest(
-          record.exact_profile_hash, record.independent_run_count,
+          record.exact_profile_hash, record.worker_certification_hash,
+          record.independent_run_count,
           record.request_payload_hash, record.request_payload_size);
   if (record.qualification_request_hash != expected_request_hash) {
     return absl::DataLossError(
@@ -261,7 +267,9 @@ absl::Status ValidateAdmissionRecordFields(
         IsZeroHash(run.worker_instance_nonce) ||
         IsZeroHash(run.request_envelope_hash) ||
         IsZeroHash(run.result_envelope_hash) ||
-        IsZeroHash(run.launch_spec_hash) ||
+        run.worker_certification_hash != record.worker_certification_hash ||
+        run.launch_spec_hash != ComputeFreshWorkerLaunchSpecHash(
+                                    record.worker_certification_hash) ||
         run.output_evidence_hash != expected_output_hash) {
       return absl::DataLossError(
           "Exact-profile admission run evidence is incomplete.");
@@ -365,6 +373,7 @@ absl::StatusOr<ExactProfileAdmissionRecord> DecodeRecordFields(
   record.replay_isolation =
       static_cast<FreshWorkerReplayIsolation>(replay_isolation);
   ABSL_ASSIGN_OR_RETURN(record.exact_profile_hash, reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(record.worker_certification_hash, reader.ReadHash());
   ABSL_ASSIGN_OR_RETURN(record.qualification_id, reader.ReadHash());
   ABSL_ASSIGN_OR_RETURN(record.qualification_request_hash, reader.ReadHash());
   ABSL_ASSIGN_OR_RETURN(record.request_payload_hash, reader.ReadHash());
@@ -418,6 +427,7 @@ absl::StatusOr<ExactProfileAdmissionRecord> DecodeRecordFields(
     ABSL_ASSIGN_OR_RETURN(run.worker_instance_nonce, reader.ReadHash());
     ABSL_ASSIGN_OR_RETURN(run.request_envelope_hash, reader.ReadHash());
     ABSL_ASSIGN_OR_RETURN(run.result_envelope_hash, reader.ReadHash());
+    ABSL_ASSIGN_OR_RETURN(run.worker_certification_hash, reader.ReadHash());
     ABSL_ASSIGN_OR_RETURN(run.launch_spec_hash, reader.ReadHash());
     ABSL_ASSIGN_OR_RETURN(run.output_evidence_hash, reader.ReadHash());
     record.runs.push_back(run);
@@ -494,44 +504,7 @@ absl::Status ValidateQualificationSpec(
 
 absl::Status ValidateDerivedProfileForQualification(
     const ExactLiteRtProfile& derived_profile) {
-  if (IsZeroHash(derived_profile.profile_id) ||
-      derived_profile.qualification_requirement !=
-          ExactLiteRtQualificationRequirement::
-              kIndependentColdProcessesTokensAndLogits ||
-      derived_profile.sampler_identity !=
-          ExactLiteRtSamplerIdentity::kCpuGreedyArgmaxMinIndex ||
-      derived_profile.batch_size != 1 ||
-      derived_profile.logits_frame.batch_size != 1 ||
-      derived_profile.logits_frame.sequence_size != 1 ||
-      derived_profile.logits_frame.vocabulary_size == 0 ||
-      derived_profile.logits_frame.byte_count == 0) {
-    return absl::FailedPreconditionError(
-        "The loaded Engine did not derive an admissible batch-one exact profile.");
-  }
-  uint64_t element_byte_width = 0;
-  switch (derived_profile.logits_frame.element_type) {
-    case ExactLiteRtLogitsElementType::kFloat16:
-      element_byte_width = 2;
-      break;
-    case ExactLiteRtLogitsElementType::kFloat32:
-      element_byte_width = 4;
-      break;
-    case ExactLiteRtLogitsElementType::kUnsupported:
-      return absl::FailedPreconditionError(
-          "The loaded Engine did not derive a supported logits element type.");
-    default:
-      return absl::FailedPreconditionError(
-          "The loaded Engine derived an unknown logits element type.");
-  }
-  if (derived_profile.logits_frame.vocabulary_size >
-          std::numeric_limits<uint64_t>::max() / element_byte_width ||
-      derived_profile.logits_frame.byte_count !=
-          static_cast<uint64_t>(derived_profile.logits_frame.vocabulary_size) *
-              element_byte_width) {
-    return absl::FailedPreconditionError(
-        "The loaded Engine derived an inconsistent packed logits extent.");
-  }
-  return absl::OkStatus();
+  return ValidateExactLiteRtProfile(derived_profile);
 }
 
 absl::Status ValidateLogitFramesMatchDerivedProfile(
@@ -579,18 +552,25 @@ absl::Status ValidateAdmissionMatchesSpec(
     const ExactProfileAdmissionRecord& record,
     const ExactLiteRtProfile& derived_profile,
     const ExactProfileQualificationSpec& spec,
-    const FreshWorkerAuthentication& authentication) {
+    const FreshWorkerAuthentication& authentication,
+    const Hash256& worker_certification_hash) {
   ABSL_RETURN_IF_ERROR(ValidateExactProfileAdmissionRecordForProfile(
       record, derived_profile));
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 expected_qualification_request_hash,
+      ComputeExactProfileQualificationRequestHash(
+          derived_profile, spec, worker_certification_hash));
   if (record.exact_profile_hash != derived_profile.profile_id ||
+      record.worker_certification_hash != worker_certification_hash ||
       record.independent_run_count != spec.independent_run_count ||
       record.qualification_request_hash !=
-          ComputeExactProfileQualificationRequestHash(derived_profile, spec) ||
+          expected_qualification_request_hash ||
       record.request_payload_hash != Sha256(spec.canonical_request_payload) ||
       record.request_payload_size != spec.canonical_request_payload.size() ||
       record.authentication_key_id != authentication.key_id) {
     return absl::AlreadyExistsError(
-        "The exact profile already has admission for a different qualification request.");
+        "The exact profile and certified worker already have admission for a "
+        "different qualification request.");
   }
   return absl::OkStatus();
 }
@@ -606,11 +586,19 @@ absl::StatusOr<Hash256> GenerateUniqueNonce(const std::set<Hash256>& used) {
 
 }  // namespace
 
-Hash256 ComputeExactProfileQualificationRequestHash(
+absl::StatusOr<Hash256> ComputeExactProfileQualificationRequestHash(
     const ExactLiteRtProfile& derived_profile,
-    const ExactProfileQualificationSpec& spec) {
+    const ExactProfileQualificationSpec& spec,
+    const Hash256& worker_certification_hash) {
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(derived_profile));
+  ABSL_RETURN_IF_ERROR(ValidateQualificationSpec(spec));
+  if (IsZeroHash(worker_certification_hash)) {
+    return absl::InvalidArgumentError(
+        "Exact-profile qualification requires a certified concrete worker.");
+  }
   return ComputeQualificationRequestHashFromDigest(
-      derived_profile.profile_id, spec.independent_run_count,
+      derived_profile.profile_id, worker_certification_hash,
+      spec.independent_run_count,
       Sha256(spec.canonical_request_payload),
       spec.canonical_request_payload.size());
 }
@@ -755,6 +743,9 @@ absl::StatusOr<ExactProfileAdmissionRecord> ExactProfileQualifier::Qualify(
     return absl::FailedPreconditionError(
         "Exact-profile qualification has no fresh-worker runner.");
   }
+  ABSL_RETURN_IF_ERROR(runner_->certification().ValidateExecutableImage());
+  const Hash256 worker_certification_hash =
+      runner_->certification().certification_hash();
   if (authoritative_engine_ == nullptr) {
     return absl::FailedPreconditionError(
         "Exact-profile qualification has no authoritative loaded Engine.");
@@ -772,14 +763,17 @@ absl::StatusOr<ExactProfileAdmissionRecord> ExactProfileQualifier::Qualify(
   ABSL_ASSIGN_OR_RETURN(const Hash256 qualification_id,
                         GenerateUniqueNonce(allocated_nonces));
   allocated_nonces.insert(qualification_id);
-  const Hash256 qualification_request_hash =
-      ComputeExactProfileQualificationRequestHash(derived_profile, spec);
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 qualification_request_hash,
+      ComputeExactProfileQualificationRequestHash(
+          derived_profile, spec, worker_certification_hash));
   const Hash256 payload_hash = Sha256(spec.canonical_request_payload);
   ABSL_ASSIGN_OR_RETURN(const FreshWorkerExecutionPlan execution_plan,
                         MakeAdmissionExecutionPlan(payload_hash));
 
   ExactProfileAdmissionRecord record;
   record.exact_profile_hash = derived_profile.profile_id;
+  record.worker_certification_hash = worker_certification_hash;
   record.qualification_id = qualification_id;
   record.qualification_request_hash = qualification_request_hash;
   record.request_payload_hash = payload_hash;
@@ -814,6 +808,7 @@ absl::StatusOr<ExactProfileAdmissionRecord> ExactProfileQualifier::Qualify(
     ABSL_RETURN_IF_ERROR(
         ValidateFreshWorkerResultForRequest(observation.result, request));
     if (observation.result.exact_profile_hash != derived_profile.profile_id ||
+        observation.worker_certification_hash != worker_certification_hash ||
         observation.result.qualification_id != qualification_id ||
         observation.result.run_index != run_index ||
         observation.result.run_count != spec.independent_run_count ||
@@ -850,7 +845,9 @@ absl::StatusOr<ExactProfileAdmissionRecord> ExactProfileQualifier::Qualify(
     }
     if (IsZeroHash(observation.request_envelope_hash) ||
         IsZeroHash(observation.result_envelope_hash) ||
-        IsZeroHash(observation.launch_spec_hash)) {
+        IsZeroHash(observation.worker_certification_hash) ||
+        observation.launch_spec_hash != ComputeFreshWorkerLaunchSpecHash(
+                                            worker_certification_hash)) {
       return absl::DataLossError(
           "Fresh-worker observation omitted authenticated process evidence.");
     }
@@ -887,6 +884,8 @@ absl::StatusOr<ExactProfileAdmissionRecord> ExactProfileQualifier::Qualify(
         .worker_instance_nonce = observation.result.worker_instance_nonce,
         .request_envelope_hash = observation.request_envelope_hash,
         .result_envelope_hash = observation.result_envelope_hash,
+        .worker_certification_hash =
+            observation.worker_certification_hash,
         .launch_spec_hash = observation.launch_spec_hash,
         .output_evidence_hash = output_hash});
   }
@@ -913,6 +912,13 @@ ExactProfileQualifier::QualifyAndAdmit(
   }
   ABSL_RETURN_IF_ERROR(ValidateQualificationSpec(spec));
   ABSL_RETURN_IF_ERROR(ValidateFreshWorkerAuthentication(authentication));
+  if (runner_ == nullptr) {
+    return absl::FailedPreconditionError(
+        "Exact-profile admission has no certified process runner.");
+  }
+  ABSL_RETURN_IF_ERROR(runner_->certification().ValidateExecutableImage());
+  const Hash256 worker_certification_hash =
+      runner_->certification().certification_hash();
   if (authoritative_engine_ == nullptr) {
     return absl::FailedPreconditionError(
         "Exact-profile admission has no authoritative loaded Engine.");
@@ -924,11 +930,13 @@ ExactProfileQualifier::QualifyAndAdmit(
   ABSL_RETURN_IF_ERROR(
       ValidateDerivedProfileForQualification(derived_profile));
   absl::StatusOr<ExactProfileAdmissionRecord> existing =
-      repository->Get(derived_profile, authentication);
+      repository->Get(derived_profile, worker_certification_hash,
+                      authentication);
   if (existing.ok()) {
     ABSL_RETURN_IF_ERROR(
         ValidateAdmissionMatchesSpec(*existing, derived_profile, spec,
-                                     authentication));
+                                     authentication,
+                                     worker_certification_hash));
     return std::move(*existing);
   }
   if (existing.status().code() != absl::StatusCode::kNotFound) {
@@ -940,6 +948,10 @@ ExactProfileQualifier::QualifyAndAdmit(
     return absl::AbortedError(
         "The authoritative exact profile changed during qualification.");
   }
+  if (record.worker_certification_hash != worker_certification_hash) {
+    return absl::AbortedError(
+        "The certified worker changed during exact-profile qualification.");
+  }
   const absl::Status put_status =
       repository->PutIfAbsent(record, authentication);
   if (put_status.ok()) return record;
@@ -948,10 +960,12 @@ ExactProfileQualifier::QualifyAndAdmit(
   }
   ABSL_ASSIGN_OR_RETURN(
       ExactProfileAdmissionRecord winner,
-      repository->Get(derived_profile, authentication));
+      repository->Get(derived_profile, worker_certification_hash,
+                      authentication));
   ABSL_RETURN_IF_ERROR(
       ValidateAdmissionMatchesSpec(winner, derived_profile, spec,
-                                   authentication));
+                                   authentication,
+                                   worker_certification_hash));
   // Another qualifier won create-once publication. Return only that durable,
   // authenticated record; never leak this call's unpublished candidate.
   return winner;

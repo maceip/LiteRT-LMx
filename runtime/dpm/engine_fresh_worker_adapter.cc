@@ -293,6 +293,7 @@ absl::Status ValidateFreshSession(
     const Engine& engine, const Engine::Session& session,
     const SessionConfig& resolved_config,
     const ExactLiteRtProfile& profile) {
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(profile));
   ABSL_RETURN_IF_ERROR(ValidateResolvedSessionConfig(
       session.GetSessionConfig(),
       resolved_config.GetMemoryStrategy() ==
@@ -406,6 +407,7 @@ absl::Status PrefillAgent(Engine* engine, Engine::Session* session,
 absl::Status ValidateImportedSession(
     const Engine::Session& session, const SessionConfig& resolved_config,
     const ExactLiteRtProfile& profile) {
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(profile));
   ABSL_RETURN_IF_ERROR(ValidateResolvedSessionConfig(
       session.GetSessionConfig(), DPMReplayStage::kAgentDecision,
       static_cast<uint32_t>(resolved_config.GetMaxOutputTokens())));
@@ -542,6 +544,7 @@ absl::StatusOr<FreshWorkerDerivedExecution> ExecuteEngineFreshWorkerRequest(
   ABSL_ASSIGN_OR_RETURN(
       const ExactLiteRtProfile profile_before,
       engine->ResolveExactLiteRtProfile(session_config, profile_assertion));
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(profile_before));
   if (profile_before.profile_id != request.exact_profile_hash) {
     return absl::FailedPreconditionError(
         "Worker-derived exact profile does not match the authenticated "
@@ -693,6 +696,9 @@ absl::StatusOr<FreshWorkerDerivedExecution> ExecuteEngineFreshWorkerRequest(
 
 absl::Status RunEngineFreshWorkerOnce(
     EngineSettings fixed_engine_settings) {
+  // Seal the product-provided settings contract before the generic worker
+  // boundary reads or authenticates any request bytes.
+  ABSL_RETURN_IF_ERROR(ValidateFixedEngineSettings(fixed_engine_settings));
   // RunFreshWorkerOnce is synchronous and invokes its callback exactly once.
   // Keep an independent guard here so this concrete adapter cannot silently
   // become a reusable in-process Engine service if the generic boundary ever
@@ -710,6 +716,31 @@ absl::Status RunEngineFreshWorkerOnce(
         return ExecuteEngineFreshWorkerRequest(
             std::move(fixed_engine_settings), context);
       });
+}
+
+absl::StatusOr<EngineFreshWorkerEntrypoint>
+EngineFreshWorkerEntrypoint::Create(
+    EngineSettings fixed_engine_settings) {
+  ABSL_RETURN_IF_ERROR(ValidateFixedEngineSettings(fixed_engine_settings));
+  return EngineFreshWorkerEntrypoint(std::move(fixed_engine_settings));
+}
+
+absl::Status EngineFreshWorkerEntrypoint::Run() && {
+  if (consumed_) {
+    return absl::FailedPreconditionError(
+        "Engine fresh-worker entrypoint was already consumed.");
+  }
+  consumed_ = true;
+  return RunEngineFreshWorkerOnce(std::move(fixed_engine_settings_));
+}
+
+absl::Status DispatchEngineFreshWorkerProcess(
+    EngineSettings fixed_engine_settings) {
+  ABSL_ASSIGN_OR_RETURN(
+      EngineFreshWorkerEntrypoint entrypoint,
+      EngineFreshWorkerEntrypoint::Create(
+          std::move(fixed_engine_settings)));
+  return std::move(entrypoint).Run();
 }
 
 }  // namespace litert::lm

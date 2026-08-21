@@ -18,10 +18,21 @@
 #include <cstdint>
 
 #include "absl/status/statusor.h"  // from @com_google_absl
+#include "absl/strings/string_view.h"  // from @com_google_absl
 #include "runtime/dpm/dpm_replay_mode.h"
 #include "runtime/engine/engine_settings.h"
 
 namespace litert::lm {
+
+// Product-local version label for the adapter contract a configured worker is
+// expected to implement. The parent commits this value, the canonical
+// executable image, argv, and the empty environment contract into one worker
+// certification digest. The label is configuration/version binding under
+// local packaging trust, not cryptographic proof that arbitrary executable
+// bytes implement this contract. Changing the expected contract requires a
+// new value and therefore a new admission.
+inline constexpr absl::string_view kEngineFreshWorkerAdapterContractVersion =
+    "litert-lmx-engine-fresh-worker-v1";
 
 // Constructs the sole SessionConfig admitted by both sides of the concrete
 // Engine fresh-worker boundary. Parent-side exact-profile derivation and the

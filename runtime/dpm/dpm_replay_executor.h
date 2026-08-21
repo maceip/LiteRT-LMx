@@ -173,9 +173,10 @@ enum class ExactRegenerationCaptureRunPolicy : uint32_t {
 // Canonical evidence for one authenticated fresh-process observation. The
 // evidence ID is SHA-256 over every field below except evidence_id itself.
 // Envelope hashes bind the complete HMAC-authenticated request and result;
-// this compact record does not duplicate their model output bytes.
+// worker_certification_hash binds the parent-measured executable image and
+// launch contract. This compact record does not duplicate model output bytes.
 struct ExactRegenerationRunEvidence {
-  static constexpr uint32_t kFormatVersion = 1;
+  static constexpr uint32_t kFormatVersion = 2;
 
   uint32_t format_version = kFormatVersion;
   Hash256 evidence_id;
@@ -185,6 +186,7 @@ struct ExactRegenerationRunEvidence {
   Hash256 worker_instance_nonce;
   Hash256 request_envelope_hash;
   Hash256 result_envelope_hash;
+  Hash256 worker_certification_hash;
   Hash256 launch_spec_hash;
   Hash256 output_evidence_hash;
   std::optional<Hash256> restored_checkpoint_id;
@@ -202,14 +204,15 @@ absl::Status ValidateExactRegenerationRunEvidence(
 // Request-scoped equality evidence. Unlike ExactProfileAdmissionRecord, this
 // object is never inserted into the durable profile-admission repository and
 // cannot qualify another request. Its canonical ID binds the admitted exact
-// profile, complete logical request, physical work selection, and every
-// independently authenticated process observation.
+// profile, certified worker, complete logical request, physical work
+// selection, and every independently authenticated process observation.
 struct ExactRegenerationRequestEvidence {
-  static constexpr uint32_t kFormatVersion = 1;
+  static constexpr uint32_t kFormatVersion = 2;
 
   uint32_t format_version = kFormatVersion;
   Hash256 evidence_id;
   Hash256 exact_profile_id;
+  Hash256 worker_certification_hash;
   Hash256 profile_admission_record_id;
   SessionHandoffIdentity session_identity;
   Hash256 request_execution_id;
@@ -344,10 +347,11 @@ class ExactRegenerationExecutor final {
       const Engine* engine,
       ExactProfileAdmissionRepository* admission_repository,
       ExactRegenerationExecutorConfig config,
+      FreshWorkerProcessRunner worker_runner,
       SessionConfig resolved_session_config,
       ExactLiteRtProfile derived_profile)
       : engine_(engine),
-        worker_runner_(config.worker_process),
+        worker_runner_(std::move(worker_runner)),
         admission_repository_(admission_repository),
         config_(std::move(config)),
         resolved_session_config_(std::move(resolved_session_config)),
