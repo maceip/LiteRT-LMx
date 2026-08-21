@@ -582,6 +582,14 @@ SessionConfig SessionConfig::CreateDefault() {
 
 absl::Status SessionConfig::MaybeUpdateAndValidate(
     const EngineSettings& engine_settings) {
+  switch (memory_strategy_) {
+    case MemoryStrategy::kStateful:
+    case MemoryStrategy::kStatelessDeterministicProjection:
+      break;
+    default:
+      return absl::InvalidArgumentError(
+          "Session memory strategy is not recognized.");
+  }
   if ((stop_token_ids_.empty()) &&
       !engine_settings.GetLlmMetadata().has_value()) {
     return absl::InvalidArgumentError(
@@ -691,6 +699,46 @@ absl::Status SessionConfig::MaybeUpdateAndValidate(
     }
   }
 
+  if (memory_strategy_ ==
+      MemoryStrategy::kStatelessDeterministicProjection) {
+    const LlmExecutorSettings& executor_settings =
+        engine_settings.GetMainExecutorSettings();
+    const Backend executor_backend = executor_settings.GetBackend();
+    if (engine_settings.IsBenchmarkEnabled() ||
+        engine_settings.GetVisionExecutorSettings().has_value() ||
+        engine_settings.GetAudioExecutorSettings().has_value() ||
+        audio_modality_enabled_ || vision_modality_enabled_ ||
+        audio_embeddings_callback_ != nullptr) {
+      return absl::UnimplementedError(
+          "Stateless deterministic projection requires the ordinary "
+          "text-only execution path.");
+    }
+    if (executor_backend != Backend::CPU && executor_backend != Backend::GPU) {
+      return absl::UnimplementedError(
+          "Stateless deterministic projection is implemented only for "
+          "LiteRT CPU and GPU compiled-model executors.");
+    }
+    if (executor_settings.GetLoraRank() != 0 ||
+        scoped_lora_file_ != nullptr || audio_scoped_lora_file_ != nullptr) {
+      return absl::UnimplementedError(
+          "Stateless deterministic projection does not support LoRA state.");
+    }
+    if (executor_settings.GetAdvancedSettings().has_value() &&
+        executor_settings.GetAdvancedSettings()->enable_speculative_decoding) {
+      return absl::UnimplementedError(
+          "Stateless deterministic projection does not support speculative "
+          "or MTP decoding.");
+    }
+    if (use_external_sampler_ || num_output_candidates_ != 1 ||
+        sampler_backend_ != Backend::CPU ||
+        sampler_params_.type() != proto::SamplerParameters::GREEDY ||
+        sampler_params_.backend() != proto::SamplerParameters::CPU) {
+      return absl::UnimplementedError(
+          "Stateless deterministic projection requires one output and the "
+          "explicit CPU GREEDY sampler.");
+    }
+  }
+
   ABSL_VLOG(5) << "The validated session config: " << *this;
   return absl::OkStatus();
 }
@@ -777,6 +825,19 @@ std::ostream& operator<<(std::ostream& os, const SessionConfig& config) {
      << std::endl;
   os << "  VisionModalityEnabled: " << config.VisionModalityEnabled()
      << std::endl;
+  os << "  MemoryStrategy: ";
+  switch (config.GetMemoryStrategy()) {
+    case SessionConfig::MemoryStrategy::kStateful:
+      os << "Stateful";
+      break;
+    case SessionConfig::MemoryStrategy::kStatelessDeterministicProjection:
+      os << "StatelessDeterministicProjection";
+      break;
+    default:
+      os << "Unknown";
+      break;
+  }
+  os << std::endl;
   os << "  SamplerParams: " << config.GetSamplerParams().DebugString()
      << std::endl;
   os << "  SamplerBackend: " << config.GetSamplerBackend() << std::endl;

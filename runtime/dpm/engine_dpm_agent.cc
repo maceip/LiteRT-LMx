@@ -40,6 +40,12 @@ namespace litert::lm {
 namespace {
 
 absl::Status ValidateDPMConfig(const SessionConfig& config) {
+  if (config.GetMemoryStrategy() !=
+      SessionConfig::MemoryStrategy::kStateful) {
+    return absl::FailedPreconditionError(
+        "DPM agent sessions must remain stateful so capsule restore and delta "
+        "prefill cannot be erased by projection reset policy.");
+  }
   if (config.AudioModalityEnabled() || config.VisionModalityEnabled() ||
       config.GetAudioEmbeddingsCallback() != nullptr) {
     return absl::InvalidArgumentError(
@@ -148,6 +154,17 @@ EngineDPMAgentRuntime::Create(
         "DPM agent runtime does not admit benchmark sessions because their "
         "prefill path may replace canonical input token lengths.");
   }
+  if (session_config.GetMemoryStrategy() ==
+      SessionConfig::MemoryStrategy::kStatelessDeterministicProjection) {
+    return absl::InvalidArgumentError(
+        "DPM agent runtime rejects a stateless projection memory strategy; "
+        "agent sessions require stateful capsule restore and delta prefill.");
+  }
+  if (session_config.GetMemoryStrategy() !=
+      SessionConfig::MemoryStrategy::kStateful) {
+    return absl::InvalidArgumentError(
+        "DPM agent runtime received an unknown session memory strategy.");
+  }
   if (session_config.AudioModalityEnabled() ||
       session_config.VisionModalityEnabled() ||
       session_config.GetAudioEmbeddingsCallback() != nullptr) {
@@ -195,6 +212,7 @@ EngineDPMAgentRuntime::Create(
   session_config.SetNumOutputCandidates(1);
   session_config.SetSamplerBackend(Backend::CPU);
   session_config.SetApplyPromptTemplateInSession(false);
+  session_config.SetMemoryStrategy(SessionConfig::MemoryStrategy::kStateful);
   proto::SamplerParameters& sampler =
       session_config.GetMutableSamplerParams();
   sampler.set_type(proto::SamplerParameters::GREEDY);

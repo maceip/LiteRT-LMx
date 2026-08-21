@@ -126,7 +126,7 @@ absl::StatusOr<Hash256> DeriveSessionHandoffInferenceProfileHash(
   if (!supported.ok()) return supported;
 
   Sha256Hasher hasher;
-  HashFrame("LITERT_LM_SESSION_INFERENCE_PROFILE_V1", &hasher);
+  HashFrame("LITERT_LM_SESSION_INFERENCE_PROFILE_V2", &hasher);
   HashFrame(canonical_runtime_profile, &hasher);
   HashI32(static_cast<int32_t>(tokenizer_type), &hasher);
   HashBool(engine_settings.GetParallelFileSectionLoading(), &hasher);
@@ -144,6 +144,8 @@ absl::StatusOr<Hash256> DeriveSessionHandoffInferenceProfileHash(
 
   HashBool(resolved_session_config.AudioModalityEnabled(), &hasher);
   HashBool(resolved_session_config.VisionModalityEnabled(), &hasher);
+  HashI32(static_cast<int32_t>(resolved_session_config.GetMemoryStrategy()),
+          &hasher);
   HashFrame(resolved_session_config.GetSamplerParams().SerializeAsString(),
             &hasher);
   HashU32(

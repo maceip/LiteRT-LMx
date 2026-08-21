@@ -76,6 +76,14 @@ bool IsValidUtf8(absl::string_view text) {
 absl::Status ValidateRequestedFeatures(const Engine& engine,
                                        const SessionConfig& config,
                                        uint32_t max_output_tokens) {
+  switch (config.GetMemoryStrategy()) {
+    case SessionConfig::MemoryStrategy::kStateful:
+    case SessionConfig::MemoryStrategy::kStatelessDeterministicProjection:
+      break;
+    default:
+      return absl::InvalidArgumentError(
+          "DPM projection received an unknown session memory strategy.");
+  }
   if (max_output_tokens == 0 ||
       max_output_tokens > kMaximumDPMGenerationTokens) {
     return absl::InvalidArgumentError(
@@ -158,6 +166,8 @@ EngineDPMProjectionRuntime::Create(
   session_config.SetSamplerBackend(Backend::CPU);
   session_config.SetApplyPromptTemplateInSession(false);
   session_config.SetMaxOutputTokens(static_cast<int>(max_output_tokens));
+  session_config.SetMemoryStrategy(
+      SessionConfig::MemoryStrategy::kStatelessDeterministicProjection);
   proto::SamplerParameters& sampler =
       session_config.GetMutableSamplerParams();
   sampler.set_type(proto::SamplerParameters::GREEDY);
@@ -168,6 +178,12 @@ EngineDPMProjectionRuntime::Create(
   sampler.clear_seed();
   ABSL_RETURN_IF_ERROR(
       session_config.MaybeUpdateAndValidate(engine->GetEngineSettings()));
+  if (session_config.GetMemoryStrategy() !=
+      SessionConfig::MemoryStrategy::kStatelessDeterministicProjection) {
+    return absl::FailedPreconditionError(
+        "DPM projection failed to pin its stateless memory strategy before "
+        "identity derivation.");
+  }
 
   ABSL_ASSIGN_OR_RETURN(
       SessionHandoffIdentity runtime_identity,
@@ -198,7 +214,9 @@ absl::Status EngineDPMProjectionRuntime::ValidateResolvedConfig(
   if (config.GetNumOutputCandidates() != 1 ||
       config.GetSamplerBackend() != Backend::CPU ||
       config.GetMaxOutputTokens() != static_cast<int>(max_output_tokens_) ||
-      config.GetApplyPromptTemplateInSession()) {
+      config.GetApplyPromptTemplateInSession() ||
+      config.GetMemoryStrategy() !=
+          SessionConfig::MemoryStrategy::kStatelessDeterministicProjection) {
     return absl::FailedPreconditionError(
         "Resolved DPM projection session differs from its canonical profile.");
   }

@@ -15,6 +15,7 @@
 #ifndef THIRD_PARTY_ODML_LITERT_LM_RUNTIME_ENGINE_ENGINE_SETTINGS_H_
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_ENGINE_ENGINE_SETTINGS_H_
 
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -188,6 +189,15 @@ std::ostream& operator<<(std::ostream& os, const EngineSettings& settings);
 // creating a LiteRT LM session.
 class SessionConfig {
  public:
+  // Controls whether a session retains conversation state across requests or
+  // is dedicated to one deterministic projection. The stateless strategy is a
+  // protocol signal consumed by execution managers; ordinary sessions remain
+  // stateful by default.
+  enum class MemoryStrategy : uint8_t {
+    kStateful = 0,
+    kStatelessDeterministicProjection = 1,
+  };
+
   // Creates a default SessionConfig.
   static SessionConfig CreateDefault();
 
@@ -282,6 +292,11 @@ class SessionConfig {
     max_output_tokens_ = max_output_tokens;
   }
 
+  MemoryStrategy GetMemoryStrategy() const { return memory_strategy_; }
+  void SetMemoryStrategy(MemoryStrategy memory_strategy) {
+    memory_strategy_ = memory_strategy;
+  }
+
   using AudioEmbeddingsCallback =
       absl::AnyInvocable<void(const ExecutorAudioData&) const>;
   const AudioEmbeddingsCallback* GetAudioEmbeddingsCallback() const {
@@ -354,6 +369,11 @@ class SessionConfig {
   // tokens (input + output) stored in the KV cache over the lifetime of a
   // session.
   int max_output_tokens_ = std::numeric_limits<int>::max();
+
+  // Ordinary sessions preserve their accumulated state. DPM projection
+  // runtimes explicitly opt into the stateless strategy before the Engine
+  // derives an identity or creates a session.
+  MemoryStrategy memory_strategy_ = MemoryStrategy::kStateful;
 
   // Optional callback to receive audio embeddings. If not set, it will be
   // nullptr.
