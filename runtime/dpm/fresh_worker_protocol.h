@@ -217,6 +217,13 @@ absl::Status ValidateFreshWorkerAuthentication(
 absl::Status ValidateFreshWorkerRequest(const FreshWorkerRequest& request);
 absl::Status ValidateFreshWorkerExecutionOutput(
     const FreshWorkerExecutionOutput& output);
+// Canonical digest over the complete stage output, canonical token bytes, and
+// ordered full-logits evidence. This is the output binding used by both
+// profile admission and producing-session capsule evidence.
+Hash256 ComputeFreshWorkerOutputEvidenceHash(
+    absl::string_view canonical_output,
+    absl::string_view token_bytes,
+    const std::vector<FreshWorkerLogitFrameEvidence>& logit_frames);
 absl::Status ValidateFreshWorkerResult(const FreshWorkerResult& result);
 // Cross-checks a self-valid result against the authenticated request plan.
 // Failure results carry the plan hash but no claimed restore or capsule.

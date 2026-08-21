@@ -32,10 +32,12 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -47,6 +49,8 @@
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
+#include "absl/types/span.h"  // from @com_google_absl
+#include "runtime/core/session_handoff_codec.h"
 #include "runtime/platform/hash/hmac_sha256.h"
 #include "runtime/platform/hash/sha256_hasher.h"
 
@@ -59,6 +63,8 @@ namespace {
 
 constexpr std::array<char, 8> kIpcFrameMagic = {'D', 'P', 'M', 'I', 'P', 'C',
                                                  '0', '1'};
+constexpr std::array<char, 8> kCapsuleFrameMagic = {
+    'D', 'P', 'M', 'C', 'A', 'P', '0', '1'};
 constexpr std::array<char, 8> kAuthenticationMagic = {
     'D', 'P', 'M', 'K', 'E', 'Y', '0', '1'};
 constexpr uint32_t kAuthenticationPreludeVersion = 1;
@@ -74,11 +80,28 @@ constexpr absl::string_view kLaunchSpecDomain =
     "LITERT_LMX_FRESH_WORKER_LAUNCH_SPEC_SHA256_V1";
 constexpr absl::string_view kTransportKeyDomain =
     "LITERT_LMX_FRESH_WORKER_PER_REQUEST_TRANSPORT_KEY_HMAC_SHA256_V2";
+constexpr absl::string_view kCapsuleKeyDomain =
+    "LITERT_LMX_FRESH_WORKER_CAPSULE_KEY_HMAC_SHA256_V1";
+constexpr absl::string_view kRestoreCapsuleDirection = "RESTORE_TO_WORKER";
+constexpr absl::string_view kProducingCapsuleDirection =
+    "PRODUCING_FROM_WORKER";
+constexpr absl::string_view kRestoreCapsuleKeyId =
+    "litert-lmx-fresh-worker-restore-v1";
+constexpr absl::string_view kProducingCapsuleKeyId =
+    "litert-lmx-fresh-worker-producing-v1";
+constexpr uint64_t kCapsuleIoChunkBytes = uint64_t{1024} * 1024;
 
 bool IsZeroHash(const Hash256& hash) {
   uint8_t combined = 0;
   for (uint8_t byte : hash.bytes) combined |= byte;
   return combined == 0;
+}
+
+bool IsCompleteSessionHandoffIdentity(
+    const SessionHandoffIdentity& identity) {
+  return !IsZeroHash(identity.model_artifact_hash) &&
+         !IsZeroHash(identity.runtime_artifact_hash) &&
+         !IsZeroHash(identity.inference_profile_hash);
 }
 
 void AppendU32(uint32_t value, std::string* output) {
@@ -206,11 +229,18 @@ absl::StatusOr<std::string> CanonicalExecutablePath(
   return canonical.string();
 }
 
-std::string EncodeIpcFrame(absl::string_view envelope) {
+std::string EncodeFrameHeader(const std::array<char, 8>& magic,
+                              uint64_t payload_size) {
   std::string frame;
-  frame.reserve(kIpcFrameMagic.size() + 8 + envelope.size());
-  frame.append(kIpcFrameMagic.data(), kIpcFrameMagic.size());
-  AppendU64(envelope.size(), &frame);
+  frame.reserve(magic.size() + 8);
+  frame.append(magic.data(), magic.size());
+  AppendU64(payload_size, &frame);
+  return frame;
+}
+
+std::string EncodeIpcFrame(absl::string_view envelope) {
+  std::string frame = EncodeFrameHeader(kIpcFrameMagic, envelope.size());
+  frame.reserve(frame.size() + envelope.size());
   frame.append(envelope);
   return frame;
 }
@@ -266,8 +296,97 @@ absl::StatusOr<FreshWorkerAuthentication> DeriveTransportAuthentication(
   return FreshWorkerAuthentication{
       .key_id = master_authentication.key_id,
       .authentication_key = std::string(
-          reinterpret_cast<const char*>(derived_key.bytes.data()),
+      reinterpret_cast<const char*>(derived_key.bytes.data()),
           derived_key.bytes.size())};
+}
+
+SessionHandoffOptions DeriveCapsuleOptions(
+    const FreshWorkerAuthentication& transport_authentication,
+    const Hash256& request_envelope_hash, absl::string_view direction,
+    absl::string_view key_id,
+    std::optional<SessionHandoffIdentity> expected_identity) {
+  const absl::string_view request_hash_bytes(
+      reinterpret_cast<const char*>(request_envelope_hash.bytes.data()),
+      request_envelope_hash.bytes.size());
+  const Hash256 derived_key = HmacSha256(
+      transport_authentication.authentication_key,
+      {kCapsuleKeyDomain, direction, request_hash_bytes});
+  return SessionHandoffOptions{
+      .key_id = std::string(key_id),
+      .authentication_key = std::string(
+          reinterpret_cast<const char*>(derived_key.bytes.data()),
+          derived_key.bytes.size()),
+      .expected_identity = std::move(expected_identity)};
+}
+
+absl::Status ValidateSessionHandoffTransfer(
+    const FreshWorkerRequest& request,
+    const FreshWorkerSessionHandoffTransfer& transfer) {
+  const bool has_restore_source = transfer.durable_restore_source != nullptr;
+  const bool has_restore_options =
+      transfer.durable_restore_options != nullptr;
+  if (has_restore_source != has_restore_options) {
+    return absl::InvalidArgumentError(
+        "Durable restore source and options must be supplied together.");
+  }
+  const bool has_capture_destination =
+      transfer.durable_capture_destination != nullptr;
+  const bool has_capture_options =
+      transfer.durable_capture_options != nullptr;
+  if (has_capture_destination != has_capture_options) {
+    return absl::InvalidArgumentError(
+        "Durable capture destination and options must be supplied together.");
+  }
+
+  const bool restore_required =
+      request.execution_plan.prefill_mode ==
+      FreshWorkerPrefillMode::kOwnPositionCapsuleDelta;
+  if (restore_required != has_restore_source) {
+    return absl::InvalidArgumentError(
+        "Fresh-worker restore transfer disagrees with the execution plan.");
+  }
+  if (request.execution_plan.prefill_mode ==
+          FreshWorkerPrefillMode::kFullCanonicalPrefill &&
+      has_restore_source) {
+    return absl::InvalidArgumentError(
+        "Full-prefill execution cannot receive a restore capsule.");
+  }
+  if (request.execution_plan.capture_producing_capsule !=
+      has_capture_destination) {
+    return absl::InvalidArgumentError(
+        "Fresh-worker durable capture transfer disagrees with capture "
+        "policy.");
+  }
+  if (has_capture_options &&
+      (!transfer.durable_capture_options->expected_identity.has_value() ||
+       !IsCompleteSessionHandoffIdentity(
+           *transfer.durable_capture_options->expected_identity))) {
+    return absl::InvalidArgumentError(
+        "Durable capture requires a complete parent-asserted session "
+        "identity.");
+  }
+  if (restore_required &&
+      request.execution_plan.restore_durable_envelope_size >
+          kMaximumFreshWorkerCapsuleBytes) {
+    return absl::ResourceExhaustedError(
+        "Durable restore capsule exceeds the fresh-worker capsule limit.");
+  }
+  if (restore_required &&
+      transfer.durable_restore_source->Size() !=
+          request.execution_plan.restore_durable_envelope_size) {
+    return absl::DataLossError(
+        "Durable restore capsule size differs from its execution-plan "
+        "binding.");
+  }
+  if (restore_required && has_capture_options &&
+      transfer.durable_capture_options->expected_identity.has_value() &&
+      *transfer.durable_capture_options->expected_identity !=
+          request.execution_plan.session_identity) {
+    return absl::FailedPreconditionError(
+        "Durable capture identity assertion differs from the restored "
+        "session identity.");
+  }
+  return absl::OkStatus();
 }
 
 #if defined(__APPLE__) || defined(__linux__) || defined(__unix__)
@@ -316,6 +435,207 @@ absl::Status SetCloseOnExec(int fd) {
   }
   return absl::OkStatus();
 }
+
+// Private, unlinked storage used while a capsule is unauthenticated or carries
+// a transient per-request key. No pathname survives construction, the
+// descriptor is never inherited across exec, and reads are unavailable until
+// the writer seals the exact extent.
+class UnlinkedTempByteFile final : public ByteSource, public ByteSink {
+ public:
+  UnlinkedTempByteFile(const UnlinkedTempByteFile&) = delete;
+  UnlinkedTempByteFile& operator=(const UnlinkedTempByteFile&) = delete;
+  UnlinkedTempByteFile(UnlinkedTempByteFile&&) noexcept = default;
+  UnlinkedTempByteFile& operator=(UnlinkedTempByteFile&&) noexcept = default;
+
+  static absl::StatusOr<UnlinkedTempByteFile> Create() {
+    char path[] = "/tmp/litert-lmx-fresh-capsule.XXXXXX";
+    const int descriptor = mkstemp(path);
+    if (descriptor < 0) {
+      return absl::ErrnoToStatus(
+          errno, "Unable to create private fresh-worker capsule storage.");
+    }
+    ScopedFd file(descriptor);
+    if (fchmod(file.get(), S_IRUSR | S_IWUSR) != 0) {
+      const int saved_errno = errno;
+      unlink(path);
+      return absl::ErrnoToStatus(
+          saved_errno, "Unable to restrict fresh-worker capsule storage.");
+    }
+    const absl::Status close_on_exec = SetCloseOnExec(file.get());
+    if (!close_on_exec.ok()) {
+      unlink(path);
+      return close_on_exec;
+    }
+    struct stat file_stat;
+    if (fstat(file.get(), &file_stat) != 0) {
+      const int saved_errno = errno;
+      unlink(path);
+      return absl::ErrnoToStatus(
+          saved_errno, "Unable to inspect fresh-worker capsule storage.");
+    }
+    if (!S_ISREG(file_stat.st_mode)) {
+      unlink(path);
+      return absl::FailedPreconditionError(
+          "Fresh-worker capsule storage is not a regular file.");
+    }
+    if (unlink(path) != 0) {
+      return absl::ErrnoToStatus(
+          errno, "Unable to unlink private fresh-worker capsule storage.");
+    }
+    return UnlinkedTempByteFile(std::move(file));
+  }
+
+  uint64_t Size() const override { return size_; }
+
+  absl::Status Append(absl::string_view bytes) override {
+    if (sealed_) {
+      return absl::FailedPreconditionError(
+          "Fresh-worker capsule storage is already sealed.");
+    }
+    if (bytes.size() > kMaximumFreshWorkerCapsuleBytes - size_) {
+      return absl::ResourceExhaustedError(
+          "Fresh-worker capsule exceeds its independent storage limit.");
+    }
+    size_t source_offset = 0;
+    while (source_offset < bytes.size()) {
+      if (size_ > static_cast<uint64_t>(
+                      std::numeric_limits<off_t>::max())) {
+        return absl::ResourceExhaustedError(
+            "Fresh-worker capsule offset is not representable.");
+      }
+      const size_t count = std::min<size_t>(
+          bytes.size() - source_offset,
+          static_cast<size_t>(std::numeric_limits<ssize_t>::max()));
+      const ssize_t written =
+          pwrite(file_.get(), bytes.data() + source_offset, count,
+                 static_cast<off_t>(size_));
+      if (written < 0 && errno == EINTR) continue;
+      if (written < 0) {
+        return absl::ErrnoToStatus(
+            errno, "Unable to write fresh-worker capsule storage.");
+      }
+      if (written == 0) {
+        return absl::DataLossError(
+            "Fresh-worker capsule storage accepted zero bytes.");
+      }
+      source_offset += static_cast<size_t>(written);
+      size_ += static_cast<uint64_t>(written);
+    }
+    return absl::OkStatus();
+  }
+
+  absl::Status Seal() {
+    if (sealed_) return absl::OkStatus();
+    struct stat file_stat;
+    if (fstat(file_.get(), &file_stat) != 0) {
+      return absl::ErrnoToStatus(
+          errno, "Unable to seal fresh-worker capsule storage.");
+    }
+    if (!S_ISREG(file_stat.st_mode) || file_stat.st_nlink != 0 ||
+        file_stat.st_size < 0 ||
+        static_cast<uint64_t>(file_stat.st_size) != size_) {
+      return absl::DataLossError(
+          "Fresh-worker capsule storage extent or ownership changed.");
+    }
+    sealed_ = true;
+    return absl::OkStatus();
+  }
+
+  absl::Status ReadAt(uint64_t offset,
+                      absl::Span<char> destination) const override {
+    if (!sealed_) {
+      return absl::FailedPreconditionError(
+          "Fresh-worker capsule storage must be sealed before reading.");
+    }
+    if (offset > size_ || destination.size() > size_ - offset) {
+      return absl::OutOfRangeError(
+          "Fresh-worker capsule storage read exceeds bounds.");
+    }
+    size_t destination_offset = 0;
+    while (destination_offset < destination.size()) {
+      const uint64_t absolute_offset = offset + destination_offset;
+      if (absolute_offset > static_cast<uint64_t>(
+                                std::numeric_limits<off_t>::max())) {
+        return absl::OutOfRangeError(
+            "Fresh-worker capsule read offset is not representable.");
+      }
+      const size_t count = std::min<size_t>(
+          destination.size() - destination_offset,
+          static_cast<size_t>(std::numeric_limits<ssize_t>::max()));
+      const ssize_t read_count =
+          pread(file_.get(), destination.data() + destination_offset, count,
+                static_cast<off_t>(absolute_offset));
+      if (read_count < 0 && errno == EINTR) continue;
+      if (read_count < 0) {
+        return absl::ErrnoToStatus(
+            errno, "Unable to read fresh-worker capsule storage.");
+      }
+      if (read_count == 0) {
+        return absl::DataLossError(
+            "Fresh-worker capsule storage was truncated.");
+      }
+      destination_offset += static_cast<size_t>(read_count);
+    }
+    return absl::OkStatus();
+  }
+
+ private:
+  explicit UnlinkedTempByteFile(ScopedFd file) : file_(std::move(file)) {}
+
+  ScopedFd file_;
+  uint64_t size_ = 0;
+  bool sealed_ = false;
+};
+
+absl::StatusOr<Hash256> HashCapsuleSource(const ByteSource& source) {
+  if (source.Size() > kMaximumFreshWorkerCapsuleBytes) {
+    return absl::ResourceExhaustedError(
+        "Fresh-worker capsule exceeds its independent storage limit.");
+  }
+  Sha256Hasher hasher;
+  const size_t chunk_size = static_cast<size_t>(std::min<uint64_t>(
+      std::max<uint64_t>(source.Size(), 1), kCapsuleIoChunkBytes));
+  std::vector<char> chunk(chunk_size);
+  uint64_t offset = 0;
+  while (offset < source.Size()) {
+    const size_t count = static_cast<size_t>(std::min<uint64_t>(
+        chunk.size(), source.Size() - offset));
+    ABSL_RETURN_IF_ERROR(source.ReadAt(
+        offset, absl::MakeSpan(chunk).subspan(0, count)));
+    hasher.Update(absl::string_view(chunk.data(), count));
+    offset += count;
+  }
+  return hasher.Finalize();
+}
+
+class BoundedHashingByteSink final : public ByteSink {
+ public:
+  explicit BoundedHashingByteSink(ByteSink* destination)
+      : destination_(destination) {}
+
+  absl::Status Append(absl::string_view bytes) override {
+    if (destination_ == nullptr) {
+      return absl::InvalidArgumentError(
+          "Durable capsule destination must not be null.");
+    }
+    if (bytes.size() > kMaximumFreshWorkerCapsuleBytes - size_) {
+      return absl::ResourceExhaustedError(
+          "Durable fresh-worker capsule exceeds its storage limit.");
+    }
+    ABSL_RETURN_IF_ERROR(destination_->Append(bytes));
+    hasher_.Update(bytes);
+    size_ += bytes.size();
+    return absl::OkStatus();
+  }
+
+  uint64_t Size() const { return size_; }
+  Hash256 Finalize() { return hasher_.Finalize(); }
+
+ private:
+  ByteSink* destination_;
+  Sha256Hasher hasher_;
+  uint64_t size_ = 0;
+};
 
 absl::Status SetNonBlocking(int fd) {
   const int flags = fcntl(fd, F_GETFL);
@@ -510,6 +830,32 @@ absl::Status WriteWithDeadline(int fd, absl::string_view bytes,
   return absl::OkStatus();
 }
 
+absl::Status WriteCapsuleFrameWithDeadline(
+    int fd, const ByteSource* source, const RunControl& control) {
+  const uint64_t size = source == nullptr ? 0 : source->Size();
+  if (size > kMaximumFreshWorkerCapsuleBytes) {
+    return absl::ResourceExhaustedError(
+        "Fresh-worker capsule frame exceeds its independent limit.");
+  }
+  const std::string header = EncodeFrameHeader(kCapsuleFrameMagic, size);
+  ABSL_RETURN_IF_ERROR(WriteWithDeadline(fd, header, control));
+  if (size == 0) return absl::OkStatus();
+
+  std::vector<char> chunk(static_cast<size_t>(std::min<uint64_t>(
+      size, kCapsuleIoChunkBytes)));
+  uint64_t offset = 0;
+  while (offset < size) {
+    const size_t count = static_cast<size_t>(
+        std::min<uint64_t>(chunk.size(), size - offset));
+    ABSL_RETURN_IF_ERROR(
+        source->ReadAt(offset, absl::MakeSpan(chunk).subspan(0, count)));
+    ABSL_RETURN_IF_ERROR(WriteWithDeadline(
+        fd, absl::string_view(chunk.data(), count), control));
+    offset += count;
+  }
+  return absl::OkStatus();
+}
+
 absl::Status ReadExactWithDeadline(int fd, char* output, size_t size,
                                    const RunControl& control) {
   size_t offset = 0;
@@ -527,6 +873,57 @@ absl::Status ReadExactWithDeadline(int fd, char* output, size_t size,
       return absl::DataLossError("Fresh-worker response was truncated.");
     }
     offset += static_cast<size_t>(count);
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<uint64_t> ReadCapsuleFrameWithDeadline(
+    int fd, UnlinkedTempByteFile* destination,
+    const RunControl& control) {
+  if (destination == nullptr) {
+    return absl::InvalidArgumentError(
+        "Fresh-worker capsule destination is null.");
+  }
+  std::array<char, 16> header{};
+  ABSL_RETURN_IF_ERROR(
+      ReadExactWithDeadline(fd, header.data(), header.size(), control));
+  if (std::memcmp(header.data(), kCapsuleFrameMagic.data(),
+                  kCapsuleFrameMagic.size()) != 0) {
+    return absl::DataLossError(
+        "Fresh-worker capsule has invalid framing magic.");
+  }
+  const uint64_t size = ReadU64(header.data() + 8);
+  if (size > kMaximumFreshWorkerCapsuleBytes) {
+    return absl::ResourceExhaustedError(
+        "Fresh-worker capsule frame exceeds its independent limit.");
+  }
+  std::vector<char> chunk(static_cast<size_t>(std::min<uint64_t>(
+      std::max<uint64_t>(size, 1), kCapsuleIoChunkBytes)));
+  uint64_t offset = 0;
+  while (offset < size) {
+    const size_t count = static_cast<size_t>(
+        std::min<uint64_t>(chunk.size(), size - offset));
+    ABSL_RETURN_IF_ERROR(
+        ReadExactWithDeadline(fd, chunk.data(), count, control));
+    ABSL_RETURN_IF_ERROR(destination->Append(
+        absl::string_view(chunk.data(), count)));
+    offset += count;
+  }
+  ABSL_RETURN_IF_ERROR(destination->Seal());
+  return size;
+}
+
+absl::Status ReadZeroCapsuleFrameWithDeadline(
+    int fd, const RunControl& control) {
+  std::array<char, 16> header{};
+  ABSL_RETURN_IF_ERROR(
+      ReadExactWithDeadline(fd, header.data(), header.size(), control));
+  if (std::memcmp(header.data(), kCapsuleFrameMagic.data(),
+                  kCapsuleFrameMagic.size()) != 0 ||
+      ReadU64(header.data() + 8) != 0) {
+    return absl::DataLossError(
+        "Capsule-free fresh worker emitted a nonzero or invalid capsule "
+        "frame.");
   }
   return absl::OkStatus();
 }
@@ -587,6 +984,32 @@ absl::Status WriteAllBlocking(int fd, absl::string_view bytes,
   return absl::OkStatus();
 }
 
+absl::Status WriteCapsuleFrameBlocking(int fd, const ByteSource* source,
+                                       absl::string_view description) {
+  const uint64_t size = source == nullptr ? 0 : source->Size();
+  if (size > kMaximumFreshWorkerCapsuleBytes) {
+    return absl::ResourceExhaustedError(
+        absl::StrCat(description, " exceeds the capsule framing limit."));
+  }
+  ABSL_RETURN_IF_ERROR(WriteAllBlocking(
+      fd, EncodeFrameHeader(kCapsuleFrameMagic, size), description));
+  if (size == 0) return absl::OkStatus();
+
+  std::vector<char> chunk(static_cast<size_t>(std::min<uint64_t>(
+      size, kCapsuleIoChunkBytes)));
+  uint64_t offset = 0;
+  while (offset < size) {
+    const size_t count = static_cast<size_t>(
+        std::min<uint64_t>(chunk.size(), size - offset));
+    ABSL_RETURN_IF_ERROR(
+        source->ReadAt(offset, absl::MakeSpan(chunk).subspan(0, count)));
+    ABSL_RETURN_IF_ERROR(WriteAllBlocking(
+        fd, absl::string_view(chunk.data(), count), description));
+    offset += count;
+  }
+  return absl::OkStatus();
+}
+
 absl::Status ExpectEofBlocking(int fd, absl::string_view description) {
   char trailing;
   while (true) {
@@ -602,7 +1025,7 @@ absl::Status ExpectEofBlocking(int fd, absl::string_view description) {
   }
 }
 
-absl::StatusOr<std::string> ReadIpcFrameBlocking(
+absl::StatusOr<std::string> ReadIpcFrameBlockingWithoutEof(
     int fd, absl::string_view description) {
   std::array<char, 16> header{};
   ABSL_RETURN_IF_ERROR(
@@ -622,8 +1045,58 @@ absl::StatusOr<std::string> ReadIpcFrameBlocking(
   std::string envelope(static_cast<size_t>(envelope_size), '\0');
   ABSL_RETURN_IF_ERROR(ReadExactBlocking(fd, envelope.data(), envelope.size(),
                                          description));
-  ABSL_RETURN_IF_ERROR(ExpectEofBlocking(fd, description));
   return envelope;
+}
+
+absl::StatusOr<uint64_t> ReadCapsuleFrameBlocking(
+    int fd, UnlinkedTempByteFile* destination,
+    absl::string_view description) {
+  if (destination == nullptr) {
+    return absl::InvalidArgumentError(
+        "Fresh-worker capsule destination is null.");
+  }
+  std::array<char, 16> header{};
+  ABSL_RETURN_IF_ERROR(
+      ReadExactBlocking(fd, header.data(), header.size(), description));
+  if (std::memcmp(header.data(), kCapsuleFrameMagic.data(),
+                  kCapsuleFrameMagic.size()) != 0) {
+    return absl::DataLossError(
+        absl::StrCat(description, " has invalid framing magic."));
+  }
+  const uint64_t size = ReadU64(header.data() + 8);
+  if (size > kMaximumFreshWorkerCapsuleBytes) {
+    return absl::ResourceExhaustedError(
+        absl::StrCat(description, " exceeds the capsule framing limit."));
+  }
+  std::vector<char> chunk(static_cast<size_t>(std::min<uint64_t>(
+      std::max<uint64_t>(size, 1), kCapsuleIoChunkBytes)));
+  uint64_t offset = 0;
+  while (offset < size) {
+    const size_t count = static_cast<size_t>(
+        std::min<uint64_t>(chunk.size(), size - offset));
+    ABSL_RETURN_IF_ERROR(
+        ReadExactBlocking(fd, chunk.data(), count, description));
+    ABSL_RETURN_IF_ERROR(destination->Append(
+        absl::string_view(chunk.data(), count)));
+    offset += count;
+  }
+  ABSL_RETURN_IF_ERROR(destination->Seal());
+  return size;
+}
+
+absl::Status ReadZeroCapsuleFrameBlocking(
+    int fd, absl::string_view description) {
+  std::array<char, 16> header{};
+  ABSL_RETURN_IF_ERROR(
+      ReadExactBlocking(fd, header.data(), header.size(), description));
+  if (std::memcmp(header.data(), kCapsuleFrameMagic.data(),
+                  kCapsuleFrameMagic.size()) != 0 ||
+      ReadU64(header.data() + 8) != 0) {
+    return absl::DataLossError(
+        absl::StrCat(description,
+                     " must be an explicit zero-size capsule frame."));
+  }
+  return absl::OkStatus();
 }
 
 absl::Status WriteIpcFrameBlocking(int fd, absl::string_view envelope,
@@ -838,7 +1311,7 @@ absl::StatusOr<pid_t> SpawnWorker(
   return pid;
 }
 
-absl::StatusOr<std::string> ReadParentResultFrame(
+absl::StatusOr<std::string> ReadParentResultFrameWithoutEof(
     int fd, const RunControl& control) {
   std::array<char, 16> header{};
   ABSL_RETURN_IF_ERROR(
@@ -858,7 +1331,6 @@ absl::StatusOr<std::string> ReadParentResultFrame(
   std::string envelope(static_cast<size_t>(envelope_size), '\0');
   ABSL_RETURN_IF_ERROR(ReadExactWithDeadline(
       fd, envelope.data(), envelope.size(), control));
-  ABSL_RETURN_IF_ERROR(ExpectEofWithDeadline(fd, control));
   return envelope;
 }
 
@@ -957,16 +1429,23 @@ absl::StatusOr<FreshWorkerProcessObservation> FreshWorkerProcessRunner::Run(
   SecureErase(&authentication_prelude);
   ABSL_RETURN_IF_ERROR(
       WriteWithDeadline(request_pipe.write.get(), request_frame, control));
-  request_pipe.write.Reset();
   request_frame.clear();
+  ABSL_RETURN_IF_ERROR(WriteCapsuleFrameWithDeadline(
+      request_pipe.write.get(), nullptr, control));
+  request_pipe.write.Reset();
 
-  ABSL_ASSIGN_OR_RETURN(const std::string result_envelope,
-                        ReadParentResultFrame(result_pipe.read.get(), control));
+  ABSL_ASSIGN_OR_RETURN(
+      const std::string result_envelope,
+      ReadParentResultFrameWithoutEof(result_pipe.read.get(), control));
+  ABSL_RETURN_IF_ERROR(
+      ReadZeroCapsuleFrameWithDeadline(result_pipe.read.get(), control));
+  ABSL_RETURN_IF_ERROR(ExpectEofWithDeadline(result_pipe.read.get(), control));
   result_pipe.read.Reset();
   ABSL_ASSIGN_OR_RETURN(const int process_status, child.Wait(control));
   if (!WIFEXITED(process_status) || WEXITSTATUS(process_status) != 0) {
     return absl::DataLossError(
-        "Fresh worker did not exit successfully after its one response.");
+        "Fresh worker did not exit successfully after its capsule-free "
+        "response frames.");
   }
   ABSL_ASSIGN_OR_RETURN(
       FreshWorkerResult result,
@@ -981,7 +1460,8 @@ absl::StatusOr<FreshWorkerProcessObservation> FreshWorkerProcessRunner::Run(
       result.request_envelope_hash != request_envelope_hash ||
       result.execution_plan_hash != request.execution_plan.plan_hash) {
     return absl::UnauthenticatedError(
-        "Fresh-worker result is not bound to its exact request.");
+        "Capsule-free fresh-worker result is not bound to its exact request "
+        "or emitted an unexpected capsule.");
   }
   return FreshWorkerProcessObservation{
       .result = std::move(result),
@@ -993,6 +1473,274 @@ absl::StatusOr<FreshWorkerProcessObservation> FreshWorkerProcessRunner::Run(
   return absl::UnimplementedError(
       "Fresh-worker process isolation is not implemented on this platform.");
 #endif
+}
+
+absl::StatusOr<FreshWorkerProcessObservation>
+FreshWorkerProcessRunner::RunWithSessionHandoff(
+    const FreshWorkerRequest& request,
+    const FreshWorkerAuthentication& authentication,
+    const FreshWorkerSessionHandoffTransfer& transfer) const {
+#if defined(__APPLE__) || defined(__linux__) || defined(__unix__)
+  ABSL_RETURN_IF_ERROR(ValidateProcessOptions(options_));
+  ABSL_RETURN_IF_ERROR(ValidateFreshWorkerRequest(request));
+  ABSL_RETURN_IF_ERROR(ValidateFreshWorkerAuthentication(authentication));
+  ABSL_RETURN_IF_ERROR(ValidateSessionHandoffTransfer(request, transfer));
+  ABSL_ASSIGN_OR_RETURN(
+      const std::string executable_path,
+      CanonicalExecutablePath(options_.executable_path));
+  ABSL_ASSIGN_OR_RETURN(
+      FreshWorkerAuthentication transport_authentication,
+      DeriveTransportAuthentication(authentication, request));
+  SecretEraser transport_key_eraser(
+      &transport_authentication.authentication_key);
+
+  // Encode and authenticate the request before deriving capsule keys. The
+  // exact envelope hash is a non-circular physical-execution binding because
+  // capsule bytes never enter this envelope.
+  ABSL_ASSIGN_OR_RETURN(
+      const std::string request_envelope,
+      EncodeFreshWorkerRequest(request, transport_authentication));
+  const Hash256 request_envelope_hash =
+      HashFreshWorkerEnvelope(request_envelope);
+  std::string request_frame = EncodeIpcFrame(request_envelope);
+
+  const bool restore_required =
+      request.execution_plan.prefill_mode ==
+      FreshWorkerPrefillMode::kOwnPositionCapsuleDelta;
+  const std::optional<SessionHandoffIdentity> expected_session_identity =
+      restore_required
+          ? std::optional<SessionHandoffIdentity>(
+                request.execution_plan.session_identity)
+          : std::nullopt;
+  SessionHandoffOptions transient_restore_options = DeriveCapsuleOptions(
+      transport_authentication, request_envelope_hash,
+      kRestoreCapsuleDirection, kRestoreCapsuleKeyId,
+      expected_session_identity);
+  SecretEraser transient_restore_key_eraser(
+      &transient_restore_options.authentication_key);
+  SessionHandoffOptions transient_producing_options = DeriveCapsuleOptions(
+      transport_authentication, request_envelope_hash,
+      kProducingCapsuleDirection, kProducingCapsuleKeyId,
+      expected_session_identity);
+  if (request.execution_plan.capture_producing_capsule) {
+    transient_producing_options.expected_identity =
+        *transfer.durable_capture_options->expected_identity;
+  }
+  SecretEraser transient_producing_key_eraser(
+      &transient_producing_options.authentication_key);
+
+  ABSL_ASSIGN_OR_RETURN(UnlinkedTempByteFile transient_restore,
+                        UnlinkedTempByteFile::Create());
+  if (restore_required) {
+    ABSL_ASSIGN_OR_RETURN(
+        const Hash256 durable_restore_hash,
+        HashCapsuleSource(*transfer.durable_restore_source));
+    if (durable_restore_hash !=
+        request.execution_plan.restore_durable_envelope_hash) {
+      return absl::DataLossError(
+          "Durable restore capsule hash differs from its execution-plan "
+          "binding.");
+    }
+    ABSL_RETURN_IF_ERROR(ReauthenticateSessionHandoffTo(
+        *transfer.durable_restore_source,
+        request.execution_plan.session_identity,
+        *transfer.durable_restore_options, transient_restore_options,
+        &transient_restore));
+  }
+  ABSL_RETURN_IF_ERROR(transient_restore.Seal());
+  if (restore_required && transient_restore.Size() == 0) {
+    return absl::DataLossError(
+        "Authenticated restore capsule rewrap produced no bytes.");
+  }
+
+  // Allocate response storage before spawning when capture is requested so
+  // every post-spawn local failure is a transport/process failure, never an
+  // accidental fallback to materializing capsule bytes in memory.
+  std::optional<UnlinkedTempByteFile> transient_producing;
+  if (request.execution_plan.capture_producing_capsule) {
+    ABSL_ASSIGN_OR_RETURN(UnlinkedTempByteFile storage,
+                          UnlinkedTempByteFile::Create());
+    transient_producing.emplace(std::move(storage));
+  }
+  ABSL_ASSIGN_OR_RETURN(std::string authentication_prelude,
+                        BuildAuthenticationPrelude(transport_authentication));
+  SecretEraser prelude_eraser(&authentication_prelude);
+
+  ABSL_ASSIGN_OR_RETURN(Pipe request_pipe, MakePipe());
+  ABSL_ASSIGN_OR_RETURN(Pipe result_pipe, MakePipe());
+  ABSL_ASSIGN_OR_RETURN(Pipe authentication_pipe, MakePipe());
+
+  ScopedSigpipeBlock sigpipe_block;
+  if (!sigpipe_block.active()) {
+    return absl::InternalError(
+        "Unable to block SIGPIPE for fresh-worker communication.");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      const pid_t pid,
+      SpawnWorker(executable_path, options_.arguments, request_pipe.read.get(),
+                  result_pipe.write.get(), authentication_pipe.read.get()));
+  ChildGuard child(pid, options_.termination_grace);
+  request_pipe.read.Reset();
+  result_pipe.write.Reset();
+  authentication_pipe.read.Reset();
+
+  ABSL_RETURN_IF_ERROR(SetNonBlocking(request_pipe.write.get()));
+  ABSL_RETURN_IF_ERROR(SetNonBlocking(result_pipe.read.get()));
+  ABSL_RETURN_IF_ERROR(SetNonBlocking(authentication_pipe.write.get()));
+  ABSL_RETURN_IF_ERROR(SuppressSigpipeOnWriteFd(request_pipe.write.get()));
+  ABSL_RETURN_IF_ERROR(
+      SuppressSigpipeOnWriteFd(authentication_pipe.write.get()));
+  const RunControl control(options_);
+
+  ABSL_RETURN_IF_ERROR(WriteWithDeadline(authentication_pipe.write.get(),
+                                         authentication_prelude, control));
+  authentication_pipe.write.Reset();
+  SecureErase(&authentication_prelude);
+  ABSL_RETURN_IF_ERROR(
+      WriteWithDeadline(request_pipe.write.get(), request_frame, control));
+  request_frame.clear();
+  ABSL_RETURN_IF_ERROR(WriteCapsuleFrameWithDeadline(
+      request_pipe.write.get(), restore_required ? &transient_restore : nullptr,
+      control));
+  request_pipe.write.Reset();
+
+  ABSL_ASSIGN_OR_RETURN(
+      const std::string result_envelope,
+      ReadParentResultFrameWithoutEof(result_pipe.read.get(), control));
+  uint64_t transient_producing_size = 0;
+  if (request.execution_plan.capture_producing_capsule) {
+    ABSL_ASSIGN_OR_RETURN(
+        transient_producing_size,
+        ReadCapsuleFrameWithDeadline(result_pipe.read.get(),
+                                     &*transient_producing, control));
+  } else {
+    ABSL_RETURN_IF_ERROR(
+        ReadZeroCapsuleFrameWithDeadline(result_pipe.read.get(), control));
+  }
+  ABSL_RETURN_IF_ERROR(ExpectEofWithDeadline(result_pipe.read.get(), control));
+  result_pipe.read.Reset();
+  ABSL_ASSIGN_OR_RETURN(const int process_status, child.Wait(control));
+  if (!WIFEXITED(process_status) || WEXITSTATUS(process_status) != 0) {
+    return absl::DataLossError(
+        "Fresh worker did not exit successfully after its response and "
+        "capsule frames.");
+  }
+
+  ABSL_ASSIGN_OR_RETURN(
+      FreshWorkerResult result,
+      DecodeFreshWorkerResult(result_envelope, transport_authentication));
+  ABSL_RETURN_IF_ERROR(
+      ValidateFreshWorkerResultForRequest(result, request));
+  if (result.request_envelope_hash != request_envelope_hash) {
+    return absl::UnauthenticatedError(
+        "Fresh-worker result is not bound to the authenticated request "
+        "envelope.");
+  }
+
+  std::optional<FreshWorkerDurableProducingCapsuleEvidence>
+      durable_capsule_evidence;
+  if (result.status_code != absl::StatusCode::kOk) {
+    if (transient_producing_size != 0) {
+      return absl::DataLossError(
+          "Failed fresh worker emitted a producing capsule.");
+    }
+  } else if (request.execution_plan.capture_producing_capsule) {
+    if (!result.producing_capsule_evidence.has_value()) {
+      return absl::DataLossError(
+          "Successful capture result omitted capsule evidence.");
+    }
+    const FreshWorkerProducingCapsuleEvidence& transient_evidence =
+        *result.producing_capsule_evidence;
+    if (transient_evidence.session_identity !=
+        *transfer.durable_capture_options->expected_identity) {
+      return absl::FailedPreconditionError(
+          "Producing capsule identity differs from the parent-derived "
+          "durable capture assertion.");
+    }
+    if (transient_producing_size == 0 ||
+        transient_producing_size != transient_evidence.transient_envelope_size) {
+      return absl::DataLossError(
+          "Producing capsule size differs from authenticated result "
+          "evidence.");
+    }
+    ABSL_ASSIGN_OR_RETURN(const Hash256 transient_hash,
+                          HashCapsuleSource(*transient_producing));
+    if (transient_hash != transient_evidence.transient_envelope_hash) {
+      return absl::DataLossError(
+          "Producing capsule hash differs from authenticated result "
+          "evidence.");
+    }
+    // Authenticate the complete transient capsule before any durable output.
+    absl::StatusOr<DecodedSessionHandoff> decoded_transient =
+        DecodeSessionHandoffFrom(*transient_producing,
+                                 transient_evidence.session_identity,
+                                 transient_producing_options);
+    if (!decoded_transient.ok()) return decoded_transient.status();
+
+    BoundedHashingByteSink durable_sink(
+        transfer.durable_capture_destination);
+    ABSL_RETURN_IF_ERROR(ReauthenticateSessionHandoffTo(
+        *transient_producing, transient_evidence.session_identity,
+        transient_producing_options, *transfer.durable_capture_options,
+        &durable_sink));
+    if (durable_sink.Size() == 0) {
+      return absl::DataLossError(
+          "Durable producing-capsule rewrap produced no bytes.");
+    }
+    durable_capsule_evidence =
+        FreshWorkerDurableProducingCapsuleEvidence{
+            .session_identity = transient_evidence.session_identity,
+            .key_id = transfer.durable_capture_options->key_id,
+            .envelope_size = durable_sink.Size(),
+            .envelope_hash = durable_sink.Finalize(),
+            .output_evidence_hash = transient_evidence.output_evidence_hash};
+  } else if (transient_producing_size != 0) {
+    return absl::DataLossError(
+        "Fresh worker emitted an unrequested producing capsule.");
+  }
+
+  return FreshWorkerProcessObservation{
+      .result = std::move(result),
+      .process_id = static_cast<int64_t>(pid),
+      .request_envelope_hash = request_envelope_hash,
+      .result_envelope_hash = HashFreshWorkerEnvelope(result_envelope),
+      .launch_spec_hash = HashLaunchSpec(executable_path, options_.arguments),
+      .durable_producing_capsule_evidence =
+          std::move(durable_capsule_evidence)};
+#else
+  return absl::UnimplementedError(
+      "Fresh-worker process isolation is not implemented on this platform.");
+#endif
+}
+
+absl::Status RunFreshWorkerOnce(
+    const FreshWorkerCapsuleFreeExecutionCallback& execute) {
+  if (!execute) {
+    return absl::InvalidArgumentError(
+        "Fresh-worker execution callback is missing.");
+  }
+  return RunFreshWorkerOnce(FreshWorkerExecutionCallback(
+      [&execute](const FreshWorkerExecutionContext& context)
+          -> absl::StatusOr<FreshWorkerDerivedExecution> {
+        if (context.request.execution_plan.prefill_mode !=
+                FreshWorkerPrefillMode::kFullCanonicalPrefill ||
+            context.request.execution_plan.capture_producing_capsule ||
+            context.restore_source != nullptr ||
+            context.restore_options != nullptr ||
+            context.producing_sink != nullptr ||
+            context.producing_options != nullptr) {
+          return absl::UnimplementedError(
+              "The configured worker adapter is capsule-free.");
+        }
+        ABSL_ASSIGN_OR_RETURN(FreshWorkerDerivedExecution execution,
+                              execute(context.request));
+        if (execution.restored_checkpoint_id.has_value() ||
+            execution.exported_producing_capsule) {
+          return absl::FailedPreconditionError(
+              "Capsule-free worker execution claimed restore or capture.");
+        }
+        return execution;
+      }));
 }
 
 absl::Status RunFreshWorkerOnce(
@@ -1008,9 +1756,12 @@ absl::Status RunFreshWorkerOnce(
       ReadAuthenticationPrelude(authentication_fd.get()));
   authentication_fd.Reset();
   SecretEraser authentication_eraser(&authentication.authentication_key);
+
+  ScopedFd input_fd(STDIN_FILENO);
   ABSL_ASSIGN_OR_RETURN(
       const std::string request_envelope,
-      ReadIpcFrameBlocking(STDIN_FILENO, "fresh-worker request"));
+      ReadIpcFrameBlockingWithoutEof(input_fd.get(),
+                                     "fresh-worker request"));
   ABSL_ASSIGN_OR_RETURN(
       const FreshWorkerRequest request,
       DecodeFreshWorkerRequest(request_envelope, authentication));
@@ -1019,61 +1770,199 @@ absl::Status RunFreshWorkerOnce(
   ABSL_ASSIGN_OR_RETURN(const Hash256 worker_nonce,
                         GenerateFreshWorkerNonce());
 
-  FreshWorkerResult result;
-  absl::StatusOr<FreshWorkerDerivedExecution> execution =
+  const bool restore_required =
       request.execution_plan.prefill_mode ==
-                  FreshWorkerPrefillMode::kFullCanonicalPrefill &&
-              !request.execution_plan.capture_producing_capsule
-          ? execute(request)
-          : absl::StatusOr<FreshWorkerDerivedExecution>(
-                absl::UnimplementedError(
-                    "Fresh-worker capsule restore/capture requires the "
-                    "authenticated capsule-stream boundary."));
-  if (!execution.ok()) {
-    result = MakeFailureResult(request, request_envelope_hash, worker_nonce,
-                               execution.status());
-  } else if (execution->derived_exact_profile_hash !=
-             request.exact_profile_hash) {
-    result = MakeFailureResult(
-        request, request_envelope_hash, worker_nonce,
-        absl::FailedPreconditionError(
-            "Worker-derived ExactLiteRtProfile does not match the request."));
-  } else if (execution->replay_isolation !=
-             FreshWorkerReplayIsolation::kEmptyCatalogs) {
-    result = MakeFailureResult(
-        request, request_envelope_hash, worker_nonce,
-        absl::FailedPreconditionError(
-            "Exact qualification worker did not attest catalog-free construction."));
+      FreshWorkerPrefillMode::kOwnPositionCapsuleDelta;
+  const std::optional<SessionHandoffIdentity> expected_session_identity =
+      restore_required
+          ? std::optional<SessionHandoffIdentity>(
+                request.execution_plan.session_identity)
+          : std::nullopt;
+  SessionHandoffOptions transient_restore_options = DeriveCapsuleOptions(
+      authentication, request_envelope_hash, kRestoreCapsuleDirection,
+      kRestoreCapsuleKeyId, expected_session_identity);
+  SecretEraser transient_restore_key_eraser(
+      &transient_restore_options.authentication_key);
+  SessionHandoffOptions transient_producing_options = DeriveCapsuleOptions(
+      authentication, request_envelope_hash, kProducingCapsuleDirection,
+      kProducingCapsuleKeyId, expected_session_identity);
+  SecretEraser transient_producing_key_eraser(
+      &transient_producing_options.authentication_key);
+
+  const auto emit_result =
+      [&](const FreshWorkerResult& result,
+          const ByteSource* capsule) -> absl::Status {
+    // Closing unread input prevents a malformed or locally failed child from
+    // deadlocking with a parent that is still writing the capsule frame.
+    input_fd.Reset();
+    ABSL_RETURN_IF_ERROR(
+        ValidateFreshWorkerResultForRequest(result, request));
+    ABSL_ASSIGN_OR_RETURN(
+        const std::string result_envelope,
+        EncodeFreshWorkerResult(result, authentication));
+    ABSL_RETURN_IF_ERROR(WriteIpcFrameBlocking(
+        STDOUT_FILENO, result_envelope, "fresh-worker result"));
+    return WriteCapsuleFrameBlocking(
+        STDOUT_FILENO, capsule, "fresh-worker producing capsule");
+  };
+  const auto emit_failure = [&](const absl::Status& status) -> absl::Status {
+    return emit_result(MakeFailureResult(request, request_envelope_hash,
+                                         worker_nonce, status),
+                       nullptr);
+  };
+
+  std::optional<UnlinkedTempByteFile> restore_storage;
+  if (restore_required) {
+    absl::StatusOr<UnlinkedTempByteFile> restore_storage_or =
+        UnlinkedTempByteFile::Create();
+    if (!restore_storage_or.ok()) {
+      return emit_failure(restore_storage_or.status());
+    }
+    restore_storage.emplace(std::move(restore_storage_or).value());
+    absl::StatusOr<uint64_t> restore_size_or = ReadCapsuleFrameBlocking(
+        input_fd.get(), &*restore_storage, "fresh-worker restore capsule");
+    if (!restore_size_or.ok()) {
+      return emit_failure(restore_size_or.status());
+    }
+    if (*restore_size_or == 0) {
+      return emit_failure(absl::DataLossError(
+          "Own-position execution did not receive a restore capsule."));
+    }
   } else {
-    const absl::Status output_status =
-        ValidateFreshWorkerExecutionOutput(execution->output);
-    if (!output_status.ok()) {
-      result = MakeFailureResult(request, request_envelope_hash, worker_nonce,
-                                 output_status);
-    } else {
-      result.exact_profile_hash = request.exact_profile_hash;
-      result.qualification_id = request.qualification_id;
-      result.run_index = request.run_index;
-      result.run_count = request.run_count;
-      result.challenge_nonce = request.challenge_nonce;
-      result.request_envelope_hash = request_envelope_hash;
-      result.worker_instance_nonce = worker_nonce;
-      result.execution_plan_hash = request.execution_plan.plan_hash;
-      result.replay_isolation = execution->replay_isolation;
-      result.canonical_output = std::move(execution->output.canonical_output);
-      result.token_bytes = std::move(execution->output.token_bytes);
-      result.logit_frames = std::move(execution->output.logit_frames);
+    const absl::Status zero_restore = ReadZeroCapsuleFrameBlocking(
+        input_fd.get(), "fresh-worker restore capsule");
+    if (!zero_restore.ok()) return emit_failure(zero_restore);
+  }
+  const absl::Status input_eof =
+      ExpectEofBlocking(input_fd.get(), "fresh-worker input frames");
+  if (!input_eof.ok()) return emit_failure(input_eof);
+  if (restore_required) {
+    absl::StatusOr<DecodedSessionHandoff> decoded_restore =
+        DecodeSessionHandoffFrom(*restore_storage,
+                                 request.execution_plan.session_identity,
+                                 transient_restore_options);
+    if (!decoded_restore.ok()) {
+      return emit_failure(decoded_restore.status());
     }
   }
-  ABSL_ASSIGN_OR_RETURN(const std::string result_envelope,
-                        EncodeFreshWorkerResult(result, authentication));
+
+  const bool capture_requested =
+      request.execution_plan.capture_producing_capsule;
+  std::optional<UnlinkedTempByteFile> producing_storage;
+  if (capture_requested) {
+    absl::StatusOr<UnlinkedTempByteFile> producing_storage_or =
+        UnlinkedTempByteFile::Create();
+    if (!producing_storage_or.ok()) {
+      return emit_failure(producing_storage_or.status());
+    }
+    producing_storage.emplace(std::move(producing_storage_or).value());
+  }
+  const FreshWorkerExecutionContext context{
+      .request = request,
+      .restore_source = restore_required ? &*restore_storage : nullptr,
+      .restore_options =
+          restore_required ? &transient_restore_options : nullptr,
+      .producing_sink = capture_requested ? &*producing_storage : nullptr,
+      .producing_options =
+          capture_requested ? &transient_producing_options : nullptr};
+
+  absl::StatusOr<FreshWorkerDerivedExecution> execution = execute(context);
+  if (!execution.ok()) return emit_failure(execution.status());
+  if (execution->derived_exact_profile_hash != request.exact_profile_hash) {
+    return emit_failure(absl::FailedPreconditionError(
+        "Worker-derived ExactLiteRtProfile does not match the request."));
+  }
+  if (execution->replay_isolation !=
+      FreshWorkerReplayIsolation::kEmptyCatalogs) {
+    return emit_failure(absl::FailedPreconditionError(
+        "Exact worker did not attest catalog-free construction."));
+  }
+  if (restore_required) {
+    if (!execution->restored_checkpoint_id.has_value() ||
+        execution->restored_checkpoint_id !=
+            request.execution_plan.restore_checkpoint_id) {
+      return emit_failure(absl::FailedPreconditionError(
+          "Worker did not attest the requested restored checkpoint."));
+    }
+  } else if (execution->restored_checkpoint_id.has_value()) {
+    return emit_failure(absl::FailedPreconditionError(
+        "Full-prefill worker claimed a restored checkpoint."));
+  }
+  if (execution->exported_producing_capsule != capture_requested) {
+    return emit_failure(absl::FailedPreconditionError(
+        "Worker producing-capsule export disagrees with capture policy."));
+  }
+  const absl::Status output_status =
+      ValidateFreshWorkerExecutionOutput(execution->output);
+  if (!output_status.ok()) return emit_failure(output_status);
+
+  FreshWorkerResult result;
+  result.exact_profile_hash = request.exact_profile_hash;
+  result.qualification_id = request.qualification_id;
+  result.run_index = request.run_index;
+  result.run_count = request.run_count;
+  result.challenge_nonce = request.challenge_nonce;
+  result.request_envelope_hash = request_envelope_hash;
+  result.worker_instance_nonce = worker_nonce;
+  result.execution_plan_hash = request.execution_plan.plan_hash;
+  result.restored_checkpoint_id = execution->restored_checkpoint_id;
+  result.replay_isolation = execution->replay_isolation;
+  result.canonical_output = std::move(execution->output.canonical_output);
+  result.token_bytes = std::move(execution->output.token_bytes);
+  result.logit_frames = std::move(execution->output.logit_frames);
+
+  const ByteSource* producing_capsule = nullptr;
+  if (capture_requested) {
+    const absl::Status seal_status = producing_storage->Seal();
+    if (!seal_status.ok()) return emit_failure(seal_status);
+    if (producing_storage->Size() == 0) {
+      return emit_failure(absl::DataLossError(
+          "Worker claimed producing-capsule export without bytes."));
+    }
+    absl::StatusOr<DecodedSessionHandoff> decoded_producing =
+        DecodeSessionHandoffFrom(
+            *producing_storage, execution->producing_session_identity,
+            transient_producing_options);
+    if (!decoded_producing.ok()) {
+      return emit_failure(decoded_producing.status());
+    }
+    absl::StatusOr<Hash256> producing_hash_or =
+        HashCapsuleSource(*producing_storage);
+    if (!producing_hash_or.ok()) {
+      return emit_failure(producing_hash_or.status());
+    }
+    const Hash256 producing_hash = *producing_hash_or;
+    result.producing_capsule_evidence =
+        FreshWorkerProducingCapsuleEvidence{
+            .session_identity = execution->producing_session_identity,
+            .transient_envelope_size = producing_storage->Size(),
+            .transient_envelope_hash = producing_hash,
+            .output_evidence_hash = ComputeFreshWorkerOutputEvidenceHash(
+                result.canonical_output, result.token_bytes,
+                result.logit_frames)};
+    producing_capsule = &*producing_storage;
+  }
+  const absl::Status result_status =
+      ValidateFreshWorkerResultForRequest(result, request);
+  if (!result_status.ok()) return emit_failure(result_status);
+  absl::StatusOr<std::string> result_envelope =
+      EncodeFreshWorkerResult(result, authentication);
+  if (!result_envelope.ok()) return emit_failure(result_envelope.status());
+  input_fd.Reset();
   ABSL_RETURN_IF_ERROR(WriteIpcFrameBlocking(
-      STDOUT_FILENO, result_envelope, "fresh-worker result"));
-  return absl::OkStatus();
+      STDOUT_FILENO, *result_envelope, "fresh-worker result"));
+  return WriteCapsuleFrameBlocking(
+      STDOUT_FILENO, producing_capsule,
+      "fresh-worker producing capsule");
 #else
   return absl::UnimplementedError(
       "Fresh-worker process isolation is not implemented on this platform.");
 #endif
+}
+
+absl::Status RunFreshWorkerWithSessionHandoffOnce(
+    const FreshWorkerExecutionCallback& execute) {
+  return RunFreshWorkerOnce(execute);
 }
 
 absl::StatusOr<Hash256> GenerateFreshWorkerNonce() {

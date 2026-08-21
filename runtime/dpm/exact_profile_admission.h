@@ -101,10 +101,6 @@ struct ExactProfileAdmissionRecord {
 Hash256 ComputeExactProfileQualificationRequestHash(
     const ExactLiteRtProfile& derived_profile,
     const ExactProfileQualificationSpec& spec);
-Hash256 ComputeFreshWorkerOutputEvidenceHash(
-    absl::string_view canonical_output,
-    absl::string_view token_bytes,
-    const std::vector<FreshWorkerLogitFrameEvidence>& logit_frames);
 absl::StatusOr<Hash256> ComputeExactProfileAdmissionRecordId(
     const ExactProfileAdmissionRecord& record);
 absl::Status ValidateExactProfileAdmissionRecord(

@@ -45,8 +45,6 @@ constexpr uint64_t kAdmissionEnvelopeFixedBytes = 8 + 4 + 4 + 8 + 32;
 constexpr uint64_t kMaximumAdmissionKeyIdBytes = 256;
 constexpr absl::string_view kQualificationRequestDomain =
     "LITERT_LMX_EXACT_PROFILE_QUALIFICATION_REQUEST_SHA256_V2";
-constexpr absl::string_view kOutputEvidenceDomain =
-    "LITERT_LMX_FRESH_WORKER_OUTPUT_EVIDENCE_SHA256_V1";
 constexpr absl::string_view kAdmissionRecordDomain =
     "LITERT_LMX_EXACT_PROFILE_ADMISSION_RECORD_SHA256_V2";
 constexpr absl::string_view kAdmissionMacDomain =
@@ -103,11 +101,6 @@ void HashU64(uint64_t value, Sha256Hasher* hasher) {
 void HashValue(const Hash256& hash, Sha256Hasher* hasher) {
   hasher->Update(absl::string_view(
       reinterpret_cast<const char*>(hash.bytes.data()), hash.bytes.size()));
-}
-
-void HashFrame(absl::string_view bytes, Sha256Hasher* hasher) {
-  HashU64(bytes.size(), hasher);
-  hasher->Update(bytes);
 }
 
 Hash256 ComputeQualificationRequestHashFromDigest(
@@ -622,27 +615,6 @@ Hash256 ComputeExactProfileQualificationRequestHash(
       spec.canonical_request_payload.size());
 }
 
-Hash256 ComputeFreshWorkerOutputEvidenceHash(
-    absl::string_view canonical_output,
-    absl::string_view token_bytes,
-    const std::vector<FreshWorkerLogitFrameEvidence>& logit_frames) {
-  Sha256Hasher hasher;
-  hasher.Update(kOutputEvidenceDomain);
-  HashFrame(canonical_output, &hasher);
-  HashFrame(token_bytes, &hasher);
-  HashU32(static_cast<uint32_t>(logit_frames.size()), &hasher);
-  for (const FreshWorkerLogitFrameEvidence& frame : logit_frames) {
-    HashU32(static_cast<uint32_t>(frame.element_type), &hasher);
-    HashU32(frame.element_byte_width, &hasher);
-    HashU32(frame.batch_size, &hasher);
-    HashU32(frame.sequence_size, &hasher);
-    HashU32(frame.vocabulary_size, &hasher);
-    HashU64(frame.byte_count, &hasher);
-    HashValue(frame.sha256, &hasher);
-  }
-  return hasher.Finalize();
-}
-
 absl::StatusOr<Hash256> ComputeExactProfileAdmissionRecordId(
     const ExactProfileAdmissionRecord& record) {
   ABSL_RETURN_IF_ERROR(ValidateAdmissionRecordFields(record, false));
@@ -850,7 +822,8 @@ absl::StatusOr<ExactProfileAdmissionRecord> ExactProfileQualifier::Qualify(
             observation.request_envelope_hash ||
         observation.result.execution_plan_hash != execution_plan.plan_hash ||
         observation.result.restored_checkpoint_id.has_value() ||
-        observation.result.producing_capsule_evidence.has_value()) {
+        observation.result.producing_capsule_evidence.has_value() ||
+        observation.durable_producing_capsule_evidence.has_value()) {
       return absl::UnauthenticatedError(
           "Fresh-worker observation is not bound to its capsule-free "
           "qualification run.");

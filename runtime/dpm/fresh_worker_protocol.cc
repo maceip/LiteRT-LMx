@@ -153,24 +153,6 @@ void HashFrame(absl::string_view bytes, Sha256Hasher* hasher) {
   hasher->Update(bytes);
 }
 
-Hash256 ComputeResultOutputEvidenceHash(const FreshWorkerResult& result) {
-  Sha256Hasher hasher;
-  hasher.Update(kOutputEvidenceHashDomain);
-  HashFrame(result.canonical_output, &hasher);
-  HashFrame(result.token_bytes, &hasher);
-  HashU32(static_cast<uint32_t>(result.logit_frames.size()), &hasher);
-  for (const FreshWorkerLogitFrameEvidence& frame : result.logit_frames) {
-    HashU32(static_cast<uint32_t>(frame.element_type), &hasher);
-    HashU32(frame.element_byte_width, &hasher);
-    HashU32(frame.batch_size, &hasher);
-    HashU32(frame.sequence_size, &hasher);
-    HashU32(frame.vocabulary_size, &hasher);
-    HashU64(frame.byte_count, &hasher);
-    HashValue(frame.sha256, &hasher);
-  }
-  return hasher.Finalize();
-}
-
 absl::Status ValidateExecutionPlanFields(
     const FreshWorkerExecutionPlan& plan) {
   if (plan.format_version != kFreshWorkerExecutionPlanFormatVersion) {
@@ -832,6 +814,27 @@ absl::Status ValidateFreshWorkerExecutionOutput(
   return absl::OkStatus();
 }
 
+Hash256 ComputeFreshWorkerOutputEvidenceHash(
+    absl::string_view canonical_output,
+    absl::string_view token_bytes,
+    const std::vector<FreshWorkerLogitFrameEvidence>& logit_frames) {
+  Sha256Hasher hasher;
+  hasher.Update(kOutputEvidenceHashDomain);
+  HashFrame(canonical_output, &hasher);
+  HashFrame(token_bytes, &hasher);
+  HashU32(static_cast<uint32_t>(logit_frames.size()), &hasher);
+  for (const FreshWorkerLogitFrameEvidence& frame : logit_frames) {
+    HashU32(static_cast<uint32_t>(frame.element_type), &hasher);
+    HashU32(frame.element_byte_width, &hasher);
+    HashU32(frame.batch_size, &hasher);
+    HashU32(frame.sequence_size, &hasher);
+    HashU32(frame.vocabulary_size, &hasher);
+    HashU64(frame.byte_count, &hasher);
+    HashValue(frame.sha256, &hasher);
+  }
+  return hasher.Finalize();
+}
+
 absl::Status ValidateFreshWorkerLogitFrameEvidence(
     const FreshWorkerLogitFrameEvidence& frame) {
   ABSL_ASSIGN_OR_RETURN(
@@ -914,7 +917,9 @@ absl::Status ValidateFreshWorkerResult(const FreshWorkerResult& result) {
                                    .logit_frames = result.logit_frames}));
     if (result.producing_capsule_evidence.has_value() &&
         result.producing_capsule_evidence->output_evidence_hash !=
-            ComputeResultOutputEvidenceHash(result)) {
+            ComputeFreshWorkerOutputEvidenceHash(
+                result.canonical_output, result.token_bytes,
+                result.logit_frames)) {
       return absl::DataLossError(
           "Fresh-worker producing capsule is not bound to the returned "
           "output evidence.");
