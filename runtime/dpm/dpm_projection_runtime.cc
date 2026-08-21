@@ -76,6 +76,14 @@ bool IsValidUtf8(absl::string_view text) {
 absl::Status ValidateRequestedFeatures(const Engine& engine,
                                        const SessionConfig& config,
                                        uint32_t max_output_tokens) {
+#if defined(LITERT_LM_DEBUGGER_ENABLED)
+  // EngineAdvancedImpl installs graph-run debugger callbacks in this build.
+  // Projection reset rejects callback-bearing executors, so capability
+  // discovery must fail at the same boundary instead of claiming support and
+  // waiting for the first prefill to expose the mismatch.
+  return absl::UnimplementedError(
+      "DPM projection does not support debugger graph callbacks.");
+#endif
   switch (config.GetMemoryStrategy()) {
     case SessionConfig::MemoryStrategy::kStateful:
     case SessionConfig::MemoryStrategy::kStatelessDeterministicProjection:
