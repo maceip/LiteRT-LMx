@@ -159,7 +159,7 @@ enum class ExactRegenerationCaptureRunPolicy : uint32_t {
 // worker_certification_hash binds the parent-measured executable image and
 // launch contract. This compact record does not duplicate model output bytes.
 struct ExactRegenerationRunEvidence {
-  static constexpr uint32_t kFormatVersion = 3;
+  static constexpr uint32_t kFormatVersion = 4;
 
   uint32_t format_version = kFormatVersion;
   Hash256 evidence_id;
@@ -174,12 +174,18 @@ struct ExactRegenerationRunEvidence {
   Hash256 output_evidence_hash;
   std::optional<Hash256> restored_checkpoint_id;
   // Exact agent workers retain the runtime-derived physical prefill plan from
-  // their authenticated result. Projection workers carry neither this plan nor
-  // a restored-state witness. Restore workers retain their independently
-  // recomputed live-target witness; its envelope and witness IDs may differ
-  // across otherwise agreeing cold runs.
+  // their authenticated result. Projection workers carry neither this plan,
+  // a restored-state witness, nor restore provenance. Restore workers retain
+  // their independently recomputed live-target witness; its envelope and
+  // witness IDs may differ across otherwise agreeing cold runs.
   std::optional<DPMPreparedPrefillPlan> prepared_prefill_plan;
   std::optional<SessionContinuationStateWitness> restored_state_witness;
+  // Complete parent-computed provenance for the selected durable checkpoint
+  // rewrap. Present exactly for an own-position restore. Independent workers
+  // may have different transient destination envelopes, while the durable
+  // source endpoint and canonical continuation-state commitment must agree.
+  std::optional<SessionHandoffReauthenticationEvidence>
+      restore_reauthentication_evidence;
   std::optional<FreshWorkerProducingCapsuleEvidence>
       transient_producing_capsule_evidence;
   std::optional<FreshWorkerDurableProducingCapsuleEvidence>
@@ -197,7 +203,7 @@ absl::Status ValidateExactRegenerationRunEvidence(
 // profile, certified worker, complete logical request, physical work
 // selection, and every independently authenticated process observation.
 struct ExactRegenerationRequestEvidence {
-  static constexpr uint32_t kFormatVersion = 3;
+  static constexpr uint32_t kFormatVersion = 4;
 
   uint32_t format_version = kFormatVersion;
   Hash256 evidence_id;

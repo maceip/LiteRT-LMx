@@ -166,6 +166,12 @@ struct ExactRegenerationDPMAgentPhysicalExecution {
   std::optional<Hash256> restored_checkpoint_id;
   ExactRegenerationCaptureRunPolicy capture_run_policy =
       ExactRegenerationCaptureRunPolicy::kNoCapture;
+  // Run zero's validated durable-to-transient restore provenance. Present
+  // exactly for own-position delta execution so DPMEngine can bind the
+  // selected durable checkpoint to the live worker witness without treating
+  // a transient envelope hash as durable provenance.
+  std::optional<SessionHandoffReauthenticationEvidence>
+      run_zero_restore_reauthentication_evidence;
   std::optional<FreshWorkerProducingCapsuleEvidence>
       run_zero_transient_producing_capsule_evidence;
   std::optional<FreshWorkerDurableProducingCapsuleEvidence>

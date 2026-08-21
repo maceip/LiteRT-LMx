@@ -56,6 +56,15 @@ inline constexpr absl::string_view kFreshWorkerTransientRestoreKeyId =
 inline constexpr absl::string_view kFreshWorkerTransientProducingKeyId =
     "litert-lmx-fresh-worker-producing-v3";
 
+// Stable, evidence-bound purposes for the two parent-only capsule rewraps.
+// These labels are public protocol identifiers, not authentication material.
+inline constexpr absl::string_view
+    kFreshWorkerDurableRestoreToTransientReauthenticationPurpose =
+        "litert-lmx/fresh-worker/durable-restore-to-transient/v1";
+inline constexpr absl::string_view
+    kFreshWorkerTransientProducingToDurableReauthenticationPurpose =
+        "litert-lmx/fresh-worker/transient-producing-to-durable/v1";
+
 struct FreshWorkerProcessOptions {
   // Must be an absolute path to a regular executable. `arguments` excludes
   // argv[0]. No string is ever interpreted by a shell.
@@ -184,6 +193,10 @@ struct FreshWorkerDurableProducingCapsuleEvidence {
   uint64_t envelope_size = 0;
   Hash256 envelope_hash;
   Hash256 output_evidence_hash;
+  // Parent-computed provenance for the authenticated transient-to-durable
+  // rewrap. Its source endpoint is the worker's sealed producing capsule and
+  // its destination endpoint is exactly the durable envelope above.
+  SessionHandoffReauthenticationEvidence reauthentication_evidence;
 };
 
 struct FreshWorkerProcessObservation {
@@ -204,6 +217,13 @@ struct FreshWorkerProcessObservation {
   // the worker.
   Hash256 worker_certification_hash;
   Hash256 launch_spec_hash;
+
+  // Present only for a successful own-position restore. The parent
+  // authenticates the selected durable capsule and retains the complete
+  // durable-to-transient rewrap provenance before the transient envelope can
+  // enter the worker. Failed observations deliberately publish none.
+  std::optional<SessionHandoffReauthenticationEvidence>
+      restore_reauthentication_evidence;
 
   // Present only after a requested producing capsule has been authenticated,
   // rewrapped under the caller's durable parent-only key, and completely

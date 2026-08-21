@@ -602,7 +602,9 @@ bool DurableCapsuleEvidenceEqual(
          left.key_id == right.key_id &&
          left.envelope_size == right.envelope_size &&
          left.envelope_hash == right.envelope_hash &&
-         left.output_evidence_hash == right.output_evidence_hash;
+         left.output_evidence_hash == right.output_evidence_hash &&
+         left.reauthentication_evidence ==
+             right.reauthentication_evidence;
 }
 
 absl::StatusOr<DPMAgentReplayExecution> BuildExactAgentReplayExecution(
@@ -1381,6 +1383,24 @@ absl::Status ValidateExactRegenerationDPMAgentPhysicalExecution(
     return absl::DataLossError(
         "Exact agent physical execution changed its agreed prepared-prefill "
         "plan.");
+  }
+  if (execution.run_zero_restore_reauthentication_evidence.has_value() !=
+          run_zero.restore_reauthentication_evidence.has_value() ||
+      (execution.run_zero_restore_reauthentication_evidence.has_value() &&
+       *execution.run_zero_restore_reauthentication_evidence !=
+           *run_zero.restore_reauthentication_evidence)) {
+    return absl::DataLossError(
+        "Exact agent physical execution changed run-zero restore "
+        "reauthentication provenance.");
+  }
+  const bool restored =
+      execution.prefill_mode ==
+      FreshWorkerPrefillMode::kOwnPositionCapsuleDelta;
+  if (execution.run_zero_restore_reauthentication_evidence.has_value() !=
+      restored) {
+    return absl::DataLossError(
+        "Exact agent physical execution restore provenance disagrees with "
+        "its prefill mode.");
   }
   if (execution.run_zero_transient_producing_capsule_evidence.has_value() !=
           run_zero.transient_producing_capsule_evidence.has_value() ||
@@ -2320,6 +2340,8 @@ ExactRegenerationDPMAgentRuntime::GeneratePhysicalExact(
       .restored_checkpoint_id =
           exact.request_evidence.restored_checkpoint_id,
       .capture_run_policy = exact.request_evidence.capture_run_policy,
+      .run_zero_restore_reauthentication_evidence =
+          run_zero.restore_reauthentication_evidence,
       .run_zero_transient_producing_capsule_evidence =
           run_zero.transient_producing_capsule_evidence,
       .durable_producing_capsule_evidence =

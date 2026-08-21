@@ -1824,21 +1824,27 @@ FreshWorkerProcessRunner::RunWithSessionHandoff(
 
   ABSL_ASSIGN_OR_RETURN(UnlinkedTempByteFile transient_restore,
                         UnlinkedTempByteFile::Create());
+  std::optional<Hash256> durable_restore_hash;
+  std::optional<SessionHandoffReauthenticationEvidence>
+      restore_reauthentication_evidence;
   if (restore_required) {
     ABSL_ASSIGN_OR_RETURN(
-        const Hash256 durable_restore_hash,
+        durable_restore_hash,
         HashCapsuleSource(*transfer.durable_restore_source));
-    if (durable_restore_hash !=
+    if (*durable_restore_hash !=
         request.execution_plan.restore_durable_envelope_hash) {
       return absl::DataLossError(
           "Durable restore capsule hash differs from its execution-plan "
           "binding.");
     }
-    ABSL_RETURN_IF_ERROR(ReauthenticateSessionHandoffTo(
-        *transfer.durable_restore_source,
-        request.execution_plan.session_identity,
-        *transfer.durable_restore_options, transient_restore_options,
-        &transient_restore));
+    ABSL_ASSIGN_OR_RETURN(
+        restore_reauthentication_evidence,
+        ReauthenticateSessionHandoffToWithEvidence(
+            *transfer.durable_restore_source,
+            request.execution_plan.session_identity,
+            *transfer.durable_restore_options, transient_restore_options,
+            kFreshWorkerDurableRestoreToTransientReauthenticationPurpose,
+            &transient_restore));
   }
   ABSL_RETURN_IF_ERROR(transient_restore.Seal());
   if (restore_required && transient_restore.Size() == 0) {
@@ -1849,6 +1855,33 @@ FreshWorkerProcessRunner::RunWithSessionHandoff(
   if (restore_required) {
     ABSL_ASSIGN_OR_RETURN(transient_restore_hash,
                           HashCapsuleSource(transient_restore));
+    ABSL_RETURN_IF_ERROR(ValidateSessionHandoffReauthenticationEvidence(
+        *restore_reauthentication_evidence));
+    const SessionHandoffReauthenticationEvidence& reauthentication =
+        *restore_reauthentication_evidence;
+    if (reauthentication.session_identity !=
+            request.execution_plan.session_identity ||
+        reauthentication.purpose !=
+            kFreshWorkerDurableRestoreToTransientReauthenticationPurpose ||
+        reauthentication.source_envelope_hash !=
+            request.execution_plan.restore_durable_envelope_hash ||
+        reauthentication.source_envelope_hash != *durable_restore_hash ||
+        reauthentication.source_envelope_size !=
+            request.execution_plan.restore_durable_envelope_size ||
+        reauthentication.source_envelope_size !=
+            transfer.durable_restore_source->Size() ||
+        reauthentication.source_key_id !=
+            transfer.durable_restore_options->key_id ||
+        reauthentication.destination_envelope_hash !=
+            *transient_restore_hash ||
+        reauthentication.destination_envelope_size !=
+            transient_restore.Size() ||
+        reauthentication.destination_key_id !=
+            transient_restore_options.key_id) {
+      return absl::DataLossError(
+          "Restore reauthentication evidence does not bind the selected "
+          "durable capsule and exact transient worker envelope.");
+    }
   }
 
   // Allocate response storage before spawning when capture is requested so
@@ -1961,6 +1994,9 @@ FreshWorkerProcessRunner::RunWithSessionHandoff(
   std::optional<FreshWorkerDurableProducingCapsuleEvidence>
       durable_capsule_evidence;
   if (result.status_code != absl::StatusCode::kOk) {
+    // Failed executions do not publish success-path capsule provenance even
+    // when a restore rewrap necessarily occurred before worker launch.
+    restore_reauthentication_evidence.reset();
     if (transient_producing_size != 0) {
       return absl::DataLossError(
           "Failed fresh worker emitted a producing capsule.");
@@ -1984,6 +2020,20 @@ FreshWorkerProcessRunner::RunWithSessionHandoff(
           "Producing capsule size differs from authenticated result "
           "evidence.");
     }
+    const SessionContinuationStateWitness& producing_witness =
+        transient_evidence.producer_first_export;
+    if (transient_evidence.producer_second_export != producing_witness ||
+        transient_evidence.fresh_import_target != producing_witness ||
+        producing_witness.session_identity !=
+            transient_evidence.session_identity ||
+        producing_witness.envelope_size != transient_producing_size ||
+        producing_witness.envelope_hash !=
+            transient_evidence.transient_envelope_hash ||
+        producing_witness.key_id != transient_producing_options.key_id) {
+      return absl::DataLossError(
+          "Producing continuation witnesses do not bind the exact "
+          "transient capsule source endpoint.");
+    }
     ABSL_ASSIGN_OR_RETURN(const Hash256 transient_hash,
                           HashCapsuleSource(*transient_producing));
     if (transient_hash != transient_evidence.transient_envelope_hash) {
@@ -2000,21 +2050,52 @@ FreshWorkerProcessRunner::RunWithSessionHandoff(
 
     BoundedHashingByteSink durable_sink(
         transfer.durable_capture_destination);
-    ABSL_RETURN_IF_ERROR(ReauthenticateSessionHandoffTo(
-        *transient_producing, transient_evidence.session_identity,
-        transient_producing_options, *transfer.durable_capture_options,
-        &durable_sink));
+    ABSL_ASSIGN_OR_RETURN(
+        SessionHandoffReauthenticationEvidence capture_reauthentication,
+        ReauthenticateSessionHandoffToWithEvidence(
+            *transient_producing, transient_evidence.session_identity,
+            transient_producing_options,
+            *transfer.durable_capture_options,
+            kFreshWorkerTransientProducingToDurableReauthenticationPurpose,
+            &durable_sink));
     if (durable_sink.Size() == 0) {
       return absl::DataLossError(
           "Durable producing-capsule rewrap produced no bytes.");
+    }
+    const Hash256 durable_hash = durable_sink.Finalize();
+    ABSL_RETURN_IF_ERROR(ValidateSessionHandoffReauthenticationEvidence(
+        capture_reauthentication));
+    if (capture_reauthentication.session_identity !=
+            transient_evidence.session_identity ||
+        capture_reauthentication.purpose !=
+            kFreshWorkerTransientProducingToDurableReauthenticationPurpose ||
+        capture_reauthentication.source_envelope_hash != transient_hash ||
+        capture_reauthentication.source_envelope_hash !=
+            transient_evidence.transient_envelope_hash ||
+        capture_reauthentication.source_envelope_size !=
+            transient_producing_size ||
+        capture_reauthentication.source_envelope_size !=
+            transient_evidence.transient_envelope_size ||
+        capture_reauthentication.source_key_id !=
+            transient_producing_options.key_id ||
+        capture_reauthentication.destination_envelope_hash != durable_hash ||
+        capture_reauthentication.destination_envelope_size !=
+            durable_sink.Size() ||
+        capture_reauthentication.destination_key_id !=
+            transfer.durable_capture_options->key_id) {
+      return absl::DataLossError(
+          "Producing-capsule reauthentication evidence does not bind the "
+          "worker transient source and exact durable destination.");
     }
     durable_capsule_evidence =
         FreshWorkerDurableProducingCapsuleEvidence{
             .session_identity = transient_evidence.session_identity,
             .key_id = transfer.durable_capture_options->key_id,
             .envelope_size = durable_sink.Size(),
-            .envelope_hash = durable_sink.Finalize(),
-            .output_evidence_hash = transient_evidence.output_evidence_hash};
+            .envelope_hash = durable_hash,
+            .output_evidence_hash = transient_evidence.output_evidence_hash,
+            .reauthentication_evidence =
+                std::move(capture_reauthentication)};
   } else if (transient_producing_size != 0) {
     return absl::DataLossError(
         "Fresh worker emitted an unrequested producing capsule.");
@@ -2028,6 +2109,8 @@ FreshWorkerProcessRunner::RunWithSessionHandoff(
       .worker_certification_hash = certification_.certification_hash(),
       .launch_spec_hash = ComputeFreshWorkerLaunchSpecHash(
           certification_.certification_hash()),
+      .restore_reauthentication_evidence =
+          std::move(restore_reauthentication_evidence),
       .durable_producing_capsule_evidence =
           std::move(durable_capsule_evidence)};
 #else

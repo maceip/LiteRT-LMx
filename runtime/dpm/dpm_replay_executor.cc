@@ -45,9 +45,9 @@ constexpr std::array<char, 8> kCanonicalRequestMagic = {'D', 'P', 'M', 'R',
 constexpr uint64_t kMaximumEvidenceKeyIdBytes = 256;
 constexpr uint64_t kMaximumEvidenceAuthenticationKeyBytes = 4096;
 constexpr absl::string_view kExactRegenerationRunEvidenceDomain =
-    "LITERT_LMX_EXACT_REGENERATION_RUN_EVIDENCE_SHA256_V3";
+    "LITERT_LMX_EXACT_REGENERATION_RUN_EVIDENCE_SHA256_V4";
 constexpr absl::string_view kExactRegenerationRequestEvidenceDomain =
-    "LITERT_LMX_EXACT_REGENERATION_REQUEST_EVIDENCE_SHA256_V3";
+    "LITERT_LMX_EXACT_REGENERATION_REQUEST_EVIDENCE_SHA256_V4";
 
 bool IsZeroHash(const Hash256& hash) {
   uint8_t combined = 0;
@@ -115,6 +115,24 @@ void AppendContinuationWitness(
   AppendHash(witness.envelope_hash, output);
   AppendU64(witness.envelope_size, output);
   AppendString(witness.key_id, output);
+}
+
+void AppendReauthenticationEvidence(
+    const SessionHandoffReauthenticationEvidence& evidence,
+    std::string* output) {
+  AppendU32(evidence.format_version, output);
+  AppendHash(evidence.evidence_id, output);
+  AppendIdentity(evidence.session_identity, output);
+  AppendHash(evidence.canonical_continuation_state_hash, output);
+  AppendHash(evidence.source_envelope_hash, output);
+  AppendU64(evidence.source_envelope_size, output);
+  AppendString(evidence.source_key_id, output);
+  AppendHash(evidence.destination_envelope_hash, output);
+  AppendU64(evidence.destination_envelope_size, output);
+  AppendString(evidence.destination_key_id, output);
+  AppendHash(evidence.capsule_codec_contract_hash, output);
+  AppendHash(evidence.reauthentication_contract_hash, output);
+  AppendString(evidence.purpose, output);
 }
 
 absl::Status ValidateEvidenceKeyId(absl::string_view key_id) {
@@ -193,6 +211,43 @@ absl::Status ValidateDurableCapsuleEvidence(
     return absl::InvalidArgumentError(
         "Exact-regeneration durable capsule evidence is incomplete.");
   }
+  ABSL_RETURN_IF_ERROR(ValidateSessionHandoffReauthenticationEvidence(
+      evidence.reauthentication_evidence));
+  const SessionHandoffReauthenticationEvidence& reauthentication =
+      evidence.reauthentication_evidence;
+  if (reauthentication.session_identity != evidence.session_identity ||
+      reauthentication.purpose !=
+          kFreshWorkerTransientProducingToDurableReauthenticationPurpose ||
+      reauthentication.source_key_id !=
+          kFreshWorkerTransientProducingKeyId ||
+      reauthentication.destination_envelope_hash != evidence.envelope_hash ||
+      reauthentication.destination_envelope_size != evidence.envelope_size ||
+      reauthentication.destination_key_id != evidence.key_id) {
+    return absl::DataLossError(
+        "Exact-regeneration durable capsule evidence is not bound to its "
+        "authenticated transient-to-durable rewrap.");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateProducingCapsuleEvidencePair(
+    const FreshWorkerProducingCapsuleEvidence& transient,
+    const FreshWorkerDurableProducingCapsuleEvidence& durable) {
+  ABSL_RETURN_IF_ERROR(ValidateTransientCapsuleEvidence(transient));
+  ABSL_RETURN_IF_ERROR(ValidateDurableCapsuleEvidence(durable));
+  const SessionHandoffReauthenticationEvidence& reauthentication =
+      durable.reauthentication_evidence;
+  if (transient.session_identity != durable.session_identity ||
+      transient.output_evidence_hash != durable.output_evidence_hash ||
+      reauthentication.source_envelope_hash !=
+          transient.transient_envelope_hash ||
+      reauthentication.source_envelope_size !=
+          transient.transient_envelope_size ||
+      reauthentication.session_identity != transient.session_identity) {
+    return absl::DataLossError(
+        "Exact-regeneration transient capsule, durable capsule, and "
+        "reauthentication evidence disagree.");
+  }
   return absl::OkStatus();
 }
 
@@ -216,6 +271,7 @@ void AppendDurableCapsuleEvidence(
   AppendU64(evidence.envelope_size, output);
   AppendHash(evidence.envelope_hash, output);
   AppendHash(evidence.output_evidence_hash, output);
+  AppendReauthenticationEvidence(evidence.reauthentication_evidence, output);
 }
 
 std::string EncodeExactRegenerationRunEvidenceFields(
@@ -242,6 +298,12 @@ std::string EncodeExactRegenerationRunEvidenceFields(
   AppendU32(evidence.restored_state_witness.has_value() ? 1 : 0, &encoded);
   if (evidence.restored_state_witness.has_value()) {
     AppendContinuationWitness(*evidence.restored_state_witness, &encoded);
+  }
+  AppendU32(evidence.restore_reauthentication_evidence.has_value() ? 1 : 0,
+            &encoded);
+  if (evidence.restore_reauthentication_evidence.has_value()) {
+    AppendReauthenticationEvidence(
+        *evidence.restore_reauthentication_evidence, &encoded);
   }
   AppendU32(evidence.transient_producing_capsule_evidence.has_value() ? 1 : 0,
             &encoded);
@@ -291,9 +353,14 @@ absl::Status ValidateExactRegenerationRunEvidenceFields(
     ABSL_RETURN_IF_ERROR(ValidateSessionContinuationStateWitness(
         *evidence.restored_state_witness));
   }
+  if (evidence.restore_reauthentication_evidence.has_value()) {
+    ABSL_RETURN_IF_ERROR(ValidateSessionHandoffReauthenticationEvidence(
+        *evidence.restore_reauthentication_evidence));
+  }
   if (!evidence.prepared_prefill_plan.has_value()) {
     if (evidence.restored_checkpoint_id.has_value() ||
-        evidence.restored_state_witness.has_value()) {
+        evidence.restored_state_witness.has_value() ||
+        evidence.restore_reauthentication_evidence.has_value()) {
       return absl::InvalidArgumentError(
           "Exact-regeneration run without a prepared plan cannot claim a "
           "restore.");
@@ -303,7 +370,8 @@ absl::Status ValidateExactRegenerationRunEvidenceFields(
     switch (plan.start_kind) {
       case DPMPreparedPrefillStartKind::kFreshSession:
         if (evidence.restored_checkpoint_id.has_value() ||
-            evidence.restored_state_witness.has_value()) {
+            evidence.restored_state_witness.has_value() ||
+            evidence.restore_reauthentication_evidence.has_value()) {
           return absl::DataLossError(
               "Fresh exact-regeneration run carries restored-state evidence.");
         }
@@ -311,6 +379,7 @@ absl::Status ValidateExactRegenerationRunEvidenceFields(
       case DPMPreparedPrefillStartKind::kOwnPositionRestore: {
         if (!evidence.restored_checkpoint_id.has_value() ||
             !evidence.restored_state_witness.has_value() ||
+            !evidence.restore_reauthentication_evidence.has_value() ||
             plan.restore_checkpoint_id != evidence.restored_checkpoint_id ||
             plan.start_state_witness_id !=
                 evidence.restored_state_witness->witness_id ||
@@ -327,10 +396,23 @@ absl::Status ValidateExactRegenerationRunEvidenceFields(
                 plan.start_step ||
             evidence.restored_state_witness
                     ->processed_history_token_bytes_hash !=
-                plan.start_history_token_bytes_hash) {
+                plan.start_history_token_bytes_hash ||
+            evidence.restore_reauthentication_evidence->session_identity !=
+                plan.session_identity ||
+            evidence.restore_reauthentication_evidence->purpose !=
+                kFreshWorkerDurableRestoreToTransientReauthenticationPurpose ||
+            evidence.restore_reauthentication_evidence
+                    ->destination_envelope_hash !=
+                evidence.restored_state_witness->envelope_hash ||
+            evidence.restore_reauthentication_evidence
+                    ->destination_envelope_size !=
+                evidence.restored_state_witness->envelope_size ||
+            evidence.restore_reauthentication_evidence
+                    ->destination_key_id !=
+                evidence.restored_state_witness->key_id) {
           return absl::DataLossError(
               "Restored exact-regeneration run has inconsistent checkpoint, "
-              "prepared-plan, or live witness evidence.");
+              "prepared-plan, live witness, or rewrap evidence.");
         }
         break;
       }
@@ -350,8 +432,8 @@ absl::Status ValidateExactRegenerationRunEvidenceFields(
         *evidence.transient_producing_capsule_evidence;
     const FreshWorkerDurableProducingCapsuleEvidence& durable =
         *evidence.durable_producing_capsule_evidence;
-    ABSL_RETURN_IF_ERROR(ValidateTransientCapsuleEvidence(transient));
-    ABSL_RETURN_IF_ERROR(ValidateDurableCapsuleEvidence(durable));
+    ABSL_RETURN_IF_ERROR(
+        ValidateProducingCapsuleEvidencePair(transient, durable));
     if (!evidence.prepared_prefill_plan.has_value() ||
         transient.session_identity !=
             evidence.prepared_prefill_plan->session_identity ||
@@ -494,6 +576,8 @@ absl::Status ValidateExactRegenerationRequestEvidenceFields(
   std::set<Hash256> result_envelopes;
   std::set<Hash256> run_evidence_ids;
   Hash256 common_launch_spec_hash;
+  std::optional<SessionHandoffReauthenticationEvidence>
+      common_restore_reauthentication;
   for (uint32_t index = 0; index < evidence.run_count; ++index) {
     const ExactRegenerationRunEvidence& run = evidence.runs[index];
     ABSL_RETURN_IF_ERROR(ValidateExactRegenerationRunEvidence(run));
@@ -508,7 +592,8 @@ absl::Status ValidateExactRegenerationRequestEvidenceFields(
     }
     if (evidence.stage == DPMReplayStage::kProjection) {
       if (run.prepared_prefill_plan.has_value() ||
-          run.restored_state_witness.has_value()) {
+          run.restored_state_witness.has_value() ||
+          run.restore_reauthentication_evidence.has_value()) {
         return absl::DataLossError(
             "Projection exact-regeneration run carries agent prefill state.");
       }
@@ -535,7 +620,8 @@ absl::Status ValidateExactRegenerationRequestEvidenceFields(
           FreshWorkerPrefillMode::kFullCanonicalPrefill) {
         if (plan.start_kind !=
                 DPMPreparedPrefillStartKind::kFreshSession ||
-            run.restored_state_witness.has_value()) {
+            run.restored_state_witness.has_value() ||
+            run.restore_reauthentication_evidence.has_value()) {
           return absl::DataLossError(
               "Full-prefill exact agent run did not start from a fresh "
               "session.");
@@ -543,11 +629,42 @@ absl::Status ValidateExactRegenerationRequestEvidenceFields(
       } else if (plan.start_kind !=
                      DPMPreparedPrefillStartKind::kOwnPositionRestore ||
                  !run.restored_state_witness.has_value() ||
+                 !run.restore_reauthentication_evidence.has_value() ||
                  plan.restore_checkpoint_id !=
                      evidence.restored_checkpoint_id) {
         return absl::DataLossError(
             "Delta exact agent run lacks its checkpoint-bound decoded live "
             "witness.");
+      }
+    }
+    if (evidence.prefill_mode ==
+        FreshWorkerPrefillMode::kOwnPositionCapsuleDelta) {
+      const SessionHandoffReauthenticationEvidence& reauthentication =
+          *run.restore_reauthentication_evidence;
+      if (index == 0) {
+        common_restore_reauthentication = reauthentication;
+      } else if (reauthentication.session_identity !=
+                     common_restore_reauthentication->session_identity ||
+                 reauthentication.canonical_continuation_state_hash !=
+                     common_restore_reauthentication
+                         ->canonical_continuation_state_hash ||
+                 reauthentication.source_envelope_hash !=
+                     common_restore_reauthentication->source_envelope_hash ||
+                 reauthentication.source_envelope_size !=
+                     common_restore_reauthentication->source_envelope_size ||
+                 reauthentication.source_key_id !=
+                     common_restore_reauthentication->source_key_id ||
+                 reauthentication.capsule_codec_contract_hash !=
+                     common_restore_reauthentication
+                         ->capsule_codec_contract_hash ||
+                 reauthentication.reauthentication_contract_hash !=
+                     common_restore_reauthentication
+                         ->reauthentication_contract_hash ||
+                 reauthentication.purpose !=
+                     common_restore_reauthentication->purpose) {
+        return absl::FailedPreconditionError(
+            "Independent restore workers disagree on the durable source or "
+            "canonical continuation-state commitment.");
       }
     }
     if (!process_ids.insert(run.process_id).second ||
@@ -1381,6 +1498,11 @@ ExactRegenerationExecutor::RunWithExecutionInput(
       input.execution_plan.prefill_mode ==
           FreshWorkerPrefillMode::kOwnPositionCapsuleDelta ||
       input.execution_plan.capture_producing_capsule;
+  if (request.stage == DPMReplayStage::kProjection && transfers_capsule) {
+    return absl::InvalidArgumentError(
+        "Projection exact regeneration cannot restore or capture a session "
+        "capsule.");
+  }
   if (transfers_capsule && capsule_restore_admission == nullptr) {
     return absl::FailedPreconditionError(
         "Exact capsule restore/capture requires authenticated "
@@ -1481,6 +1603,15 @@ ExactRegenerationExecutor::RunWithExecutionInput(
       return absl::Status(observation.result.status_code,
                           observation.result.status_message);
     }
+    const bool restore_this_run =
+        input.execution_plan.prefill_mode ==
+        FreshWorkerPrefillMode::kOwnPositionCapsuleDelta;
+    if (observation.restore_reauthentication_evidence.has_value() !=
+        restore_this_run) {
+      return absl::DataLossError(
+          "Physical exact execution omitted or invented restore "
+          "reauthentication provenance.");
+    }
     if (observation.result.exact_profile_hash != profile_before.profile_id ||
         observation.worker_certification_hash !=
             worker_certification_hash ||
@@ -1562,6 +1693,32 @@ ExactRegenerationExecutor::RunWithExecutionInput(
           return absl::DataLossError(
               "Delta exact agent plan and independently recomputed live "
               "restore witness disagree.");
+        }
+        const SessionHandoffReauthenticationEvidence& reauthentication =
+            *observation.restore_reauthentication_evidence;
+        ABSL_RETURN_IF_ERROR(
+            ValidateSessionHandoffReauthenticationEvidence(
+                reauthentication));
+        if (reauthentication.session_identity !=
+                profile_before.session_identity ||
+            reauthentication.purpose !=
+                kFreshWorkerDurableRestoreToTransientReauthenticationPurpose ||
+            reauthentication.source_envelope_hash !=
+                input.execution_plan.restore_durable_envelope_hash ||
+            reauthentication.source_envelope_size !=
+                input.execution_plan.restore_durable_envelope_size ||
+            reauthentication.source_envelope_size !=
+                input.durable_restore_source->Size() ||
+            reauthentication.source_key_id !=
+                input.durable_restore_options->key_id ||
+            reauthentication.destination_envelope_hash !=
+                restored_witness.envelope_hash ||
+            reauthentication.destination_envelope_size !=
+                restored_witness.envelope_size ||
+            reauthentication.destination_key_id != restored_witness.key_id) {
+          return absl::DataLossError(
+              "Delta exact agent restore provenance does not bind the "
+              "selected durable input to the live transient witness.");
         }
       }
 
@@ -1649,8 +1806,8 @@ ExactRegenerationExecutor::RunWithExecutionInput(
           *observation.result.producing_capsule_evidence;
       const FreshWorkerDurableProducingCapsuleEvidence& durable =
           *observation.durable_producing_capsule_evidence;
-      ABSL_RETURN_IF_ERROR(ValidateTransientCapsuleEvidence(transient));
-      ABSL_RETURN_IF_ERROR(ValidateDurableCapsuleEvidence(durable));
+      ABSL_RETURN_IF_ERROR(
+          ValidateProducingCapsuleEvidencePair(transient, durable));
       if (transient.session_identity != profile_before.session_identity ||
           durable.session_identity != profile_before.session_identity ||
           transient.output_evidence_hash != output_hash ||
@@ -1680,6 +1837,8 @@ ExactRegenerationExecutor::RunWithExecutionInput(
             observation.result.restored_checkpoint_id,
         .prepared_prefill_plan = observation.result.prepared_prefill_plan,
         .restored_state_witness = observation.result.restored_state_witness,
+        .restore_reauthentication_evidence =
+            observation.restore_reauthentication_evidence,
         .transient_producing_capsule_evidence =
             observation.result.producing_capsule_evidence,
         .durable_producing_capsule_evidence =
