@@ -53,9 +53,12 @@ enum class CapsulePrefillModeV2 : uint32_t {
   kOwnPositionCapsuleDelta = 2,
 };
 
-// A root capture starts from a genuinely fresh session. A verified-parent
-// capture starts only after the complete parent restore evidence below has been
-// validated against its source capture. No third/off-position basis exists.
+// A root capture starts from a genuinely fresh session and fully prefills the
+// current correction epoch. Its raw-log interval therefore need not begin at
+// event zero; a higher-level authority check must bind a nonzero start to the
+// most recent correction boundary. A verified-parent capture starts only after
+// the complete parent restore evidence below has been validated against its
+// source capture. No third/off-position basis exists.
 enum class CapsuleCaptureBasisV2 : uint32_t {
   kRootFreshSession = 1,
   kVerifiedParentRestore = 2,
@@ -207,7 +210,10 @@ struct CapsulePrefillPlanV2 {
 };
 
 // Content-addressed plan for publishing one descendant checkpoint. A root plan
-// contains a full prefill and no parent references. A verified-parent plan
+// contains a fresh-session full prefill of the nonempty current correction
+// epoch and no parent references. Its event range ends at
+// `checkpoint_state.source_event_count`, but may start after event zero when
+// the authoritative log has a correction boundary. A verified-parent plan
 // contains an own-position delta and names the exact restore evidence that put
 // the producer at `prefill.start_step`. The new checkpoint ID is intentionally
 // absent because it depends on the envelope produced by this plan.

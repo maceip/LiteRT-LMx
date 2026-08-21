@@ -831,11 +831,11 @@ absl::Status ValidateCapturePlanFields(const CapsuleCapturePlanV2& plan,
     case CapsuleCaptureBasisV2::kRootFreshSession:
       if (plan.prefill.mode !=
               CapsulePrefillModeV2::kFullCanonicalPrefill ||
-          plan.prefill.event_range_start != 0 ||
           plan.prefill.start_step != 0 || has_parent_checkpoint) {
         return absl::FailedPreconditionError(
-            "A root capsule capture requires event-zero fresh-session full "
-            "prefill and must not name parent restore evidence.");
+            "A root capsule capture requires a fresh-session full prefill of "
+            "the current correction epoch and must not name parent restore "
+            "evidence.");
       }
       break;
     case CapsuleCaptureBasisV2::kVerifiedParentRestore:
@@ -1403,6 +1403,7 @@ Hash256 GetCapsuleRestoreCaptureEvidenceV2ContractHash() {
   AppendU64(kMaximumCapsuleEvidenceEnvelopeBytes, &canonical);
   AppendU32(kMaximumCapsuleEvidenceTokenIds, &canonical);
   append_frame("ROOT_OR_VERIFIED_PARENT_CAPTURE");
+  append_frame("ROOT_FULL_PREFILL_CURRENT_CORRECTION_EPOCH");
   append_frame("COMPLETE_RUNTIME_PREPARED_PREFILL_PLAN");
   append_frame("PRODUCER_BEFORE_AFTER_AND_FRESH_IMPORT_EQUALITY");
   append_frame("EDGE_VALIDATED_RECURSIVE_ANCESTRY");
@@ -1568,6 +1569,7 @@ Hash256 GetCapsuleRestoreCaptureEvidenceV3ContractHash() {
       kFreshWorkerTransientProducingToDurableReauthenticationPurpose);
   append_frame(kFreshWorkerTransientProducingKeyId);
   append_frame("V2_LOGICAL_AND_RUNTIME_PREPARED_CAPTURE_PLAN");
+  append_frame("ROOT_FULL_PREFILL_CURRENT_CORRECTION_EPOCH");
   append_frame("THREE_EQUAL_TRANSIENT_PRODUCER_WITNESSES");
   append_frame("EXACT_TRANSIENT_SOURCE_TO_DURABLE_DESTINATION_ENDPOINTS");
   append_frame("REWRAP_INVARIANT_COMPLETE_CONTINUATION_STATE");
