@@ -90,7 +90,9 @@ class SessionAdvanced : public SessionInterface {
       std::optional<BenchmarkInfo> benchmark_info,
       std::atomic<int>* living_sessions_count = nullptr,
       std::optional<SessionHandoffIdentity> session_handoff_identity =
-          std::nullopt);
+          std::nullopt,
+      std::optional<ExactLiteRtLogitsFrameContract>
+          exact_litert_logits_frame_contract = std::nullopt);
 
   // Destroys the SessionAdvanced object. It will wait for all tasks to be
   // done and release the session from the execution manager.
@@ -152,6 +154,9 @@ class SessionAdvanced : public SessionInterface {
 
   absl::StatusOr<Responses> RunDecode(
       const DecodeConfig& decode_config) override;
+
+  absl::StatusOr<ExactLiteRtDecodeResult> RunExactDecode(
+      int max_output_tokens) override;
 
   absl::StatusOr<std::unique_ptr<TaskController>> RunDecodeAsync(
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) override
@@ -274,7 +279,10 @@ class SessionAdvanced : public SessionInterface {
                            absl::flat_hash_set<TaskId> last_task_ids = {},
                            std::atomic<int>* living_sessions_count = nullptr,
                            std::optional<SessionHandoffIdentity>
-                               session_handoff_identity = std::nullopt)
+                               session_handoff_identity = std::nullopt,
+                           std::optional<ExactLiteRtLogitsFrameContract>
+                               exact_litert_logits_frame_contract =
+                                   std::nullopt)
       : session_id_(session_id),
         execution_manager_(execution_manager),
         tokenizer_(tokenizer),
@@ -282,7 +290,9 @@ class SessionAdvanced : public SessionInterface {
         session_state_(session_state),
         last_task_ids_(last_task_ids),
         living_sessions_count_(living_sessions_count),
-        session_handoff_identity_(std::move(session_handoff_identity)) {
+        session_handoff_identity_(std::move(session_handoff_identity)),
+        exact_litert_logits_frame_contract_(
+            std::move(exact_litert_logits_frame_contract)) {
     if (living_sessions_count_) {
       (*living_sessions_count_)++;
     }
@@ -292,6 +302,16 @@ class SessionAdvanced : public SessionInterface {
   absl::StatusOr<std::unique_ptr<SessionInterface>> CloneAsyncLocked(
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  absl::StatusOr<Responses> RunDecodeBlockingInternal(
+      const DecodeConfig& decode_config,
+      std::shared_ptr<ExactLiteRtDecodeCapture> exact_litert_decode_capture);
+
+  absl::StatusOr<std::unique_ptr<TaskController>> RunDecodeAsyncInternal(
+      absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback,
+      const DecodeConfig& decode_config,
+      std::shared_ptr<ExactLiteRtDecodeCapture> exact_litert_decode_capture)
+      ABSL_LOCKS_EXCLUDED(mutex_);
 
   // The session ID used for the session.
   SessionId session_id_;
@@ -331,6 +351,11 @@ class SessionAdvanced : public SessionInterface {
   // session's fully-resolved configuration. Sessions created through legacy
   // engines leave this absent and fail closed for handoff.
   const std::optional<SessionHandoffIdentity> session_handoff_identity_;
+
+  // Engine-owned contract measured from the loaded compiled logits buffer at
+  // Engine creation. Callers cannot provide or override this value.
+  const std::optional<ExactLiteRtLogitsFrameContract>
+      exact_litert_logits_frame_contract_;
 };
 
 }  // namespace litert::lm

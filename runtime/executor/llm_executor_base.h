@@ -33,6 +33,7 @@
 #include "runtime/executor/llm_executor_settings.h"
 #include "runtime/executor/session_handoff_runtime.h"
 #include "runtime/executor/state_interface.h"
+#include "runtime/engine/exact_litert_profile.h"
 #include "runtime/util/byte_stream.h"
 
 namespace litert::lm {
@@ -271,6 +272,17 @@ class LlmExecutorBase {
   GetSessionHandoffRuntimeProfile() const {
     return absl::UnimplementedError(absl::StrCat(
         "Loaded runtime identity is not implemented for backend: ",
+        ExecutorBackendName()));
+  }
+
+  // Returns only the immutable packed decode-logits contract measured from
+  // the loaded executor. This is intentionally independent of session-capsule
+  // support and exact-profile admission so a cold worker can collect evidence
+  // without pretending it can export or restore execution state.
+  virtual absl::StatusOr<ExactLiteRtLogitsFrameContract>
+  GetExactLiteRtLogitsFrameContract() const {
+    return absl::UnimplementedError(absl::StrCat(
+        "Exact logits frame contract is not implemented for backend: ",
         ExecutorBackendName()));
   }
 

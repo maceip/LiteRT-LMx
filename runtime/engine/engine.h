@@ -30,6 +30,7 @@
 #include "absl/time/time.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
 #include "runtime/engine/engine_settings.h"
+#include "runtime/engine/exact_litert_decode.h"
 #include "runtime/engine/exact_litert_profile.h"
 #include "runtime/engine/io_types.h"
 #include "runtime/engine/session_handoff.h"
@@ -236,6 +237,19 @@ class SessionInterface {
   // - decode_config: configuration for the model decode process.
   virtual absl::StatusOr<Responses> RunDecode(
       const DecodeConfig& decode_config) = 0;
+
+  // Runs the narrow, blocking exact-evidence path. The implementation accepts
+  // only a loaded compiled LiteRT executor with an Engine-derived exact
+  // logits contract, one explicit CPU GREEDY min-index sampler, and no logits
+  // modifiers, speculative decoding, benchmark/debug callbacks, or
+  // multimodal/LoRA state. Evidence includes stop/EOS IDs that ordinary
+  // Responses may filter from visible output. Backend-specific profile
+  // admission remains separate and may reject this evidence path.
+  virtual absl::StatusOr<ExactLiteRtDecodeResult> RunExactDecode(
+      int max_output_tokens) {
+    (void)max_output_tokens;
+    return absl::UnimplementedError("Exact LiteRT decode is not available.");
+  }
 
   // Startes the decoding process for the model to predict the response based
   // on the input prompt/query added after using RunPrefill* functions.

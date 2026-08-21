@@ -106,6 +106,8 @@ class EngineAdvancedImpl : public Engine {
                      absl::Status model_artifact_post_load_status,
                      absl::StatusOr<LoadedExactLiteRtEvidence>
                          loaded_exact_litert_evidence,
+                     absl::StatusOr<ExactLiteRtLogitsFrameContract>
+                         loaded_exact_logits_frame_contract,
                      absl::StatusOr<LoadedRuntimeIdentity>
                          loaded_runtime_identity)
       : engine_settings_(std::move(engine_settings)),
@@ -119,6 +121,8 @@ class EngineAdvancedImpl : public Engine {
             std::move(model_artifact_post_load_status)),
         loaded_exact_litert_evidence_(
             std::move(loaded_exact_litert_evidence)),
+        loaded_exact_logits_frame_contract_(
+            std::move(loaded_exact_logits_frame_contract)),
         loaded_runtime_identity_(std::move(loaded_runtime_identity)) {}
 
   // Method to create the Session.
@@ -144,6 +148,10 @@ class EngineAdvancedImpl : public Engine {
     if (identity.ok()) {
       session_handoff_identity = *identity;
     }
+    std::optional<ExactLiteRtLogitsFrameContract> exact_logits_frame_contract;
+    if (loaded_exact_logits_frame_contract_.ok()) {
+      exact_logits_frame_contract = *loaded_exact_logits_frame_contract_;
+    }
 
     if (litert_model_resources_ == nullptr) {
       return absl::FailedPreconditionError(
@@ -155,7 +163,8 @@ class EngineAdvancedImpl : public Engine {
         SessionAdvanced::Create(execution_manager_, tokenizer_.get(), config,
                                 std::move(session_benchmark_info),
                                 &living_sessions_,
-                                std::move(session_handoff_identity)));
+                                std::move(session_handoff_identity),
+                                std::move(exact_logits_frame_contract)));
 
     if (benchmark_info_.has_value()) {
       auto session_benchmark_info_or = session->GetMutableBenchmarkInfo();
@@ -490,6 +499,11 @@ class EngineAdvancedImpl : public Engine {
   const absl::StatusOr<LoadedExactLiteRtEvidence>
       loaded_exact_litert_evidence_;
 
+  // Narrow executor-owned capture contract. It is independent of session
+  // capsule eligibility and broader exact-profile admission.
+  const absl::StatusOr<ExactLiteRtLogitsFrameContract>
+      loaded_exact_logits_frame_contract_;
+
   // Measured runtime/delegate evidence and canonical concrete executor
   // profile. Unsupported platforms/backends retain the failure status so
   // ordinary inference remains available while capsule mode fails closed.
@@ -710,6 +724,25 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
         BenchmarkInfo::InitPhase::kTokenizer, tokenizer_duration));
   }
 
+  // Capture the narrow immutable logits contract separately from session
+  // capsule/runtime-profile evidence. Cold exact decode can collect evidence
+  // even when handoff is not supported, but the loaded tokenizer and logits
+  // vocabulary must still agree.
+  absl::StatusOr<ExactLiteRtLogitsFrameContract>
+      loaded_exact_logits_frame_contract =
+          executor->GetExactLiteRtLogitsFrameContract();
+  const int tokenizer_vocabulary_size = tokenizer->GetVocabSize();
+  if (tokenizer_vocabulary_size <= 0) {
+    loaded_exact_logits_frame_contract = absl::FailedPreconditionError(
+        "Loaded tokenizer has no positive exact-decode vocabulary.");
+  } else if (loaded_exact_logits_frame_contract.ok() &&
+             loaded_exact_logits_frame_contract->vocabulary_size !=
+                 static_cast<uint32_t>(tokenizer_vocabulary_size)) {
+    loaded_exact_logits_frame_contract = absl::FailedPreconditionError(
+        "Loaded decode logits vocabulary does not match the loaded "
+        "tokenizer vocabulary.");
+  }
+
   // Capture the ordered tokenizer contract and the exact embedded LiteRT
   // prefill/decode bytecode after all lazy model/tokenizer reads have
   // completed. Failure is retained as exact-profile capability evidence and
@@ -859,6 +892,7 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
       std::move(benchmark_info), model_artifact_hash,
       std::move(model_artifact_post_load_status),
       std::move(loaded_exact_litert_evidence),
+      std::move(loaded_exact_logits_frame_contract),
       std::move(loaded_runtime_identity));
 
   return llm_impl;

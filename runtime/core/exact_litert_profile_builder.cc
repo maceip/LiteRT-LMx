@@ -204,13 +204,16 @@ absl::Status ValidateCpuProfileInputs(
   if (resolved_session_config.UseExternalSampler() ||
       resolved_session_config.GetSamplerBackend() != Backend::CPU ||
       resolved_session_config.GetNumOutputCandidates() != 1 ||
+      resolved_session_config.GetSuppressTokensConfig().enabled() ||
+      resolved_session_config.GetApplyPromptTemplateInSession() ||
       resolved_session_config.GetSamplerParams().type() !=
           proto::SamplerParameters::GREEDY ||
       resolved_session_config.GetSamplerParams().backend() !=
           proto::SamplerParameters::CPU) {
     return absl::UnimplementedError(
-        "Exact LiteRT profiles require one output and the explicit stable CPU "
-        "GREEDY sampler.");
+        "Exact LiteRT profiles require one output, no hidden prompt template "
+        "or inherited token suppression, and the explicit stable CPU GREEDY "
+        "sampler.");
   }
   return absl::OkStatus();
 }
@@ -283,13 +286,16 @@ absl::Status ValidateMetalProfileInputs(
   if (resolved_session_config.UseExternalSampler() ||
       resolved_session_config.GetSamplerBackend() != Backend::CPU ||
       resolved_session_config.GetNumOutputCandidates() != 1 ||
+      resolved_session_config.GetSuppressTokensConfig().enabled() ||
+      resolved_session_config.GetApplyPromptTemplateInSession() ||
       resolved_session_config.GetSamplerParams().type() !=
           proto::SamplerParameters::GREEDY ||
       resolved_session_config.GetSamplerParams().backend() !=
           proto::SamplerParameters::CPU) {
     return absl::UnimplementedError(
         "Exact LiteRT Metal profiles require GPU logits to cross the "
-        "explicit stable CPU GREEDY argmax boundary with one output.");
+        "explicit stable CPU GREEDY argmax boundary with one output and no "
+        "hidden prompt template or inherited token suppression.");
   }
   const auto& main_settings = engine_settings.GetMainExecutorSettings();
   if (!main_settings.GetAdvancedSettings().has_value() ||

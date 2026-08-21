@@ -680,6 +680,8 @@ std::ostream& operator<<(std::ostream& os, const ExecutorDecodeParams& params) {
   } else {
     os << "not set";
   }
+  os << "\n" << kFieldIndent << "ExactLiteRtDecodeCapture: "
+     << (params.GetExactLiteRtDecodeCapture() != nullptr ? "set" : "not set");
   os << "\n"
      << "}";
   return os;

@@ -121,6 +121,9 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
   absl::StatusOr<SessionHandoffRuntimeProfile>
   GetSessionHandoffRuntimeProfile() const override;
 
+  absl::StatusOr<ExactLiteRtLogitsFrameContract>
+  GetExactLiteRtLogitsFrameContract() const override;
+
   absl::string_view ExecutorBackendName() const override {
     return "LiteRT Compiled Model";
   }

@@ -63,8 +63,10 @@
 #include "litert/cc/litert_tensor_buffer_types.h"  // from @litert
 #include "runtime/components/constrained_decoding/logits_processor.h"
 #include "runtime/components/embedding_lookup/embedding_lookup_manager.h"
+#include "runtime/components/greedy_cpu_sampler.h"
 #include "runtime/components/model_resources.h"
 #include "runtime/components/sampler_factory.h"
+#include "runtime/engine/exact_litert_decode.h"
 #include "runtime/executor/common_utils.h"
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/litert/state.h"
@@ -1470,6 +1472,178 @@ absl::StatusOr<std::vector<std::vector<int>>>
 LlmLiteRtCompiledModelExecutorBase::Decode(
     const ExecutorDecodeParams& decode_params) {
 
+  const std::shared_ptr<ExactLiteRtDecodeCapture>& exact_capture =
+      decode_params.GetExactLiteRtDecodeCapture();
+  if (exact_capture != nullptr) {
+    // Every rejection in this block precedes DecodeLogits and therefore
+    // precedes graph/session mutation. Exact evidence is confined to the one-
+    // token compiled path whose CPU sampler implementation is the stable
+    // strict-greater-than scan with the minimum-index tie rule. Model compute
+    // may use a separately admitted CPU or GPU backend.
+    if (mtp_drafter_ != nullptr) {
+      return absl::UnimplementedError(
+          "Exact decode does not support speculative or MTP decoding.");
+    }
+    if (!decode_params.GetLogitsProcessorList().empty()) {
+      return absl::UnimplementedError(
+          "Exact decode does not support logits processors or constraints.");
+    }
+    if (HasGraphRunCallbacks()) {
+      return absl::UnimplementedError(
+          "Exact decode does not support graph callbacks.");
+    }
+    const LlmExecutorSettings settings = [this]() {
+      absl::MutexLock lock(executor_settings_mutex_);
+      return executor_settings_;
+    }();
+    if (compiled_model_ == nullptr || llm_context_ == nullptr) {
+      return absl::FailedPreconditionError(
+          "Exact decode has no loaded compiled model or active context.");
+    }
+    if (compiled_backend_ != Backend::CPU &&
+        compiled_backend_ != Backend::GPU) {
+      return absl::UnimplementedError(
+          "Exact decode supports only loaded LiteRT CPU or GPU compiled-model "
+          "execution.");
+    }
+    if (settings.GetBackend() != compiled_backend_) {
+      return absl::FailedPreconditionError(
+          "Exact decode executor settings no longer match the compiled "
+          "backend.");
+    }
+    ABSL_ASSIGN_OR_RETURN(const Backend configured_sampler_backend,
+                          GetSamplerBackend(settings));
+    if (configured_sampler_backend != Backend::CPU) {
+      return absl::UnimplementedError(
+          "Exact decode requires CPU-side stable GREEDY token selection.");
+    }
+    if (settings.GetLoraRank() != 0 ||
+        llm_context_->processed_context().lora_id().has_value()) {
+      return absl::UnimplementedError(
+          "Exact decode does not support configured or active LoRA state.");
+    }
+    const RuntimeConfig& runtime_config = llm_context_->runtime_config();
+    if (!runtime_config.output_heads.has_value() ||
+        *runtime_config.output_heads != 1 ||
+        !runtime_config.tokens_per_decode.has_value() ||
+        *runtime_config.tokens_per_decode != 1) {
+      return absl::UnimplementedError(
+          "Exact decode requires one output head and one token per compiled "
+          "decode invocation.");
+    }
+    if (!runtime_config.sampler_params.has_value() ||
+        runtime_config.sampler_params->type() !=
+            proto::SamplerParameters::GREEDY ||
+        runtime_config.sampler_params->backend() !=
+            proto::SamplerParameters::CPU) {
+      return absl::UnimplementedError(
+          "Exact decode runtime context is not the explicit CPU GREEDY "
+          "sampler profile.");
+    }
+    const RuntimeState& runtime_state = llm_context_->runtime_state();
+    if (runtime_state.current_step < 0 || runtime_state.rand_gen == nullptr) {
+      return absl::FailedPreconditionError(
+          "Exact decode runtime continuation state is incomplete.");
+    }
+    const ProcessedTokens& processed_tokens =
+        llm_context_->processed_context().processed_tokens();
+    // This ProcessedTokens-level validation is intentionally narrower than
+    // executor session handoff: it rejects pending embeddings and malformed
+    // candidate state without imposing capsule/cache requirements.
+    ABSL_RETURN_IF_ERROR(processed_tokens.ValidateSessionHandoffSupport());
+    if (processed_tokens.TokenCount() != runtime_state.current_step) {
+      return absl::FailedPreconditionError(
+          "Exact decode step does not match its processed-token history.");
+    }
+    ABSL_ASSIGN_OR_RETURN(const int loaded_vocabulary_size,
+                          GetLoadedVocabularySizeForSessionHandoff());
+    ABSL_RETURN_IF_ERROR(
+        processed_tokens.ValidateTokenIds(loaded_vocabulary_size));
+
+    const ExactLiteRtLogitsFrameContract& expected_logits =
+        exact_capture->contract();
+    if (expected_logits.batch_size != 1 ||
+        expected_logits.sequence_size != 1 ||
+        expected_logits.vocabulary_size !=
+            static_cast<uint32_t>(loaded_vocabulary_size)) {
+      return absl::FailedPreconditionError(
+          "Exact decode capture contract differs from the loaded executor "
+          "shape.");
+    }
+    const auto loaded_logits = decode_output_buffers_.find(
+        absl::string_view(signatures_.output_logits));
+    if (signatures_.output_logits.empty() ||
+        loaded_logits == decode_output_buffers_.end()) {
+      return absl::FailedPreconditionError(
+          "Exact decode has no loaded logits output allocation.");
+    }
+    LITERT_ASSIGN_OR_RETURN(const RankedTensorType loaded_logits_type,
+                            loaded_logits->second.TensorType());
+    const ElementType expected_element_type =
+        expected_logits.element_type == ExactLiteRtLogitsElementType::kFloat16
+            ? ElementType::Float16
+            : ElementType::Float32;
+    if (loaded_logits_type.ElementType() != expected_element_type ||
+        loaded_logits_type.Layout().HasStrides()) {
+      return absl::FailedPreconditionError(
+          "Exact decode capture contract differs from the loaded packed "
+          "logits representation.");
+    }
+    const auto loaded_logits_dimensions =
+        loaded_logits_type.Layout().Dimensions();
+    if (loaded_logits_dimensions.size() != 3 ||
+        loaded_logits_dimensions[0] != 1 ||
+        loaded_logits_dimensions[1] != 1 ||
+        loaded_logits_dimensions[2] != loaded_vocabulary_size) {
+      return absl::FailedPreconditionError(
+          "Exact decode loaded logits are not [1, 1, vocabulary].");
+    }
+    LITERT_ASSIGN_OR_RETURN(const size_t loaded_logits_bytes,
+                            loaded_logits->second.PackedSize());
+    if (loaded_logits_bytes != expected_logits.byte_count) {
+      return absl::FailedPreconditionError(
+          "Exact decode capture byte extent differs from the loaded complete "
+          "logits frame.");
+    }
+
+    if (!settings.GetAdvancedSettings().has_value()) {
+      return absl::FailedPreconditionError(
+          "Exact decode has no resolved compiled executor settings.");
+    }
+    const AdvancedSettings& advanced = *settings.GetAdvancedSettings();
+    if (advanced.is_benchmark || advanced.enable_profiling ||
+        advanced.num_logits_to_print_after_decode != 0 ||
+        advanced.enable_speculative_decoding) {
+      return absl::UnimplementedError(
+          "Exact decode does not support benchmark, profiling, or logits "
+          "debug callbacks.");
+    }
+
+    ActivationDataType logits_data_type;
+    switch (exact_capture->contract().element_type) {
+      case ExactLiteRtLogitsElementType::kFloat16:
+        logits_data_type = ActivationDataType::FLOAT16;
+        break;
+      case ExactLiteRtLogitsElementType::kFloat32:
+        logits_data_type = ActivationDataType::FLOAT32;
+        break;
+      default:
+        return absl::UnimplementedError(
+            "Exact decode requires an Engine-derived FP16 or FP32 logits "
+            "contract.");
+    }
+    ABSL_RETURN_IF_ERROR(InitializeSampler(logits_data_type));
+    if (initialized_sampler_backend_ != Backend::CPU ||
+        initialized_sampler_type_ !=
+            static_cast<int>(proto::SamplerParameters::GREEDY) ||
+        dynamic_cast<GreedyCpuSampler*>(sampler_.get()) == nullptr ||
+        sampler_handles_input_) {
+      return absl::FailedPreconditionError(
+          "Exact decode did not resolve to the stable CPU GREEDY min-index "
+          "sampler path.");
+    }
+  }
+
   std::vector<std::vector<int>> output_tokens_vector;
   if (mtp_drafter_ == nullptr) {
     ABSL_ASSIGN_OR_RETURN(auto decoded_logits,
@@ -1485,9 +1659,17 @@ LlmLiteRtCompiledModelExecutorBase::Decode(
           output_tokens,
           CreateTensorBuffer<int>({dimensions[0], dimensions[1]}));
     }
+    if (exact_capture != nullptr) {
+      ABSL_RETURN_IF_ERROR(
+          exact_capture->CaptureLogitsBeforeSampling(decoded_logits));
+    }
     ABSL_RETURN_IF_ERROR(SampleLogits(decoded_logits, *output_tokens));
     LITERT_ASSIGN_OR_RETURN(output_tokens_vector,
                             CopyFromTensorBuffer2D<int>(*output_tokens));
+    if (exact_capture != nullptr) {
+      ABSL_RETURN_IF_ERROR(
+          exact_capture->CaptureSampledTokenIds(output_tokens_vector));
+    }
   } else {
     // MTP keeps an internal state of the last time it was called and will
     // use those projected activations to kick off the next draft steps. As
@@ -2646,6 +2828,76 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::ImportSessionStateFrom(
   *live_runtime.rand_gen = snapshot.random_engine;
   force_prepare_needed_ = true;
   return absl::OkStatus();
+}
+
+absl::StatusOr<ExactLiteRtLogitsFrameContract>
+LlmLiteRtCompiledModelExecutorBase::GetExactLiteRtLogitsFrameContract() const {
+  if (signatures_.output_logits.empty()) {
+    return absl::FailedPreconditionError(
+        "Loaded LiteRT executor has no resolved decode logits signature.");
+  }
+  const auto logits = decode_output_buffers_.find(
+      absl::string_view(signatures_.output_logits));
+  if (logits == decode_output_buffers_.end()) {
+    return absl::FailedPreconditionError(
+        "Loaded LiteRT executor has no decode logits allocation.");
+  }
+  LITERT_ASSIGN_OR_RETURN(const RankedTensorType tensor_type,
+                          logits->second.TensorType());
+  ExactLiteRtLogitsElementType element_type =
+      ExactLiteRtLogitsElementType::kUnsupported;
+  uint64_t element_byte_count = 0;
+  switch (tensor_type.ElementType()) {
+    case ElementType::Float16:
+      element_type = ExactLiteRtLogitsElementType::kFloat16;
+      element_byte_count = 2;
+      break;
+    case ElementType::Float32:
+      element_type = ExactLiteRtLogitsElementType::kFloat32;
+      element_byte_count = 4;
+      break;
+    default:
+      return absl::UnimplementedError(
+          "Exact logits capture requires loaded FP16 or FP32 logits.");
+  }
+  if (tensor_type.Layout().HasStrides()) {
+    return absl::UnimplementedError(
+        "Exact logits capture requires a packed logits allocation.");
+  }
+  const auto dimensions = tensor_type.Layout().Dimensions();
+  if (dimensions.size() != 3 || dimensions[0] != 1 || dimensions[1] != 1 ||
+      dimensions[2] <= 0) {
+    return absl::UnimplementedError(
+        "Exact logits capture requires loaded [1, 1, vocabulary] logits.");
+  }
+  LITERT_ASSIGN_OR_RETURN(const size_t element_count,
+                          tensor_type.Layout().NumElements());
+  if (element_count != static_cast<size_t>(dimensions[2])) {
+    return absl::FailedPreconditionError(
+        "Loaded logits element count does not match its vocabulary extent.");
+  }
+  const uint64_t vocabulary_size = static_cast<uint64_t>(dimensions[2]);
+  if (vocabulary_size >
+      std::numeric_limits<uint64_t>::max() / element_byte_count) {
+    return absl::ResourceExhaustedError(
+        "Loaded exact logits frame byte count overflows uint64.");
+  }
+  const uint64_t expected_byte_count =
+      vocabulary_size * element_byte_count;
+  LITERT_ASSIGN_OR_RETURN(const size_t packed_byte_count,
+                          logits->second.PackedSize());
+  if (packed_byte_count != expected_byte_count) {
+    return absl::FailedPreconditionError(
+        "Loaded logits packed bytes do not cover the complete vocabulary "
+        "frame.");
+  }
+  return ExactLiteRtLogitsFrameContract{
+      .element_type = element_type,
+      .batch_size = 1,
+      .sequence_size = 1,
+      .vocabulary_size = static_cast<uint32_t>(dimensions[2]),
+      .byte_count = expected_byte_count,
+  };
 }
 
 absl::StatusOr<SessionHandoffRuntimeProfile>

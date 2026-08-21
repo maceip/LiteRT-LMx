@@ -20,6 +20,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "absl/base/nullability.h"  // from @com_google_absl
 #include "absl/base/thread_annotations.h"  // from @com_google_absl
@@ -143,6 +144,15 @@ class ResourceManager {
                                      const StateInterface&)>
           consumer) ABSL_LOCKS_EXCLUDED(executor_mutex_)
       ABSL_LOCKS_EXCLUDED(audio_executor_mutex_);
+
+  // Reads only processed-token continuation metadata while holding the
+  // executor/context-switch lock. Unlike ExportSessionSnapshotTo, this does
+  // not require a serializable execution-state capsule.
+  absl::StatusOr<std::vector<std::vector<int>>>
+  GetExactProcessedTokenHistory(
+      std::shared_ptr<ContextHandler> context_handler)
+      ABSL_LOCKS_EXCLUDED(executor_mutex_)
+          ABSL_LOCKS_EXCLUDED(audio_executor_mutex_);
 
   // Imports validated metadata and canonical state into a fresh compatible
   // backend context. Concrete state loading is transactional.

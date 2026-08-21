@@ -901,6 +901,56 @@ absl::Status ResourceManager::ExportSessionSnapshotTo(
       });
 }
 
+absl::StatusOr<std::vector<std::vector<int>>>
+ResourceManager::GetExactProcessedTokenHistory(
+    std::shared_ptr<ContextHandler> context_handler) {
+  if (context_handler == nullptr) {
+    return absl::InvalidArgumentError(
+        "Exact token-history context handler must not be null.");
+  }
+  if (context_handler->HasAudioContext()) {
+    return absl::UnimplementedError(
+        "Exact token-history capture does not support audio context state.");
+  }
+
+  ABSL_ASSIGN_OR_RETURN(auto executor,
+                        AcquireExecutorWithContextHandler(context_handler));
+  ABSL_ASSIGN_OR_RETURN(const int current_step, executor->GetCurrentStep());
+  ABSL_ASSIGN_OR_RETURN(const ProcessedTokens* processed_tokens,
+                        executor->GetProcessedTokens());
+  if (processed_tokens == nullptr) {
+    return absl::FailedPreconditionError(
+        "Exact token-history capture has no processed-token state.");
+  }
+  ABSL_ASSIGN_OR_RETURN(const int vocabulary_size, executor->GetVocabSize());
+  ABSL_ASSIGN_OR_RETURN(ProcessedTokens::Snapshot snapshot,
+                        processed_tokens->ExportSnapshot());
+  ABSL_RETURN_IF_ERROR(ProcessedTokens::ValidateSnapshotTokenIds(
+      snapshot, vocabulary_size));
+  if (snapshot.processed_token_ids.size() != 1) {
+    return absl::UnimplementedError(
+        "Exact token-history capture requires exactly one token candidate.");
+  }
+
+  std::vector<std::vector<int>> token_history =
+      std::move(snapshot.processed_token_ids);
+  if (!snapshot.pending_token_ids.empty()) {
+    if (snapshot.pending_token_ids.size() != token_history.size()) {
+      return absl::DataLossError(
+          "Exact token history has inconsistent pending candidates.");
+    }
+    for (size_t index = 0; index < token_history.size(); ++index) {
+      token_history[index].push_back(snapshot.pending_token_ids[index]);
+    }
+  }
+  if (current_step < 0 ||
+      static_cast<size_t>(current_step) != token_history.front().size()) {
+    return absl::DataLossError(
+        "Exact token history does not match the executor step.");
+  }
+  return token_history;
+}
+
 absl::Status ResourceManager::ImportSessionSnapshot(
     std::shared_ptr<ContextHandler> context_handler,
     const ExecutorSessionSnapshot& snapshot) {

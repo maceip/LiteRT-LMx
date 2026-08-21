@@ -50,6 +50,7 @@
 #include "runtime/components/constrained_decoding/suppress_tokens_constraint.h"
 #include "runtime/components/constrained_decoding/thinking_budget_constraint.h"
 #include "runtime/engine/io_types.h"
+#include "runtime/engine/exact_litert_decode.h"
 #include "runtime/executor/llm_executor.h"
 #include "runtime/executor/llm_executor_io_types.h"
 #include "runtime/executor/llm_executor_settings.h"
@@ -208,7 +209,9 @@ class DecodeOneStep {
                 std::unique_ptr<CompositeConstraint> composite_constraint,
                 std::unique_ptr<ConstrainedDecoder> constrained_decoder,
                 std::optional<litert::TensorBuffer> scores_tensor,
-                const std::atomic<bool>* cancelled)
+                const std::atomic<bool>* cancelled,
+                std::shared_ptr<ExactLiteRtDecodeCapture>
+                    exact_litert_decode_capture)
       : executor_(*executor),
         tokenizer_(*tokenizer),
         detokenizer_(&tokenizer_, num_output_candidates),
@@ -221,7 +224,9 @@ class DecodeOneStep {
         stop_token_filter_(&stop_token_detector_, num_output_candidates),
         result_text_(num_output_candidates, ""),
         result_token_ids_(num_output_candidates),
-        cancelled_(cancelled) {
+        cancelled_(cancelled),
+        exact_litert_decode_capture_(
+            std::move(exact_litert_decode_capture)) {
     if (scores_tensor.has_value()) {
       scores_tensor_ = std::move(*scores_tensor);
     }
@@ -236,10 +241,11 @@ class DecodeOneStep {
       RepetitionPenaltyConfig repetition_penalty_config,
       NoRepeatNgramConfig no_repeat_ngram_config,
       SuppressTokensConfig suppress_tokens_config, Constraint* constraint,
-      const std::atomic<bool>* cancelled =
-          nullptr  // Add cancelled signal for one decode step (eg.
-                   // for diffusion-llm)
-  ) {
+      // Add a cancellation signal for one decode step (for example,
+      // diffusion-llm).
+      const std::atomic<bool>* cancelled = nullptr,
+      std::shared_ptr<ExactLiteRtDecodeCapture> exact_litert_decode_capture =
+          nullptr) {
     ABSL_ASSIGN_OR_RETURN(auto composite_constraint,
                           CompositeConstraint::Create());
     if (repetition_penalty_config.enabled()) {
@@ -275,7 +281,8 @@ class DecodeOneStep {
     return std::unique_ptr<DecodeOneStep>(new DecodeOneStep(
         executor, tokenizer, num_output_candidates, stop_token_detector,
         benchmark_info, sampler, std::move(composite_constraint),
-        std::move(constrained_decoder), std::move(scores_tensor), cancelled));
+        std::move(constrained_decoder), std::move(scores_tensor), cancelled,
+        std::move(exact_litert_decode_capture)));
   }
 
   // Runs one step of the decode process and returns if all stops for all
@@ -494,6 +501,10 @@ class DecodeOneStep {
       auto decode_params = ExecutorDecodeParams();
       // Convey the cancellation token for the decode process.
       decode_params.SetCancelled(cancelled_);
+      if (exact_litert_decode_capture_ != nullptr) {
+        decode_params.SetExactLiteRtDecodeCapture(
+            exact_litert_decode_capture_);
+      }
       if (constrained_decoder_ != nullptr) {
         decode_params.SetLogitsProcessorList({constrained_decoder_.get()});
       }
@@ -529,6 +540,7 @@ class DecodeOneStep {
 
   bool is_first_step_ = true;
   const std::atomic<bool>* cancelled_ = nullptr;
+  std::shared_ptr<ExactLiteRtDecodeCapture> exact_litert_decode_capture_;
 };
 
 }  // namespace
@@ -593,9 +605,41 @@ absl::StatusOr<Responses> Decode(
     std::atomic<bool>* cancelled, int max_output_tokens,
     std::optional<int> thinking_token_budget,
     const std::vector<int>& thinking_end_token_ids,
-    const std::vector<int>& thinking_start_token_ids) {
+    const std::vector<int>& thinking_start_token_ids,
+    std::shared_ptr<ExactLiteRtDecodeCapture> exact_litert_decode_capture) {
   const bool is_streaming = callback != nullptr;
   const bool is_custom_sampling = sampler.has_value();
+
+  // Exact evidence is defined only for the unmodified internal CPU GREEDY
+  // sampler path. Reject unsupported surfaces before DecodeOneStep can mutate
+  // model state. The compiled executor performs a second, authoritative
+  // validation of its live backend, sampler, callbacks, and tensor contract.
+  if (exact_litert_decode_capture != nullptr) {
+    if (num_output_candidates != 1) {
+      return absl::UnimplementedError(
+          "Exact decode requires exactly one output candidate.");
+    }
+    if (is_custom_sampling) {
+      return absl::UnimplementedError(
+          "Exact decode does not support an external sampler.");
+    }
+    if (benchmark_info.has_value()) {
+      return absl::UnimplementedError(
+          "Exact decode does not support benchmark-controlled decode.");
+    }
+    if (repetition_penalty_config.enabled() ||
+        no_repeat_ngram_config.enabled() ||
+        suppress_tokens_config.enabled() || constraint != nullptr) {
+      return absl::UnimplementedError(
+          "Exact decode does not support constraints or logits processors.");
+    }
+    if (thinking_token_budget.has_value() ||
+        !thinking_end_token_ids.empty() ||
+        !thinking_start_token_ids.empty()) {
+      return absl::UnimplementedError(
+          "Exact decode does not support thinking-token control.");
+    }
+  }
 
   int benchmark_decode_token_count = 0;
   if (benchmark_info.has_value()) {
@@ -650,7 +694,7 @@ absl::StatusOr<Responses> Decode(
           &executor, &tokenizer, num_output_candidates, stop_token_detector,
           benchmark_info, sampler, std::move(repetition_penalty_config),
           std::move(no_repeat_ngram_config), std::move(suppress_tokens_config),
-          constraint, cancelled));
+          constraint, cancelled, std::move(exact_litert_decode_capture)));
   while (true) {
     if (cancelled != nullptr && cancelled->load()) {
       if (benchmark_info.has_value()) {

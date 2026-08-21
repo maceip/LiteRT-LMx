@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -81,6 +82,58 @@ absl::Status ValidateSessionHandoffConfig(const SessionConfig& config) {
   return absl::OkStatus();
 }
 
+absl::Status ValidateExactDecodeConfig(
+    const SessionConfig& config,
+    const std::optional<BenchmarkInfo>& benchmark_info,
+    int max_output_tokens) {
+  if (config.UseExternalSampler()) {
+    return absl::UnimplementedError(
+        "Exact decode does not support an external sampler.");
+  }
+  if (config.GetSamplerBackend() != Backend::CPU ||
+      config.GetSamplerParams().type() !=
+          proto::SamplerParameters::GREEDY ||
+      config.GetSamplerParams().backend() !=
+          proto::SamplerParameters::CPU) {
+    return absl::UnimplementedError(
+        "Exact decode requires the explicit CPU GREEDY min-index sampler.");
+  }
+  if (config.GetNumOutputCandidates() != 1) {
+    return absl::UnimplementedError(
+        "Exact decode requires exactly one output candidate.");
+  }
+  if (config.GetSuppressTokensConfig().enabled()) {
+    return absl::UnimplementedError(
+        "Exact decode does not support session-level token suppression.");
+  }
+  if (config.GetApplyPromptTemplateInSession()) {
+    return absl::UnimplementedError(
+        "Exact decode requires the worker to prefill an already-canonical "
+        "prompt without hidden prompt-template tail tokens.");
+  }
+  if (config.AudioModalityEnabled() || config.VisionModalityEnabled() ||
+      config.GetAudioEmbeddingsCallback() != nullptr) {
+    return absl::UnimplementedError(
+        "Exact decode supports only ordinary text sessions.");
+  }
+  if (config.GetScopedLoraFile() != nullptr ||
+      config.GetAudioScopedLoraFile() != nullptr) {
+    return absl::UnimplementedError(
+        "Exact decode does not support LoRA state.");
+  }
+  if (benchmark_info.has_value()) {
+    return absl::UnimplementedError(
+        "Exact decode does not support benchmark-controlled execution.");
+  }
+  if (max_output_tokens <= 0 ||
+      max_output_tokens >
+          static_cast<int>(kMaximumExactLiteRtDecodeFrames)) {
+    return absl::InvalidArgumentError(
+        "Exact decode max_output_tokens is outside the admitted range.");
+  }
+  return absl::OkStatus();
+}
+
 }  // namespace
 
 // static
@@ -90,7 +143,9 @@ absl::StatusOr<std::unique_ptr<SessionAdvanced>> SessionAdvanced::Create(
     const SessionConfig& session_config,
     std::optional<BenchmarkInfo> benchmark_info,
     std::atomic<int>* living_sessions_count,
-    std::optional<SessionHandoffIdentity> session_handoff_identity) {
+    std::optional<SessionHandoffIdentity> session_handoff_identity,
+    std::optional<ExactLiteRtLogitsFrameContract>
+        exact_litert_logits_frame_contract) {
   auto execution_manager_lock = execution_manager.lock();
   if (execution_manager_lock == nullptr) {
     return absl::FailedPreconditionError("Execution manager is not available.");
@@ -104,7 +159,8 @@ absl::StatusOr<std::unique_ptr<SessionAdvanced>> SessionAdvanced::Create(
       session_id, execution_manager, tokenizer, session_info_,
       /*session_state=*/SessionState::kFresh,
       /*last_task_ids=*/{}, living_sessions_count,
-      std::move(session_handoff_identity)));
+      std::move(session_handoff_identity),
+      std::move(exact_litert_logits_frame_contract)));
 }
 
 absl::Status SessionAdvanced::RunPrefill(
@@ -204,6 +260,12 @@ absl::StatusOr<Responses> SessionAdvanced::RunDecode() {
 
 absl::StatusOr<Responses> SessionAdvanced::RunDecode(
     const DecodeConfig& decode_config) {
+  return RunDecodeBlockingInternal(decode_config, nullptr);
+}
+
+absl::StatusOr<Responses> SessionAdvanced::RunDecodeBlockingInternal(
+    const DecodeConfig& decode_config,
+    std::shared_ptr<ExactLiteRtDecodeCapture> exact_litert_decode_capture) {
   auto execution_manager_lock = execution_manager_.lock();
   if (execution_manager_lock == nullptr) {
     return absl::FailedPreconditionError("Execution manager is not available.");
@@ -274,9 +336,94 @@ absl::StatusOr<Responses> SessionAdvanced::RunDecode(
 
   ABSL_ASSIGN_OR_RETURN(
       auto task_controller,
-      RunDecodeAsync(std::move(decode_sync_callback), decode_config));
+      RunDecodeAsyncInternal(std::move(decode_sync_callback), decode_config,
+                             std::move(exact_litert_decode_capture)));
   ABSL_RETURN_IF_ERROR(task_controller->WaitUntilDone(Engine::kDefaultTimeout));
   return collected_responses;
+}
+
+absl::StatusOr<ExactLiteRtDecodeResult> SessionAdvanced::RunExactDecode(
+    int max_output_tokens) {
+  ABSL_RETURN_IF_ERROR(ValidateExactDecodeConfig(
+      session_info_->session_config, session_info_->benchmark_info,
+      max_output_tokens));
+  if (!exact_litert_logits_frame_contract_.has_value()) {
+    return absl::FailedPreconditionError(
+        "The loaded Engine did not provide an exact logits frame contract.");
+  }
+  {
+    absl::MutexLock lock(mutex_);
+    if (session_state_ != SessionState::kPrefilled) {
+      return absl::FailedPreconditionError(
+          "Exact decode requires a successfully prefilled session.");
+    }
+  }
+
+  // The executor-owned history is checked on both sides of decode so captured
+  // IDs cannot diverge from the continuation state actually committed by the
+  // model. Unlike Responses, this history includes a terminating stop/EOS ID.
+  ABSL_ASSIGN_OR_RETURN(
+      std::vector<std::vector<int>> history_before,
+      GetExactProcessedTokenHistory());
+  if (history_before.size() != 1) {
+    return absl::DataLossError(
+        "Exact decode pre-state does not contain exactly one token history.");
+  }
+
+  ABSL_ASSIGN_OR_RETURN(
+      std::shared_ptr<ExactLiteRtDecodeCapture> capture,
+      ExactLiteRtDecodeCapture::Create(*exact_litert_logits_frame_contract_,
+                                       max_output_tokens));
+  DecodeConfig decode_config = DecodeConfig::CreateDefault();
+  decode_config.SetMaxOutputTokens(max_output_tokens);
+  ABSL_ASSIGN_OR_RETURN(
+      Responses responses,
+      RunDecodeBlockingInternal(decode_config, capture));
+  if (responses.GetTaskState() == TaskState::kCancelled ||
+      responses.GetTaskState() == TaskState::kDependentTaskCancelled) {
+    return absl::CancelledError(
+        "Exact decode was cancelled; partial evidence is not admissible.");
+  }
+  if (responses.GetTaskState() != TaskState::kDone &&
+      responses.GetTaskState() != TaskState::kMaxNumTokensReached) {
+    return absl::DataLossError(
+        "Exact decode did not end in an admissible completed task state.");
+  }
+  ABSL_ASSIGN_OR_RETURN(ExactLiteRtDecodeEvidence evidence,
+                        capture->Finish());
+
+  ABSL_ASSIGN_OR_RETURN(
+      std::vector<std::vector<int>> history_after,
+      GetExactProcessedTokenHistory());
+  if (history_after.size() != 1 ||
+      history_after.front().size() < history_before.front().size()) {
+    return absl::DataLossError(
+        "Exact decode post-state has an inconsistent token history.");
+  }
+  if (!std::equal(history_before.front().begin(),
+                  history_before.front().end(),
+                  history_after.front().begin())) {
+    return absl::DataLossError(
+        "Exact decode modified the pre-existing token-history prefix.");
+  }
+  const size_t generated_count =
+      history_after.front().size() - history_before.front().size();
+  if (generated_count != evidence.sampled_token_ids.size() ||
+      evidence.sampled_token_ids.size() != evidence.logits_frames.size()) {
+    return absl::DataLossError(
+        "Exact decode token-history, sampled-token, and logits-frame counts "
+        "differ.");
+  }
+  for (size_t index = 0; index < generated_count; ++index) {
+    const int committed_token =
+        history_after.front()[history_before.front().size() + index];
+    if (committed_token != evidence.sampled_token_ids[index]) {
+      return absl::DataLossError(
+          "Exact decode captured token IDs differ from committed executor "
+          "history.");
+    }
+  }
+  return ExactLiteRtDecodeResult(std::move(responses), std::move(evidence));
 }
 
 absl::StatusOr<std::unique_ptr<TaskController>> SessionAdvanced::RunDecodeAsync(
@@ -287,6 +434,14 @@ absl::StatusOr<std::unique_ptr<TaskController>> SessionAdvanced::RunDecodeAsync(
 absl::StatusOr<std::unique_ptr<TaskController>> SessionAdvanced::RunDecodeAsync(
     absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback,
     const DecodeConfig& decode_config) {
+  return RunDecodeAsyncInternal(std::move(callback), decode_config, nullptr);
+}
+
+absl::StatusOr<std::unique_ptr<TaskController>>
+SessionAdvanced::RunDecodeAsyncInternal(
+    absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback,
+    const DecodeConfig& decode_config,
+    std::shared_ptr<ExactLiteRtDecodeCapture> exact_litert_decode_capture) {
   absl::MutexLock lock(mutex_);
   if (session_state_ != SessionState::kPrefilled) {
     return absl::InternalError("Session is not prefilled yet.");
@@ -339,7 +494,8 @@ absl::StatusOr<std::unique_ptr<TaskController>> SessionAdvanced::RunDecodeAsync(
           session_info_->session_config.GetMaxOutputTokens()),
       decode_config.GetThinkingTokenBudget(),
       decode_config.GetThinkingStartTokenIds(),
-      decode_config.GetThinkingEndTokenIds()));
+      decode_config.GetThinkingEndTokenIds(),
+      std::move(exact_litert_decode_capture)));
 
   last_task_ids_ = {task_id};
 
@@ -508,7 +664,8 @@ SessionAdvanced::CloneAsyncLocked(
                                               tokenizer_, session_info,
                                               session_state_, last_task_ids_,
                                               /*living_sessions_count=*/nullptr,
-                                              session_handoff_identity_));
+                                              session_handoff_identity_,
+                                              exact_litert_logits_frame_contract_));
 }
 
 SessionAdvanced::~SessionAdvanced() {
@@ -638,38 +795,9 @@ SessionAdvanced::GetExactProcessedTokenHistory() const {
   ABSL_RETURN_IF_ERROR(execution_manager->WaitUntilSessionDone(
       session_id_, Engine::kDefaultTimeout));
 
-  std::vector<std::vector<int>> token_history;
   absl::MutexLock lock(mutex_);
-  ABSL_RETURN_IF_ERROR(execution_manager->ExportSessionSnapshotTo(
-      session_id_, last_task_ids_,
-      [&token_history](const ExecutorSessionSnapshot& snapshot,
-                       const StateInterface& state) -> absl::Status {
-        (void)state;
-        token_history = snapshot.processed_tokens.processed_token_ids;
-        if (token_history.empty()) {
-          return absl::FailedPreconditionError(
-              "Exact token history contains no candidates.");
-        }
-        if (!snapshot.processed_tokens.pending_token_ids.empty()) {
-          if (snapshot.processed_tokens.pending_token_ids.size() !=
-              token_history.size()) {
-            return absl::DataLossError(
-                "Exact token history has inconsistent pending candidates.");
-          }
-          for (size_t i = 0; i < token_history.size(); ++i) {
-            token_history[i].push_back(
-                snapshot.processed_tokens.pending_token_ids[i]);
-          }
-        }
-        if (snapshot.current_step < 0 ||
-            static_cast<size_t>(snapshot.current_step) !=
-                token_history[0].size()) {
-          return absl::DataLossError(
-              "Exact token history does not match the executor step.");
-        }
-        return absl::OkStatus();
-      }));
-  return token_history;
+  return execution_manager->GetExactProcessedTokenHistory(session_id_,
+                                                           last_task_ids_);
 }
 
 absl::StatusOr<std::string> SessionAdvanced::ExportHandoff(

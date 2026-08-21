@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -31,6 +32,7 @@
 #include "runtime/components/sampler.h"
 #include "runtime/components/stop_token_detector.h"
 #include "runtime/engine/io_types.h"
+#include "runtime/engine/exact_litert_decode.h"
 #include "runtime/executor/llm_executor.h"
 #include "runtime/executor/llm_executor_io_types.h"
 #include "support/tokenizer/tokenizer.h"
@@ -57,7 +59,9 @@ absl::StatusOr<Responses> Decode(
     int max_output_tokens = std::numeric_limits<int>::max(),
     std::optional<int> thinking_token_budget = std::nullopt,
     const std::vector<int>& thinking_end_token_ids = {},
-    const std::vector<int>& thinking_start_token_ids = {});
+    const std::vector<int>& thinking_start_token_ids = {},
+    std::shared_ptr<ExactLiteRtDecodeCapture> exact_litert_decode_capture =
+        nullptr);
 
 absl::StatusOr<Responses> Score(
     LlmExecutor& executor, Tokenizer& tokenizer,

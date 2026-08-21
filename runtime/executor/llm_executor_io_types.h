@@ -35,6 +35,8 @@
 
 namespace litert::lm {
 
+class ExactLiteRtDecodeCapture;
+
 // KVCache direct related context container.
 class ProcessedContext {
  public:
@@ -479,11 +481,26 @@ class ExecutorDecodeParams {
   // Returns the cancellation flag if set, otherwise nullptr.
   const std::atomic<bool>* GetCancelled() const { return cancelled_; }
 
+  // Installs request-owned exact logits capture. Shared ownership keeps the
+  // capture alive when a threaded execution manager outlives the initiating
+  // stack. Executors that support this surface must fail closed on every path
+  // that cannot pair one pre-sampling full logits frame with one sampled ID.
+  void SetExactLiteRtDecodeCapture(
+      std::shared_ptr<ExactLiteRtDecodeCapture> capture) {
+    exact_litert_decode_capture_ = std::move(capture);
+  }
+
+  const std::shared_ptr<ExactLiteRtDecodeCapture>&
+  GetExactLiteRtDecodeCapture() const {
+    return exact_litert_decode_capture_;
+  }
+
  private:
   // List of active logits processors (e.g. repetition penalty, no-repeat
   // ngram, token suppression, constrained decoding).
   std::vector<LogitsProcessor*> logits_processors_;
   const std::atomic<bool>* cancelled_ = nullptr;
+  std::shared_ptr<ExactLiteRtDecodeCapture> exact_litert_decode_capture_;
 };
 std::ostream& operator<<(std::ostream& os, const ExecutorDecodeParams& params);
 
