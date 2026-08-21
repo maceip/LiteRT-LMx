@@ -60,6 +60,10 @@ class EngineDPMAgentRuntime final : public DPMAgentRuntime {
         session_handoff_identity_(session_handoff_identity) {}
 
   absl::Status ValidateSession(const Engine::Session& session) const;
+  // Generation/profile support is deliberately separate from capsule
+  // support. CanonicalWinnerReplay can generate and publish a winner even
+  // when the resolved session cannot export a complete handoff envelope.
+  absl::Status ValidateRuntimeSupport() const;
   absl::Status ProbeSessionHandoffSupport() const;
 
   Engine* const engine_;

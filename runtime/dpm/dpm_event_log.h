@@ -24,6 +24,7 @@
 
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "runtime/dpm/dpm_projection_manifest.h"
+#include "runtime/dpm/dpm_replay_mode.h"
 #include "runtime/engine/session_handoff.h"
 #include "runtime/platform/hash/hasher.h"
 
@@ -47,7 +48,7 @@ inline constexpr size_t kMaximumDPMCanonicalAgentInputBytes =
 // The raw event log is the authority for a DPM session. Session checkpoints,
 // projections, and manifests are disposable derivatives of these events.
 struct DPMTurnReceipt {
-  static constexpr uint32_t kFormatVersion = 2;
+  static constexpr uint32_t kFormatVersion = 3;
 
   uint32_t format_version = kFormatVersion;
   std::string operation_id;
@@ -62,6 +63,19 @@ struct DPMTurnReceipt {
   SessionHandoffIdentity agent_session_identity;
   uint32_t max_decision_tokens = 0;
   Hash256 agent_request_hash;
+
+  // Agent-decision execution provenance. WinnerReplay and ExactRegeneration
+  // remain distinct in the immutable receipt just as they do for projection.
+  DPMReplayMode agent_replay_mode =
+      DPMReplayMode::kCanonicalWinnerReplay;
+  Hash256 agent_replay_request_hash;
+  Hash256 agent_execution_evidence_hash;
+  std::optional<Hash256> agent_exact_profile_id;
+  std::optional<Hash256> agent_exact_profile_admission_record_id;
+  std::optional<Hash256> agent_exact_output_evidence_hash;
+  uint32_t agent_exact_logit_frame_count = 0;
+  bool agent_reused_canonical_winner = false;
+  bool agent_producing_session_matched_output = false;
 
   // Stored in the immutable log so a missing KV artifact can be reconstructed
   // without treating the checkpoint repository as memory truth.

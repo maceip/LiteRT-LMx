@@ -237,19 +237,11 @@ EngineDPMAgentRuntime::Create(
   auto runtime = std::unique_ptr<EngineDPMAgentRuntime>(
       new EngineDPMAgentRuntime(engine, std::move(session_config),
                                 authoritative_identity));
-
-  // Finish pre-mutation admission by exercising the fresh-state handoff
-  // surface after the resolved configuration, identity, and capability checks
-  // above. The probe exports one fresh Engine session through the authenticated
-  // streaming codec and imports it into another. It performs no prefill or
-  // decode and therefore does not prove non-fresh own-position/logit equality;
-  // that remains a later profile-acceptance obligation. Production handoff
-  // still enforces authenticated identity and structural compatibility.
-  ABSL_RETURN_IF_ERROR(runtime->ProbeSessionHandoffSupport());
+  ABSL_RETURN_IF_ERROR(runtime->ValidateRuntimeSupport());
   return runtime;
 }
 
-absl::Status EngineDPMAgentRuntime::ValidateSessionHandoffSupport() const {
+absl::Status EngineDPMAgentRuntime::ValidateRuntimeSupport() const {
   if (engine_ == nullptr) {
     return absl::FailedPreconditionError(
         "DPM agent runtime has lost its loaded Engine.");
@@ -263,6 +255,18 @@ absl::Status EngineDPMAgentRuntime::ValidateSessionHandoffSupport() const {
         "Loaded Engine identity changed after DPM agent admission.");
   }
   return absl::OkStatus();
+}
+
+absl::Status EngineDPMAgentRuntime::ValidateSessionHandoffSupport() const {
+  ABSL_RETURN_IF_ERROR(ValidateRuntimeSupport());
+
+  // CapsuleRestore is a separate capability from generation and
+  // CanonicalWinnerReplay. Exercise the authenticated fresh-state
+  // export/import surface only when the product configuration enables
+  // checkpoint restore or capture. This probe does not establish
+  // own-position continuation equality; profile admission remains
+  // responsible for that stronger claim.
+  return ProbeSessionHandoffSupport();
 }
 
 absl::Status EngineDPMAgentRuntime::ValidateSession(
@@ -325,7 +329,7 @@ absl::Status EngineDPMAgentRuntime::ProbeSessionHandoffSupport() const {
 
 absl::StatusOr<std::unique_ptr<Engine::Session>>
 EngineDPMAgentRuntime::CreateSession() {
-  ABSL_RETURN_IF_ERROR(ValidateSessionHandoffSupport());
+  ABSL_RETURN_IF_ERROR(ValidateRuntimeSupport());
   ABSL_ASSIGN_OR_RETURN(
       std::unique_ptr<Engine::Session> session,
       engine_->CreateSession(resolved_session_config_));

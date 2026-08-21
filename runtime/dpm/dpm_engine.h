@@ -35,6 +35,8 @@
 
 namespace litert::lm {
 
+class DPMAgentReplayRuntime;
+
 class DPMClock {
  public:
   virtual ~DPMClock() = default;
@@ -162,6 +164,15 @@ struct DPMTurnResult {
   Hash256 projection_execution_evidence_hash;
   std::optional<Hash256> projection_exact_profile_id;
   std::optional<Hash256> projection_exact_profile_admission_record_id;
+  DPMReplayMode agent_replay_mode =
+      DPMReplayMode::kCanonicalWinnerReplay;
+  Hash256 agent_execution_evidence_hash;
+  std::optional<Hash256> agent_exact_profile_id;
+  std::optional<Hash256> agent_exact_profile_admission_record_id;
+  std::optional<Hash256> agent_exact_output_evidence_hash;
+  uint32_t agent_exact_logit_frame_count = 0;
+  bool agent_reused_canonical_winner = false;
+  bool agent_producing_session_matched_output = false;
   std::optional<Hash256> session_checkpoint_id;
   bool restored_session_checkpoint = false;
   bool recovered_committed_turn = false;
@@ -189,7 +200,7 @@ struct DPMCorrectionResult {
 class DPMEngine {
  public:
   DPMEngine(DPMEventLog* log, DPMProjectionProvider* projection_provider,
-            DPMAgentRuntime* agent_runtime,
+            DPMAgentReplayRuntime* agent_runtime,
             DPMSessionCheckpointRepository* checkpoint_repository,
             DPMEngineConfig config, DPMClock* clock = nullptr);
 
@@ -241,7 +252,7 @@ class DPMEngine {
 
   DPMEventLog* log_;
   DPMProjectionProvider* projection_provider_;
-  DPMAgentRuntime* agent_runtime_;
+  DPMAgentReplayRuntime* agent_runtime_;
   DPMSessionCheckpointRepository* checkpoint_repository_;
   DPMEngineConfig config_;
   DPMClock* clock_;

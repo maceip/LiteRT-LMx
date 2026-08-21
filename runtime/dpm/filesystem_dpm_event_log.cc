@@ -46,11 +46,11 @@ namespace litert::lm {
 namespace {
 
 constexpr std::array<char, 8> kLogMagic = {'D', 'P', 'M', 'L', 'O', 'G',
-                                            '0', '3'};
+                                            '0', '4'};
 constexpr std::array<char, 8> kRecordMagic = {'D', 'P', 'M', 'E', 'V', 'T',
-                                               '0', '3'};
-constexpr uint32_t kLogFormatVersion = 3;
-constexpr uint32_t kEventFormatVersion = 3;
+                                               '0', '4'};
+constexpr uint32_t kLogFormatVersion = 4;
+constexpr uint32_t kEventFormatVersion = 4;
 // A maximum model-turn record contains three payload-sized strings (the event
 // payload, projected memory, and the receipt's decision output), the canonical
 // agent input, all repeated operation/case/manifest identities, the complete
@@ -63,8 +63,8 @@ constexpr uint64_t kMaxRecordBytes =
     uint64_t{kMaximumDPMGenerationTokens} * sizeof(int32_t) + 4 * 1024;
 constexpr uint64_t kRecordHeaderSize =
     kRecordMagic.size() + sizeof(uint64_t) + 32 + 32;
-constexpr absl::string_view kGenesisDomain = "DPM_EVENT_LOG_GENESIS_SHA256_V3";
-constexpr absl::string_view kRecordDomain = "DPM_EVENT_LOG_PREFIX_SHA256_V3";
+constexpr absl::string_view kGenesisDomain = "DPM_EVENT_LOG_GENESIS_SHA256_V4";
+constexpr absl::string_view kRecordDomain = "DPM_EVENT_LOG_PREFIX_SHA256_V4";
 static_assert(sizeof(size_t) <= sizeof(uint64_t));
 static_assert(sizeof(int) >= sizeof(int32_t));
 
@@ -620,6 +620,53 @@ absl::StatusOr<DPMProjectionManifest> ReadProjectionManifest(
   return manifest;
 }
 
+absl::Status ValidateAgentReplayReceiptEvidence(
+    const DPMTurnReceipt& receipt) {
+  ABSL_RETURN_IF_ERROR(ValidateDPMReplayMode(receipt.agent_replay_mode));
+  if (receipt.agent_replay_mode != receipt.projection_manifest.replay_mode ||
+      IsZeroHash(receipt.agent_replay_request_hash) ||
+      IsZeroHash(receipt.agent_execution_evidence_hash) ||
+      (receipt.session_checkpoint_id.has_value() &&
+       !receipt.agent_producing_session_matched_output)) {
+    return absl::InvalidArgumentError(
+        "DPM agent receipt has incomplete, mixed-mode, or false producing-"
+        "session evidence.");
+  }
+  switch (receipt.agent_replay_mode) {
+    case DPMReplayMode::kCanonicalWinnerReplay:
+      if (receipt.agent_exact_profile_id.has_value() ||
+          receipt.agent_exact_profile_admission_record_id.has_value() ||
+          receipt.agent_exact_output_evidence_hash.has_value() ||
+          receipt.agent_exact_logit_frame_count != 0 ||
+          receipt.agent_producing_session_matched_output ==
+              receipt.agent_reused_canonical_winner) {
+        return absl::InvalidArgumentError(
+            "WinnerReplay agent receipt contains exact evidence or invalid "
+            "producing-session provenance.");
+      }
+      break;
+    case DPMReplayMode::kExactRegeneration:
+      if (!receipt.agent_exact_profile_id.has_value() ||
+          IsZeroHash(*receipt.agent_exact_profile_id) ||
+          !receipt.agent_exact_profile_admission_record_id.has_value() ||
+          IsZeroHash(*receipt.agent_exact_profile_admission_record_id) ||
+          !receipt.agent_exact_output_evidence_hash.has_value() ||
+          IsZeroHash(*receipt.agent_exact_output_evidence_hash) ||
+          receipt.agent_exact_logit_frame_count == 0 ||
+          receipt.agent_exact_logit_frame_count !=
+              receipt.decision_token_ids.size() ||
+          receipt.agent_reused_canonical_winner ||
+          receipt.agent_producing_session_matched_output ||
+          receipt.session_checkpoint_id.has_value()) {
+        return absl::InvalidArgumentError(
+            "Exact agent receipt is missing ordered evidence or claims a "
+            "catalog/parent-session result.");
+      }
+      break;
+  }
+  return absl::OkStatus();
+}
+
 absl::Status ValidateEvent(const DPMEvent& event,
                            const std::vector<DPMEvent>& prior_events,
                            absl::string_view log_id,
@@ -803,6 +850,7 @@ absl::Status ValidateEvent(const DPMEvent& event,
     return absl::InvalidArgumentError(
         "DPM turn receipt contains an empty checkpoint identity.");
   }
+  ABSL_RETURN_IF_ERROR(ValidateAgentReplayReceiptEvidence(receipt));
   return absl::OkStatus();
 }
 
@@ -830,6 +878,26 @@ absl::StatusOr<std::string> EncodeEventCanonical(const DPMEvent& event) {
   AppendHash(receipt.agent_session_identity.inference_profile_hash, &bytes);
   AppendU32(receipt.max_decision_tokens, &bytes);
   AppendHash(receipt.agent_request_hash, &bytes);
+  bytes.push_back(static_cast<char>(receipt.agent_replay_mode));
+  AppendHash(receipt.agent_replay_request_hash, &bytes);
+  AppendHash(receipt.agent_execution_evidence_hash, &bytes);
+  bytes.push_back(receipt.agent_exact_profile_id.has_value() ? 1 : 0);
+  if (receipt.agent_exact_profile_id.has_value()) {
+    AppendHash(*receipt.agent_exact_profile_id, &bytes);
+  }
+  bytes.push_back(
+      receipt.agent_exact_profile_admission_record_id.has_value() ? 1 : 0);
+  if (receipt.agent_exact_profile_admission_record_id.has_value()) {
+    AppendHash(*receipt.agent_exact_profile_admission_record_id, &bytes);
+  }
+  bytes.push_back(
+      receipt.agent_exact_output_evidence_hash.has_value() ? 1 : 0);
+  if (receipt.agent_exact_output_evidence_hash.has_value()) {
+    AppendHash(*receipt.agent_exact_output_evidence_hash, &bytes);
+  }
+  AppendU32(receipt.agent_exact_logit_frame_count, &bytes);
+  bytes.push_back(receipt.agent_reused_canonical_winner ? 1 : 0);
+  bytes.push_back(receipt.agent_producing_session_matched_output ? 1 : 0);
   ABSL_RETURN_IF_ERROR(AppendString(receipt.projected_memory, &bytes));
   ABSL_RETURN_IF_ERROR(AppendString(receipt.canonical_agent_input, &bytes));
   ABSL_RETURN_IF_ERROR(AppendString(receipt.decision_output, &bytes));
@@ -896,6 +964,50 @@ absl::StatusOr<DPMEvent> DecodeEventCanonical(absl::string_view bytes) {
         reader.ReadHash());
     ABSL_ASSIGN_OR_RETURN(receipt.max_decision_tokens, reader.ReadU32());
     ABSL_ASSIGN_OR_RETURN(receipt.agent_request_hash, reader.ReadHash());
+    ABSL_ASSIGN_OR_RETURN(uint8_t agent_replay_mode, reader.ReadU8());
+    receipt.agent_replay_mode = static_cast<DPMReplayMode>(agent_replay_mode);
+    ABSL_ASSIGN_OR_RETURN(receipt.agent_replay_request_hash,
+                          reader.ReadHash());
+    ABSL_ASSIGN_OR_RETURN(receipt.agent_execution_evidence_hash,
+                          reader.ReadHash());
+    ABSL_ASSIGN_OR_RETURN(uint8_t has_agent_exact_profile, reader.ReadU8());
+    if (has_agent_exact_profile > 1) {
+      return absl::DataLossError(
+          "Non-canonical DPM agent exact-profile-presence flag.");
+    }
+    if (has_agent_exact_profile == 1) {
+      ABSL_ASSIGN_OR_RETURN(Hash256 exact_profile, reader.ReadHash());
+      receipt.agent_exact_profile_id = exact_profile;
+    }
+    ABSL_ASSIGN_OR_RETURN(uint8_t has_agent_exact_admission, reader.ReadU8());
+    if (has_agent_exact_admission > 1) {
+      return absl::DataLossError(
+          "Non-canonical DPM agent exact-admission-presence flag.");
+    }
+    if (has_agent_exact_admission == 1) {
+      ABSL_ASSIGN_OR_RETURN(Hash256 exact_admission, reader.ReadHash());
+      receipt.agent_exact_profile_admission_record_id = exact_admission;
+    }
+    ABSL_ASSIGN_OR_RETURN(uint8_t has_agent_exact_output, reader.ReadU8());
+    if (has_agent_exact_output > 1) {
+      return absl::DataLossError(
+          "Non-canonical DPM agent exact-output-evidence-presence flag.");
+    }
+    if (has_agent_exact_output == 1) {
+      ABSL_ASSIGN_OR_RETURN(Hash256 exact_output, reader.ReadHash());
+      receipt.agent_exact_output_evidence_hash = exact_output;
+    }
+    ABSL_ASSIGN_OR_RETURN(receipt.agent_exact_logit_frame_count,
+                          reader.ReadU32());
+    ABSL_ASSIGN_OR_RETURN(uint8_t reused_agent_winner, reader.ReadU8());
+    ABSL_ASSIGN_OR_RETURN(uint8_t producing_agent_session, reader.ReadU8());
+    if (reused_agent_winner > 1 || producing_agent_session > 1) {
+      return absl::DataLossError(
+          "Non-canonical DPM agent replay provenance flag.");
+    }
+    receipt.agent_reused_canonical_winner = reused_agent_winner == 1;
+    receipt.agent_producing_session_matched_output =
+        producing_agent_session == 1;
     ABSL_ASSIGN_OR_RETURN(
         receipt.projected_memory,
         reader.ReadString(kMaximumDPMEventPayloadBytes,
