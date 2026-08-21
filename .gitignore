@@ -1,2 +1,10 @@
 /MODULE.bazel.lock
 /bazel-*
+
+# LiteRT-LMx is source-only. Platform prebuilts stay local when needed.
+/prebuilt/*/*.so
+/prebuilt/*/*.dylib
+/prebuilt/*/*.dll
+/prebuilt/*/*.lib
+/prebuilt/*/lit
+/prebuilt/*/lit.exe
