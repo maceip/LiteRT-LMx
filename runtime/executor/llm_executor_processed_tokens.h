@@ -106,6 +106,11 @@ class ProcessedTokens {
   // token, if any.
   int TokenCount() const;
 
+  // Returns the number of token positions already consumed by the model. This
+  // excludes the optional pending token and is the minimum state capacity
+  // required by an exact session handoff.
+  int ProcessedTokenCount() const { return GetStep(); }
+
   // Reduces the token candidates to 1 with one of given index.
   // It will be called when LLM switches from decode to prefill.
   absl::Status ReduceTokenCandidates(size_t index);
@@ -157,6 +162,24 @@ class ProcessedTokens {
   // Exports the exact processed/pending distinction. Inconsistent candidate
   // state and pending embeddings fail closed instead of being discarded.
   absl::StatusOr<Snapshot> ExportSnapshot() const;
+
+  // Validates the live history without allocating a snapshot. This is the
+  // capability gate for state that cannot be represented by Snapshot, such as
+  // pending token embeddings.
+  absl::Status ValidateSessionHandoffSupport() const;
+
+  // Validates every live processed and pending token ID against the loaded
+  // vocabulary without allocating a Snapshot.
+  absl::Status ValidateTokenIds(int vocabulary_size) const;
+
+  // Validates the structural invariants and supported step range of an
+  // untrusted snapshot without constructing a ProcessedTokens instance.
+  static absl::Status ValidateSnapshot(const Snapshot& snapshot);
+
+  // Validates every processed and pending token ID against the vocabulary of
+  // the loaded decode logits tensor. A non-positive vocabulary is rejected.
+  static absl::Status ValidateSnapshotTokenIds(
+      const Snapshot& snapshot, int vocabulary_size);
 
   // Constructs a validated token history without partially mutating a live
   // ProcessedTokens instance.

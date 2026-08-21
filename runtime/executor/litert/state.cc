@@ -642,6 +642,130 @@ absl::StatusOr<std::unique_ptr<LitertState>> LitertState::Create(
                              clear_kv_cache_before_prefill);
 }
 
+absl::Status LitertState::ValidateSessionHandoffSupport() const {
+  if (allocation_policy_ == AllocationPolicy::kGpuOptimizedInplace) {
+    return absl::UnimplementedError(
+        "Session handoff has not admitted GPU-optimized LiteRT state.");
+  }
+  return ValidateStateInventory(/*allow_gpu_optimized=*/false);
+}
+
+absl::Status LitertState::ValidateDeterministicProjectionResetSupport() const {
+  return ValidateStateInventory(/*allow_gpu_optimized=*/true);
+}
+
+absl::Status LitertState::ValidateStateInventory(
+    bool allow_gpu_optimized) const {
+  if (!authoritative_state_inventory_) {
+    return absl::UnimplementedError(
+        "Continuation-state operations require an authoritative "
+        "executor-metadata state inventory; heuristic discovery is not "
+        "sufficient.");
+  }
+  if (batch_size_ <= 0 || num_entries_ <= 0) {
+    return absl::FailedPreconditionError(
+        "LiteRT state has an invalid batch or entry capacity.");
+  }
+  switch (allocation_policy_) {
+    case AllocationPolicy::kInplace:
+      if (bank_2_state_buffers_.has_value()) {
+        return absl::FailedPreconditionError(
+            "In-place LiteRT state unexpectedly has a second bank.");
+      }
+      break;
+    case AllocationPolicy::kPingPong:
+      if (!bank_2_state_buffers_.has_value()) {
+        return absl::FailedPreconditionError(
+            "Ping-pong LiteRT state is missing its second bank.");
+      }
+      break;
+    case AllocationPolicy::kGpuOptimizedInplace:
+      if (!allow_gpu_optimized) {
+        return absl::UnimplementedError(
+            "This continuation-state operation has not admitted "
+            "GPU-optimized LiteRT state.");
+      }
+      if (bank_2_state_buffers_.has_value()) {
+        return absl::FailedPreconditionError(
+            "GPU-optimized in-place LiteRT state unexpectedly has a second "
+            "bank.");
+      }
+      break;
+    default:
+      return absl::FailedPreconditionError(
+          "LiteRT state has an unknown allocation policy.");
+  }
+  if (bank_1_state_buffers_.empty()) {
+    return absl::FailedPreconditionError(
+        "LiteRT state has no inventoried continuation buffers.");
+  }
+  if (bank_2_state_buffers_.has_value()) {
+    RETURN_IF_ERROR(ValidateMatchingStateBankNames(
+        bank_1_state_buffers_, *bank_2_state_buffers_));
+  }
+
+  for (const auto& [name, state_buffer] : bank_1_state_buffers_) {
+    if (name.empty()) {
+      return absl::FailedPreconditionError(
+          "LiteRT state inventory contains an unnamed buffer.");
+    }
+    switch (state_buffer.type) {
+      case proto::StateBuffer::TYPE_GLOBAL_KEY_CACHE:
+      case proto::StateBuffer::TYPE_GLOBAL_VALUE_CACHE:
+      case proto::StateBuffer::TYPE_LOCAL_KEY_CACHE:
+      case proto::StateBuffer::TYPE_LOCAL_VALUE_CACHE:
+      case proto::StateBuffer::TYPE_LINEAR_ATTENTION:
+        break;
+      case proto::StateBuffer::TYPE_UNSPECIFIED:
+      default:
+        return absl::UnimplementedError(absl::StrCat(
+            "Continuation-state operations have not admitted LiteRT state "
+            "buffer type ",
+            state_buffer.type, " for ", name, "."));
+    }
+
+    LITERT_ASSIGN_OR_RETURN(const RankedTensorType tensor_type,
+                            state_buffer.buffer.TensorType());
+    const Layout& layout = tensor_type.Layout();
+    if (state_buffer.dynamic_dim.has_value()) {
+      const int dynamic_dim = *state_buffer.dynamic_dim;
+      if (dynamic_dim < 0 ||
+          static_cast<uint32_t>(dynamic_dim) >= layout.Rank()) {
+        return absl::FailedPreconditionError(absl::StrCat(
+            "LiteRT state has an invalid dynamic dimension for ", name, "."));
+      }
+      if (layout.Dimensions()[dynamic_dim] != num_entries_) {
+        return absl::FailedPreconditionError(absl::StrCat(
+            "LiteRT state capacity does not match the dynamic dimension for ",
+            name, "."));
+      }
+    }
+    LITERT_ASSIGN_OR_RETURN(const size_t packed_size,
+                            state_buffer.buffer.PackedSize());
+    LITERT_ASSIGN_OR_RETURN(const size_t size, state_buffer.buffer.Size());
+    LITERT_ASSIGN_OR_RETURN(const size_t offset,
+                            state_buffer.buffer.Offset());
+    RETURN_IF_ERROR(ValidateBufferByteRange(packed_size, size, offset, name));
+
+    if (bank_2_state_buffers_.has_value()) {
+      const auto secondary = bank_2_state_buffers_->find(name);
+      if (secondary == bank_2_state_buffers_->end() ||
+          secondary->second.type != state_buffer.type) {
+        return absl::FailedPreconditionError(absl::StrCat(
+            "LiteRT state banks disagree about the type of ", name, "."));
+      }
+      LITERT_ASSIGN_OR_RETURN(const RankedTensorType secondary_tensor_type,
+                              secondary->second.buffer.TensorType());
+      if (secondary_tensor_type != tensor_type) {
+        return absl::FailedPreconditionError(absl::StrCat(
+            "LiteRT state banks disagree about the tensor type of ", name,
+            "."));
+      }
+    }
+  }
+  return absl::OkStatus();
+}
+
 absl::StatusOr<uint64_t> LitertState::SerializedSize() const {
   if (batch_size_ < 0 || num_entries_ < 0) {
     return absl::FailedPreconditionError(
@@ -923,6 +1047,78 @@ absl::Status LitertState::SerializeTo(ByteSink* sink) const {
 absl::Status LitertState::Load(absl::string_view serialized_state) {
   StringByteSource source(serialized_state);
   return LoadFrom(source, /*target_is_disposable=*/false);
+}
+
+absl::Status LitertState::ValidateSnapshotHeaderForImport(
+    const ByteSource& source, int required_consumed_entries) const {
+  if (required_consumed_entries < 0) {
+    return absl::InvalidArgumentError(
+        "Required LiteRT state entry count must not be negative.");
+  }
+  constexpr uint64_t kSnapshotHeaderSize =
+      kSnapshotMagic.size() + 5 * sizeof(uint32_t);
+  if (source.Size() < kSnapshotHeaderSize + kSnapshotDigestSize) {
+    return absl::DataLossError("Truncated LiteRT state snapshot");
+  }
+
+  SourceSnapshotReader reader(source, source.Size() - kSnapshotDigestSize);
+  std::array<char, kSnapshotMagic.size()> magic;
+  RETURN_IF_ERROR(reader.ReadBytes(absl::MakeSpan(magic)));
+  if (!std::equal(magic.begin(), magic.end(), kSnapshotMagic.begin())) {
+    return absl::DataLossError("Invalid LiteRT state snapshot magic");
+  }
+  ABSL_ASSIGN_OR_RETURN(const uint32_t version, reader.ReadU32());
+  if (version != kSnapshotVersion) {
+    return IncompatibleSnapshot("format version");
+  }
+  ABSL_ASSIGN_OR_RETURN(const uint32_t allocation_policy, reader.ReadU32());
+  if (allocation_policy >
+      static_cast<uint32_t>(AllocationPolicy::kGpuOptimizedInplace)) {
+    return absl::DataLossError(
+        "Invalid allocation policy in LiteRT state snapshot");
+  }
+  if (allocation_policy != static_cast<uint32_t>(allocation_policy_)) {
+    return IncompatibleSnapshot("allocation policy");
+  }
+  ABSL_ASSIGN_OR_RETURN(const uint32_t batch_size, reader.ReadU32());
+  ABSL_ASSIGN_OR_RETURN(const uint32_t num_entries, reader.ReadU32());
+  ABSL_ASSIGN_OR_RETURN(const uint32_t tensor_count, reader.ReadU32());
+  if (batch_size_ < 0 || batch_size != static_cast<uint32_t>(batch_size_)) {
+    return IncompatibleSnapshot("batch size");
+  }
+  if (num_entries >
+      static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+    return absl::DataLossError(
+        "Invalid entry count in LiteRT state snapshot");
+  }
+  if (tensor_count != bank_1_state_buffers_.size()) {
+    return IncompatibleSnapshot("tensor count");
+  }
+  const int snapshot_num_entries = static_cast<int>(num_entries);
+  if (snapshot_num_entries < required_consumed_entries) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "LiteRT state snapshot capacity ", snapshot_num_entries,
+        " is smaller than the ", required_consumed_entries,
+        " consumed token positions in the session handoff."));
+  }
+  if (snapshot_num_entries != num_entries_) {
+    if (snapshot_num_entries == 0) {
+      return IncompatibleSnapshot("entry count");
+    }
+    if (bank_2_state_buffers_.has_value()) {
+      return absl::UnimplementedError(
+          "Cannot reshape a ping-pong LiteRT state during snapshot restore");
+    }
+    const bool has_dynamic_buffer = std::any_of(
+        bank_1_state_buffers_.begin(), bank_1_state_buffers_.end(),
+        [](const auto& named_buffer) {
+          return named_buffer.second.dynamic_dim.has_value();
+        });
+    if (!has_dynamic_buffer) {
+      return IncompatibleSnapshot("entry count");
+    }
+  }
+  return absl::OkStatus();
 }
 
 absl::Status LitertState::LoadFrom(const ByteSource& source,
@@ -1370,7 +1566,8 @@ absl::StatusOr<std::unique_ptr<StateInterface>> LitertState::DeepCopy() const {
 
   auto copy = absl::WrapUnique(new LitertState(
       batch_size_, num_entries_, env_, std::move(bank_1_state_buffers),
-      std::move(bank_2_state_buffers), allocation_policy_));
+      std::move(bank_2_state_buffers), allocation_policy_,
+      authoritative_state_inventory_));
   copy->bank_1_is_input_ = bank_1_is_input_;
 
   return copy;
@@ -1632,7 +1829,8 @@ absl::StatusOr<std::unique_ptr<LitertState>> LitertState::HeuristicBasedCreate(
 
   return absl::WrapUnique(new LitertState(
       batch_size, context_size, env, std::move(bank_1_state_buffers),
-      std::move(bank_2_state_buffers), allocation_policy));
+      std::move(bank_2_state_buffers), allocation_policy,
+      /*authoritative_state_inventory=*/false));
 }
 
 absl::StatusOr<std::unique_ptr<LitertState>> LitertState::MetadataBasedCreate(
@@ -1803,7 +2001,8 @@ absl::StatusOr<std::unique_ptr<LitertState>> LitertState::MetadataBasedCreate(
 
   return absl::WrapUnique(new LitertState(
       batch_size, context_size, env, std::move(bank_1_state_buffers),
-      std::move(bank_2_state_buffers), allocation_policy));
+      std::move(bank_2_state_buffers), allocation_policy,
+      /*authoritative_state_inventory=*/true));
 }
 
 }  // namespace litert::lm

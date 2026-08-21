@@ -143,7 +143,11 @@ SessionAdvanced::RunPrefillAsync(
         PreprocessContents(contents, session_info_->session_config, *tokenizer_,
                            session_info_->benchmark_info));
   } else {
-    bool is_first_turn = session_state_ == SessionState::kFresh;
+    const bool is_first_turn =
+        session_state_ == SessionState::kFresh ||
+        session_info_->session_config.GetMemoryStrategy() ==
+            SessionConfig::MemoryStrategy::
+                kStatelessDeterministicProjection;
     ContentType content_type;
     if (session_info_->session_config.GetApplyPromptTemplateInSession()) {
       content_type = (is_first_turn || session_state_ == SessionState::kDecoded)
@@ -164,7 +168,7 @@ SessionAdvanced::RunPrefillAsync(
   ABSL_ASSIGN_OR_RETURN(auto task_id, execution_manager_lock->GetNewTaskId());
   ABSL_RETURN_IF_ERROR(execution_manager_lock->AddPrefillTask(
       session_id_, task_id, std::move(preprocessed_contents), last_task_ids_,
-      cancelled, std::move(callback)));
+      PrefillBoundary::kStartProjection, cancelled, std::move(callback)));
   session_state_ = SessionState::kPrefilled;
   last_task_ids_ = {task_id};
 
@@ -186,7 +190,7 @@ SessionAdvanced::PrefillPreprocessedContents(
   ABSL_ASSIGN_OR_RETURN(auto task_id, execution_manager_lock->GetNewTaskId());
   ABSL_RETURN_IF_ERROR(execution_manager_lock->AddPrefillTask(
       session_id_, task_id, std::move(preprocessed_contents), last_task_ids_,
-      cancelled, std::move(callback)));
+      PrefillBoundary::kStartProjection, cancelled, std::move(callback)));
   session_state_ = SessionState::kPrefilled;
   last_task_ids_ = {task_id};
 
@@ -315,7 +319,8 @@ absl::StatusOr<std::unique_ptr<TaskController>> SessionAdvanced::RunDecodeAsync(
                             execution_manager_lock->GetNewTaskId());
       ABSL_RETURN_IF_ERROR(execution_manager_lock->AddPrefillTask(
           session_id_, task_id, std::move(preprocessed_contents),
-          last_task_ids_, cancelled, std::move(noop_callback)));
+          last_task_ids_, PrefillBoundary::kContinueSession, cancelled,
+          std::move(noop_callback)));
       last_task_ids_ = {task_id};
     }
   }
@@ -524,6 +529,12 @@ SessionAdvanced::~SessionAdvanced() {
 
 absl::Status SessionAdvanced::SaveCheckpoint(absl::string_view label) {
   absl::MutexLock lock(mutex_);
+  if (session_info_->session_config.GetMemoryStrategy() ==
+      SessionConfig::MemoryStrategy::kStatelessDeterministicProjection) {
+    return absl::FailedPreconditionError(
+        "Step-only checkpoints are not complete deterministic projection "
+        "capsules.");
+  }
   auto execution_manager_lock = execution_manager_.lock();
   if (execution_manager_lock == nullptr) {
     return absl::FailedPreconditionError("Execution manager is not available.");
@@ -536,6 +547,13 @@ absl::Status SessionAdvanced::SaveCheckpoint(absl::string_view label) {
 
 absl::Status SessionAdvanced::RewindToCheckpoint(absl::string_view label) {
   absl::MutexLock lock(mutex_);
+
+  if (session_info_->session_config.GetMemoryStrategy() ==
+      SessionConfig::MemoryStrategy::kStatelessDeterministicProjection) {
+    return absl::FailedPreconditionError(
+        "Step-only rewind is not supported for deterministic projection "
+        "sessions.");
+  }
 
   // Look up the checkpoint step.
   auto it = checkpoint_map_.find(label);
@@ -565,6 +583,12 @@ absl::Status SessionAdvanced::RewindToCheckpoint(absl::string_view label) {
 
 absl::Status SessionAdvanced::RewindToStep(int step) {
   absl::MutexLock lock(mutex_);
+  if (session_info_->session_config.GetMemoryStrategy() ==
+      SessionConfig::MemoryStrategy::kStatelessDeterministicProjection) {
+    return absl::FailedPreconditionError(
+        "Step-only rewind is not supported for deterministic projection "
+        "sessions.");
+  }
   auto execution_manager_lock = execution_manager_.lock();
   if (execution_manager_lock == nullptr) {
     return absl::FailedPreconditionError("Execution manager is not available.");

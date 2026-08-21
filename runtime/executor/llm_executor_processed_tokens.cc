@@ -22,6 +22,7 @@
 
 #include "absl/log/absl_check.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 
@@ -171,15 +172,32 @@ void ProcessedTokens::InvalidatePendingInputToken() {
 
 absl::StatusOr<ProcessedTokens::Snapshot> ProcessedTokens::ExportSnapshot()
     const {
+  ABSL_RETURN_IF_ERROR(ValidateSessionHandoffSupport());
+  Snapshot snapshot;
+  snapshot.processed_token_ids.reserve(tokens_.size());
+  if (tokens_[0].pending_input_token != nullptr) {
+    snapshot.pending_token_ids.reserve(tokens_.size());
+  }
+  for (const Tokens& tokens : tokens_) {
+    snapshot.processed_token_ids.push_back(tokens.token_ids);
+    if (tokens.pending_input_token != nullptr) {
+      snapshot.pending_token_ids.push_back(tokens.pending_input_token->id());
+    }
+  }
+  return snapshot;
+}
+
+absl::Status ProcessedTokens::ValidateSessionHandoffSupport() const {
   if (tokens_.empty()) {
     return absl::InternalError("ProcessedTokens has no token candidates.");
   }
   const size_t processed_count = tokens_[0].token_ids.size();
   const bool has_pending = tokens_[0].pending_input_token != nullptr;
-  Snapshot snapshot;
-  snapshot.processed_token_ids.reserve(tokens_.size());
-  if (has_pending) {
-    snapshot.pending_token_ids.reserve(tokens_.size());
+  const size_t pending_count = has_pending ? 1 : 0;
+  if (processed_count >
+      static_cast<size_t>(std::numeric_limits<int>::max()) - pending_count) {
+    return absl::ResourceExhaustedError(
+        "Processed token history exceeds the supported step range.");
   }
   for (const Tokens& tokens : tokens_) {
     if (tokens.token_ids.size() != processed_count) {
@@ -190,21 +208,41 @@ absl::StatusOr<ProcessedTokens::Snapshot> ProcessedTokens::ExportSnapshot()
       return absl::FailedPreconditionError(
           "Processed token candidates disagree about pending-token state.");
     }
-    snapshot.processed_token_ids.push_back(tokens.token_ids);
     if (has_pending) {
       if (!tokens.pending_input_token->embedding().empty() ||
           !tokens.pending_input_token->per_layer_embedding().empty()) {
         return absl::UnimplementedError(
             "Session handoff does not support pending token embeddings.");
       }
-      snapshot.pending_token_ids.push_back(tokens.pending_input_token->id());
     }
   }
-  return snapshot;
+  return absl::OkStatus();
 }
 
-absl::StatusOr<ProcessedTokens> ProcessedTokens::FromSnapshot(
-    const Snapshot& snapshot) {
+absl::Status ProcessedTokens::ValidateTokenIds(int vocabulary_size) const {
+  ABSL_RETURN_IF_ERROR(ValidateSessionHandoffSupport());
+  if (vocabulary_size <= 0) {
+    return absl::FailedPreconditionError(
+        "Loaded decode vocabulary must be positive.");
+  }
+  for (const Tokens& tokens : tokens_) {
+    for (int token_id : tokens.token_ids) {
+      if (token_id < 0 || token_id >= vocabulary_size) {
+        return absl::InvalidArgumentError(
+            "Live session token ID is outside the loaded vocabulary.");
+      }
+    }
+    if (tokens.pending_input_token != nullptr &&
+        (tokens.pending_input_token->id() < 0 ||
+         tokens.pending_input_token->id() >= vocabulary_size)) {
+      return absl::InvalidArgumentError(
+          "Live pending token ID is outside the loaded vocabulary.");
+    }
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ProcessedTokens::ValidateSnapshot(const Snapshot& snapshot) {
   if (snapshot.processed_token_ids.empty()) {
     return absl::InvalidArgumentError(
         "Processed token snapshot must contain at least one candidate.");
@@ -228,6 +266,38 @@ absl::StatusOr<ProcessedTokens> ProcessedTokens::FromSnapshot(
     return absl::ResourceExhaustedError(
         "Processed token snapshot exceeds the supported step range.");
   }
+  return absl::OkStatus();
+}
+
+absl::Status ProcessedTokens::ValidateSnapshotTokenIds(
+    const Snapshot& snapshot, int vocabulary_size) {
+  ABSL_RETURN_IF_ERROR(ValidateSnapshot(snapshot));
+  if (vocabulary_size <= 0) {
+    return absl::FailedPreconditionError(
+        "Loaded decode vocabulary must be positive.");
+  }
+  const auto validate_token_id =
+      [vocabulary_size](int token_id) -> absl::Status {
+    if (token_id < 0 || token_id >= vocabulary_size) {
+      return absl::InvalidArgumentError(
+          "Session handoff token ID is outside the loaded vocabulary.");
+    }
+    return absl::OkStatus();
+  };
+  for (const auto& candidate : snapshot.processed_token_ids) {
+    for (int token_id : candidate) {
+      ABSL_RETURN_IF_ERROR(validate_token_id(token_id));
+    }
+  }
+  for (int token_id : snapshot.pending_token_ids) {
+    ABSL_RETURN_IF_ERROR(validate_token_id(token_id));
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<ProcessedTokens> ProcessedTokens::FromSnapshot(
+    const Snapshot& snapshot) {
+  ABSL_RETURN_IF_ERROR(ValidateSnapshot(snapshot));
 
   ProcessedTokens restored;
   restored.tokens_.clear();

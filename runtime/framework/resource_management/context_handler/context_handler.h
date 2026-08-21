@@ -16,6 +16,7 @@
 #define THIRD_PARTY_ODML_LITERT_LM_FRAMEWORK_RESOURCE_MANAGEMENT_CONTEXT_HANDLER_CONTEXT_HANDLER_H_
 
 #include <algorithm>
+#include <cstddef>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -167,6 +168,14 @@ class ContextHandler::SharedProcessedContext {
     absl::MutexLock lock(&handlers_mutex_);
     handlers_.erase(std::remove(handlers_.begin(), handlers_.end(), handler),
                     handlers_.end());
+  }
+
+  // Returns how many context handlers currently share the processed context.
+  // Deterministic projection reset uses this to separate a cloned handler
+  // before clearing the executor-owned state.
+  std::size_t HandlerCount() const {
+    absl::MutexLock lock(&handlers_mutex_);
+    return handlers_.size();
   }
 
   // Returns the number of tokens in the longest handler.

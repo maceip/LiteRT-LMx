@@ -194,6 +194,24 @@ class LlmExecutorBase {
         "Reset not implemented for backend: ", ExecutorBackendName()));
   };
 
+  // Returns OK only when this concrete executor can discard every
+  // history-dependent state element at a deterministic projection boundary.
+  // Backends must opt in explicitly; the base implementation fails closed.
+  virtual absl::Status ValidateDeterministicProjectionSupport() const {
+    return absl::UnimplementedError(absl::StrCat(
+        "Deterministic projection reset not implemented for backend: ",
+        ExecutorBackendName()));
+  }
+
+  // Transactionally replaces all history-dependent execution state with a
+  // fresh projection state. A failed reset must leave the live state usable
+  // and unchanged. Callers must validate support before admitting a session.
+  virtual absl::Status ResetForDeterministicProjection() {
+    return absl::UnimplementedError(absl::StrCat(
+        "Deterministic projection reset not implemented for backend: ",
+        ExecutorBackendName()));
+  }
+
   // ------------State/context management APIs------------:
   // Creates a new context with the given configs.
   virtual absl::StatusOr<std::unique_ptr<LlmContext>> CreateNewContext(

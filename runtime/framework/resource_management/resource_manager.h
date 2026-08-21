@@ -110,6 +110,11 @@ class ResourceManager {
   absl::StatusOr<std::unique_ptr<LlmExecutor>> AcquireExecutor()
       ABSL_LOCKS_EXCLUDED(executor_mutex_);
 
+  // Validates the concrete executor's deterministic projection capability
+  // before a stateless session allocates any context.
+  absl::Status ValidateDeterministicProjectionSupport()
+      ABSL_LOCKS_EXCLUDED(executor_mutex_);
+
   // Acquires the executor after loading the provided context handle.
   // Typically, this function is called instead of AcquireExecutor() when the
   // usage of the returned executor involves any state updates, e.g. prefill,

@@ -381,6 +381,10 @@ class LockedLlmExecutor : public LlmExecutor {
     return llm_executor_->ValidateSessionHandoffSupport();
   }
 
+  absl::Status ValidateDeterministicProjectionSupport() const override {
+    return llm_executor_->ValidateDeterministicProjectionSupport();
+  }
+
   absl::Status VisitSessionState(
       absl::FunctionRef<absl::Status(const StateInterface&)> visitor) const
       override {
@@ -431,6 +435,17 @@ class LockedLlmExecutor : public LlmExecutor {
   }
 
   absl::Status Reset() override { return llm_executor_->Reset(); }
+
+  absl::Status ResetForDeterministicProjection() override {
+    ABSL_RETURN_IF_ERROR(
+        llm_executor_->ValidateDeterministicProjectionSupport());
+    if (current_handler_ != nullptr &&
+        current_handler_->shared_processed_context()->HandlerCount() > 1) {
+      ABSL_RETURN_IF_ERROR(SaveProcessedContextAndSeparateLoadedHandler(
+          current_handler_, llm_executor_));
+    }
+    return llm_executor_->ResetForDeterministicProjection();
+  }
 
   absl::StatusOr<int> GetVocabSize() override {
     return llm_executor_->GetVocabSize();
@@ -699,6 +714,11 @@ ResourceManager::AcquireExecutor() {
   return std::make_unique<LockedLlmExecutor>(llm_executor_, std::move(lock));
 }
 
+absl::Status ResourceManager::ValidateDeterministicProjectionSupport() {
+  ABSL_ASSIGN_OR_RETURN(auto executor, AcquireExecutor());
+  return executor->ValidateDeterministicProjectionSupport();
+}
+
 absl::StatusOr<std::unique_ptr<LlmExecutor>>
 ResourceManager::AcquireExecutorWithContextHandler(
     std::shared_ptr<ContextHandler> new_context_handler) {
@@ -854,6 +874,13 @@ absl::Status ResourceManager::ExportSessionSnapshotTo(
   if (runtime_state.current_step < 0 || runtime_state.rand_gen == nullptr) {
     return absl::FailedPreconditionError(
         "LiteRT session handoff runtime state is incomplete.");
+  }
+  ABSL_ASSIGN_OR_RETURN(const int vocabulary_size, executor->GetVocabSize());
+  if (last_prefill_token_id < 0 ||
+      last_prefill_token_id >= vocabulary_size) {
+    return absl::InvalidArgumentError(
+        "Session handoff last prefill token is outside the loaded "
+        "vocabulary.");
   }
 
   ExecutorSessionSnapshot snapshot;

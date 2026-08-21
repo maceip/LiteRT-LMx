@@ -15,6 +15,7 @@
 #ifndef THIRD_PARTY_ODML_LITERT_LM_RUNTIME_EXECUTOR_LITERT_STATE_H_
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_EXECUTOR_LITERT_STATE_H_
 
+#include <cstddef>
 #include <memory>
 #include <optional>
 #include <string>
@@ -62,6 +63,25 @@ class LitertState : public StateInterface {
 
   AllocationPolicy allocation_policy() const { return allocation_policy_; }
 
+  // True only when this state was constructed from runtime-owned executor
+  // metadata that explicitly enumerated its generalized state buffers.
+  bool HasAuthoritativeStateInventory() const {
+    return authoritative_state_inventory_;
+  }
+
+  size_t StateBufferCount() const { return bank_1_state_buffers_.size(); }
+
+  // Fails closed unless the allocation policy and every generalized state
+  // buffer type are admitted for exact session handoff. Heuristic KV discovery
+  // is deliberately insufficient proof of complete continuation state.
+  absl::Status ValidateSessionHandoffSupport() const;
+
+  // Fails closed unless every history-dependent buffer is authoritatively
+  // inventoried and can be replaced as one reset transaction. Unlike session
+  // handoff, backend-native GPU-optimized allocations are admitted here
+  // because reset recreates them instead of serializing them.
+  absl::Status ValidateDeterministicProjectionResetSupport() const;
+
   // Serializes the logical input bank into a canonical, versioned snapshot.
   // The snapshot binds the state structure and buffer layout and includes an
   // integrity digest. The caller remains responsible for authenticating the
@@ -87,6 +107,13 @@ class LitertState : public StateInterface {
   absl::Status Load(absl::string_view serialized_state) override;
   absl::Status LoadFrom(const ByteSource& source,
                         bool target_is_disposable = false) override;
+
+  // Reads only the immutable LRTST001 header and validates it against this
+  // live state and the number of model-consumed token positions. This method
+  // does not allocate, lock, write, or otherwise mutate live state. LoadFrom
+  // still authenticates and validates the complete snapshot before commit.
+  absl::Status ValidateSnapshotHeaderForImport(
+      const ByteSource& source, int required_consumed_entries) const;
 
   absl::Status SelectAndCopyFrom(StateInterface& other,
                                  int batch_index) override;
@@ -126,6 +153,8 @@ class LitertState : public StateInterface {
     std::optional<int> dynamic_dim;
   };
 
+  absl::Status ValidateStateInventory(bool allow_gpu_optimized) const;
+
   absl::Status SyncShapes(CompiledModel& compiled_model,
                           absl::string_view signature_name);
 
@@ -146,13 +175,14 @@ class LitertState : public StateInterface {
       absl::flat_hash_map<std::string, StateBuffer> bank_1_state_buffers,
       std::optional<absl::flat_hash_map<std::string, StateBuffer>>
           bank_2_state_buffers,
-      AllocationPolicy allocation_policy)
+      AllocationPolicy allocation_policy, bool authoritative_state_inventory)
       : batch_size_(batch_size),
         num_entries_(num_entries),
         env_(env),
         bank_1_state_buffers_(std::move(bank_1_state_buffers)),
         bank_2_state_buffers_(std::move(bank_2_state_buffers)),
-        allocation_policy_(allocation_policy) {}
+        allocation_policy_(allocation_policy),
+        authoritative_state_inventory_(authoritative_state_inventory) {}
 
   // Batch size of the KV cache buffers.
   int batch_size_;
@@ -170,6 +200,10 @@ class LitertState : public StateInterface {
   bool bank_1_is_input_ = true;
 
   AllocationPolicy allocation_policy_;
+
+  // Construction provenance is immutable session-handoff evidence. A caller
+  // cannot upgrade heuristic state discovery after the model is loaded.
+  const bool authoritative_state_inventory_;
 };
 
 }  // namespace litert::lm

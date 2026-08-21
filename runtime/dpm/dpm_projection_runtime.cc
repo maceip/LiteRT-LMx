@@ -277,12 +277,14 @@ absl::StatusOr<std::string> EngineDPMProjectionRuntime::GenerateFresh(
         "Loaded Engine returned a null DPM projection session.");
   }
   ABSL_RETURN_IF_ERROR(ValidateSession(*session));
-  ABSL_ASSIGN_OR_RETURN(
-      std::vector<std::vector<int>> fresh_history,
-      session->GetExactProcessedTokenHistory());
-  if (fresh_history.size() != 1 || !fresh_history[0].empty()) {
+  // This is only a freshness assertion. Exporting a complete session capsule
+  // here would incorrectly make projection reset depend on capsule support
+  // (and would reject GPU before its backend-native reset can run). The
+  // mandatory kStartProjection prefill below performs the transactional reset.
+  ABSL_ASSIGN_OR_RETURN(const int fresh_step, session->GetCurrentStep());
+  if (fresh_step != 0) {
     return absl::FailedPreconditionError(
-        "DPM projection Engine did not create one empty fresh context.");
+        "DPM projection Engine did not create a step-zero fresh context.");
   }
 
   ABSL_RETURN_IF_ERROR(session->RunPrefill(

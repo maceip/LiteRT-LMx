@@ -106,6 +106,10 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
 
   absl::Status ValidateSessionHandoffSupport() const override;
 
+  absl::Status ValidateDeterministicProjectionSupport() const override;
+
+  absl::Status ResetForDeterministicProjection() override;
+
   absl::Status VisitSessionState(
       absl::FunctionRef<absl::Status(const StateInterface&)> visitor) const
       override;
@@ -237,6 +241,7 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
             (executor_settings.GetCacheDir() == ":nocache" ||
              (executor_settings.IsWeightCacheDisabled() &&
               executor_settings.IsProgramCacheDisabled()))),
+        compiled_backend_(executor_settings.GetBackend()),
         executor_settings_(std::move(executor_settings)),
         env_(env),
         model_(*model),
@@ -383,6 +388,24 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
   absl::Status BindSamplerToContext(const RuntimeConfig& runtime_config,
                                     const RuntimeState& runtime_state);
 
+  struct ContextSampler {
+    std::unique_ptr<Sampler> sampler;
+    Backend backend = Backend::UNSPECIFIED;
+    int sampler_type = 0;
+    int max_top_k = 0;
+  };
+
+  // Constructs and validates a sampler without mutating the live executor.
+  // Resource-manager context switches use this when two sessions select
+  // different concrete sampling algorithms.
+  absl::StatusOr<ContextSampler> CreateSamplerForContext(
+      const RuntimeConfig& runtime_config,
+      const RuntimeState& runtime_state) const;
+
+  // Returns the vocabulary dimension of the immutable loaded decode logits
+  // allocation, without consulting mutable executor settings.
+  absl::StatusOr<int> GetLoadedVocabularySizeForSessionHandoff() const;
+
   // Gets the LiteRT run options based on the current executor settings.
   litert::Options GetRunOptions() const;
 
@@ -390,6 +413,10 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
   // settings updates must never be able to relabel a cache-backed compiled
   // executor as eligible for exact session handoff identity.
   const bool session_handoff_compile_caches_disabled_;
+
+  // Backend used to create compiled_model_. Runtime settings are mutable and
+  // therefore cannot be authoritative continuation-state evidence.
+  const Backend compiled_backend_;
 
   mutable absl::Mutex executor_settings_mutex_;
   LlmExecutorSettings executor_settings_
@@ -459,7 +486,7 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
   std::unique_ptr<LlmLiteRtMtpDrafter> mtp_drafter_;
 
   // The executor metadata.
-  const proto::ExecutorMetadata* executor_metadata_ = nullptr;
+  const proto::ExecutorMetadata* const executor_metadata_;
 
   // Callback invoked immediately before executing an individual computation
   // graph/subgraph (signature runner like "prefill_128" or "decode"). Allows

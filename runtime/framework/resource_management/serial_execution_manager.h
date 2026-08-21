@@ -156,11 +156,12 @@ class SerialExecutionManager : public ExecutionManager {
   // - inputs: The inputs of the prefill task.
   // - dep_tasks: The dependent tasks that should be done before the prefill
   //   task starts.
+  // - boundary: Whether this prefill starts a projection or continues one.
   // - cancelled: The cancelled flag for the prefill task.
   // - callback: The callback function.
   absl::Status AddPrefillTask(
       SessionId session_id, TaskId task_id, std::vector<InputData> inputs,
-      absl::flat_hash_set<TaskId> dep_tasks,
+      absl::flat_hash_set<TaskId> dep_tasks, PrefillBoundary boundary,
       std::shared_ptr<std::atomic<bool>> absl_nonnull cancelled,
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) override;
 
@@ -265,6 +266,7 @@ class SerialExecutionManager : public ExecutionManager {
       SessionId session_id, TaskId task_id,
       absl::AnyInvocable<void()> absl_nonnull task,
       absl::flat_hash_set<TaskId> dependent_tasks,
+      bool potentially_mutating,
       std::shared_ptr<std::atomic<bool>> absl_nonnull cancelled,
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> absl_nonnull
       callback);
@@ -330,6 +332,15 @@ class SerialExecutionManager : public ExecutionManager {
   absl::StatusOr<ExecutorInputs> ProcessAndCombineContents(
       const std::vector<InputData>& preprocessed_contents,
       std::optional<BenchmarkInfo>& benchmark_info);
+
+  absl::Status BeginDeterministicProjectionReset(SessionId session_id,
+                                                 TaskId task_id);
+  void EndDeterministicProjectionReset(SessionId session_id, TaskId task_id);
+  absl::Status SetDeterministicProjectionReady(SessionId session_id,
+                                               bool ready);
+  absl::Status ValidateDeterministicProjectionReady(SessionId session_id);
+  void PoisonSessionHandoff(SessionInfo& session_info,
+                            absl::string_view reason);
 
   // The tokenizer used for encoding the text input.
   Tokenizer* tokenizer_;

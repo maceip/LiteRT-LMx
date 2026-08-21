@@ -184,6 +184,16 @@ absl::Status SerialExecutionManager::WaitUntilAllDone(absl::Duration timeout) {
 
 absl::StatusOr<SessionId> SerialExecutionManager::RegisterNewSession(
     SessionConfig session_config, std::optional<BenchmarkInfo> benchmark_info) {
+  switch (session_config.GetMemoryStrategy()) {
+    case SessionConfig::MemoryStrategy::kStateful:
+      break;
+    case SessionConfig::MemoryStrategy::kStatelessDeterministicProjection:
+      ABSL_RETURN_IF_ERROR(
+          resource_manager_->ValidateDeterministicProjectionSupport());
+      break;
+    default:
+      return absl::InvalidArgumentError("Unknown session memory strategy.");
+  }
   ABSL_ASSIGN_OR_RETURN(
       auto context_handler,
       resource_manager_->CreateContextHandler(session_config));
@@ -247,9 +257,13 @@ absl::Status SerialExecutionManager::ReleaseSession(SessionId session_id) {
     return absl::InvalidArgumentError(
         absl::StrCat("Session ", session_id, " not found in session list."));
   }
-  if (session_lookup_.at(session_id)->handoff_in_progress) {
+  if (!session_lookup_.at(session_id)->active_tasks.empty() ||
+      session_lookup_.at(session_id)->handoff_in_progress ||
+      session_lookup_.at(session_id)
+          ->deterministic_projection_reset_owner.has_value()) {
     return absl::FailedPreconditionError(
-        "Cannot release a session while handoff is in progress.");
+        "Cannot release a session with active tasks, during handoff, or "
+        "during deterministic projection reset.");
   }
   if (session_lookup_.at(session_id)->session_config.AudioModalityEnabled() &&
       session_lookup_.size() == 1) {
@@ -281,6 +295,8 @@ absl::Status SerialExecutionManager::CancelAllTasksInSession(
     return absl::InvalidArgumentError(
         absl::StrCat("Session ", session_id, " not found in session list."));
   }
+  PoisonSessionHandoff(*session_lookup_.at(session_id),
+                       "Session cancellation was requested.");
   for (TaskId task_id : session_lookup_.at(session_id)->active_tasks) {
     task_lookup_.at(task_id).cancelled->store(true);
   }
@@ -337,8 +353,14 @@ absl::Status SerialExecutionManager::ExportSessionSnapshotTo(
         absl::StrCat("Session ", session_id, " not found in session list."));
   }
   std::shared_ptr<SessionInfo> session_info = session_lookup_.at(session_id);
+  if (session_info->handoff_poisoned) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "Session handoff is permanently unavailable: ",
+        session_info->handoff_poison_reason));
+  }
   if (!session_info->active_tasks.empty() ||
-      session_info->handoff_in_progress) {
+      session_info->handoff_in_progress ||
+      session_info->deterministic_projection_reset_owner.has_value()) {
     return absl::FailedPreconditionError(
         "Session must be quiescent before handoff export.");
   }
@@ -378,10 +400,20 @@ absl::Status SerialExecutionManager::ImportSessionSnapshotFrom(
         absl::StrCat("Session ", session_id, " not found in session list."));
   }
   std::shared_ptr<SessionInfo> session_info = session_lookup_.at(session_id);
+  if (session_info->handoff_poisoned) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "Session handoff is permanently unavailable: ",
+        session_info->handoff_poison_reason));
+  }
   if (!session_info->active_tasks.empty() ||
-      session_info->handoff_in_progress) {
+      session_info->handoff_in_progress ||
+      session_info->deterministic_projection_reset_owner.has_value()) {
     return absl::FailedPreconditionError(
         "Session must be quiescent before handoff import.");
+  }
+  if (session_info->session_config.GetMemoryStrategy() ==
+      SessionConfig::MemoryStrategy::kStatelessDeterministicProjection) {
+    session_info->deterministic_projection_ready = false;
   }
   session_info->handoff_in_progress = true;
   absl::Cleanup clear_handoff = [session_info] {
@@ -403,6 +435,7 @@ absl::Status SerialExecutionManager::CreateTask(
     SessionId session_id, TaskId task_id,
     absl::AnyInvocable<void()> absl_nonnull task,
     absl::flat_hash_set<TaskId> dependent_tasks,
+    bool potentially_mutating,
     std::shared_ptr<std::atomic<bool>> absl_nonnull cancelled,
     absl::AnyInvocable<void(absl::StatusOr<Responses>)> absl_nonnull callback) {
   if (!session_lookup_.contains(session_id)) {
@@ -469,6 +502,39 @@ absl::Status SerialExecutionManager::CreateTask(
     }
   }
 
+  const bool defer_lifecycle_callbacks =
+      session_lookup_.at(session_id)->session_config.GetMemoryStrategy() ==
+      SessionConfig::MemoryStrategy::kStatelessDeterministicProjection;
+  if (defer_lifecycle_callbacks && IsTaskEndState(task_state)) {
+    // A dependency may make the task terminal before it ever executes. Turn
+    // that result into a queued notification task so callbacks are delivered
+    // only after SessionAdvanced releases its mutex.
+    const TaskState terminal_state = task_state;
+    task_state = TaskState::kCreated;
+    potentially_mutating = false;
+    for (TaskId dependency_id : dependent_tasks) {
+      auto dependency = task_lookup_.find(dependency_id);
+      if (dependency != task_lookup_.end()) {
+        dependency->second.following_tasks.erase(task_id);
+      }
+    }
+    dependent_tasks.clear();
+    task = [this, task_id, terminal_state]() mutable {
+      auto task_info_or = StartTask(task_id);
+      if (!task_info_or.ok()) {
+        FinishTaskAndLogErrors(task_id, task_info_or.status(),
+                               [](absl::StatusOr<Responses>) {});
+        return;
+      }
+      auto [session_info, cancelled, callback] =
+          std::move(task_info_or.value());
+      if (session_info == nullptr) return;
+      (void)cancelled;
+      FinishTaskAndLogErrors(task_id, Responses(terminal_state),
+                             std::move(callback));
+    };
+  }
+
   if (!IsTaskEndState(task_state)) {
     session_lookup_.at(session_id)->active_tasks.insert(task_id);
   }
@@ -478,11 +544,15 @@ absl::Status SerialExecutionManager::CreateTask(
   task_info.task_state = task_state;
   task_info.task = std::move(task);
   task_info.dependent_tasks = std::move(dependent_tasks);
+  task_info.potentially_mutating = potentially_mutating;
+  task_info.defer_lifecycle_callbacks = defer_lifecycle_callbacks;
   task_info.cancelled = cancelled;
   task_info.callback = std::move(callback);
   task_lookup_.insert({task_id, std::move(task_info)});
 
-  task_lookup_.at(task_id).callback(Responses(task_state));
+  if (!task_lookup_.at(task_id).defer_lifecycle_callbacks) {
+    task_lookup_.at(task_id).callback(Responses(task_state));
+  }
 
   if (task_state == TaskState::kCreated &&
       task_lookup_.at(task_id).dependent_tasks.empty()) {
@@ -499,12 +569,16 @@ absl::Status SerialExecutionManager::QueueTask(TaskId task_id) {
   if (task_lookup_.at(task_id).task_state != TaskState::kCreated) {
     auto error_status = absl::FailedPreconditionError(
         absl::StrCat("Task ", task_id, " is not in Created state."));
-    task_lookup_.at(task_id).callback(error_status);
+    if (!task_lookup_.at(task_id).defer_lifecycle_callbacks) {
+      task_lookup_.at(task_id).callback(error_status);
+    }
     return error_status;
   }
 
   ready_queue_.push_back(task_id);
-  task_lookup_.at(task_id).callback(Responses(TaskState::kQueued));
+  if (!task_lookup_.at(task_id).defer_lifecycle_callbacks) {
+    task_lookup_.at(task_id).callback(Responses(TaskState::kQueued));
+  }
   ABSL_RETURN_IF_ERROR(UpdateTaskState(task_id, TaskState::kQueued));
 
   return absl::OkStatus();
@@ -553,13 +627,26 @@ SerialExecutionManager::StartTask(TaskId task_id) {
     return error_status;
   }
 
-  task_lookup_.at(task_id).callback(Responses(TaskState::kProcessing));
+  const bool defer_lifecycle_callbacks =
+      task_lookup_.at(task_id).defer_lifecycle_callbacks;
+  if (!defer_lifecycle_callbacks) {
+    task_lookup_.at(task_id).callback(Responses(TaskState::kProcessing));
+  }
   ABSL_RETURN_IF_ERROR(UpdateTaskState(task_id, TaskState::kProcessing));
+  task_lookup_.at(task_id).execution_started = true;
 
   std::shared_ptr<SessionInfo> session_info =
       session_lookup_.at(task_lookup_.at(task_id).session_id);
-  return std::make_tuple(session_info, task_lookup_.at(task_id).cancelled,
-                         std::move(task_lookup_.at(task_id).callback));
+  std::shared_ptr<std::atomic<bool>> cancelled =
+      task_lookup_.at(task_id).cancelled;
+  auto callback = std::move(task_lookup_.at(task_id).callback);
+  if (defer_lifecycle_callbacks) {
+    callback(Responses(TaskState::kCreated));
+    callback(Responses(TaskState::kQueued));
+    callback(Responses(TaskState::kProcessing));
+  }
+  return std::make_tuple(session_info, std::move(cancelled),
+                         std::move(callback));
 }
 
 absl::Status SerialExecutionManager::FinishTask(
@@ -581,15 +668,36 @@ absl::Status SerialExecutionManager::FinishTask(
     return invoke_callback_and_return(error_status);
   }
 
-  if (!responses.ok() || responses->GetTaskState() == TaskState::kCancelled) {
+  TaskInfo& completing_task = task_lookup_.at(task_id);
+  const bool task_cancelled =
+      responses.ok() &&
+      (responses->GetTaskState() == TaskState::kCancelled ||
+       responses->GetTaskState() == TaskState::kDependentTaskCancelled);
+  const bool task_failed =
+      !responses.ok() ||
+      (responses->GetTaskState() == TaskState::kFailed ||
+       responses->GetTaskState() == TaskState::kDependentTaskFailed);
+  if (task_cancelled) {
+    PoisonSessionHandoff(*session_lookup_.at(completing_task.session_id),
+                         absl::StrCat("Task ", task_id,
+                                      " was cancelled."));
+  } else if (task_failed && completing_task.potentially_mutating &&
+             completing_task.execution_started) {
+    PoisonSessionHandoff(
+        *session_lookup_.at(completing_task.session_id),
+        absl::StrCat("Potentially mutating task ", task_id,
+                     " failed after execution started."));
+  }
+
+  if (task_cancelled || task_failed) {
     auto following_waiting_tasks = FollowingWaitingTasks(task_id);
     if (!following_waiting_tasks.ok()) {
       return invoke_callback_and_return(following_waiting_tasks.status());
     }
-    auto status = UpdateAllTasksToState(following_waiting_tasks.value(),
-                                        responses.ok()
-                                            ? TaskState::kDependentTaskCancelled
-                                            : TaskState::kDependentTaskFailed);
+    auto status = UpdateAllTasksToState(
+        following_waiting_tasks.value(),
+        task_cancelled ? TaskState::kDependentTaskCancelled
+                       : TaskState::kDependentTaskFailed);
     if (!status.ok()) {
       return invoke_callback_and_return(status);
     }
@@ -650,31 +758,103 @@ SerialExecutionManager::FollowingWaitingTasks(TaskId task_id) {
   return following_waiting_tasks;
 }
 
+absl::Status SerialExecutionManager::BeginDeterministicProjectionReset(
+    SessionId session_id, TaskId task_id) {
+  if (!session_lookup_.contains(session_id)) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Session ", session_id, " not found in session list."));
+  }
+  SessionInfo& session_info = *session_lookup_.at(session_id);
+  if (session_info.deterministic_projection_reset_owner.has_value()) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "Session already has a deterministic projection reset owner: ",
+        *session_info.deterministic_projection_reset_owner));
+  }
+  session_info.deterministic_projection_reset_owner = task_id;
+  return absl::OkStatus();
+}
+
+void SerialExecutionManager::EndDeterministicProjectionReset(
+    SessionId session_id, TaskId task_id) {
+  if (!session_lookup_.contains(session_id)) return;
+  SessionInfo& session_info = *session_lookup_.at(session_id);
+  if (session_info.deterministic_projection_reset_owner == task_id) {
+    session_info.deterministic_projection_reset_owner.reset();
+  }
+}
+
+absl::Status SerialExecutionManager::SetDeterministicProjectionReady(
+    SessionId session_id, bool ready) {
+  if (!session_lookup_.contains(session_id)) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Session ", session_id, " not found in session list."));
+  }
+  session_lookup_.at(session_id)->deterministic_projection_ready = ready;
+  return absl::OkStatus();
+}
+
+absl::Status SerialExecutionManager::ValidateDeterministicProjectionReady(
+    SessionId session_id) {
+  if (!session_lookup_.contains(session_id)) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Session ", session_id, " not found in session list."));
+  }
+  if (!session_lookup_.at(session_id)->deterministic_projection_ready) {
+    return absl::FailedPreconditionError(
+        "Stateless session has no successfully initialized projection epoch.");
+  }
+  return absl::OkStatus();
+}
+
+void SerialExecutionManager::PoisonSessionHandoff(
+    SessionInfo& session_info, absl::string_view reason) {
+  session_info.deterministic_projection_ready = false;
+  if (session_info.handoff_poisoned) return;
+  session_info.handoff_poisoned = true;
+  session_info.handoff_poison_reason = std::string(reason);
+}
+
 absl::Status SerialExecutionManager::UpdateTaskState(TaskId task_id,
                                                      TaskState task_state) {
   if (!task_lookup_.contains(task_id)) {
     return absl::InvalidArgumentError(
         absl::StrCat("Task ", task_id, " not found in task list."));
   }
-  if (!IsTaskEndState(task_lookup_.at(task_id).task_state) &&
+  TaskInfo& task_info = task_lookup_.at(task_id);
+  if (!IsTaskEndState(task_info.task_state) &&
       IsTaskEndState(task_state)) {
-    SessionId session_id = task_lookup_.at(task_id).session_id;
+    SessionId session_id = task_info.session_id;
     if (session_lookup_.contains(session_id)) {
-      session_lookup_.at(session_id)->active_tasks.erase(task_id);
+      SessionInfo& session_info = *session_lookup_.at(session_id);
+      if (task_state == TaskState::kCancelled ||
+          task_state == TaskState::kDependentTaskCancelled) {
+        PoisonSessionHandoff(
+            session_info,
+            absl::StrCat("Task ", task_id, " was cancelled."));
+      } else if ((task_state == TaskState::kFailed ||
+                  task_state == TaskState::kDependentTaskFailed) &&
+                 task_info.potentially_mutating &&
+                 task_info.execution_started) {
+        PoisonSessionHandoff(
+            session_info,
+            absl::StrCat("Potentially mutating task ", task_id,
+                         " failed after execution started."));
+      }
+      session_info.active_tasks.erase(task_id);
     }
   }
-  task_lookup_.at(task_id).task_state = task_state;
+  task_info.task_state = task_state;
   return absl::OkStatus();
 }
 
 absl::Status SerialExecutionManager::UpdateAllTasksToState(
     const absl::flat_hash_set<TaskId>& task_ids, TaskState task_state) {
   for (TaskId task_id : task_ids) {
+    task_lookup_.at(task_id).dependent_tasks.clear();
+    ABSL_RETURN_IF_ERROR(UpdateTaskState(task_id, task_state));
     if (task_lookup_.at(task_id).callback) {
       task_lookup_.at(task_id).callback(Responses(task_state));
     }
-    task_lookup_.at(task_id).dependent_tasks.clear();
-    ABSL_RETURN_IF_ERROR(UpdateTaskState(task_id, task_state));
   }
   return absl::OkStatus();
 }
@@ -816,14 +996,21 @@ SerialExecutionManager::ProcessAndCombineContents(
 
 absl::Status SerialExecutionManager::AddPrefillTask(
     SessionId session_id, TaskId task_id, std::vector<InputData> inputs,
-    absl::flat_hash_set<TaskId> dep_tasks,
+    absl::flat_hash_set<TaskId> dep_tasks, PrefillBoundary boundary,
     std::shared_ptr<std::atomic<bool>> absl_nonnull cancelled,
     absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) {
+  switch (boundary) {
+    case PrefillBoundary::kStartProjection:
+    case PrefillBoundary::kContinueSession:
+      break;
+    default:
+      return absl::InvalidArgumentError("Unknown prefill boundary.");
+  }
   if (callback == nullptr) {
     callback = [](absl::StatusOr<Responses>) {};
   }
 
-  auto task = [this, task_id, session_id,
+  auto task = [this, task_id, session_id, boundary,
                inputs = std::move(inputs)]() mutable {
     auto task_info_or = StartTask(task_id);
     if (!task_info_or.ok()) {
@@ -834,14 +1021,28 @@ absl::Status SerialExecutionManager::AddPrefillTask(
     auto [session_info, cancelled, callback] = std::move(task_info_or.value());
     if (session_info == nullptr) return;
 
-    RETURN_IF_CANCELLED(cancelled, task_id, callback);
-
-    auto llm_executor = resource_manager_->AcquireExecutorWithContextHandler(
-        session_info->context_handler);
-    if (!llm_executor.ok()) {
-      FinishTaskAndLogErrors(task_id, llm_executor.status(),
-                             std::move(callback));
-      return;
+    const bool stateless_projection_session =
+        session_info->session_config.GetMemoryStrategy() ==
+        SessionConfig::MemoryStrategy::kStatelessDeterministicProjection;
+    const bool starts_stateless_projection =
+        stateless_projection_session &&
+        boundary == PrefillBoundary::kStartProjection;
+    if (starts_stateless_projection) {
+      absl::Status readiness_status =
+          SetDeterministicProjectionReady(session_id, false);
+      if (!readiness_status.ok()) {
+        FinishTaskAndLogErrors(task_id, readiness_status,
+                               std::move(callback));
+        return;
+      }
+    } else if (stateless_projection_session) {
+      absl::Status readiness_status =
+          ValidateDeterministicProjectionReady(session_id);
+      if (!readiness_status.ok()) {
+        FinishTaskAndLogErrors(task_id, readiness_status,
+                               std::move(callback));
+        return;
+      }
     }
 
     RETURN_IF_CANCELLED(cancelled, task_id, callback);
@@ -857,7 +1058,6 @@ absl::Status SerialExecutionManager::AddPrefillTask(
       }
     }
     if (!executor_inputs.ok()) {
-      llm_executor.value().reset();
       if (executor_inputs.status().message() ==
               "No token IDs found in preprocessed_contents." &&
           session_info->session_config.AudioModalityEnabled()) {
@@ -900,6 +1100,53 @@ absl::Status SerialExecutionManager::AddPrefillTask(
 
     RETURN_IF_CANCELLED(cancelled, task_id, callback);
 
+    auto llm_executor = resource_manager_->AcquireExecutorWithContextHandler(
+        session_info->context_handler);
+    if (!llm_executor.ok()) {
+      FinishTaskAndLogErrors(task_id, llm_executor.status(),
+                             std::move(callback));
+      return;
+    }
+
+    bool owns_projection_reset = false;
+    auto finish_after_executor_unlock =
+        [&](absl::StatusOr<Responses> result) mutable {
+          llm_executor.value().reset();
+          if (owns_projection_reset) {
+            EndDeterministicProjectionReset(session_id, task_id);
+            owns_projection_reset = false;
+          }
+          FinishTaskAndLogErrors(task_id, std::move(result),
+                                 std::move(callback));
+        };
+
+    if (cancelled != nullptr && cancelled->load()) {
+      finish_after_executor_unlock(Responses(TaskState::kCancelled));
+      return;
+    }
+
+    if (starts_stateless_projection) {
+      absl::Status owner_status =
+          BeginDeterministicProjectionReset(session_id, task_id);
+      if (!owner_status.ok()) {
+        finish_after_executor_unlock(owner_status);
+        return;
+      }
+      owns_projection_reset = true;
+      absl::Status reset_status =
+          llm_executor.value()->ResetForDeterministicProjection();
+      if (!reset_status.ok()) {
+        finish_after_executor_unlock(reset_status);
+        return;
+      }
+      session_info->last_prefill_token_id = 0;
+      last_prefill_token_id_ = 0;
+      if (cancelled != nullptr && cancelled->load()) {
+        finish_after_executor_unlock(Responses(TaskState::kCancelled));
+        return;
+      }
+    }
+
 #if defined(LITERT_LM_DEBUGGER_ENABLED)
     if (runtime_debugger_ != nullptr) {
       runtime_debugger_->SetActiveDebugSession(session_id);
@@ -914,7 +1161,7 @@ absl::Status SerialExecutionManager::AddPrefillTask(
                        /*wait_for_completion=*/true,
                        /*benchmark_info=*/session_info->benchmark_info);
     if (!responses.ok()) {
-      FinishTaskAndLogErrors(task_id, responses.status(), std::move(callback));
+      finish_after_executor_unlock(responses.status());
       return;
     }
 
@@ -923,27 +1170,44 @@ absl::Status SerialExecutionManager::AddPrefillTask(
     } else {
       auto processed_tokens = llm_executor.value()->GetProcessedTokens();
       if (!processed_tokens.ok()) {
-        FinishTaskAndLogErrors(task_id, processed_tokens.status(),
-                               std::move(callback));
+        finish_after_executor_unlock(processed_tokens.status());
         return;
       }
       auto current_step = llm_executor.value()->GetCurrentStep();
       if (!current_step.ok()) {
-        FinishTaskAndLogErrors(task_id, current_step.status(),
-                               std::move(callback));
+        finish_after_executor_unlock(current_step.status());
         return;
       }
-      session_info->last_prefill_token_id =
-          processed_tokens.value()
-              ->GetTokenAtStep(current_step.value() - 1)
-              .at(0);
+      if (current_step.value() <= 0) {
+        finish_after_executor_unlock(absl::FailedPreconditionError(
+            "Prefill completed without a positive current step."));
+        return;
+      }
+      std::vector<int> last_step_tokens =
+          processed_tokens.value()->GetTokenAtStep(current_step.value() - 1);
+      if (last_step_tokens.size() != 1) {
+        finish_after_executor_unlock(absl::FailedPreconditionError(
+            "Prefill did not produce exactly one last-token candidate."));
+        return;
+      }
+      session_info->last_prefill_token_id = last_step_tokens.front();
+      last_prefill_token_id_ = session_info->last_prefill_token_id;
+      if (starts_stateless_projection) {
+        absl::Status readiness_status =
+            SetDeterministicProjectionReady(session_id, true);
+        if (!readiness_status.ok()) {
+          finish_after_executor_unlock(readiness_status);
+          return;
+        }
+      }
     }
 
-    FinishTaskAndLogErrors(task_id, std::move(responses), std::move(callback));
+    finish_after_executor_unlock(std::move(responses));
   };
 
   return CreateTask(session_id, task_id, std::move(task), std::move(dep_tasks),
-                    cancelled, std::move(callback));
+                    /*potentially_mutating=*/true, cancelled,
+                    std::move(callback));
 }
 
 absl::Status SerialExecutionManager::AddDecodeTask(
@@ -990,6 +1254,17 @@ absl::Status SerialExecutionManager::AddDecodeTask(
     auto [session_info, cancelled, callback] = std::move(task_info_or.value());
     if (session_info == nullptr) return;
 
+    if (session_info->session_config.GetMemoryStrategy() ==
+        SessionConfig::MemoryStrategy::kStatelessDeterministicProjection) {
+      absl::Status readiness_status =
+          ValidateDeterministicProjectionReady(session_id);
+      if (!readiness_status.ok()) {
+        FinishTaskAndLogErrors(task_id, readiness_status,
+                               std::move(callback));
+        return;
+      }
+    }
+
     RETURN_IF_CANCELLED(cancelled, task_id, callback);
 
     auto llm_executor = resource_manager_->AcquireExecutorWithContextHandler(
@@ -1012,6 +1287,7 @@ absl::Status SerialExecutionManager::AddDecodeTask(
         auto decoded_ids_buffer_or =
             CopyToTensorBuffer<int>(decoded_ids, {num_output_candidates, 1});
         if (!decoded_ids_buffer_or.HasValue()) {
+          llm_executor.value().reset();
           FinishTaskAndLogErrors(
               task_id,
               absl::InternalError(decoded_ids_buffer_or.Error().Message()),
@@ -1047,11 +1323,13 @@ absl::Status SerialExecutionManager::AddDecodeTask(
       responses = Responses(TaskState::kCancelled);
     }
 
+    llm_executor.value().reset();
     FinishTaskAndLogErrors(task_id, std::move(responses), std::move(callback));
   };
 
   return CreateTask(session_id, task_id, std::move(task), std::move(dep_tasks),
-                    cancelled, std::move(callback));
+                    /*potentially_mutating=*/true, cancelled,
+                    std::move(callback));
 }
 
 absl::Status SerialExecutionManager::AddCloneSessionTask(
@@ -1131,6 +1409,16 @@ absl::Status SerialExecutionManager::AddCloneSessionTask(
                   std::move(cloned_stop_token_detector);
               session_lookup_.at(cloned_session_id)->benchmark_info =
                   original_session_info->benchmark_info;
+              session_lookup_.at(cloned_session_id)
+                  ->deterministic_projection_ready =
+                  original_session_info->deterministic_projection_ready;
+              if (original_session_info->handoff_poisoned) {
+                PoisonSessionHandoff(
+                    *session_lookup_.at(cloned_session_id),
+                    absl::StrCat("Cloned from a handoff-poisoned session: ",
+                                 original_session_info
+                                     ->handoff_poison_reason));
+              }
             }
           }
         }
@@ -1145,7 +1433,8 @@ absl::Status SerialExecutionManager::AddCloneSessionTask(
   };
 
   return CreateTask(cloned_session_id, task_id, std::move(task),
-                    std::move(dep_tasks), cancelled, std::move(callback));
+                    std::move(dep_tasks), /*potentially_mutating=*/true,
+                    cancelled, std::move(callback));
 }
 
 absl::Status SerialExecutionManager::AddTextScoringTask(
@@ -1163,7 +1452,8 @@ absl::Status SerialExecutionManager::AddTextScoringTask(
     target_text_str.push_back(std::string(text));
   }
 
-  auto task = [this, task_id, target_text_str = std::move(target_text_str),
+  auto task = [this, task_id, session_id,
+               target_text_str = std::move(target_text_str),
                store_token_lengths]() mutable {
     auto task_info_or = StartTask(task_id);
     if (!task_info_or.ok()) {
@@ -1173,6 +1463,17 @@ absl::Status SerialExecutionManager::AddTextScoringTask(
     }
     auto [session_info, cancelled, callback] = std::move(task_info_or.value());
     if (session_info == nullptr) return;
+
+    if (session_info->session_config.GetMemoryStrategy() ==
+        SessionConfig::MemoryStrategy::kStatelessDeterministicProjection) {
+      absl::Status readiness_status =
+          ValidateDeterministicProjectionReady(session_id);
+      if (!readiness_status.ok()) {
+        FinishTaskAndLogErrors(task_id, readiness_status,
+                               std::move(callback));
+        return;
+      }
+    }
 
     RETURN_IF_CANCELLED(cancelled, task_id, callback);
 
@@ -1191,6 +1492,7 @@ absl::Status SerialExecutionManager::AddTextScoringTask(
     auto decoded_ids_buffer =
         CopyToTensorBuffer<int>(decoded_ids, {num_output_candidates, 1});
     if (!decoded_ids_buffer.HasValue()) {
+      llm_executor.value().reset();
       FinishTaskAndLogErrors(
           task_id, absl::InternalError(decoded_ids_buffer.Error().Message()),
           std::move(callback));
@@ -1212,11 +1514,13 @@ absl::Status SerialExecutionManager::AddTextScoringTask(
       responses = Responses(TaskState::kCancelled);
     }
 
+    llm_executor.value().reset();
     FinishTaskAndLogErrors(task_id, std::move(responses), std::move(callback));
   };
 
   return CreateTask(session_id, task_id, std::move(task), std::move(dep_tasks),
-                    cancelled, std::move(callback));
+                    /*potentially_mutating=*/true, cancelled,
+                    std::move(callback));
 }
 
 absl::StatusOr<int> SerialExecutionManager::GetCurrentStep(
@@ -1229,6 +1533,12 @@ absl::StatusOr<int> SerialExecutionManager::GetCurrentStep(
 
 absl::Status SerialExecutionManager::SetCurrentStep(
     const SessionInfo& session_info, int target_step) {
+  if (session_info.session_config.GetMemoryStrategy() ==
+      SessionConfig::MemoryStrategy::kStatelessDeterministicProjection) {
+    return absl::FailedPreconditionError(
+        "Step-only rewind is not supported for deterministic projection "
+        "sessions.");
+  }
   ABSL_ASSIGN_OR_RETURN(auto llm_executor,
                         resource_manager_->AcquireExecutorWithContextHandler(
                             session_info.context_handler));

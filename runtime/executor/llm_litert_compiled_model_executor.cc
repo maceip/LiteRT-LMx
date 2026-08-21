@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <random>
@@ -29,6 +30,7 @@
 
 #include "absl/cleanup/cleanup.h"  // from @com_google_absl
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
+#include "absl/container/flat_hash_set.h"  // from @com_google_absl
 #include "absl/log/absl_log.h"  // from @com_google_absl
 #include "absl/memory/memory.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
@@ -40,6 +42,8 @@
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
 #include "litert/c/litert_common.h"  // from @litert
+#include "litert/c/litert_model.h"  // from @litert
+#include "litert/c/litert_op_code.h"  // from @litert
 #include "litert/cc/internal/litert_handle.h"  // from @litert
 #include "litert/cc/litert_compiled_model.h"  // from @litert
 #include "litert/cc/litert_element_type.h"  // from @litert
@@ -86,6 +90,226 @@ using ::absl::Span;
 constexpr absl::string_view kPrefillSignatureRunner = "prefill";
 constexpr absl::string_view kDecodeSignatureRunner = "decode";
 constexpr int kDynamicDimValue = -1;
+
+bool OpMayCarryUncapturedSessionState(LiteRtOpCode opcode) {
+  switch (opcode) {
+    case kLiteRtOpCodeTflHashtableLookup:
+    case kLiteRtOpCodeTflLstm:
+    case kLiteRtOpCodeTflRnn:
+    case kLiteRtOpCodeTflSvdf:
+    case kLiteRtOpCodeTflCustom:
+    case kLiteRtOpCodeTflUnidirectionalSequenceRnn:
+    case kLiteRtOpCodeTflUnidirectionalSequenceLstm:
+    case kLiteRtOpCodeTflBidirectionalSequenceRnn:
+    case kLiteRtOpCodeTflDelegate:
+    case kLiteRtOpCodeTflBidirectionalSequenceLstm:
+    case kLiteRtOpCodeTflCallOnce:
+    case kLiteRtOpCodeTflHashtable:
+    case kLiteRtOpCodeTflHashtableFind:
+    case kLiteRtOpCodeTflHashtableImport:
+    case kLiteRtOpCodeTflHashtableSize:
+    case kLiteRtOpCodeTflVarHandle:
+    case kLiteRtOpCodeTflReadVariable:
+    case kLiteRtOpCodeTflAssignVariable:
+    case kLiteRtOpCodeTflRandomStandardNormal:
+    case kLiteRtOpCodeTflRandomUniform:
+    case kLiteRtOpCodeTflMultinomial:
+    case kLiteRtOpCodeShloCustomCall:
+    case kLiteRtOpCodeShloRngBitGenerator:
+    case kLiteRtOpCodeShloComposite:
+      return true;
+    default:
+      return false;
+  }
+}
+
+absl::Status ValidateTensorHasNoOpaqueStateType(
+    LiteRtTensor tensor, LiteRtParamIndex subgraph_index,
+    LiteRtParamIndex op_index, absl::string_view tensor_role,
+    LiteRtParamIndex tensor_index) {
+  if (tensor == nullptr) {
+    return absl::FailedPreconditionError(
+        "Session handoff encountered a null LiteRT operation tensor.");
+  }
+  LiteRtTensorTypeId type_id{};
+  if (LiteRtGetTensorTypeId(tensor, &type_id) != kLiteRtStatusOk) {
+    return absl::FailedPreconditionError(
+        "Session handoff could not inspect a LiteRT tensor type.");
+  }
+  LiteRtElementType element_type{};
+  switch (type_id) {
+    case kLiteRtRankedTensorType: {
+      LiteRtRankedTensorType ranked_type{};
+      if (LiteRtGetRankedTensorType(tensor, &ranked_type) != kLiteRtStatusOk) {
+        return absl::FailedPreconditionError(
+            "Session handoff could not inspect a ranked LiteRT tensor.");
+      }
+      element_type = ranked_type.element_type;
+      break;
+    }
+    case kLiteRtUnrankedTensorType: {
+      LiteRtUnrankedTensorType unranked_type{};
+      if (LiteRtGetUnrankedTensorType(tensor, &unranked_type) !=
+          kLiteRtStatusOk) {
+        return absl::FailedPreconditionError(
+            "Session handoff could not inspect an unranked LiteRT tensor.");
+      }
+      element_type = unranked_type.element_type;
+      break;
+    }
+    default:
+      return absl::UnimplementedError(
+          "Session handoff has not admitted an unknown LiteRT tensor type.");
+  }
+  if (element_type == kLiteRtElementTypeTfResource ||
+      element_type == kLiteRtElementTypeTfVariant) {
+    return absl::UnimplementedError(absl::StrCat(
+        "Session handoff has not admitted opaque resource/variant ",
+        tensor_role, " tensor ", tensor_index, " at subgraph ",
+        subgraph_index, ", operation ", op_index, "."));
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateLoadedModelStatefulness(const Model& model) {
+  if (model.Get() == nullptr) {
+    return absl::FailedPreconditionError(
+        "Session handoff cannot inspect a null loaded LiteRT model.");
+  }
+  LiteRtParamIndex subgraph_count = 0;
+  if (LiteRtGetNumModelSubgraphs(model.Get(), &subgraph_count) !=
+      kLiteRtStatusOk) {
+    return absl::FailedPreconditionError(
+        "Session handoff could not enumerate loaded LiteRT subgraphs.");
+  }
+  if (subgraph_count == 0) {
+    return absl::FailedPreconditionError(
+        "Loaded LiteRT model has no inspectable subgraphs.");
+  }
+  for (LiteRtParamIndex subgraph_index = 0;
+       subgraph_index < subgraph_count; ++subgraph_index) {
+    LiteRtSubgraph subgraph = nullptr;
+    if (LiteRtGetModelSubgraph(model.Get(), subgraph_index, &subgraph) !=
+            kLiteRtStatusOk ||
+        subgraph == nullptr) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "Session handoff could not inspect LiteRT subgraph ",
+          subgraph_index, "."));
+    }
+    LiteRtParamIndex op_count = 0;
+    if (LiteRtGetNumSubgraphOps(subgraph, &op_count) != kLiteRtStatusOk) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "Session handoff could not enumerate operations in LiteRT "
+          "subgraph ",
+          subgraph_index, "."));
+    }
+    for (LiteRtParamIndex op_index = 0; op_index < op_count; ++op_index) {
+      LiteRtOp op = nullptr;
+      if (LiteRtGetSubgraphOp(subgraph, op_index, &op) != kLiteRtStatusOk ||
+          op == nullptr) {
+        return absl::FailedPreconditionError(absl::StrCat(
+            "Session handoff could not inspect LiteRT operation ", op_index,
+            " in subgraph ", subgraph_index, "."));
+      }
+      LiteRtOpCode opcode{};
+      if (LiteRtGetOpCode(op, &opcode) != kLiteRtStatusOk) {
+        return absl::FailedPreconditionError(absl::StrCat(
+            "Session handoff could not identify LiteRT operation ", op_index,
+            " in subgraph ", subgraph_index, "."));
+      }
+      if (OpMayCarryUncapturedSessionState(opcode)) {
+        return absl::UnimplementedError(absl::StrCat(
+            "Session handoff has not admitted LiteRT opcode ",
+            static_cast<int>(opcode), " at subgraph ", subgraph_index,
+            ", operation ", op_index,
+            "; its complete continuation state cannot be proven."));
+      }
+      LiteRtParamIndex input_count = 0;
+      if (LiteRtGetNumOpInputs(op, &input_count) != kLiteRtStatusOk) {
+        return absl::FailedPreconditionError(
+            "Session handoff could not enumerate LiteRT operation inputs.");
+      }
+      for (LiteRtParamIndex input_index = 0; input_index < input_count;
+           ++input_index) {
+        LiteRtTensor input = nullptr;
+        if (LiteRtGetOpInput(op, input_index, &input) != kLiteRtStatusOk) {
+          return absl::FailedPreconditionError(
+              "Session handoff could not inspect a LiteRT operation input.");
+        }
+        ABSL_RETURN_IF_ERROR(ValidateTensorHasNoOpaqueStateType(
+            input, subgraph_index, op_index, "input", input_index));
+      }
+      LiteRtParamIndex output_count = 0;
+      if (LiteRtGetNumOpOutputs(op, &output_count) != kLiteRtStatusOk) {
+        return absl::FailedPreconditionError(
+            "Session handoff could not enumerate LiteRT operation outputs.");
+      }
+      for (LiteRtParamIndex output_index = 0; output_index < output_count;
+           ++output_index) {
+        LiteRtTensor output = nullptr;
+        if (LiteRtGetOpOutput(op, output_index, &output) != kLiteRtStatusOk) {
+          return absl::FailedPreconditionError(
+              "Session handoff could not inspect a LiteRT operation output.");
+        }
+        ABSL_RETURN_IF_ERROR(ValidateTensorHasNoOpaqueStateType(
+            output, subgraph_index, op_index, "output", output_index));
+      }
+    }
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateAuthoritativeStateMetadata(
+    const proto::ExecutorMetadata* executor_metadata,
+    const LitertState& state, absl::string_view state_label) {
+  if (executor_metadata == nullptr ||
+      !executor_metadata->has_llm_executor_metadata()) {
+    return absl::UnimplementedError(
+        "Session handoff requires runtime-owned LLM executor metadata.");
+  }
+  const auto& metadata_buffers =
+      executor_metadata->llm_executor_metadata().state_buffers();
+  if (metadata_buffers.empty()) {
+    return absl::UnimplementedError(
+        "Session handoff requires a non-empty executor-metadata state "
+        "inventory.");
+  }
+
+  absl::flat_hash_set<std::string> inventoried_names;
+  inventoried_names.reserve(metadata_buffers.size());
+  for (const proto::StateBuffer& metadata_buffer : metadata_buffers) {
+    const std::string& name = metadata_buffer.prefill_input_name();
+    if (name.empty() || metadata_buffer.prefill_output_name().empty() ||
+        metadata_buffer.decode_input_name().empty() ||
+        metadata_buffer.decode_output_name().empty()) {
+      return absl::UnimplementedError(
+          "Session handoff requires every state buffer to be explicit in "
+          "prefill/decode inputs and outputs.");
+    }
+    if (metadata_buffer.prefill_output_name() != name ||
+        metadata_buffer.decode_input_name() != name ||
+        metadata_buffer.decode_output_name() != name) {
+      return absl::UnimplementedError(
+          "Session handoff has not admitted aliased state-buffer names "
+          "across prefill and decode signatures.");
+    }
+    if (!inventoried_names.insert(name).second) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "Executor metadata contains duplicate state buffer ", name, "."));
+    }
+    if (!state.Contains(name)) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "Executor metadata state buffer ", name,
+          " is absent from the loaded ", state_label, "."));
+    }
+  }
+  if (inventoried_names.size() != state.StateBufferCount()) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "Executor metadata does not account for every loaded ", state_label,
+        " buffer."));
+  }
+  return absl::OkStatus();
+}
 
 void AppendRuntimeU8(uint8_t value, std::string* output) {
   output->push_back(static_cast<char>(value));
@@ -1423,14 +1647,23 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::RestoreContext(
   if (context_data == nullptr) {
     return absl::InvalidArgumentError("Cannot restore a null LLM context.");
   }
+  std::optional<ContextSampler> replacement_sampler;
   if (sampler_ != nullptr) {
     absl::Status bind_status = BindSamplerToContext(
         context_data->runtime_config(), context_data->runtime_state());
     if (!bind_status.ok()) {
-      BindSamplerToContext(llm_context_->runtime_config(),
-                           llm_context_->runtime_state())
-          .IgnoreError();
-      return bind_status;
+      // Sampling algorithm is session configuration, not immutable executor
+      // state. Stage a replacement so a previous session cannot prevent a
+      // fresh CPU-GREEDY projection context from becoming active.
+      absl::StatusOr<ContextSampler> staged = CreateSamplerForContext(
+          context_data->runtime_config(), context_data->runtime_state());
+      if (!staged.ok()) {
+        BindSamplerToContext(llm_context_->runtime_config(),
+                             llm_context_->runtime_state())
+            .IgnoreError();
+        return staged.status();
+      }
+      replacement_sampler = std::move(*staged);
     }
   }
   llm_context_ = std::move(context_data);
@@ -1444,6 +1677,19 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::RestoreContext(
     ABSL_RETURN_IF_ERROR(RestoreState(std::move(restored_state)));
   }
 
+  if (replacement_sampler.has_value()) {
+    sampler_ = std::move(replacement_sampler->sampler);
+    initialized_sampler_backend_ = replacement_sampler->backend;
+    initialized_sampler_type_ = replacement_sampler->sampler_type;
+    gpu_sampler_max_top_k_ = replacement_sampler->max_top_k;
+    // Input-handling buffers are execution-history state. Algorithm switches
+    // conservatively return to executor-managed decode inputs.
+    sampler_handles_input_ = false;
+    decode_prev_input_pos_ = TensorBuffer();
+    decode_prev_mask_ = TensorBuffer();
+    decode_prev_param_ = TensorBuffer();
+  }
+
   force_prepare_needed_ = true;
 
   return absl::OkStatus();
@@ -1451,17 +1697,34 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::RestoreContext(
 
 absl::Status LlmLiteRtCompiledModelExecutorBase::UpdateRuntimeConfig(
     const RuntimeConfig& runtime_config) {
+  std::optional<ContextSampler> replacement_sampler;
   if (sampler_ != nullptr) {
     absl::Status bind_status =
         BindSamplerToContext(runtime_config, llm_context_->runtime_state());
     if (!bind_status.ok()) {
-      BindSamplerToContext(llm_context_->runtime_config(),
-                           llm_context_->runtime_state())
-          .IgnoreError();
-      return bind_status;
+      absl::StatusOr<ContextSampler> staged = CreateSamplerForContext(
+          runtime_config, llm_context_->runtime_state());
+      if (!staged.ok()) {
+        BindSamplerToContext(llm_context_->runtime_config(),
+                             llm_context_->runtime_state())
+            .IgnoreError();
+        return staged.status();
+      }
+      replacement_sampler = std::move(*staged);
     }
   }
   llm_context_->runtime_config() = runtime_config;
+  if (replacement_sampler.has_value()) {
+    sampler_ = std::move(replacement_sampler->sampler);
+    initialized_sampler_backend_ = replacement_sampler->backend;
+    initialized_sampler_type_ = replacement_sampler->sampler_type;
+    gpu_sampler_max_top_k_ = replacement_sampler->max_top_k;
+    sampler_handles_input_ = false;
+    decode_prev_input_pos_ = TensorBuffer();
+    decode_prev_mask_ = TensorBuffer();
+    decode_prev_param_ = TensorBuffer();
+    force_prepare_needed_ = true;
+  }
   return absl::OkStatus();
 }
 
@@ -1508,6 +1771,54 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::BindSamplerToContext(
   return sampler_->UpdateConfig(sampler_params,
                                 runtime_config.output_heads.value_or(1),
                                 runtime_state.rand_gen);
+}
+
+absl::StatusOr<LlmLiteRtCompiledModelExecutorBase::ContextSampler>
+LlmLiteRtCompiledModelExecutorBase::CreateSamplerForContext(
+    const RuntimeConfig& runtime_config,
+    const RuntimeState& runtime_state) const {
+  if (runtime_state.rand_gen == nullptr) {
+    return absl::FailedPreconditionError(
+        "Sampler context has no random engine.");
+  }
+  if (!runtime_config.output_heads.has_value() ||
+      *runtime_config.output_heads <= 0) {
+    return absl::FailedPreconditionError(
+        "Sampler context has no positive output-head count.");
+  }
+  proto::SamplerParameters sampler_params;
+  if (runtime_config.sampler_params.has_value()) {
+    sampler_params = *runtime_config.sampler_params;
+  }
+  if (sampler_params.type() == proto::SamplerParameters::TYPE_UNSPECIFIED) {
+    sampler_params.set_type(proto::SamplerParameters::TOP_P);
+    sampler_params.set_k(1);
+    sampler_params.set_p(0.0f);
+    sampler_params.set_temperature(1.0f);
+    sampler_params.set_seed(0);
+  }
+  const LlmExecutorSettings settings = [this]() {
+    absl::MutexLock lock(executor_settings_mutex_);
+    return executor_settings_;
+  }();
+  ABSL_ASSIGN_OR_RETURN(const Backend sampler_backend,
+                        GetSamplerBackend(settings));
+  ABSL_ASSIGN_OR_RETURN(const int vocabulary_size,
+                        GetLoadedVocabularySizeForSessionHandoff());
+  const int output_heads = *runtime_config.output_heads;
+  ABSL_ASSIGN_OR_RETURN(
+      std::unique_ptr<Sampler> sampler,
+      CreateSampler(sampler_backend, output_heads, sampler_params, env_,
+                    /*sequence_size=*/1, vocabulary_size,
+                    logits_data_type_));
+  ABSL_RETURN_IF_ERROR(sampler->UpdateConfig(
+      sampler_params, output_heads, runtime_state.rand_gen));
+  return ContextSampler{
+      .sampler = std::move(sampler),
+      .backend = sampler_backend,
+      .sampler_type = static_cast<int>(sampler_params.type()),
+      .max_top_k = sampler_params.k(),
+  };
 }
 
 absl::Status LlmLiteRtCompiledModelExecutorBase::InitializeSampler(
@@ -1728,8 +2039,220 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::Reset() {
   return absl::OkStatus();
 }
 
+absl::Status LlmLiteRtCompiledModelExecutorBase::
+    ValidateDeterministicProjectionSupport() const {
+  if (compiled_model_ == nullptr) {
+    return absl::FailedPreconditionError(
+        "Deterministic projection reset has no loaded compiled LiteRT "
+        "model.");
+  }
+  if (compiled_backend_ != Backend::CPU && compiled_backend_ != Backend::GPU) {
+    return absl::UnimplementedError(
+        "Deterministic projection reset is implemented only for LiteRT CPU "
+        "and GPU compiled-model executors.");
+  }
+  const LlmExecutorSettings settings = [this]() {
+    absl::MutexLock lock(executor_settings_mutex_);
+    return executor_settings_;
+  }();
+  if (settings.GetBackend() != compiled_backend_) {
+    return absl::FailedPreconditionError(
+        "Mutable executor settings no longer match the compiled backend.");
+  }
+  ABSL_ASSIGN_OR_RETURN(const Backend configured_sampler_backend,
+                        GetSamplerBackend(settings));
+  if (configured_sampler_backend != Backend::CPU) {
+    return absl::UnimplementedError(
+        "Deterministic projection requires CPU-side stable GREEDY selection "
+        "for LiteRT logits.");
+  }
+  if (mtp_drafter_ != nullptr ||
+      (settings.GetAdvancedSettings().has_value() &&
+       settings.GetAdvancedSettings()->enable_speculative_decoding)) {
+    return absl::UnimplementedError(
+        "Deterministic projection does not support speculative or MTP "
+        "decoder state.");
+  }
+  if (HasGraphRunCallbacks()) {
+    return absl::UnimplementedError(
+        "Deterministic projection does not support graph callback state or "
+        "side effects.");
+  }
+  ABSL_RETURN_IF_ERROR(ValidateLoadedModelStatefulness(model_));
+
+  const auto* state = dynamic_cast<const LitertState*>(state_.get());
+  if (state == nullptr) {
+    return absl::UnimplementedError(
+        "Deterministic projection requires an inventoried LitertState "
+        "allocation.");
+  }
+  ABSL_RETURN_IF_ERROR(
+      state->ValidateDeterministicProjectionResetSupport());
+  ABSL_RETURN_IF_ERROR(ValidateAuthoritativeStateMetadata(
+      executor_metadata_, *state, "primary LiteRT state"));
+  const auto* decode_state =
+      dynamic_cast<const LitertState*>(decode_state_.get());
+  if (decode_state_ != nullptr && decode_state == nullptr) {
+    return absl::UnimplementedError(
+        "Deterministic projection cannot inventory a non-LiteRT decode "
+        "state.");
+  }
+  if (decode_state != nullptr) {
+    ABSL_RETURN_IF_ERROR(
+        decode_state->ValidateDeterministicProjectionResetSupport());
+    ABSL_RETURN_IF_ERROR(ValidateAuthoritativeStateMetadata(
+        executor_metadata_, *decode_state, "LiteRT decode state"));
+  }
+  return absl::OkStatus();
+}
+
+absl::Status
+LlmLiteRtCompiledModelExecutorBase::ResetForDeterministicProjection() {
+  ABSL_RETURN_IF_ERROR(ValidateDeterministicProjectionSupport());
+  if (llm_context_ == nullptr) {
+    return absl::FailedPreconditionError(
+        "Deterministic projection reset requires an active LiteRT context.");
+  }
+  if (llm_context_->processed_context().lora_id().has_value()) {
+    return absl::UnimplementedError(
+        "Deterministic projection reset does not support LoRA state.");
+  }
+
+  const RuntimeConfig runtime_config = llm_context_->runtime_config();
+  if (!runtime_config.output_heads.has_value() ||
+      *runtime_config.output_heads != 1) {
+    return absl::UnimplementedError(
+        "Deterministic projection reset requires exactly one output "
+        "candidate.");
+  }
+  if (!runtime_config.tokens_per_decode.has_value() ||
+      *runtime_config.tokens_per_decode != 1) {
+    return absl::UnimplementedError(
+        "Deterministic projection reset requires one token per decode "
+        "operation.");
+  }
+  if (!runtime_config.sampler_params.has_value() ||
+      runtime_config.sampler_params->type() !=
+          proto::SamplerParameters::GREEDY ||
+      runtime_config.sampler_params->backend() !=
+          proto::SamplerParameters::CPU) {
+    return absl::UnimplementedError(
+        "Deterministic projection reset requires the explicit CPU GREEDY "
+        "sampler contract.");
+  }
+
+  // Stage every fallible replacement before touching the live continuation.
+  // CPU state is copied and cleared so dynamic capacity is preserved. Metal
+  // and other GPU state must be allocated through the compiled model; a host
+  // deep copy would silently change its backend storage contract.
+  const bool recreate_backend_native_state = compiled_backend_ == Backend::GPU;
+  std::string prefill_signature;
+  if (recreate_backend_native_state) {
+    ABSL_ASSIGN_OR_RETURN(prefill_signature, GetPrefillSignatureKey());
+  }
+  auto make_fresh_state =
+      [this, recreate_backend_native_state](
+          const StateInterface* current,
+          absl::string_view signature)
+      -> absl::StatusOr<std::unique_ptr<StateInterface>> {
+    if (current == nullptr) return std::unique_ptr<StateInterface>();
+    if (!recreate_backend_native_state) {
+      ABSL_ASSIGN_OR_RETURN(std::unique_ptr<StateInterface> staged,
+                            current->DeepCopy());
+      ABSL_RETURN_IF_ERROR(staged->Clear());
+      return staged;
+    }
+    const auto* litert_state = dynamic_cast<const LitertState*>(current);
+    if (litert_state == nullptr) {
+      return absl::FailedPreconditionError(
+          "GPU deterministic projection reset requires native LitertState "
+          "storage.");
+    }
+    ABSL_ASSIGN_OR_RETURN(
+        std::unique_ptr<LitertState> staged,
+        LitertState::Create(env_, *compiled_model_, signature,
+                            executor_metadata_,
+                            litert_state->allocation_policy(),
+                            litert_state->GetBatchSize(),
+                            /*clear_kv_cache_before_prefill=*/true));
+    ABSL_RETURN_IF_ERROR(
+        staged->ValidateDeterministicProjectionResetSupport());
+    return std::unique_ptr<StateInterface>(std::move(staged));
+  };
+
+  ABSL_ASSIGN_OR_RETURN(
+      std::unique_ptr<StateInterface> staged_state,
+      make_fresh_state(state_.get(), prefill_signature));
+  ABSL_ASSIGN_OR_RETURN(
+      std::unique_ptr<StateInterface> staged_decode_state,
+      make_fresh_state(decode_state_.get(), kDecodeSignatureRunner));
+  ABSL_ASSIGN_OR_RETURN(
+      std::unique_ptr<LlmContext> staged_context,
+      CreateNewContext(/*lora_id=*/std::nullopt, runtime_config));
+  if (staged_context->runtime_state().rand_gen == nullptr) {
+    return absl::FailedPreconditionError(
+        "Fresh deterministic projection context has no random engine.");
+  }
+
+  proto::SamplerParameters sampler_params = *runtime_config.sampler_params;
+  ABSL_ASSIGN_OR_RETURN(
+      std::unique_ptr<Sampler> staged_sampler,
+      CreateSampler(Backend::CPU, /*batch_size=*/1, sampler_params));
+  ABSL_RETURN_IF_ERROR(staged_sampler->UpdateConfig(
+      sampler_params, /*batch_size=*/1,
+      staged_context->runtime_state().rand_gen));
+
+  // Ownership moves and scalar assignments below are the reset commit point.
+  // No live state is changed unless all state, context, and sampler staging
+  // succeeded.
+  state_ = std::move(staged_state);
+  decode_state_ = std::move(staged_decode_state);
+  llm_context_ = std::move(staged_context);
+  sampler_ = std::move(staged_sampler);
+  initialized_sampler_backend_ = Backend::CPU;
+  initialized_sampler_type_ =
+      static_cast<int>(proto::SamplerParameters::GREEDY);
+  gpu_sampler_max_top_k_ = 0;
+  sampler_handles_input_ = false;
+  decode_prev_input_pos_ = TensorBuffer();
+  decode_prev_mask_ = TensorBuffer();
+  decode_prev_param_ = TensorBuffer();
+  force_prepare_needed_ = true;
+  return absl::OkStatus();
+}
+
 absl::Status
 LlmLiteRtCompiledModelExecutorBase::ValidateSessionHandoffSupport() const {
+  if (compiled_model_ == nullptr) {
+    return absl::FailedPreconditionError(
+        "Session handoff has no loaded compiled LiteRT model.");
+  }
+  if (compiled_backend_ != Backend::CPU) {
+    return absl::UnimplementedError(
+        "Session handoff currently admits only a compiled LiteRT CPU "
+        "backend.");
+  }
+  if (!session_handoff_compile_caches_disabled_) {
+    return absl::UnimplementedError(
+        "Session handoff requires compilation caches to have been disabled "
+        "before the model was compiled.");
+  }
+  LlmExecutorSettings settings = [this]() {
+    absl::MutexLock lock(executor_settings_mutex_);
+    return executor_settings_;
+  }();
+  if (settings.GetBackend() != compiled_backend_) {
+    return absl::FailedPreconditionError(
+        "Mutable executor settings no longer match the compiled backend.");
+  }
+  if (llm_context_ == nullptr) {
+    return absl::FailedPreconditionError(
+        "LiteRT session handoff has no active context.");
+  }
+  if (llm_context_->processed_context().lora_id().has_value()) {
+    return absl::UnimplementedError(
+        "Session handoff does not support LoRA state.");
+  }
   if (mtp_drafter_ != nullptr) {
     return absl::UnimplementedError(
         "Session handoff does not support speculative/MTP decoder state.");
@@ -1738,10 +2261,49 @@ LlmLiteRtCompiledModelExecutorBase::ValidateSessionHandoffSupport() const {
     return absl::UnimplementedError(
         "Session handoff does not support graph callback state.");
   }
-  LlmExecutorSettings settings = [this]() {
-    absl::MutexLock lock(executor_settings_mutex_);
-    return executor_settings_;
-  }();
+  ABSL_RETURN_IF_ERROR(ValidateLoadedModelStatefulness(model_));
+
+  const auto* state = dynamic_cast<const LitertState*>(state_.get());
+  if (state == nullptr) {
+    return absl::UnimplementedError(
+        "Session handoff requires an inventoried LitertState allocation.");
+  }
+  ABSL_RETURN_IF_ERROR(state->ValidateSessionHandoffSupport());
+  ABSL_RETURN_IF_ERROR(ValidateAuthoritativeStateMetadata(
+      executor_metadata_, *state, "primary LiteRT state"));
+  const auto* decode_state =
+      dynamic_cast<const LitertState*>(decode_state_.get());
+  if (decode_state_ != nullptr && decode_state == nullptr) {
+    return absl::UnimplementedError(
+        "Session handoff cannot inventory a non-LiteRT decode state.");
+  }
+  if (decode_state != nullptr) {
+    ABSL_RETURN_IF_ERROR(decode_state->ValidateSessionHandoffSupport());
+    ABSL_RETURN_IF_ERROR(ValidateAuthoritativeStateMetadata(
+        executor_metadata_, *decode_state, "LiteRT decode state"));
+  }
+
+  const RuntimeState& runtime_state = llm_context_->runtime_state();
+  if (runtime_state.current_step < 0 || runtime_state.rand_gen == nullptr) {
+    return absl::FailedPreconditionError(
+        "Session handoff runtime continuation state is incomplete.");
+  }
+  const ProcessedTokens& processed_tokens =
+      llm_context_->processed_context().processed_tokens();
+  ABSL_RETURN_IF_ERROR(processed_tokens.ValidateSessionHandoffSupport());
+  if (processed_tokens.TokenCount() != runtime_state.current_step) {
+    return absl::FailedPreconditionError(
+        "Live session step does not match its processed-token history.");
+  }
+  ABSL_ASSIGN_OR_RETURN(const int vocabulary_size,
+                        GetLoadedVocabularySizeForSessionHandoff());
+  ABSL_RETURN_IF_ERROR(processed_tokens.ValidateTokenIds(vocabulary_size));
+  if (processed_tokens.ProcessedTokenCount() > state->GetNumEntries()) {
+    return absl::FailedPreconditionError(
+        "Live LiteRT state capacity is smaller than its consumed token "
+        "history.");
+  }
+
   ABSL_ASSIGN_OR_RETURN(Backend configured_sampler_backend,
                         GetSamplerBackend(settings));
   const Backend sampler_backend = sampler_ == nullptr
@@ -1751,10 +2313,6 @@ LlmLiteRtCompiledModelExecutorBase::ValidateSessionHandoffSupport() const {
   if (sampler_backend != Backend::CPU) {
     return absl::UnimplementedError(
         "Session handoff currently supports only the CPU sampler backend.");
-  }
-  if (llm_context_ == nullptr) {
-    return absl::FailedPreconditionError(
-        "LiteRT session handoff has no active context.");
   }
   const RuntimeConfig& runtime_config = llm_context_->runtime_config();
   if (!runtime_config.output_heads.has_value() ||
@@ -1868,6 +2426,16 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::ImportSessionStateFrom(
     return absl::FailedPreconditionError(
         "Session handoff target random engine is unavailable.");
   }
+  ABSL_ASSIGN_OR_RETURN(const int vocabulary_size,
+                        GetLoadedVocabularySizeForSessionHandoff());
+  ABSL_RETURN_IF_ERROR(ProcessedTokens::ValidateSnapshotTokenIds(
+      snapshot.processed_tokens, vocabulary_size));
+  if (snapshot.last_prefill_token_id < 0 ||
+      snapshot.last_prefill_token_id >= vocabulary_size) {
+    return absl::InvalidArgumentError(
+        "Session handoff last prefill token is outside the loaded "
+        "vocabulary.");
+  }
   ABSL_ASSIGN_OR_RETURN(
       ProcessedTokens restored_tokens,
       ProcessedTokens::FromSnapshot(snapshot.processed_tokens));
@@ -1896,6 +2464,21 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::ImportSessionStateFrom(
           "Only a fresh session handoff may omit serialized state.");
     }
   } else {
+    auto* litert_state = dynamic_cast<LitertState*>(active_state);
+    if (litert_state == nullptr) {
+      return absl::UnimplementedError(
+          "Session handoff import requires a LitertState target.");
+    }
+    const size_t consumed_entries =
+        snapshot.processed_tokens.processed_token_ids[0].size();
+    if (consumed_entries >
+        static_cast<size_t>(std::numeric_limits<int>::max())) {
+      return absl::ResourceExhaustedError(
+          "Session handoff consumed-token count exceeds the supported state "
+          "range.");
+    }
+    ABSL_RETURN_IF_ERROR(litert_state->ValidateSnapshotHeaderForImport(
+        serialized_state, static_cast<int>(consumed_entries)));
     // LoadFrom is transactional for live host and Metal buffers. All other
     // fallible work is complete before this state-import commit point.
     ABSL_RETURN_IF_ERROR(active_state->LoadFrom(
@@ -1924,18 +2507,23 @@ LlmLiteRtCompiledModelExecutorBase::GetSessionHandoffRuntimeProfile() const {
     return absl::UnimplementedError(
         "Loaded runtime identity does not support graph callbacks.");
   }
+  ABSL_RETURN_IF_ERROR(ValidateLoadedModelStatefulness(model_));
 
   LlmExecutorSettings settings = [this]() {
     absl::MutexLock lock(executor_settings_mutex_);
     return executor_settings_;
   }();
+  if (settings.GetBackend() != compiled_backend_) {
+    return absl::FailedPreconditionError(
+        "Loaded executor settings do not match the compiled backend.");
+  }
   ABSL_ASSIGN_OR_RETURN(const Backend sampler_backend,
                         GetSamplerBackend(settings));
   if (sampler_backend != Backend::CPU) {
     return absl::UnimplementedError(
         "Loaded runtime identity currently requires the CPU sampler.");
   }
-  if (settings.GetBackend() != Backend::CPU) {
+  if (compiled_backend_ != Backend::CPU) {
     return absl::UnimplementedError(
         "Exact loaded delegate/device evidence is currently available only "
         "for the LiteRT CPU executor.");
@@ -2037,6 +2625,14 @@ LlmLiteRtCompiledModelExecutorBase::GetSessionHandoffRuntimeProfile() const {
         "Loaded runtime identity cannot measure the decode state "
         "allocation.");
   }
+  ABSL_RETURN_IF_ERROR(state->ValidateSessionHandoffSupport());
+  ABSL_RETURN_IF_ERROR(ValidateAuthoritativeStateMetadata(
+      executor_metadata_, *state, "primary LiteRT state"));
+  if (decode_state != nullptr) {
+    ABSL_RETURN_IF_ERROR(decode_state->ValidateSessionHandoffSupport());
+    ABSL_RETURN_IF_ERROR(ValidateAuthoritativeStateMetadata(
+        executor_metadata_, *decode_state, "LiteRT decode state"));
+  }
 
   uint8_t executor_shape = 0;
   if (dynamic_cast<const LlmLiteRtCompiledModelExecutorStatic*>(this) !=
@@ -2068,7 +2664,7 @@ LlmLiteRtCompiledModelExecutorBase::GetSessionHandoffRuntimeProfile() const {
   }
   AppendRuntimeU32(static_cast<uint32_t>(logits_element_count), &profile);
   AppendRuntimeU8(executor_shape, &profile);
-  AppendRuntimeI32(static_cast<int32_t>(settings.GetBackend()), &profile);
+  AppendRuntimeI32(static_cast<int32_t>(compiled_backend_), &profile);
   AppendRuntimeI32(static_cast<int32_t>(sampler_backend), &profile);
   AppendRuntimeBool(settings.GetActivationDataType().has_value(), &profile);
   if (settings.GetActivationDataType().has_value()) {
@@ -2176,14 +2772,45 @@ LlmLiteRtCompiledModelExecutorBase::GetSessionHandoffRuntimeProfile() const {
   };
 }
 
-absl::StatusOr<int> LlmLiteRtCompiledModelExecutorBase::GetVocabSize() {
-  if (!decode_output_buffers_.contains(signatures_.output_logits)) {
-    return absl::NotFoundError("Output logits info not found.");
+absl::StatusOr<int> LlmLiteRtCompiledModelExecutorBase::
+    GetLoadedVocabularySizeForSessionHandoff() const {
+  if (signatures_.output_logits.empty()) {
+    return absl::FailedPreconditionError(
+        "Loaded LiteRT executor has no decode logits signature.");
+  }
+  const auto logits = decode_output_buffers_.find(signatures_.output_logits);
+  if (logits == decode_output_buffers_.end()) {
+    return absl::FailedPreconditionError(
+        "Loaded LiteRT executor has no decode logits allocation.");
   }
 
-  LITERT_ASSIGN_OR_RETURN(
-      auto logits_tensor_type,
-      decode_output_buffers_[signatures_.output_logits].TensorType());
+  LITERT_ASSIGN_OR_RETURN(const RankedTensorType logits_tensor_type,
+                          logits->second.TensorType());
+  if (logits_tensor_type.ElementType() != ElementType::Float16 &&
+      logits_tensor_type.ElementType() != ElementType::Float32) {
+    return absl::UnimplementedError(
+        "Session handoff requires FP16 or FP32 decode logits.");
+  }
+  if (logits_tensor_type.Layout().HasStrides()) {
+    return absl::UnimplementedError(
+        "Session handoff requires packed decode logits.");
+  }
+  const auto dimensions = logits_tensor_type.Layout().Dimensions();
+  if (dimensions.size() != 3 || dimensions[0] != 1 || dimensions[1] != 1 ||
+      dimensions[2] <= 0) {
+    return absl::FailedPreconditionError(
+        "Loaded decode logits must have shape [1, 1, vocabulary].");
+  }
+  return dimensions[2];
+}
+
+absl::StatusOr<int> LlmLiteRtCompiledModelExecutorBase::GetVocabSize() {
+  const auto logits = decode_output_buffers_.find(signatures_.output_logits);
+  if (logits == decode_output_buffers_.end()) {
+    return absl::NotFoundError("Output logits info not found.");
+  }
+  LITERT_ASSIGN_OR_RETURN(const RankedTensorType logits_tensor_type,
+                          logits->second.TensorType());
   RET_CHECK_EQ(logits_tensor_type.Layout().Dimensions().size(), 3);
   return logits_tensor_type.Layout().Dimensions()[2];
 }

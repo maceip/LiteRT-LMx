@@ -19,6 +19,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -48,6 +49,15 @@ namespace litert::lm {
 using SessionId = int;
 using TaskId = int;
 
+// Identifies whether a prefill starts a new logical projection or continues
+// the current session. Callers must always choose explicitly; in particular,
+// the prompt-template tail inserted immediately before decode is a
+// continuation and must never trigger a reset.
+enum class PrefillBoundary {
+  kStartProjection,
+  kContinueSession,
+};
+
 // All the information about a session.
 // - session_config: The config of the session.
 // - context_handler: The context handler of the session.
@@ -67,6 +77,16 @@ struct SessionInfo {
   // Prevents task creation and release while a quiescent handoff is copied or
   // committed. Protected by the owning manager's session lock.
   bool handoff_in_progress = false;
+  // Identifies the task that owns an in-progress deterministic projection
+  // reset/prefill transition. Handoff and release are forbidden while set.
+  std::optional<TaskId> deterministic_projection_reset_owner = std::nullopt;
+  // A stateless continuation is admitted only after the current projection
+  // epoch completed its reset and first prefill successfully.
+  bool deterministic_projection_ready = false;
+  // Cancellation or a failed task that may have changed execution state makes
+  // subsequent handoff unsafe. This bit is monotonic for the session lifetime.
+  bool handoff_poisoned = false;
+  std::string handoff_poison_reason;
 };
 
 // All the information about a task.
@@ -87,6 +107,12 @@ struct TaskInfo {
   TaskState task_state = TaskState::kUnknown;
   absl::flat_hash_set<TaskId> dependent_tasks = {};
   absl::flat_hash_set<TaskId> following_tasks = {};
+  bool potentially_mutating = false;
+  bool execution_started = false;
+  // Stateless projection tasks defer Created/Queued/Processing callbacks
+  // until execution starts, after SessionAdvanced and the threaded manager
+  // have released their lifecycle locks. This makes DPM callbacks re-entrant.
+  bool defer_lifecycle_callbacks = false;
   std::shared_ptr<std::atomic<bool>> cancelled = nullptr;
   absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback;
 };
@@ -179,11 +205,14 @@ class ExecutionManager {
   // - inputs: The inputs of the prefill task.
   // - dep_tasks: The dependent tasks that should be done before the prefill
   //   task starts.
+  // - boundary: Whether this prefill starts a projection or continues one.
+  //   This argument is required so internal continuation prefills cannot
+  //   accidentally reset stateless state.
   // - cancelled: The cancelled flag for the prefill task.
   // - callback: The callback function.
   virtual absl::Status AddPrefillTask(
       SessionId session_id, TaskId task_id, std::vector<InputData> inputs,
-      absl::flat_hash_set<TaskId> dep_tasks,
+      absl::flat_hash_set<TaskId> dep_tasks, PrefillBoundary boundary,
       std::shared_ptr<std::atomic<bool>> absl_nonnull cancelled,
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) = 0;
 

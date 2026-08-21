@@ -171,12 +171,13 @@ class ThreadedExecutionManager : public ExecutionManager {
   // - inputs: The inputs of the prefill task.
   // - dep_tasks: The dependent tasks that should be done before the prefill
   //   task starts.
+  // - boundary: Whether this prefill starts a projection or continues one.
   // - cancelled: The cancelled flag for the prefill task.
   // - callback: The callback function.
   // Note: AddPrefillTask will acquire the task lookup mutex.
   absl::Status AddPrefillTask(
       SessionId session_id, TaskId task_id, std::vector<InputData> inputs,
-      absl::flat_hash_set<TaskId> dep_tasks,
+      absl::flat_hash_set<TaskId> dep_tasks, PrefillBoundary boundary,
       std::shared_ptr<std::atomic<bool>> absl_nonnull cancelled,
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) override
       ABSL_LOCKS_EXCLUDED(session_and_task_lookup_mutex_);
@@ -289,6 +290,7 @@ class ThreadedExecutionManager : public ExecutionManager {
       SessionId session_id, TaskId task_id,
       absl::AnyInvocable<void()> absl_nonnull task,
       absl::flat_hash_set<TaskId> dependent_tasks,
+      bool potentially_mutating,
       std::shared_ptr<std::atomic<bool>> absl_nonnull cancelled,
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> absl_nonnull callback)
       ABSL_LOCKS_EXCLUDED(session_and_task_lookup_mutex_);
@@ -367,6 +369,20 @@ class ThreadedExecutionManager : public ExecutionManager {
   absl::StatusOr<ExecutorInputs> ProcessAndCombineContents(
       const std::vector<InputData>& preprocessed_contents,
       std::optional<BenchmarkInfo>& benchmark_info);
+
+  absl::Status BeginDeterministicProjectionReset(SessionId session_id,
+                                                 TaskId task_id)
+      ABSL_LOCKS_EXCLUDED(session_and_task_lookup_mutex_);
+  void EndDeterministicProjectionReset(SessionId session_id, TaskId task_id)
+      ABSL_LOCKS_EXCLUDED(session_and_task_lookup_mutex_);
+  absl::Status SetDeterministicProjectionReady(SessionId session_id,
+                                               bool ready)
+      ABSL_LOCKS_EXCLUDED(session_and_task_lookup_mutex_);
+  absl::Status ValidateDeterministicProjectionReady(SessionId session_id)
+      ABSL_LOCKS_EXCLUDED(session_and_task_lookup_mutex_);
+  void PoisonSessionHandoff(SessionInfo& session_info,
+                            absl::string_view reason)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(session_and_task_lookup_mutex_);
 
   // The session ID.
   std::atomic<SessionId> next_session_id_ = 0;
