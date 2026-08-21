@@ -339,6 +339,38 @@ absl::Status ValidateReceiptAndAdvance(const DPMLogSnapshot& snapshot,
         "DPM turn receipt projection manifest is not bound to its raw-log "
         "source and projected-memory bytes.");
   }
+  if (receipt.projection_manifest.baseline_manifest_hash.has_value()) {
+    const uint64_t baseline_response_index =
+        receipt.projection_manifest.event_range_start;
+    if (baseline_response_index >= response.index ||
+        baseline_response_index >= snapshot.events.size()) {
+      return absl::DataLossError(
+          "DPM projection baseline does not name a prior response event.");
+    }
+    const DPMEvent& baseline_response =
+        snapshot.events[baseline_response_index];
+    if (baseline_response.kind != DPMEvent::Kind::kModelTurn ||
+        !baseline_response.turn_receipt.has_value()) {
+      return absl::DataLossError(
+          "DPM projection baseline does not name an authoritative receipt.");
+    }
+    const DPMProjectionManifest& baseline =
+        baseline_response.turn_receipt->projection_manifest;
+    if (baseline.source_event_count != baseline_response_index ||
+        baseline.manifest_hash !=
+            *receipt.projection_manifest.baseline_manifest_hash ||
+        baseline.output_hash !=
+            *receipt.projection_manifest.baseline_output_hash ||
+        baseline.correction_digest !=
+            receipt.projection_manifest.correction_digest ||
+        baseline.config_hash != receipt.projection_manifest.config_hash ||
+        baseline.runtime_identity !=
+            receipt.projection_manifest.runtime_identity) {
+      return absl::DataLossError(
+          "DPM projection baseline hashes do not identify the compatible "
+          "prior authoritative receipt.");
+    }
+  }
   if (receipt.decision_token_ids.size() > receipt.max_decision_tokens) {
     return absl::DataLossError(
         "DPM turn receipt exceeds its committed decision-token limit.");
@@ -699,7 +731,9 @@ absl::Status DPMEngine::ValidateRestoreCandidate(
           receipt.projection_manifest.source_event_count ||
       descriptor.source_prefix_hash !=
           receipt.projection_manifest.source_prefix_hash ||
-      descriptor.response_event_index >= current.events.size()) {
+      descriptor.response_event_index >= current.events.size() ||
+      descriptor.response_event_index >=
+          projection.manifest.input_event_index) {
     return absl::FailedPreconditionError(
         "DPM checkpoint descriptor is not attached to this log receipt.");
   }
@@ -739,6 +773,13 @@ absl::Status DPMEngine::ValidateRestoreCandidate(
   bool found = false;
   Hash256 candidate_transcript_hash;
   for (const DPMEvent& event : current.events) {
+    if (found && event.kind == DPMEvent::Kind::kCorrection) {
+      // Corrections are immutable epoch boundaries. Even a hypothetical hash
+      // collision must not permit a descendant capsule to cross one.
+      return absl::FailedPreconditionError(
+          "DPM correction event invalidates the selected checkpoint "
+          "descendant interval.");
+    }
     if (event.kind != DPMEvent::Kind::kModelTurn) continue;
     ABSL_RETURN_IF_ERROR(
         ValidateReceiptAndAdvance(current, event, &transcript));
@@ -769,18 +810,36 @@ DPMEngine::FindRestoreCandidate(
     return std::optional<RestoreCandidate>();
   }
   for (auto it = current.events.rbegin(); it != current.events.rend(); ++it) {
+    if (it->kind == DPMEvent::Kind::kCorrection) {
+      // The newest correction is the immutable lower bound of the active
+      // checkpoint interval. Every older capsule belongs to an invalidated
+      // lineage, so do not scan or touch its repository objects.
+      break;
+    }
     if (it->kind != DPMEvent::Kind::kModelTurn || !it->turn_receipt ||
         !it->turn_receipt->session_checkpoint_id) {
       continue;
     }
+    const DPMTurnReceipt& receipt = *it->turn_receipt;
+    if (receipt.response_event_index >=
+            projection.manifest.input_event_index ||
+        receipt.projection_manifest.correction_digest !=
+            projection.manifest.correction_digest ||
+        receipt.agent_session_identity !=
+            agent_runtime_->GetSessionHandoffIdentity()) {
+      // Receipt metadata is immutable and authoritative. Filter invalidated
+      // epochs and incompatible runtime branches before touching disposable
+      // checkpoint storage; an older compatible interval may still exist.
+      continue;
+    }
     absl::StatusOr<DPMSessionCheckpointArtifact> artifact =
-        checkpoint_repository_->Get(*it->turn_receipt->session_checkpoint_id);
+        checkpoint_repository_->Get(*receipt.session_checkpoint_id);
     if (!artifact.ok()) {
       // Checkpoints are authenticated disposable accelerators. Missing or
       // unavailable storage must not prevent reconstruction from the log.
       continue;
     }
-    RestoreCandidate candidate{*it->turn_receipt, std::move(*artifact)};
+    RestoreCandidate candidate{receipt, std::move(*artifact)};
     if (ValidateRestoreCandidate(current, projection, candidate).ok()) {
       return std::optional<RestoreCandidate>(std::move(candidate));
     }
@@ -824,7 +883,8 @@ absl::StatusOr<
     std::vector<DPMAgentGenerationRequest::PrefillChunk>>
 DPMEngine::BuildDeltaTranscriptChunks(
     const DPMLogSnapshot& snapshot, uint64_t restored_response_event_index,
-    absl::string_view current_agent_input) const {
+    absl::string_view current_agent_input,
+    const Hash256& current_correction_digest) const {
   if (restored_response_event_index >= snapshot.events.size() ||
       snapshot.events[restored_response_event_index].kind !=
           DPMEvent::Kind::kModelTurn ||
@@ -836,8 +896,18 @@ DPMEngine::BuildDeltaTranscriptChunks(
   const Hash256 restored_correction_digest =
       snapshot.events[restored_response_event_index]
           .turn_receipt->projection_manifest.correction_digest;
+  if (restored_correction_digest != current_correction_digest) {
+    return absl::FailedPreconditionError(
+        "DPM restore point is outside the active correction epoch.");
+  }
   TranscriptCursor transcript;
   for (const DPMEvent& event : snapshot.events) {
+    if (event.index > restored_response_event_index &&
+        event.kind == DPMEvent::Kind::kCorrection) {
+      return absl::FailedPreconditionError(
+          "DPM correction event invalidates the selected checkpoint "
+          "descendant interval.");
+    }
     if (event.kind != DPMEvent::Kind::kModelTurn) continue;
     ABSL_RETURN_IF_ERROR(
         ValidateReceiptAndAdvance(snapshot, event, &transcript));
@@ -1190,7 +1260,8 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
           delta_chunks = BuildDeltaTranscriptChunks(
               source_snapshot,
               restore_candidate->artifact.descriptor.response_event_index,
-              canonical_agent_input);
+              canonical_agent_input,
+              projection.manifest.correction_digest);
       if (delta_chunks.ok()) {
         generation_request.canonical_prefill_chunks =
             std::move(*delta_chunks);

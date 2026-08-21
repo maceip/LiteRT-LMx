@@ -139,6 +139,12 @@ OneShotDPMProjector::SelectNewestCompatibleBaseline(
   // every process observing this exact raw-log prefix.
   for (auto event = authoritative_request.log.events.rbegin();
        event != authoritative_request.log.events.rend(); ++event) {
+    if (event->kind == DPMEvent::Kind::kCorrection) {
+      // The newest immutable correction starts a new projection lineage.
+      // Every earlier projection is invalidated, so a miss in this interval
+      // must rebuild from event zero rather than search the stale branch.
+      break;
+    }
     if (event->kind != DPMEvent::Kind::kModelTurn ||
         !event->turn_receipt.has_value()) {
       continue;

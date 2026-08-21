@@ -127,6 +127,9 @@ class DPMAgentRuntime {
 struct DPMEngineConfig {
   // Zero disables new automatic captures. Restore remains independently
   // controlled so an existing disposable checkpoint cache can still be used.
+  // A captured milestone is an own-position prefill boundary: subsequent
+  // turns restore it and prefill only the exact response-event suffix. The
+  // interval therefore changes inference work, not merely checkpoint names.
   uint32_t checkpoint_interval_turns = 1;
   bool restore_session_checkpoints = true;
   bool require_checkpoint_at_milestone = true;
@@ -212,7 +215,8 @@ class DPMEngine {
   absl::StatusOr<std::vector<DPMAgentGenerationRequest::PrefillChunk>>
   BuildDeltaTranscriptChunks(
       const DPMLogSnapshot& snapshot, uint64_t restored_response_event_index,
-      absl::string_view current_agent_input) const;
+      absl::string_view current_agent_input,
+      const Hash256& current_correction_digest) const;
   absl::StatusOr<std::string> BuildCanonicalAgentInput(
       const DPMTurnRequest& request, const DPMLogSnapshot& source_snapshot,
       uint64_t input_event_index,
