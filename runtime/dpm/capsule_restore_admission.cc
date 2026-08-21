@@ -34,6 +34,9 @@
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/time/clock.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
+#include "runtime/dpm/capsule_restore_evidence.h"
+#include "runtime/dpm/dpm_capabilities.h"
+#include "runtime/dpm/dpm_prepared_prefill_plan.h"
 #include "runtime/dpm/exact_decode_evidence.h"
 #include "runtime/engine/exact_litert_decode.h"
 #include "runtime/engine/io_types.h"
@@ -2012,6 +2015,34 @@ absl::Status ValidateCapsuleRestoreStateWitnessOperationalCoverage(
   return absl::OkStatus();
 }
 
+absl::Status ValidateCapsuleRestoreStateWitnessOperationalContracts(
+    const CapsuleRestoreStateWitnessOperationalCoverage& coverage) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateCapsuleRestoreStateWitnessOperationalCoverage(coverage));
+  const CapsuleRestoreStateWitnessOperationalDomain& domain =
+      coverage.operational_domain;
+  if (domain.resolved_session_config_hash !=
+          coverage.runtime_derived_session_identity.inference_profile_hash ||
+      domain.session_continuation_state_witness_contract_hash !=
+          GetSessionContinuationStateWitnessContractHash() ||
+      domain.capture_evidence_contract_hash !=
+          GetCapsuleRestoreCaptureEvidenceV2ContractHash() ||
+      domain.restore_evidence_contract_hash !=
+          GetCapsuleRestoreRestoreEvidenceV2ContractHash() ||
+      domain.deterministic_prefill_plan_contract_hash !=
+          GetDPMPreparedPrefillPlanContractHash() ||
+      domain.execution_shape_class_contract_hash !=
+          GetDPMPreparedPrefillShapeClassContractHash() ||
+      domain.restricted_feature_contract_hash !=
+          GetDPMRestrictedFeatureContractHash()) {
+    return absl::FailedPreconditionError(
+        "CapsuleRestore Coverage V2 was qualified against another resolved "
+        "session, witness, evidence, prefill, shape, or restricted-feature "
+        "contract.");
+  }
+  return absl::OkStatus();
+}
+
 absl::StatusOr<CapsuleRestoreStateWitnessOperationalCoverage>
 ComputeCapsuleRestoreStateWitnessOperationalCoverage(
     const ExactLiteRtProfile& runtime_derived_profile,
@@ -2044,7 +2075,7 @@ ComputeCapsuleRestoreStateWitnessOperationalCoverage(
       coverage.coverage_id,
       ComputeCapsuleRestoreStateWitnessOperationalCoverageId(coverage));
   ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleRestoreStateWitnessOperationalCoverage(coverage));
+      ValidateCapsuleRestoreStateWitnessOperationalContracts(coverage));
   return coverage;
 }
 
@@ -2751,6 +2782,9 @@ ResolveAuthenticatedCapsuleRestoreStateWitnessAdmission(
       ValidateCapsuleRestoreStateWitnessAdmissionRecordForRuntime(
           record, runtime_profile, runtime_capability,
           binding.expected_coverage_id));
+  ABSL_RETURN_IF_ERROR(
+      ValidateCapsuleRestoreStateWitnessOperationalContracts(
+          record.operational_coverage));
   ABSL_ASSIGN_OR_RETURN(
       const Hash256 canonical_record_id,
       ComputeCapsuleRestoreStateWitnessAdmissionRecordId(record));

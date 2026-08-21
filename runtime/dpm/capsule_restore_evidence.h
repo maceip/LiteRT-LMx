@@ -340,6 +340,12 @@ absl::Status ValidateCapsuleCaptureEvidenceV2ForParentCapture(
     const CapsuleCaptureEvidenceV2& child_capture_evidence,
     const CapsuleCaptureEvidenceV2& parent_capture_evidence);
 
+// Runtime-owned schema identities bound by Coverage V2 admission. These do
+// not authenticate an operation; they prevent an admission record for another
+// capture/restore evidence contract from being applied to these validators.
+Hash256 GetCapsuleRestoreCaptureEvidenceV2ContractHash();
+Hash256 GetCapsuleRestoreRestoreEvidenceV2ContractHash();
+
 }  // namespace litert::lm
 
 #endif  // THIRD_PARTY_ODML_LITERT_LM_RUNTIME_DPM_CAPSULE_RESTORE_EVIDENCE_H_

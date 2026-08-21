@@ -56,6 +56,8 @@ constexpr size_t kIoChunkSize = 2 * 1024 * 1024;
 constexpr size_t kTokenWriteChunkSize = 64 * 1024;
 constexpr absl::string_view kContinuationStateWitnessDomain =
     "LITERT_LMX_SESSION_CONTINUATION_STATE_WITNESS_SHA256_V1";
+constexpr absl::string_view kContinuationStateWitnessContractDomain =
+    "LITERT_LMX_SESSION_CONTINUATION_STATE_WITNESS_CONTRACT_SHA256_V1";
 
 bool IsZeroHash(const Hash256& hash) { return hash == Hash256{}; }
 
@@ -811,6 +813,26 @@ class SourceReader {
 };
 
 }  // namespace
+
+Hash256 GetSessionContinuationStateWitnessContractHash() {
+  std::string canonical;
+  const auto append_frame = [&canonical](absl::string_view value) {
+    AppendWitnessU32(static_cast<uint32_t>(value.size()), &canonical);
+    canonical.append(value.data(), value.size());
+  };
+  AppendWitnessU32(SessionContinuationStateWitness::kFormatVersion,
+                   &canonical);
+  AppendWitnessU64(kMaximumSessionHandoffEnvelopeBytes, &canonical);
+  AppendWitnessU32(kMaximumWitnessDpmTokenIds, &canonical);
+  append_frame("ENGINE_DERIVED_SESSION_IDENTITY");
+  append_frame("DPMTOK01_COMPLETE_HISTORY_WITH_PENDING_TOKEN");
+  append_frame("ENVELOPE_SHA256_SIZE_AND_KEY_ID");
+  append_frame("IMPORT_TARGET_CANONICAL_REEXPORT_EQUALITY");
+  Sha256Hasher hasher;
+  hasher.Update(kContinuationStateWitnessContractDomain);
+  hasher.Update(canonical);
+  return hasher.Finalize();
+}
 
 absl::StatusOr<Hash256> ComputeSessionContinuationStateWitnessId(
     const SessionContinuationStateWitness& witness) {

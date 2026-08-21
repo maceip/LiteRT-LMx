@@ -81,6 +81,11 @@ struct DPMFeatureRestriction {
 // Stable process-lifetime view of the normative fail-closed feature table.
 absl::Span<const DPMFeatureRestriction> GetDPMFeatureRestrictions();
 
+// Canonical digest of the complete normative fail-closed feature table. A
+// Coverage V2 record must bind this current table before it can authorize any
+// capsule operation.
+Hash256 GetDPMRestrictedFeatureContractHash();
+
 struct DPMStageCapabilities {
   DPMCapabilityStage stage = DPMCapabilityStage::kProjection;
   DPMReplayMode replay_mode = DPMReplayMode::kCanonicalWinnerReplay;

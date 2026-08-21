@@ -118,6 +118,11 @@ absl::StatusOr<Hash256> ComputeSessionContinuationStateWitnessId(
 absl::Status ValidateSessionContinuationStateWitness(
     const SessionContinuationStateWitness& witness);
 
+// Stable identity of the V1 witness field set and the live-target re-export
+// semantics. Coverage admission binds this value so a later witness evolution
+// cannot be accepted under an older operational contract.
+Hash256 GetSessionContinuationStateWitnessContractHash();
+
 }  // namespace litert::lm
 
 #endif  // THIRD_PARTY_ODML_LITERT_LM_RUNTIME_ENGINE_SESSION_HANDOFF_H_

@@ -43,6 +43,10 @@ constexpr absl::string_view kShapeScheduleDomain =
 constexpr absl::string_view kPlanIdDomain =
     "litert-lmx-dpm-prepared-prefill-plan-id-v1";
 constexpr absl::string_view kPreparedPrefillPlanMagic = "DPMPRP01";
+constexpr absl::string_view kPreparedPrefillPlanContractDomain =
+    "litert-lmx-dpm-prepared-prefill-plan-contract-v1";
+constexpr absl::string_view kPreparedPrefillShapeClassContractDomain =
+    "litert-lmx-dpm-prepared-prefill-shape-class-contract-v1";
 
 bool IsZeroHash(const Hash256& hash) {
   for (uint8_t byte : hash.bytes) {
@@ -627,6 +631,44 @@ absl::StatusOr<DPMPreparedPrefillPlan> DecodeDPMPreparedPrefillPlan(
         "Prepared DPM prefill plan bytes are not canonical.");
   }
   return plan;
+}
+
+Hash256 GetDPMPreparedPrefillPlanContractHash() {
+  std::string canonical;
+  const auto append_frame = [&canonical](absl::string_view value) {
+    AppendU32(static_cast<uint32_t>(value.size()), &canonical);
+    canonical.append(value.data(), value.size());
+  };
+  AppendU32(DPMPreparedPrefillPlan::kFormatVersion, &canonical);
+  AppendU32(static_cast<uint32_t>(kPreparedPrefillPlanMagic.size()),
+            &canonical);
+  canonical.append(kPreparedPrefillPlanMagic.data(),
+                   kPreparedPrefillPlanMagic.size());
+  AppendU32(kMaximumDPMPreparedPrefillCalls, &canonical);
+  AppendU32(kMaximumDPMPreparedPrefillSegmentsPerCall, &canonical);
+  AppendU64(kMaximumDPMPreparedPrefillTokenIds, &canonical);
+  AppendU64(kMaximumDPMPreparedPrefillPlanBytes, &canonical);
+  append_frame("ENGINE_DERIVED_IDENTITY_AND_TOKENIZER");
+  append_frame("WITNESS_BOUND_PLAN_ID");
+  append_frame("WITNESS_INDEPENDENT_MODEL_WORK_HASH");
+  append_frame("CANONICAL_SOURCE_TOKEN_SHAPE_HASHES");
+  return HashCanonical(kPreparedPrefillPlanContractDomain, canonical);
+}
+
+Hash256 GetDPMPreparedPrefillShapeClassContractHash() {
+  std::string canonical;
+  const auto append_frame = [&canonical](absl::string_view value) {
+    AppendU32(static_cast<uint32_t>(value.size()), &canonical);
+    canonical.append(value.data(), value.size());
+  };
+  AppendU32(DPMPreparedPrefillPlan::kFormatVersion, &canonical);
+  AppendU32(1, &canonical);
+  AppendU32(kMaximumDPMPreparedPrefillCalls, &canonical);
+  AppendU32(kMaximumDPMPreparedPrefillSegmentsPerCall, &canonical);
+  append_frame("ORDERED_CALL_START_END_POSITIONS");
+  append_frame("ORDERED_TENSOR_SEGMENT_TOKEN_COUNTS");
+  append_frame("FRESH_FIRST_CALL_OPTIONAL_BOS_SEGMENT");
+  return HashCanonical(kPreparedPrefillShapeClassContractDomain, canonical);
 }
 
 }  // namespace litert::lm

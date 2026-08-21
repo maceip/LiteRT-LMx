@@ -170,6 +170,12 @@ absl::StatusOr<std::string> EncodeDPMPreparedPrefillPlan(
 absl::StatusOr<DPMPreparedPrefillPlan> DecodeDPMPreparedPrefillPlan(
     absl::string_view bytes);
 
+// Runtime-owned identities used by Coverage V2 admission. The plan contract
+// binds the canonical field/hash/transport semantics; the shape-class contract
+// separately binds batch-one call and tensor-segment scheduling.
+Hash256 GetDPMPreparedPrefillPlanContractHash();
+Hash256 GetDPMPreparedPrefillShapeClassContractHash();
+
 }  // namespace litert::lm
 
 #endif  // THIRD_PARTY_ODML_LITERT_LM_RUNTIME_DPM_DPM_PREPARED_PREFILL_PLAN_H_

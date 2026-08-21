@@ -15,10 +15,14 @@
 #include "runtime/dpm/dpm_capabilities.h"
 
 #include <array>
+#include <cstdint>
+#include <string>
 
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/status_macros.h"  // from @com_google_absl
+#include "absl/strings/string_view.h"  // from @com_google_absl
 #include "runtime/dpm/dpm_event_log.h"
+#include "runtime/platform/hash/sha256_hasher.h"
 
 namespace litert::lm {
 namespace {
@@ -79,6 +83,31 @@ absl::Status ValidateRuntimeIdentity(
 
 absl::Span<const DPMFeatureRestriction> GetDPMFeatureRestrictions() {
   return absl::MakeConstSpan(kRestrictions);
+}
+
+Hash256 GetDPMRestrictedFeatureContractHash() {
+  std::string canonical;
+  const auto append_u32 = [&canonical](uint32_t value) {
+    for (int shift = 24; shift >= 0; shift -= 8) {
+      canonical.push_back(static_cast<char>((value >> shift) & 0xff));
+    }
+  };
+  const auto append_frame = [&canonical, &append_u32](
+                                absl::string_view value) {
+    append_u32(static_cast<uint32_t>(value.size()));
+    canonical.append(value.data(), value.size());
+  };
+  append_u32(1);
+  append_u32(static_cast<uint32_t>(kRestrictions.size()));
+  for (const DPMFeatureRestriction& restriction : kRestrictions) {
+    append_u32(static_cast<uint32_t>(restriction.feature));
+    append_u32(restriction.blocked_scopes);
+    append_frame(restriction.stable_name);
+  }
+  Sha256Hasher hasher;
+  hasher.Update("LITERT_LMX_DPM_RESTRICTED_FEATURE_CONTRACT_SHA256_V1");
+  hasher.Update(canonical);
+  return hasher.Finalize();
 }
 
 absl::Status ValidateDPMStageCapabilities(

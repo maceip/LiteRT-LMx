@@ -606,6 +606,10 @@ ComputeCapsuleRestoreStateWitnessOperationalCoverageId(
     const CapsuleRestoreStateWitnessOperationalCoverage& coverage);
 absl::Status ValidateCapsuleRestoreStateWitnessOperationalCoverage(
     const CapsuleRestoreStateWitnessOperationalCoverage& coverage);
+// Additionally requires every opaque operational contract hash to equal the
+// implementation currently linked into this runtime.
+absl::Status ValidateCapsuleRestoreStateWitnessOperationalContracts(
+    const CapsuleRestoreStateWitnessOperationalCoverage& coverage);
 absl::StatusOr<CapsuleRestoreStateWitnessOperationalCoverage>
 ComputeCapsuleRestoreStateWitnessOperationalCoverage(
     const ExactLiteRtProfile& runtime_derived_profile,

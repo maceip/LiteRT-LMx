@@ -43,6 +43,10 @@ constexpr absl::string_view kCaptureEvidenceDomain =
     "LITERT_LMX_CAPSULE_CAPTURE_EVIDENCE_SHA256_V2";
 constexpr absl::string_view kRestoreEvidenceDomain =
     "LITERT_LMX_CAPSULE_RESTORE_EVIDENCE_SHA256_V2";
+constexpr absl::string_view kCaptureEvidenceContractDomain =
+    "LITERT_LMX_CAPSULE_CAPTURE_EVIDENCE_CONTRACT_SHA256_V2";
+constexpr absl::string_view kRestoreEvidenceContractDomain =
+    "LITERT_LMX_CAPSULE_RESTORE_EVIDENCE_CONTRACT_SHA256_V2";
 
 bool IsZeroHash(const Hash256& hash) {
   uint8_t combined = 0;
@@ -1081,6 +1085,44 @@ absl::Status ValidateCapsuleCaptureEvidenceV2ForParentCapture(
   return ValidateParentRestoreLink(
       child_capture_evidence,
       *child_capture_evidence.parent_restore_evidence);
+}
+
+Hash256 GetCapsuleRestoreCaptureEvidenceV2ContractHash() {
+  std::string canonical;
+  const auto append_frame = [&canonical](absl::string_view value) {
+    AppendU32(static_cast<uint32_t>(value.size()), &canonical);
+    canonical.append(value.data(), value.size());
+  };
+  AppendU32(kCapsuleRestoreEvidenceV2FormatVersion, &canonical);
+  AppendU64(kMaximumCapsuleEvidenceEnvelopeBytes, &canonical);
+  AppendU32(kMaximumCapsuleEvidenceTokenIds, &canonical);
+  append_frame("ROOT_OR_VERIFIED_PARENT_CAPTURE");
+  append_frame("COMPLETE_RUNTIME_PREPARED_PREFILL_PLAN");
+  append_frame("PRODUCER_BEFORE_AFTER_AND_FRESH_IMPORT_EQUALITY");
+  append_frame("EDGE_VALIDATED_RECURSIVE_ANCESTRY");
+  Sha256Hasher hasher;
+  hasher.Update(kCaptureEvidenceContractDomain);
+  hasher.Update(canonical);
+  return hasher.Finalize();
+}
+
+Hash256 GetCapsuleRestoreRestoreEvidenceV2ContractHash() {
+  std::string canonical;
+  const auto append_frame = [&canonical](absl::string_view value) {
+    AppendU32(static_cast<uint32_t>(value.size()), &canonical);
+    canonical.append(value.data(), value.size());
+  };
+  AppendU32(kCapsuleRestoreEvidenceV2FormatVersion, &canonical);
+  AppendU64(kMaximumCapsuleEvidenceEnvelopeBytes, &canonical);
+  AppendU32(kMaximumCapsuleEvidenceTokenIds, &canonical);
+  append_frame("SOURCE_CAPTURE_AND_AUTHORITY_JOIN");
+  append_frame("OWN_POSITION_POST_IMPORT_WITNESS");
+  append_frame("COMPLETE_RUNTIME_PREPARED_DELTA_PLAN");
+  append_frame("OFF_POSITION_GRAFT_UNREPRESENTABLE");
+  Sha256Hasher hasher;
+  hasher.Update(kRestoreEvidenceContractDomain);
+  hasher.Update(canonical);
+  return hasher.Finalize();
 }
 
 }  // namespace litert::lm
