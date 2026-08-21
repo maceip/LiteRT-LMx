@@ -816,6 +816,10 @@ absl::Status ValidateAgentOutcome(
           "DPM agent returned a non-canonical decision token id.");
     }
   }
+  if (outcome.prepared_prefill_plan.has_value()) {
+    ABSL_RETURN_IF_ERROR(ValidateDPMPreparedPrefillPlan(
+        *outcome.prepared_prefill_plan));
+  }
   return absl::OkStatus();
 }
 
@@ -1971,7 +1975,9 @@ DPMEngine::BuildExactWorkerCheckpointArtifact(
       static_cast<uint64_t>(decoded_executor.current_step) !=
           capsule_restore_authority.operational_coverage.checkpoint_step ||
       decoded_executor.processed_tokens.processed_token_ids.size() != 1 ||
-      decoded_executor.processed_tokens.processed_token_ids.front().size() !=
+      decoded_executor.processed_tokens.pending_token_ids.size() != 1 ||
+      decoded_executor.processed_tokens.processed_token_ids.front().size() +
+              1 !=
           static_cast<size_t>(decoded_executor.current_step)) {
     return absl::FailedPreconditionError(
         "Authenticated exact-worker capsule step or phase is outside "
@@ -1979,7 +1985,7 @@ DPMEngine::BuildExactWorkerCheckpointArtifact(
   }
   std::vector<int32_t> decoded_history_token_ids;
   decoded_history_token_ids.reserve(
-      decoded_executor.processed_tokens.processed_token_ids.front().size());
+      static_cast<size_t>(decoded_executor.current_step));
   for (int token_id :
        decoded_executor.processed_tokens.processed_token_ids.front()) {
     if (token_id < 0 ||
@@ -1992,6 +1998,17 @@ DPMEngine::BuildExactWorkerCheckpointArtifact(
     }
     decoded_history_token_ids.push_back(static_cast<int32_t>(token_id));
   }
+  const int pending_token_id =
+      decoded_executor.processed_tokens.pending_token_ids.front();
+  if (pending_token_id < 0 ||
+      static_cast<uint64_t>(pending_token_id) >
+          static_cast<uint64_t>((std::numeric_limits<int32_t>::max)())) {
+    return absl::FailedPreconditionError(
+        "Authenticated exact-worker capsule contains an out-of-range pending "
+        "token.");
+  }
+  decoded_history_token_ids.push_back(
+      static_cast<int32_t>(pending_token_id));
   ABSL_ASSIGN_OR_RETURN(
       const std::string decoded_history_token_bytes,
       EncodeFreshWorkerTokenIds(decoded_history_token_ids));
@@ -2411,6 +2428,8 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
       PreparedWinnerSession prepared;
       prepared.generation_request.max_output_tokens =
           config_.max_decision_tokens;
+      prepared.generation_request.logical_agent_request_hash =
+          agent_request_hash;
       prepared.generation_request.canonical_prefill_chunks = full_chunks;
       ABSL_ASSIGN_OR_RETURN(prepared.session,
                             agent_runtime_->CreateSession());
@@ -2462,8 +2481,8 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
       }
       StringByteSource source(
           restore_candidate->artifact.authenticated_envelope);
-      absl::Status import_status =
-          prepared.session->ImportHandoffFrom(source, options);
+      absl::StatusOr<SessionContinuationStateWitness> import_witness =
+          prepared.session->ImportHandoffFromWithWitness(source, options);
       ABSL_ASSIGN_OR_RETURN(
           const CapsuleRestoreAuthority authority_after_import,
           RequireCurrentCapsuleRestoreAuthority());
@@ -2476,17 +2495,34 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
         return absl::AbortedError(
             "CapsuleRestore authority changed during WinnerReplay import.");
       }
-      if (import_status.ok()) {
-        prepared.generation_request.canonical_prefill_chunks =
-            std::move(delta_chunks);
-        prepared.restored_checkpoint_id =
-            restore_candidate->artifact.descriptor.descriptor_id;
-        return prepared;
+      if (import_witness.ok()) {
+        const absl::Status valid_witness =
+            ValidateSessionContinuationStateWitness(*import_witness);
+        if (valid_witness.ok() &&
+            import_witness->session_identity == loaded_identity &&
+            import_witness->phase == SessionHandoffPhase::kDecoded &&
+            import_witness->ran_decode &&
+            import_witness->envelope_hash ==
+                restore_descriptor.envelope_hash &&
+            import_witness->envelope_size ==
+                restore_descriptor.envelope_size &&
+            import_witness->key_id == restore_descriptor.key_id) {
+          prepared.generation_request.canonical_prefill_chunks =
+              std::move(delta_chunks);
+          prepared.restored_checkpoint_id =
+              restore_candidate->artifact.descriptor.descriptor_id;
+          prepared.generation_request.restore_checkpoint_id =
+              prepared.restored_checkpoint_id;
+          prepared.generation_request.restored_state_witness =
+              std::move(*import_witness);
+          return prepared;
+        }
       }
 
-      // Even though import is transactional, discard its target. This also
-      // covers a structurally valid capsule whose exact delta boundary can no
-      // longer be reconstructed from the authoritative log.
+      // Even though import is transactional, discard its target. This covers
+      // both an import error and a live re-export witness that no longer
+      // matches the disposable checkpoint. Full-log reconstruction remains
+      // authoritative; a cache mismatch never mutates the checkpoint in place.
       prepared.session.reset();
       ABSL_ASSIGN_OR_RETURN(prepared.session,
                             agent_runtime_->CreateSession());
@@ -2816,6 +2852,8 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
     MaterializedAgentDecision material;
     material.outcome.decision_output = execution.decision_output;
     material.outcome.decision_token_ids = execution.decision_token_ids;
+    material.outcome.prepared_prefill_plan =
+        execution.prepared_prefill_plan;
     ABSL_RETURN_IF_ERROR(
         ValidateAgentOutcome(material.outcome, max_decision_tokens));
     if (execution.mode == DPMReplayMode::kExactRegeneration) {

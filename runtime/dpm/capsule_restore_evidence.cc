@@ -35,10 +35,6 @@ constexpr absl::string_view kFullPrefillChunksDomain =
     "LITERT_LMX_CAPSULE_FULL_PREFILL_CHUNKS_SHA256_V2";
 constexpr absl::string_view kDeltaChunksDomain =
     "LITERT_LMX_CAPSULE_DELTA_CHUNKS_SHA256_V2";
-constexpr absl::string_view kPreparedUtf8SourceChunkDomain =
-    "litert-lmx-dpm-prefill-utf8-source-chunk-v1";
-constexpr absl::string_view kPreparedTokenSourceChunkDomain =
-    "litert-lmx-dpm-prefill-token-source-chunk-v1";
 constexpr absl::string_view kCapturePlanDomain =
     "LITERT_LMX_CAPSULE_CAPTURE_PLAN_SHA256_V2";
 constexpr absl::string_view kRestorePlanDomain =
@@ -439,16 +435,12 @@ absl::Status ValidateRestoreTarget(const CapsuleDPMRestoreTargetV2& state) {
 
 absl::StatusOr<Hash256> ComputePreparedSourceChunkHash(
     const CapsuleCanonicalPrefillChunkV2& chunk) {
-  std::string canonical;
   switch (chunk.encoding) {
     case CapsuleCanonicalPrefillChunkV2::Encoding::kUtf8Text:
-      AppendU32(static_cast<uint32_t>(chunk.utf8_text.size()), &canonical);
-      canonical.append(chunk.utf8_text);
-      return HashCanonical(kPreparedUtf8SourceChunkDomain, canonical);
+      return ComputeDPMPreparedPrefillUtf8SourceChunkHash(chunk.utf8_text);
     case CapsuleCanonicalPrefillChunkV2::Encoding::kExactTokenIds:
-      AppendU32(static_cast<uint32_t>(chunk.token_ids.size()), &canonical);
-      for (int32_t token_id : chunk.token_ids) AppendI32(token_id, &canonical);
-      return HashCanonical(kPreparedTokenSourceChunkDomain, canonical);
+      return ComputeDPMPreparedPrefillExactTokenSourceChunkHash(
+          chunk.token_ids);
     default:
       return absl::InvalidArgumentError(
           "CapsuleRestore canonical chunk encoding is unsupported.");

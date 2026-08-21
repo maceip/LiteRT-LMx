@@ -143,6 +143,11 @@ struct DPMAgentReplayExecution {
   // cold-worker results are false; DPMEngine must never capture those parent
   // sessions as if they produced the returned decision.
   bool producing_session_matches_output = false;
+  // Present only when this result is backed by the live session that executed
+  // this exact runtime-derived physical prefill plan. Catalog-only results have
+  // no physical-session plan. Exact workers populate this after all cold runs
+  // independently agree on the same derived plan.
+  std::optional<DPMPreparedPrefillPlan> prepared_prefill_plan;
 };
 
 absl::Status ValidateDPMAgentReplayExecution(

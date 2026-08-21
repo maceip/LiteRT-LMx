@@ -17,10 +17,13 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
+#include "absl/strings/string_view.h"  // from @com_google_absl
+#include "absl/types/span.h"  // from @com_google_absl
 #include "runtime/engine/session_handoff.h"
 #include "runtime/platform/hash/hasher.h"
 
@@ -29,6 +32,8 @@ namespace litert::lm {
 inline constexpr uint32_t kMaximumDPMPreparedPrefillCalls = 65'536;
 inline constexpr uint32_t kMaximumDPMPreparedPrefillSegmentsPerCall = 4;
 inline constexpr uint64_t kMaximumDPMPreparedPrefillTokenIds = 1'000'000;
+inline constexpr uint64_t kMaximumDPMPreparedPrefillPlanBytes =
+    uint64_t{64} * 1024 * 1024;
 
 enum class DPMPreparedPrefillStartKind : uint32_t {
   // A newly created step-zero session. The plan explicitly resolves any BOS
@@ -79,10 +84,14 @@ struct DPMPreparedPrefillCall {
 // the logical DPM replay request: checkpoints may change the selected suffix
 // and starting state without changing the logical request or winner key.
 //
-// `resolved_token_plan_hash` commits to every exact token ID and call/segment
-// boundary. `shape_schedule_hash` separately commits to the batch-one API
-// shape schedule. The SessionHandoffIdentity pins the loaded tokenizer,
-// backend, compiled runtime, and internal prefill-chunking contract.
+// `resolved_token_plan_hash` commits to every exact token ID, call/segment
+// boundary, and semantic start history, but intentionally excludes the
+// transport-specific witness ID. Independent exact workers reauthenticate the
+// same state under per-run keys, so their envelope witnesses differ while the
+// model-affecting token plan must agree. `plan_id` binds that run's witness;
+// `shape_schedule_hash` separately commits to the batch-one API shape schedule.
+// SessionHandoffIdentity pins the loaded tokenizer, backend, compiled runtime,
+// and internal prefill-chunking contract.
 struct DPMPreparedPrefillPlan {
   static constexpr uint32_t kFormatVersion = 1;
 
@@ -130,6 +139,15 @@ struct DPMPreparedPrefillPlan {
   }
 };
 
+// Canonical commitments to the source bytes that produced one prepared call.
+// These are public so replay/evidence boundaries can independently join a
+// runtime-derived plan back to the logical chunks without re-tokenizing text
+// or duplicating the hashing contract.
+absl::StatusOr<Hash256> ComputeDPMPreparedPrefillUtf8SourceChunkHash(
+    absl::string_view utf8_text);
+absl::StatusOr<Hash256> ComputeDPMPreparedPrefillExactTokenSourceChunkHash(
+    absl::Span<const int32_t> token_ids);
+
 // Hash of the ordered source_chunk_hash values and their encodings. This lets
 // the plan validator prove that no source chunk was reordered or dropped.
 absl::StatusOr<Hash256> ComputeDPMPreparedPrefillSourceChunksHash(
@@ -143,6 +161,14 @@ absl::StatusOr<Hash256> ComputeDPMPreparedPrefillPlanId(
     const DPMPreparedPrefillPlan& plan);
 absl::Status ValidateDPMPreparedPrefillPlan(
     const DPMPreparedPrefillPlan& plan);
+
+// Canonical transport form used inside authenticated fresh-worker results.
+// This encoding is content-addressed but not authenticated by itself; callers
+// must retain the enclosing worker/result authentication boundary.
+absl::StatusOr<std::string> EncodeDPMPreparedPrefillPlan(
+    const DPMPreparedPrefillPlan& plan);
+absl::StatusOr<DPMPreparedPrefillPlan> DecodeDPMPreparedPrefillPlan(
+    absl::string_view bytes);
 
 }  // namespace litert::lm
 

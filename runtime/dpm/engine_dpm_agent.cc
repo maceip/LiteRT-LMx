@@ -27,6 +27,7 @@
 #include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "runtime/dpm/dpm_engine.h"
+#include "runtime/dpm/dpm_prepared_prefill_runtime.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
@@ -578,62 +579,64 @@ absl::StatusOr<DPMAgentGenerationOutcome> EngineDPMAgentRuntime::Generate(
     return absl::InvalidArgumentError(
         "DPM agent generation requires canonical prefill chunks.");
   }
+  if (request.logical_agent_request_hash == Hash256{}) {
+    return absl::InvalidArgumentError(
+        "DPM agent generation requires its logical request hash.");
+  }
+  if (request.restore_checkpoint_id.has_value() !=
+      request.restored_state_witness.has_value()) {
+    return absl::InvalidArgumentError(
+        "DPM agent restore requires both a checkpoint and live import "
+        "witness.");
+  }
+
+  std::optional<AuthenticatedCapsuleRestoreAdmission> restore_admission;
+  if (request.restore_checkpoint_id.has_value()) {
+    if (!capsule_restore_admission_.has_value()) {
+      return absl::FailedPreconditionError(
+          "DPM agent restore-shaped generation requires an authenticated "
+          "CapsuleRestore admission binding.");
+    }
+    ABSL_ASSIGN_OR_RETURN(restore_admission,
+                          ResolveCurrentCapsuleRestoreAdmission());
+    const SessionContinuationStateWitness& witness =
+        *request.restored_state_witness;
+    const CapsuleRestoreOperationalCoverage& coverage =
+        restore_admission->operational_coverage;
+    if (restore_admission->capability.session_identity !=
+            session_handoff_identity_ ||
+        witness.session_identity != session_handoff_identity_ ||
+        witness.current_step <= 0 ||
+        static_cast<uint64_t>(witness.current_step) !=
+            coverage.checkpoint_step ||
+        witness.processed_history_token_bytes_hash !=
+            coverage.checkpoint_history_token_bytes_hash ||
+        witness.envelope_size != coverage.checkpoint_envelope_size ||
+        witness.key_id != coverage.checkpoint_authentication_key_id) {
+      return absl::FailedPreconditionError(
+          "DPM agent restore witness is outside the reauthenticated "
+          "CapsuleRestore coverage.");
+    }
+  }
+
+  DPMPreparedPrefillStart start;
+  if (request.restore_checkpoint_id.has_value()) {
+    start.kind = DPMPreparedPrefillStartKind::kOwnPositionRestore;
+    start.restore_checkpoint_id = request.restore_checkpoint_id;
+    start.restored_state_witness = request.restored_state_witness;
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      DPMPreparedPrefillPlan prepared_prefill_plan,
+      PrepareDPMEnginePrefillPlan(
+          engine_, session, request.canonical_prefill_chunks,
+          request.logical_agent_request_hash, start));
+  ABSL_RETURN_IF_ERROR(ExecuteDPMEnginePrefillPlan(
+      session, prepared_prefill_plan, request.restored_state_witness));
 
   const int vocabulary_size = engine_->GetTokenizer().GetVocabSize();
   if (vocabulary_size <= 0) {
     return absl::FailedPreconditionError(
         "DPM agent tokenizer has no measurable vocabulary.");
-  }
-  for (const DPMAgentGenerationRequest::PrefillChunk& chunk :
-       request.canonical_prefill_chunks) {
-    std::vector<InputData> contents;
-    contents.reserve(1);
-    switch (chunk.encoding) {
-      case DPMAgentGenerationRequest::PrefillChunk::Encoding::kUtf8Text:
-        if (!chunk.token_ids.empty()) {
-          return absl::InvalidArgumentError(
-              "UTF-8 DPM prefill chunk also contains token IDs.");
-        }
-        if (chunk.text.empty()) {
-          return absl::InvalidArgumentError(
-              "UTF-8 DPM prefill chunk must not be empty.");
-        }
-        if (!IsValidUtf8(chunk.text)) {
-          return absl::InvalidArgumentError(
-              "UTF-8 DPM prefill chunk contains invalid UTF-8 bytes.");
-        }
-        contents.emplace_back(InputText(std::string(chunk.text)));
-        break;
-
-      case DPMAgentGenerationRequest::PrefillChunk::Encoding::kTokenIds: {
-        if (!chunk.text.empty()) {
-          return absl::InvalidArgumentError(
-              "Token-ID DPM prefill chunk also contains UTF-8 bytes.");
-        }
-        if (chunk.token_ids.empty()) {
-          return absl::InvalidArgumentError(
-              "Token-ID DPM prefill chunk must not be empty.");
-        }
-        for (int token_id : chunk.token_ids) {
-          if (token_id < 0 || token_id >= vocabulary_size) {
-            return absl::InvalidArgumentError(
-                "Token-ID DPM prefill chunk contains an out-of-range ID.");
-          }
-        }
-        ABSL_ASSIGN_OR_RETURN(
-            auto token_buffer,
-            support::Tokenizer::TokenIdsToTensorBuffer(chunk.token_ids));
-        contents.emplace_back(InputText(std::move(token_buffer)));
-        break;
-      }
-
-      default:
-        return absl::InvalidArgumentError(
-            "DPM prefill chunk has an unknown encoding.");
-    }
-    // A distinct call per chunk preserves the canonical input/decision
-    // boundary and prevents historical decision IDs from being re-tokenized.
-    ABSL_RETURN_IF_ERROR(session->RunPrefill(contents));
   }
 
   ABSL_ASSIGN_OR_RETURN(
@@ -697,11 +700,27 @@ absl::StatusOr<DPMAgentGenerationOutcome> EngineDPMAgentRuntime::Generate(
         "DPM agent decode exceeded its exact output-token limit.");
   }
 
+  if (restore_admission.has_value()) {
+    ABSL_ASSIGN_OR_RETURN(
+        const AuthenticatedCapsuleRestoreAdmission current_admission,
+        ResolveCurrentCapsuleRestoreAdmission());
+    if (current_admission.record.record_id !=
+            restore_admission->record.record_id ||
+        current_admission.profile != restore_admission->profile ||
+        current_admission.capability != restore_admission->capability ||
+        current_admission.operational_coverage !=
+            restore_admission->operational_coverage) {
+      return absl::AbortedError(
+          "CapsuleRestore admission changed during restored DPM generation.");
+    }
+  }
+
   // The session is deliberately left alive with this exact post-decode state
   // so DPMEngine can capture the producing capsule before releasing it.
   return DPMAgentGenerationOutcome{
       .decision_output = responses.GetTexts()[0],
       .decision_token_ids = std::move(decision_token_ids),
+      .prepared_prefill_plan = std::move(prepared_prefill_plan),
   };
 }
 

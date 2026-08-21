@@ -17,7 +17,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -39,59 +38,7 @@
 namespace litert::lm {
 namespace {
 
-constexpr absl::string_view kUtf8SourceChunkDomain =
-    "litert-lmx-dpm-prefill-utf8-source-chunk-v1";
-constexpr absl::string_view kTokenSourceChunkDomain =
-    "litert-lmx-dpm-prefill-token-source-chunk-v1";
-
 bool IsZeroHash(const Hash256& hash) { return hash == Hash256{}; }
-
-void AppendU32(uint32_t value, std::string* output) {
-  for (int shift = 24; shift >= 0; shift -= 8) {
-    output->push_back(static_cast<char>((value >> shift) & 0xff));
-  }
-}
-
-absl::StatusOr<Hash256> HashSourceText(absl::string_view text) {
-  if (text.size() > std::numeric_limits<uint32_t>::max()) {
-    return absl::ResourceExhaustedError(
-        "Prepared DPM UTF-8 source chunk exceeds its canonical length field.");
-  }
-  std::string canonical;
-  AppendU32(static_cast<uint32_t>(text.size()), &canonical);
-  canonical.append(text.data(), text.size());
-  Sha256Hasher hasher;
-  hasher.Update(kUtf8SourceChunkDomain);
-  hasher.Update(canonical);
-  const Hash256 result = hasher.Finalize();
-  if (IsZeroHash(result)) {
-    return absl::InternalError(
-        "Prepared DPM UTF-8 source hashing produced an empty digest.");
-  }
-  return result;
-}
-
-absl::StatusOr<Hash256> HashSourceTokenIds(
-    const std::vector<int>& token_ids) {
-  if (token_ids.size() > std::numeric_limits<uint32_t>::max()) {
-    return absl::ResourceExhaustedError(
-        "Prepared DPM token source exceeds its canonical count field.");
-  }
-  std::string canonical;
-  AppendU32(static_cast<uint32_t>(token_ids.size()), &canonical);
-  for (int token_id : token_ids) {
-    AppendU32(static_cast<uint32_t>(token_id), &canonical);
-  }
-  Sha256Hasher hasher;
-  hasher.Update(kTokenSourceChunkDomain);
-  hasher.Update(canonical);
-  const Hash256 result = hasher.Finalize();
-  if (IsZeroHash(result)) {
-    return absl::InternalError(
-        "Prepared DPM token source hashing produced an empty digest.");
-  }
-  return result;
-}
 
 bool IsValidUtf8(absl::string_view text) {
   const auto* bytes = reinterpret_cast<const uint8_t*>(text.data());
@@ -415,8 +362,9 @@ absl::StatusOr<DPMPreparedPrefillPlan> PrepareDPMEnginePrefillPlan(
         }
         call.source_encoding =
             DPMPreparedPrefillSourceEncoding::kUtf8Text;
-        ABSL_ASSIGN_OR_RETURN(call.source_chunk_hash,
-                              HashSourceText(source.text));
+        ABSL_ASSIGN_OR_RETURN(
+            call.source_chunk_hash,
+            ComputeDPMPreparedPrefillUtf8SourceChunkHash(source.text));
         ABSL_ASSIGN_OR_RETURN(
             std::vector<int32_t> resolved,
             ResolveTextTokenIds(
@@ -437,8 +385,9 @@ absl::StatusOr<DPMPreparedPrefillPlan> PrepareDPMEnginePrefillPlan(
             std::vector<int32_t> resolved,
             CanonicalizeTokenIds(
                 source.token_ids, static_cast<uint32_t>(vocabulary_size)));
-        ABSL_ASSIGN_OR_RETURN(call.source_chunk_hash,
-                              HashSourceTokenIds(source.token_ids));
+        ABSL_ASSIGN_OR_RETURN(
+            call.source_chunk_hash,
+            ComputeDPMPreparedPrefillExactTokenSourceChunkHash(resolved));
         call.token_segments.push_back(
             DPMPreparedPrefillSegment{.token_ids = std::move(resolved)});
         break;

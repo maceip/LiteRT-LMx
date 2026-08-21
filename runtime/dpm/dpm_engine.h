@@ -27,6 +27,7 @@
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
 #include "runtime/dpm/dpm_event_log.h"
 #include "runtime/dpm/dpm_capabilities.h"
+#include "runtime/dpm/dpm_prepared_prefill_plan.h"
 #include "runtime/dpm/dpm_projection_manifest.h"
 #include "runtime/dpm/dpm_replay_mode.h"
 #include "runtime/dpm/session_checkpoint.h"
@@ -117,12 +118,24 @@ struct DPMAgentGenerationRequest {
   // delta; on fallback it contains the full log-derived transcript followed
   // by the current input.
   std::vector<PrefillChunk> canonical_prefill_chunks;
+  // The logical request hash remains unchanged when a checkpoint replaces
+  // full prefill with an authenticated suffix. Low-level runtimes use it only
+  // as a binding for their runtime-derived physical plan.
+  Hash256 logical_agent_request_hash;
+  // Restore-only state. The witness must be the independently recomputed live
+  // target returned by ImportHandoffFromWithWitness; a checkpoint ID by itself
+  // cannot authorize delta prefill.
+  std::optional<Hash256> restore_checkpoint_id;
+  std::optional<SessionContinuationStateWitness> restored_state_witness;
   int max_output_tokens = 512;
 };
 
 struct DPMAgentGenerationOutcome {
   std::string decision_output;
   std::vector<int> decision_token_ids;
+  // Present for a direct live-runtime generation. Catalog-only materialization
+  // has no physical session and therefore no prepared plan.
+  std::optional<DPMPreparedPrefillPlan> prepared_prefill_plan;
 };
 
 class DPMAgentRuntime {

@@ -262,6 +262,52 @@ bool ChunksEqual(
   return true;
 }
 
+absl::Status ValidatePreparedPlanSourceBindings(
+    const DPMPreparedPrefillPlan& plan,
+    const std::vector<DPMAgentGenerationRequest::PrefillChunk>& chunks) {
+  if (plan.calls.size() != chunks.size()) {
+    return absl::DataLossError(
+        "Prepared DPM prefill plan changed the canonical source-call count.");
+  }
+  for (size_t index = 0; index < chunks.size(); ++index) {
+    const DPMAgentGenerationRequest::PrefillChunk& chunk = chunks[index];
+    const DPMPreparedPrefillCall& call = plan.calls[index];
+    ABSL_RETURN_IF_ERROR(ValidateChunk(chunk));
+    Hash256 expected_hash;
+    DPMPreparedPrefillSourceEncoding expected_encoding;
+    switch (chunk.encoding) {
+      case DPMAgentGenerationRequest::PrefillChunk::Encoding::kUtf8Text:
+        expected_encoding = DPMPreparedPrefillSourceEncoding::kUtf8Text;
+        ABSL_ASSIGN_OR_RETURN(
+            expected_hash,
+            ComputeDPMPreparedPrefillUtf8SourceChunkHash(chunk.text));
+        break;
+      case DPMAgentGenerationRequest::PrefillChunk::Encoding::kTokenIds: {
+        expected_encoding =
+            DPMPreparedPrefillSourceEncoding::kExactTokenIds;
+        std::vector<int32_t> exact_ids;
+        exact_ids.reserve(chunk.token_ids.size());
+        for (int token_id : chunk.token_ids) {
+          exact_ids.push_back(static_cast<int32_t>(token_id));
+        }
+        ABSL_ASSIGN_OR_RETURN(
+            expected_hash,
+            ComputeDPMPreparedPrefillExactTokenSourceChunkHash(exact_ids));
+        break;
+      }
+      default:
+        return absl::InvalidArgumentError(
+            "Prepared DPM prefill source has an unknown encoding.");
+    }
+    if (call.source_encoding != expected_encoding ||
+        call.source_chunk_hash != expected_hash) {
+      return absl::DataLossError(
+          "Prepared DPM prefill plan changed a canonical source chunk.");
+    }
+  }
+  return absl::OkStatus();
+}
+
 absl::StatusOr<std::vector<CapsuleRestorePrefillChunk>>
 ToCapsuleRestoreChunks(
     const std::vector<DPMAgentGenerationRequest::PrefillChunk>& chunks) {
@@ -309,11 +355,32 @@ absl::Status ValidateGenerationRequest(
   if (request.max_output_tokens <= 0 ||
       request.max_output_tokens >
           static_cast<int>(kMaximumDPMGenerationTokens) ||
+      IsZeroHash(request.logical_agent_request_hash) ||
       request.canonical_prefill_chunks.empty() ||
       request.canonical_prefill_chunks.size() >
           kMaximumFreshWorkerTokenIds) {
     return absl::InvalidArgumentError(
         "DPM agent generation request is incomplete or oversized.");
+  }
+  if (request.restore_checkpoint_id.has_value() !=
+      request.restored_state_witness.has_value()) {
+    return absl::InvalidArgumentError(
+        "DPM agent generation restore lacks its checkpoint or live witness.");
+  }
+  if (request.restore_checkpoint_id.has_value()) {
+    if (IsZeroHash(*request.restore_checkpoint_id)) {
+      return absl::InvalidArgumentError(
+          "DPM agent generation restore has an empty checkpoint ID.");
+    }
+    ABSL_RETURN_IF_ERROR(ValidateSessionContinuationStateWitness(
+        *request.restored_state_witness));
+    if (request.restored_state_witness->phase !=
+            SessionHandoffPhase::kDecoded ||
+        !request.restored_state_witness->ran_decode) {
+      return absl::InvalidArgumentError(
+          "DPM agent generation restore witness is not a decoded producing "
+          "boundary.");
+    }
   }
   uint64_t total_token_ids = 0;
   for (const auto& chunk : request.canonical_prefill_chunks) {
@@ -379,9 +446,17 @@ class WinnerAgentInvocation final : public CanonicalWinnerReplayGenerator {
     ABSL_RETURN_IF_ERROR(
         ValidateDPMAgentExecutionRequest(*logical_request_));
     if (static_cast<uint32_t>(execution_request_->max_output_tokens) !=
-        logical_request_->max_output_tokens) {
+            logical_request_->max_output_tokens ||
+        execution_request_->logical_agent_request_hash !=
+            logical_request_->logical_agent_request_hash) {
       return absl::InvalidArgumentError(
-          "WinnerReplay live generation and logical request limits differ.");
+          "WinnerReplay live generation and logical request bindings differ.");
+    }
+    if (execution_request_->restored_state_witness.has_value() &&
+        execution_request_->restored_state_witness->session_identity !=
+            runtime_identity_) {
+      return absl::FailedPreconditionError(
+          "WinnerReplay restore witness belongs to another runtime.");
     }
     if (inference_runtime_->GetSessionHandoffIdentity() != runtime_identity_) {
       return absl::FailedPreconditionError(
@@ -421,6 +496,29 @@ class WinnerAgentInvocation final : public CanonicalWinnerReplayGenerator {
     ABSL_ASSIGN_OR_RETURN(
         DPMAgentGenerationOutcome generated,
         inference_runtime_->Generate(session_, *execution_request_));
+    if (!generated.prepared_prefill_plan.has_value()) {
+      return absl::DataLossError(
+          "WinnerReplay live generation omitted its prepared prefill plan.");
+    }
+    ABSL_RETURN_IF_ERROR(ValidateDPMPreparedPrefillPlan(
+        *generated.prepared_prefill_plan));
+    ABSL_RETURN_IF_ERROR(ValidatePreparedPlanSourceBindings(
+        *generated.prepared_prefill_plan,
+        execution_request_->canonical_prefill_chunks));
+    if (generated.prepared_prefill_plan->session_identity !=
+            runtime_identity_ ||
+        generated.prepared_prefill_plan->logical_agent_request_hash !=
+            logical_request_->logical_agent_request_hash ||
+        generated.prepared_prefill_plan->restore_checkpoint_id !=
+            execution_request_->restore_checkpoint_id ||
+        (execution_request_->restored_state_witness.has_value() &&
+         generated.prepared_prefill_plan->start_state_witness_id !=
+             std::optional<Hash256>(
+                 execution_request_->restored_state_witness->witness_id))) {
+      return absl::DataLossError(
+          "WinnerReplay prepared prefill plan differs from its runtime, "
+          "logical request, or restore start.");
+    }
     std::vector<int32_t> token_ids;
     token_ids.reserve(generated.decision_token_ids.size());
     for (int token_id : generated.decision_token_ids) {
@@ -453,6 +551,8 @@ class WinnerAgentInvocation final : public CanonicalWinnerReplayGenerator {
     }
     generated_output_hash_ = Sha256(canonical_output);
     generated_evidence_hash_ = evidence;
+    prepared_prefill_plan_ =
+        std::move(*generated.prepared_prefill_plan);
     generation_succeeded_ = true;
     return CanonicalWinnerGeneratedCandidate{
         .canonical_output = std::move(canonical_output),
@@ -462,6 +562,9 @@ class WinnerAgentInvocation final : public CanonicalWinnerReplayGenerator {
 
   bool generate_called() const { return generate_called_; }
   bool generation_succeeded() const { return generation_succeeded_; }
+  const std::optional<DPMPreparedPrefillPlan>& prepared_prefill_plan() const {
+    return prepared_prefill_plan_;
+  }
   bool GeneratedSelectedCandidate(
       const CanonicalWinnerReplayExecution& replay) const {
     return generation_succeeded_ &&
@@ -479,6 +582,7 @@ class WinnerAgentInvocation final : public CanonicalWinnerReplayGenerator {
   bool generation_succeeded_ = false;
   Hash256 generated_output_hash_;
   Hash256 generated_evidence_hash_;
+  std::optional<DPMPreparedPrefillPlan> prepared_prefill_plan_;
 };
 
 DPMCanonicalReplayRequest MakeReplayRequest(std::string encoded,
@@ -1112,6 +1216,10 @@ absl::Status ValidateDPMAgentReplayExecution(
   }
   ABSL_RETURN_IF_ERROR(ValidateDecisionFields(
       execution.decision_output, token_ids, max_output_tokens));
+  if (execution.prepared_prefill_plan.has_value()) {
+    ABSL_RETURN_IF_ERROR(ValidateDPMPreparedPrefillPlan(
+        *execution.prepared_prefill_plan));
+  }
   switch (execution.mode) {
     case DPMReplayMode::kCanonicalWinnerReplay:
       if (execution.exact_profile_id.has_value() ||
@@ -1120,7 +1228,9 @@ absl::Status ValidateDPMAgentReplayExecution(
           !execution.exact_token_bytes.empty() ||
           !execution.exact_logit_frames.empty() ||
           execution.producing_session_matches_output ==
-              execution.reused_canonical_winner) {
+              execution.reused_canonical_winner ||
+          execution.prepared_prefill_plan.has_value() !=
+              execution.producing_session_matches_output) {
         return absl::DataLossError(
             "WinnerReplay agent execution carries exact evidence or invalid "
             "producing-session provenance.");
@@ -1534,6 +1644,10 @@ CanonicalWinnerDPMAgentRuntime::Generate(
       .reused_canonical_winner = expected_reuse,
       .producing_session_matches_output =
           expected_producing_session_match,
+      .prepared_prefill_plan =
+          expected_producing_session_match
+              ? invocation.prepared_prefill_plan()
+              : std::optional<DPMPreparedPrefillPlan>(),
   };
   ABSL_RETURN_IF_ERROR(ValidateDPMAgentReplayExecution(
       execution, logical_request.max_output_tokens));
@@ -1636,6 +1750,7 @@ CanonicalWinnerDPMAgentRuntime::RematerializeCanonicalWinner(
   DPMAgentReplayExecution live_execution = selected_winner;
   live_execution.reused_canonical_winner = false;
   live_execution.producing_session_matches_output = true;
+  live_execution.prepared_prefill_plan = invocation.prepared_prefill_plan();
   ABSL_RETURN_IF_ERROR(ValidateDPMAgentReplayExecution(
       live_execution, logical_request.max_output_tokens));
   return live_execution;

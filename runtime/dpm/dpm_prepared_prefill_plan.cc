@@ -15,13 +15,16 @@
 #include "runtime/dpm/dpm_prepared_prefill_plan.h"
 
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <string>
+#include <utility>
 
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "absl/types/span.h"  // from @com_google_absl
 #include "runtime/platform/hash/sha256_hasher.h"
 
 namespace litert::lm {
@@ -29,12 +32,17 @@ namespace {
 
 constexpr absl::string_view kSourceChunksDomain =
     "litert-lmx-dpm-prepared-prefill-source-chunks-v1";
+constexpr absl::string_view kUtf8SourceChunkDomain =
+    "litert-lmx-dpm-prefill-utf8-source-chunk-v1";
+constexpr absl::string_view kTokenSourceChunkDomain =
+    "litert-lmx-dpm-prefill-token-source-chunk-v1";
 constexpr absl::string_view kResolvedTokenPlanDomain =
     "litert-lmx-dpm-prepared-prefill-token-plan-v1";
 constexpr absl::string_view kShapeScheduleDomain =
     "litert-lmx-dpm-prepared-prefill-shape-schedule-v1";
 constexpr absl::string_view kPlanIdDomain =
     "litert-lmx-dpm-prepared-prefill-plan-id-v1";
+constexpr absl::string_view kPreparedPrefillPlanMagic = "DPMPRP01";
 
 bool IsZeroHash(const Hash256& hash) {
   for (uint8_t byte : hash.bytes) {
@@ -90,6 +98,77 @@ Hash256 HashCanonical(absl::string_view domain,
   hasher.Update(canonical);
   return hasher.Finalize();
 }
+
+class CanonicalReader {
+ public:
+  explicit CanonicalReader(absl::string_view bytes) : bytes_(bytes) {}
+
+  absl::StatusOr<uint32_t> ReadU32() {
+    if (remaining() < 4) {
+      return absl::DataLossError(
+          "Prepared DPM prefill plan ended inside a uint32 field.");
+    }
+    uint32_t value = 0;
+    for (int index = 0; index < 4; ++index) {
+      value = (value << 8) |
+              static_cast<uint8_t>(bytes_[offset_ + index]);
+    }
+    offset_ += 4;
+    return value;
+  }
+
+  absl::StatusOr<uint64_t> ReadU64() {
+    if (remaining() < 8) {
+      return absl::DataLossError(
+          "Prepared DPM prefill plan ended inside a uint64 field.");
+    }
+    uint64_t value = 0;
+    for (int index = 0; index < 8; ++index) {
+      value = (value << 8) |
+              static_cast<uint8_t>(bytes_[offset_ + index]);
+    }
+    offset_ += 8;
+    return value;
+  }
+
+  absl::StatusOr<Hash256> ReadHash() {
+    if (remaining() < Hash256{}.bytes.size()) {
+      return absl::DataLossError(
+          "Prepared DPM prefill plan ended inside a digest field.");
+    }
+    Hash256 hash;
+    std::memcpy(hash.bytes.data(), bytes_.data() + offset_, hash.bytes.size());
+    offset_ += hash.bytes.size();
+    return hash;
+  }
+
+  absl::StatusOr<std::optional<Hash256>> ReadOptionalHash() {
+    ABSL_ASSIGN_OR_RETURN(const uint32_t present, ReadU32());
+    if (present == 0) return std::optional<Hash256>();
+    if (present != 1) {
+      return absl::DataLossError(
+          "Prepared DPM prefill plan has a noncanonical optional digest tag.");
+    }
+    ABSL_ASSIGN_OR_RETURN(const Hash256 hash, ReadHash());
+    return std::optional<Hash256>(hash);
+  }
+
+  absl::StatusOr<absl::string_view> ReadBytes(uint64_t size) {
+    if (size > remaining()) {
+      return absl::DataLossError(
+          "Prepared DPM prefill plan ended inside a byte field.");
+    }
+    const absl::string_view result = bytes_.substr(offset_, size);
+    offset_ += size;
+    return result;
+  }
+
+  uint64_t remaining() const { return bytes_.size() - offset_; }
+
+ private:
+  absl::string_view bytes_;
+  uint64_t offset_ = 0;
+};
 
 absl::Status ValidateBaseFields(const DPMPreparedPrefillPlan& plan,
                                 bool require_canonical_hashes) {
@@ -206,6 +285,50 @@ absl::Status ValidateBaseFields(const DPMPreparedPrefillPlan& plan,
 
 }  // namespace
 
+absl::StatusOr<Hash256> ComputeDPMPreparedPrefillUtf8SourceChunkHash(
+    absl::string_view utf8_text) {
+  if (utf8_text.empty() ||
+      utf8_text.size() > std::numeric_limits<uint32_t>::max()) {
+    return absl::InvalidArgumentError(
+        "Prepared DPM UTF-8 source chunk is empty or exceeds its canonical "
+        "length field.");
+  }
+  std::string canonical;
+  AppendU32(static_cast<uint32_t>(utf8_text.size()), &canonical);
+  canonical.append(utf8_text.data(), utf8_text.size());
+  const Hash256 result = HashCanonical(kUtf8SourceChunkDomain, canonical);
+  if (IsZeroHash(result)) {
+    return absl::InternalError(
+        "Prepared DPM UTF-8 source hashing produced an empty digest.");
+  }
+  return result;
+}
+
+absl::StatusOr<Hash256> ComputeDPMPreparedPrefillExactTokenSourceChunkHash(
+    absl::Span<const int32_t> token_ids) {
+  if (token_ids.empty() ||
+      token_ids.size() > std::numeric_limits<uint32_t>::max()) {
+    return absl::InvalidArgumentError(
+        "Prepared DPM exact-token source is empty or exceeds its canonical "
+        "count field.");
+  }
+  std::string canonical;
+  AppendU32(static_cast<uint32_t>(token_ids.size()), &canonical);
+  for (int32_t token_id : token_ids) {
+    if (token_id < 0) {
+      return absl::InvalidArgumentError(
+          "Prepared DPM exact-token source contains a negative token ID.");
+    }
+    AppendI32(token_id, &canonical);
+  }
+  const Hash256 result = HashCanonical(kTokenSourceChunkDomain, canonical);
+  if (IsZeroHash(result)) {
+    return absl::InternalError(
+        "Prepared DPM exact-token source hashing produced an empty digest.");
+  }
+  return result;
+}
+
 absl::StatusOr<Hash256> ComputeDPMPreparedPrefillSourceChunksHash(
     const std::vector<DPMPreparedPrefillCall>& calls) {
   if (calls.empty() || calls.size() > kMaximumDPMPreparedPrefillCalls) {
@@ -241,7 +364,6 @@ absl::StatusOr<Hash256> ComputeDPMPreparedPrefillResolvedTokenPlanHash(
   AppendHash(plan.canonical_source_chunks_hash, &canonical);
   AppendU32(static_cast<uint32_t>(plan.start_kind), &canonical);
   AppendOptionalHash(plan.restore_checkpoint_id, &canonical);
-  AppendOptionalHash(plan.start_state_witness_id, &canonical);
   AppendU64(plan.start_step, &canonical);
   AppendU64(plan.start_history_token_count, &canonical);
   AppendHash(plan.start_history_token_bytes_hash, &canonical);
@@ -315,6 +437,9 @@ absl::StatusOr<Hash256> ComputeDPMPreparedPrefillPlanId(
 
   std::string canonical;
   AppendU32(plan.format_version, &canonical);
+  AppendU32(static_cast<uint32_t>(plan.start_kind), &canonical);
+  AppendOptionalHash(plan.restore_checkpoint_id, &canonical);
+  AppendOptionalHash(plan.start_state_witness_id, &canonical);
   AppendHash(source_chunks_hash, &canonical);
   AppendHash(resolved_token_plan_hash, &canonical);
   AppendHash(shape_schedule_hash, &canonical);
@@ -349,6 +474,159 @@ absl::Status ValidateDPMPreparedPrefillPlan(
         "or plan digests.");
   }
   return absl::OkStatus();
+}
+
+absl::StatusOr<std::string> EncodeDPMPreparedPrefillPlan(
+    const DPMPreparedPrefillPlan& plan) {
+  ABSL_RETURN_IF_ERROR(ValidateDPMPreparedPrefillPlan(plan));
+  std::string encoded;
+  encoded.append(kPreparedPrefillPlanMagic.data(),
+                 kPreparedPrefillPlanMagic.size());
+  AppendU32(plan.format_version, &encoded);
+  AppendHash(plan.plan_id, &encoded);
+  AppendIdentity(plan.session_identity, &encoded);
+  AppendHash(plan.logical_agent_request_hash, &encoded);
+  AppendHash(plan.canonical_source_chunks_hash, &encoded);
+  AppendU32(static_cast<uint32_t>(plan.start_kind), &encoded);
+  AppendOptionalHash(plan.restore_checkpoint_id, &encoded);
+  AppendOptionalHash(plan.start_state_witness_id, &encoded);
+  AppendU64(plan.start_step, &encoded);
+  AppendU64(plan.start_history_token_count, &encoded);
+  AppendHash(plan.start_history_token_bytes_hash, &encoded);
+  AppendU32(plan.batch_size, &encoded);
+  AppendU32(plan.vocabulary_size, &encoded);
+  AppendU64(plan.end_step, &encoded);
+  AppendU32(static_cast<uint32_t>(plan.calls.size()), &encoded);
+  for (const DPMPreparedPrefillCall& call : plan.calls) {
+    AppendU32(static_cast<uint32_t>(call.source_encoding), &encoded);
+    AppendHash(call.source_chunk_hash, &encoded);
+    AppendU64(call.start_token_position, &encoded);
+    AppendU64(call.end_token_position, &encoded);
+    AppendU32(static_cast<uint32_t>(call.token_segments.size()), &encoded);
+    for (const DPMPreparedPrefillSegment& segment : call.token_segments) {
+      AppendU32(static_cast<uint32_t>(segment.token_ids.size()), &encoded);
+      for (int32_t token_id : segment.token_ids) {
+        AppendI32(token_id, &encoded);
+      }
+    }
+  }
+  AppendHash(plan.resolved_token_plan_hash, &encoded);
+  AppendHash(plan.shape_schedule_hash, &encoded);
+  if (encoded.size() > kMaximumDPMPreparedPrefillPlanBytes) {
+    return absl::ResourceExhaustedError(
+        "Prepared DPM prefill plan encoding exceeds its transport bound.");
+  }
+  return encoded;
+}
+
+absl::StatusOr<DPMPreparedPrefillPlan> DecodeDPMPreparedPrefillPlan(
+    absl::string_view bytes) {
+  if (bytes.size() > kMaximumDPMPreparedPrefillPlanBytes ||
+      bytes.size() < kPreparedPrefillPlanMagic.size() + 4) {
+    return absl::ResourceExhaustedError(
+        "Prepared DPM prefill plan bytes are empty, truncated, or oversized.");
+  }
+  CanonicalReader reader(bytes);
+  ABSL_ASSIGN_OR_RETURN(
+      const absl::string_view magic,
+      reader.ReadBytes(kPreparedPrefillPlanMagic.size()));
+  if (magic != kPreparedPrefillPlanMagic) {
+    return absl::DataLossError(
+        "Prepared DPM prefill plan has an invalid magic value.");
+  }
+
+  DPMPreparedPrefillPlan plan;
+  ABSL_ASSIGN_OR_RETURN(plan.format_version, reader.ReadU32());
+  ABSL_ASSIGN_OR_RETURN(plan.plan_id, reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(plan.session_identity.model_artifact_hash,
+                        reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(plan.session_identity.runtime_artifact_hash,
+                        reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(plan.session_identity.inference_profile_hash,
+                        reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(plan.logical_agent_request_hash, reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(plan.canonical_source_chunks_hash, reader.ReadHash());
+  uint32_t start_kind = 0;
+  ABSL_ASSIGN_OR_RETURN(start_kind, reader.ReadU32());
+  plan.start_kind = static_cast<DPMPreparedPrefillStartKind>(start_kind);
+  ABSL_ASSIGN_OR_RETURN(plan.restore_checkpoint_id,
+                        reader.ReadOptionalHash());
+  ABSL_ASSIGN_OR_RETURN(plan.start_state_witness_id,
+                        reader.ReadOptionalHash());
+  ABSL_ASSIGN_OR_RETURN(plan.start_step, reader.ReadU64());
+  ABSL_ASSIGN_OR_RETURN(plan.start_history_token_count, reader.ReadU64());
+  ABSL_ASSIGN_OR_RETURN(plan.start_history_token_bytes_hash,
+                        reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(plan.batch_size, reader.ReadU32());
+  ABSL_ASSIGN_OR_RETURN(plan.vocabulary_size, reader.ReadU32());
+  ABSL_ASSIGN_OR_RETURN(plan.end_step, reader.ReadU64());
+  uint32_t call_count = 0;
+  ABSL_ASSIGN_OR_RETURN(call_count, reader.ReadU32());
+  if (call_count == 0 || call_count > kMaximumDPMPreparedPrefillCalls) {
+    return absl::DataLossError(
+        "Prepared DPM prefill plan has an invalid call count.");
+  }
+  plan.calls.reserve(call_count);
+  uint64_t total_token_ids = 0;
+  for (uint32_t call_index = 0; call_index < call_count; ++call_index) {
+    DPMPreparedPrefillCall call;
+    uint32_t source_encoding = 0;
+    ABSL_ASSIGN_OR_RETURN(source_encoding, reader.ReadU32());
+    call.source_encoding =
+        static_cast<DPMPreparedPrefillSourceEncoding>(source_encoding);
+    ABSL_ASSIGN_OR_RETURN(call.source_chunk_hash, reader.ReadHash());
+    ABSL_ASSIGN_OR_RETURN(call.start_token_position, reader.ReadU64());
+    ABSL_ASSIGN_OR_RETURN(call.end_token_position, reader.ReadU64());
+    uint32_t segment_count = 0;
+    ABSL_ASSIGN_OR_RETURN(segment_count, reader.ReadU32());
+    if (segment_count == 0 ||
+        segment_count > kMaximumDPMPreparedPrefillSegmentsPerCall) {
+      return absl::DataLossError(
+          "Prepared DPM prefill plan has an invalid segment count.");
+    }
+    call.token_segments.reserve(segment_count);
+    for (uint32_t segment_index = 0; segment_index < segment_count;
+         ++segment_index) {
+      uint32_t token_count = 0;
+      ABSL_ASSIGN_OR_RETURN(token_count, reader.ReadU32());
+      if (token_count == 0 ||
+          token_count > kMaximumDPMPreparedPrefillTokenIds -
+                            total_token_ids) {
+        return absl::DataLossError(
+            "Prepared DPM prefill plan has an invalid token count.");
+      }
+      DPMPreparedPrefillSegment segment;
+      segment.token_ids.reserve(token_count);
+      for (uint32_t token_index = 0; token_index < token_count;
+           ++token_index) {
+        uint32_t encoded_token = 0;
+        ABSL_ASSIGN_OR_RETURN(encoded_token, reader.ReadU32());
+        if (encoded_token >
+            static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+          return absl::DataLossError(
+              "Prepared DPM prefill plan contains a negative token ID.");
+        }
+        segment.token_ids.push_back(static_cast<int32_t>(encoded_token));
+      }
+      total_token_ids += token_count;
+      call.token_segments.push_back(std::move(segment));
+    }
+    plan.calls.push_back(std::move(call));
+  }
+  ABSL_ASSIGN_OR_RETURN(plan.resolved_token_plan_hash, reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(plan.shape_schedule_hash, reader.ReadHash());
+  if (reader.remaining() != 0) {
+    return absl::DataLossError(
+        "Prepared DPM prefill plan has trailing bytes.");
+  }
+  ABSL_RETURN_IF_ERROR(ValidateDPMPreparedPrefillPlan(plan));
+  ABSL_ASSIGN_OR_RETURN(const std::string canonical,
+                        EncodeDPMPreparedPrefillPlan(plan));
+  if (canonical != bytes) {
+    return absl::DataLossError(
+        "Prepared DPM prefill plan bytes are not canonical.");
+  }
+  return plan;
 }
 
 }  // namespace litert::lm
