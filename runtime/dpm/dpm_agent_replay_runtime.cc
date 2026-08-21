@@ -1243,6 +1243,18 @@ CanonicalWinnerDPMAgentRuntime::GetExactProfileAdmissionRecordId() const {
   return std::optional<Hash256>();
 }
 
+absl::StatusOr<std::optional<Hash256>>
+CanonicalWinnerDPMAgentRuntime::GetCapsuleRestoreAdmissionRecordId() const {
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  return std::optional<Hash256>();
+}
+
+absl::StatusOr<std::optional<Hash256>>
+CanonicalWinnerDPMAgentRuntime::GetSessionHandoffCapabilityId() const {
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  return std::optional<Hash256>();
+}
+
 absl::Status CanonicalWinnerDPMAgentRuntime::ValidateSupport() const {
   if (inference_runtime_ == nullptr) {
     return absl::InvalidArgumentError(
@@ -1402,8 +1414,57 @@ ExactRegenerationDPMAgentRuntime::Create(
   }
   auto runtime = std::unique_ptr<ExactRegenerationDPMAgentRuntime>(
       new ExactRegenerationDPMAgentRuntime(exact_executor,
-                                           std::move(profile)));
+                                           std::move(profile), std::nullopt,
+                                           std::nullopt, std::nullopt));
   ABSL_RETURN_IF_ERROR(runtime->ValidateSupport());
+  return runtime;
+}
+
+absl::StatusOr<std::unique_ptr<ExactRegenerationDPMAgentRuntime>>
+ExactRegenerationDPMAgentRuntime::Create(
+    ExactRegenerationExecutor* exact_executor,
+    ExactRegenerationCapsuleRestoreAdmissionBinding
+        capsule_restore_admission) {
+  if (exact_executor == nullptr) {
+    return absl::InvalidArgumentError(
+        "Exact agent requires an ExactRegeneration executor.");
+  }
+  if (exact_executor->GetReplayStage() !=
+      DPMReplayStage::kAgentDecision) {
+    return absl::FailedPreconditionError(
+        "Exact agent executor is bound to another replay stage.");
+  }
+  ABSL_ASSIGN_OR_RETURN(ExactLiteRtProfile profile,
+                        exact_executor->GetDerivedProfile());
+  ABSL_RETURN_IF_ERROR(ValidateRuntimeIdentity(profile.session_identity));
+  if (IsZeroHash(profile.profile_id)) {
+    return absl::FailedPreconditionError(
+        "Exact agent Engine returned an empty derived profile ID.");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      ExactRegenerationAuthenticatedCapsuleRestoreAdmission admission,
+      exact_executor->GetAuthenticatedCapsuleRestoreAdmission(
+          capsule_restore_admission));
+  if (admission.capability.exact_profile_id != profile.profile_id ||
+      admission.capability.session_identity != profile.session_identity ||
+      admission.capability.backend != profile.backend ||
+      admission.record.capability != admission.capability ||
+      IsZeroHash(admission.record.record_id)) {
+    return absl::FailedPreconditionError(
+        "Exact agent CapsuleRestore admission is not bound to its immutable "
+        "Engine profile.");
+  }
+  const Hash256 admission_record_id = admission.record.record_id;
+  SessionHandoffCapability capability = admission.capability;
+  auto runtime = std::unique_ptr<ExactRegenerationDPMAgentRuntime>(
+      new ExactRegenerationDPMAgentRuntime(
+          exact_executor, std::move(profile),
+          std::optional<ExactRegenerationCapsuleRestoreAdmissionBinding>(
+              std::move(capsule_restore_admission)),
+          std::optional<Hash256>(admission_record_id),
+          std::optional<SessionHandoffCapability>(std::move(capability))));
+  ABSL_RETURN_IF_ERROR(runtime->ValidateSupport());
+  ABSL_RETURN_IF_ERROR(runtime->ValidateSessionHandoffSupport());
   return runtime;
 }
 
@@ -1426,6 +1487,58 @@ ExactRegenerationDPMAgentRuntime::GetExactProfileAdmissionRecordId() const {
   return std::optional<Hash256>(admission_id);
 }
 
+absl::StatusOr<ExactRegenerationAuthenticatedCapsuleRestoreAdmission>
+ExactRegenerationDPMAgentRuntime::ResolveCurrentCapsuleRestoreAdmission()
+    const {
+  const bool has_binding = capsule_restore_admission_.has_value();
+  if (has_binding != capsule_restore_admission_record_id_.has_value() ||
+      has_binding != session_handoff_capability_.has_value()) {
+    return absl::InternalError(
+        "Exact agent CapsuleRestore binding is internally inconsistent.");
+  }
+  if (!has_binding) {
+    return absl::FailedPreconditionError(
+        "Exact agent was constructed without CapsuleRestore admission.");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      ExactRegenerationAuthenticatedCapsuleRestoreAdmission current,
+      exact_executor_->GetAuthenticatedCapsuleRestoreAdmission(
+          *capsule_restore_admission_));
+  if (current.record.record_id !=
+          *capsule_restore_admission_record_id_ ||
+      current.capability != *session_handoff_capability_ ||
+      current.record.capability != current.capability) {
+    return absl::AbortedError(
+        "Authenticated CapsuleRestore admission or Engine-derived "
+        "capability changed after exact-runtime construction.");
+  }
+  return current;
+}
+
+absl::StatusOr<std::optional<Hash256>>
+ExactRegenerationDPMAgentRuntime::GetCapsuleRestoreAdmissionRecordId() const {
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  if (!capsule_restore_admission_.has_value()) {
+    return std::optional<Hash256>();
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      const ExactRegenerationAuthenticatedCapsuleRestoreAdmission current,
+      ResolveCurrentCapsuleRestoreAdmission());
+  return std::optional<Hash256>(current.record.record_id);
+}
+
+absl::StatusOr<std::optional<Hash256>>
+ExactRegenerationDPMAgentRuntime::GetSessionHandoffCapabilityId() const {
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  if (!capsule_restore_admission_.has_value()) {
+    return std::optional<Hash256>();
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      const ExactRegenerationAuthenticatedCapsuleRestoreAdmission current,
+      ResolveCurrentCapsuleRestoreAdmission());
+  return std::optional<Hash256>(current.capability.capability_id);
+}
+
 absl::Status ExactRegenerationDPMAgentRuntime::ValidateSupport() const {
   if (exact_executor_ == nullptr) {
     return absl::InvalidArgumentError(
@@ -1437,6 +1550,14 @@ absl::Status ExactRegenerationDPMAgentRuntime::ValidateSupport() const {
     return absl::FailedPreconditionError(
         "Exact agent executor is not bound to a valid agent-decision "
         "profile.");
+  }
+  const bool has_capsule_binding =
+      capsule_restore_admission_.has_value();
+  if (has_capsule_binding !=
+          capsule_restore_admission_record_id_.has_value() ||
+      has_capsule_binding != session_handoff_capability_.has_value()) {
+    return absl::InternalError(
+        "Exact agent CapsuleRestore binding is internally inconsistent.");
   }
   ABSL_RETURN_IF_ERROR(exact_executor_->ValidateSupport());
   ABSL_ASSIGN_OR_RETURN(const ExactLiteRtProfile current,
@@ -1467,9 +1588,18 @@ absl::Status ExactRegenerationDPMAgentRuntime::ValidateGenerationLimit(
 absl::Status
 ExactRegenerationDPMAgentRuntime::ValidateSessionHandoffSupport() const {
   ABSL_RETURN_IF_ERROR(ValidateSupport());
-  return absl::FailedPreconditionError(
-      "Exact agent physical capsule transport requires a separate admitted "
-      "CapsuleRestore profile before DPMEngine may enable checkpoints.");
+  ABSL_ASSIGN_OR_RETURN(
+      const ExactRegenerationAuthenticatedCapsuleRestoreAdmission current,
+      ResolveCurrentCapsuleRestoreAdmission());
+  if (current.record.record_id !=
+          *capsule_restore_admission_record_id_ ||
+      current.capability.capability_id !=
+          session_handoff_capability_->capability_id) {
+    return absl::AbortedError(
+        "Exact agent CapsuleRestore admission binding changed during "
+        "support validation.");
+  }
+  return absl::OkStatus();
 }
 
 absl::StatusOr<std::unique_ptr<Engine::Session>>
@@ -1564,9 +1694,20 @@ ExactRegenerationDPMAgentRuntime::GeneratePhysicalExact(
       return absl::InvalidArgumentError(
           "Exact agent physical plan has an unknown prefill mode.");
   }
-  ABSL_ASSIGN_OR_RETURN(
-      ExactRegenerationExecution exact,
-      exact_executor_->RunPhysical(replay_request, input));
+  const bool transfers_capsule =
+      input.execution_plan.prefill_mode ==
+          FreshWorkerPrefillMode::kOwnPositionCapsuleDelta ||
+      input.execution_plan.capture_producing_capsule;
+  if (transfers_capsule) {
+    ABSL_RETURN_IF_ERROR(ValidateSessionHandoffSupport());
+  }
+  absl::StatusOr<ExactRegenerationExecution> exact_result =
+      transfers_capsule
+          ? exact_executor_->RunPhysical(
+                replay_request, input, *capsule_restore_admission_)
+          : exact_executor_->RunPhysical(replay_request, input);
+  ABSL_ASSIGN_OR_RETURN(ExactRegenerationExecution exact,
+                        std::move(exact_result));
   ABSL_ASSIGN_OR_RETURN(
       DPMAgentReplayExecution replay_execution,
       BuildExactAgentReplayExecution(

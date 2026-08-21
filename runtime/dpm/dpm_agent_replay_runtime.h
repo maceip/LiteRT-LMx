@@ -182,6 +182,13 @@ class DPMAgentReplayRuntime {
   // provenance before worker launch. WinnerReplay returns nullopt.
   virtual absl::StatusOr<std::optional<Hash256>>
   GetExactProfileAdmissionRecordId() const = 0;
+  // Authenticated CapsuleRestore admission and Engine-derived capability
+  // identities available before generation. WinnerReplay and exact runtimes
+  // constructed without checkpoint support return nullopt.
+  virtual absl::StatusOr<std::optional<Hash256>>
+  GetCapsuleRestoreAdmissionRecordId() const = 0;
+  virtual absl::StatusOr<std::optional<Hash256>>
+  GetSessionHandoffCapabilityId() const = 0;
   // Replay/generation capability is independent from CapsuleRestore. This
   // method must not reject a usable WinnerReplay runtime merely because the
   // loaded session cannot export a complete handoff.
@@ -241,6 +248,10 @@ class CanonicalWinnerDPMAgentRuntime final : public DPMAgentReplayRuntime {
   absl::StatusOr<std::optional<Hash256>> GetExactProfileId() const override;
   absl::StatusOr<std::optional<Hash256>>
   GetExactProfileAdmissionRecordId() const override;
+  absl::StatusOr<std::optional<Hash256>>
+  GetCapsuleRestoreAdmissionRecordId() const override;
+  absl::StatusOr<std::optional<Hash256>>
+  GetSessionHandoffCapabilityId() const override;
   absl::Status ValidateSupport() const override;
   absl::Status ValidateGenerationLimit(
       uint32_t max_output_tokens) const override;
@@ -269,6 +280,11 @@ class ExactRegenerationDPMAgentRuntime final : public DPMAgentReplayRuntime {
  public:
   static absl::StatusOr<std::unique_ptr<ExactRegenerationDPMAgentRuntime>>
   Create(ExactRegenerationExecutor* exact_executor);
+  static absl::StatusOr<std::unique_ptr<ExactRegenerationDPMAgentRuntime>>
+  Create(
+      ExactRegenerationExecutor* exact_executor,
+      ExactRegenerationCapsuleRestoreAdmissionBinding
+          capsule_restore_admission);
 
   DPMReplayMode GetReplayMode() const override {
     return DPMReplayMode::kExactRegeneration;
@@ -279,6 +295,10 @@ class ExactRegenerationDPMAgentRuntime final : public DPMAgentReplayRuntime {
   absl::StatusOr<std::optional<Hash256>> GetExactProfileId() const override;
   absl::StatusOr<std::optional<Hash256>>
   GetExactProfileAdmissionRecordId() const override;
+  absl::StatusOr<std::optional<Hash256>>
+  GetCapsuleRestoreAdmissionRecordId() const override;
+  absl::StatusOr<std::optional<Hash256>>
+  GetSessionHandoffCapabilityId() const override;
   absl::Status ValidateSupport() const override;
   absl::Status ValidateGenerationLimit(
       uint32_t max_output_tokens) const override;
@@ -296,12 +316,28 @@ class ExactRegenerationDPMAgentRuntime final : public DPMAgentReplayRuntime {
  private:
   ExactRegenerationDPMAgentRuntime(
       ExactRegenerationExecutor* exact_executor,
-      ExactLiteRtProfile derived_profile)
+      ExactLiteRtProfile derived_profile,
+      std::optional<ExactRegenerationCapsuleRestoreAdmissionBinding>
+          capsule_restore_admission,
+      std::optional<Hash256> capsule_restore_admission_record_id,
+      std::optional<SessionHandoffCapability> session_handoff_capability)
       : exact_executor_(exact_executor),
-        derived_profile_(std::move(derived_profile)) {}
+        derived_profile_(std::move(derived_profile)),
+        capsule_restore_admission_(std::move(capsule_restore_admission)),
+        capsule_restore_admission_record_id_(
+            capsule_restore_admission_record_id),
+        session_handoff_capability_(std::move(session_handoff_capability)) {}
+
+  absl::StatusOr<ExactRegenerationAuthenticatedCapsuleRestoreAdmission>
+  ResolveCurrentCapsuleRestoreAdmission() const;
 
   ExactRegenerationExecutor* const exact_executor_;
   const ExactLiteRtProfile derived_profile_;
+  const std::optional<ExactRegenerationCapsuleRestoreAdmissionBinding>
+      capsule_restore_admission_;
+  const std::optional<Hash256> capsule_restore_admission_record_id_;
+  const std::optional<SessionHandoffCapability>
+      session_handoff_capability_;
 };
 
 }  // namespace litert::lm

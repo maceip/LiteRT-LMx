@@ -26,6 +26,7 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "runtime/dpm/canonical_replay_catalog.h"
+#include "runtime/dpm/capsule_restore_admission.h"
 #include "runtime/dpm/dpm_replay_mode.h"
 #include "runtime/dpm/exact_profile_admission.h"
 #include "runtime/dpm/fresh_worker_process.h"
@@ -141,6 +142,23 @@ struct ExactRegenerationExecutorConfig {
   ExactLiteRtProfileAssertion profile_assertion;
   FreshWorkerAuthentication authentication;
   uint32_t independent_run_count = 2;
+};
+
+// Optional immutable CapsuleRestore admission authority for an exact runtime.
+// The caller supplies no model, profile, capability, backend, or session
+// identity. The loaded Engine derives all of those from qualification_spec's
+// concrete SessionConfig; the assertions inside that spec can only reject the
+// result. `record_authentication` authenticates admission evidence and is
+// deliberately separate from each checkpoint's LRTSESS1 authentication.
+struct ExactRegenerationCapsuleRestoreAdmissionBinding {
+  const CapsuleRestoreAdmissionRepository* repository = nullptr;
+  CapsuleRestoreQualificationSpec qualification_spec;
+  FreshWorkerAuthentication record_authentication;
+};
+
+struct ExactRegenerationAuthenticatedCapsuleRestoreAdmission {
+  CapsuleRestoreAdmissionRecord record;
+  SessionHandoffCapability capability;
 };
 
 // Capture is deliberately a request-scoped physical-execution policy rather
@@ -293,6 +311,14 @@ class ExactRegenerationExecutor final {
   // descriptor before spawning any restored worker.
   absl::StatusOr<Hash256> GetProfileAdmissionRecordId() const;
 
+  // Resolves the binding's SessionConfig against this same loaded Engine,
+  // requires its complete exact profile/session semantics to equal the
+  // executor's immutable profile, derives the handoff capability, and asks
+  // the repository to reauthenticate and revalidate the bound record.
+  absl::StatusOr<ExactRegenerationAuthenticatedCapsuleRestoreAdmission>
+  GetAuthenticatedCapsuleRestoreAdmission(
+      const ExactRegenerationCapsuleRestoreAdmissionBinding& binding) const;
+
   absl::StatusOr<ExactRegenerationExecution> Run(
       const DPMCanonicalReplayRequest& request) const;
 
@@ -303,6 +329,15 @@ class ExactRegenerationExecutor final {
   absl::StatusOr<ExactRegenerationExecution> RunPhysical(
       const DPMCanonicalReplayRequest& request,
       const ExactRegenerationExecutionInput& input) const;
+
+  // The admitted overload is mandatory for restore or capture. The overload
+  // above remains available only for physical full-prefill without capsule
+  // transfer, preserving exact execution without checkpoint support.
+  absl::StatusOr<ExactRegenerationExecution> RunPhysical(
+      const DPMCanonicalReplayRequest& request,
+      const ExactRegenerationExecutionInput& input,
+      const ExactRegenerationCapsuleRestoreAdmissionBinding&
+          capsule_restore_admission) const;
 
  private:
   ExactRegenerationExecutor(
@@ -324,7 +359,9 @@ class ExactRegenerationExecutor final {
   absl::StatusOr<ExactRegenerationExecution> RunWithExecutionInput(
       const DPMCanonicalReplayRequest& request,
       const ExactRegenerationExecutionInput& input,
-      bool capsule_free_convenience) const;
+      bool capsule_free_convenience,
+      const ExactRegenerationCapsuleRestoreAdmissionBinding*
+          capsule_restore_admission) const;
 
   const Engine* const engine_;
   const FreshWorkerProcessRunner worker_runner_;
