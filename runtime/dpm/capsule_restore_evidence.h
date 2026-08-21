@@ -36,6 +36,7 @@ namespace litert::lm {
 // and evidence boundary. The limits keep canonical hashing bounded even though
 // text and exact token sequences remain self-contained.
 inline constexpr uint32_t kCapsuleRestoreEvidenceV2FormatVersion = 2;
+inline constexpr uint32_t kCapsuleRestoreEvidenceV3FormatVersion = 3;
 inline constexpr std::size_t kMaximumCapsuleEvidenceLogIdBytes = 16 * 1024;
 inline constexpr std::size_t kMaximumCapsuleEvidenceKeyIdBytes = 1024;
 inline constexpr uint32_t kMaximumCapsuleEvidencePrefillChunks = 65'536;
@@ -88,6 +89,9 @@ struct CapsuleRestoreAuthorityV2 {
   SessionHandoffCapability capability;
   Hash256 admission_record_id;
   Hash256 coverage_id;
+  // The legacy field/wire name is retained. For state-witnessed Coverage V2,
+  // this carries operational_coverage.qualification_evidence_hash; the engine
+  // operation gate and cross-binder must enforce that exact mapping.
   Hash256 qualification_spec_hash;
 
   bool operator==(const CapsuleRestoreAuthorityV2& other) const {
@@ -345,6 +349,74 @@ absl::Status ValidateCapsuleCaptureEvidenceV2ForParentCapture(
 // capture/restore evidence contract from being applied to these validators.
 Hash256 GetCapsuleRestoreCaptureEvidenceV2ContractHash();
 Hash256 GetCapsuleRestoreRestoreEvidenceV2ContractHash();
+
+// Operational proof for one durable-checkpoint to request-transient rewrap
+// followed by import into a fresh target. The target witness describes the
+// transient destination actually imported; it must not be relabeled as the
+// durable source envelope.
+struct CapsuleRestoreEvidenceV3 {
+  static constexpr uint32_t kFormatVersion =
+      kCapsuleRestoreEvidenceV3FormatVersion;
+
+  uint32_t format_version = kFormatVersion;
+  Hash256 evidence_id;
+  CapsuleRestorePlanV2 plan;
+  SessionHandoffReauthenticationEvidence
+      durable_to_transient_reauthentication;
+  SessionContinuationStateWitness target_post_import;
+};
+
+// Operational proof for a newly captured decoded session. The three witnesses
+// all describe the same worker-transient producer envelope. The explicit
+// reauthentication evidence joins that exact transient endpoint to the
+// separately keyed durable checkpoint while committing the complete canonical
+// continuation state. Recursive capture embeds the V3 restore evidence that
+// established the producing session's own-position starting state.
+struct CapsuleCaptureEvidenceV3 {
+  static constexpr uint32_t kFormatVersion =
+      kCapsuleRestoreEvidenceV3FormatVersion;
+
+  uint32_t format_version = kFormatVersion;
+  Hash256 evidence_id;
+  CapsuleCapturePlanV2 plan;
+  Hash256 checkpoint_id;
+  Hash256 checkpoint_envelope_hash;
+  uint64_t checkpoint_envelope_size = 0;
+  std::string checkpoint_authentication_key_id;
+  Hash256 checkpoint_history_token_bytes_hash;
+  SessionContinuationStateWitness producer_before_export;
+  SessionContinuationStateWitness producer_after_export;
+  SessionContinuationStateWitness fresh_import_target;
+  SessionHandoffReauthenticationEvidence
+      transient_to_durable_reauthentication;
+  std::optional<CapsuleRestoreEvidenceV3> parent_restore_evidence;
+};
+
+absl::StatusOr<Hash256> ComputeCapsuleRestoreEvidenceV3Id(
+    const CapsuleRestoreEvidenceV3& evidence);
+absl::Status ValidateCapsuleRestoreEvidenceV3(
+    const CapsuleRestoreEvidenceV3& evidence);
+
+absl::StatusOr<Hash256> ComputeCapsuleCaptureEvidenceV3Id(
+    const CapsuleCaptureEvidenceV3& evidence);
+absl::Status ValidateCapsuleCaptureEvidenceV3(
+    const CapsuleCaptureEvidenceV3& evidence);
+
+// Proves the complete endpoint chain
+// capture-transient -> durable checkpoint -> restore-transient. The two
+// transient envelopes and witnesses remain intentionally distinct; the exact
+// durable endpoint and the rewrap-invariant canonical continuation-state hash
+// must agree.
+absl::Status ValidateCapsuleRestoreEvidenceV3ForSourceCapture(
+    const CapsuleRestoreEvidenceV3& restore_evidence,
+    const CapsuleCaptureEvidenceV3& source_capture_evidence);
+
+absl::Status ValidateCapsuleCaptureEvidenceV3ForParentCapture(
+    const CapsuleCaptureEvidenceV3& child_capture_evidence,
+    const CapsuleCaptureEvidenceV3& parent_capture_evidence);
+
+Hash256 GetCapsuleRestoreCaptureEvidenceV3ContractHash();
+Hash256 GetCapsuleRestoreRestoreEvidenceV3ContractHash();
 
 }  // namespace litert::lm
 

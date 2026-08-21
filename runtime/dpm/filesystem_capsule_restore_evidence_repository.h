@@ -24,9 +24,10 @@
 
 namespace litert::lm {
 
-// Durable owner-only cache of authenticated Coverage V2 capture evidence.
-// Every record has a create-once composite name containing both checkpoint_id
-// and evidence_id. There is intentionally no lookup by checkpoint alone, no
+// Durable owner-only cache of authenticated legacy Coverage V2 capture
+// evidence and version-isolated Coverage V3 capture/restore evidence. Every
+// record has a create-once composite name containing both checkpoint_id and
+// evidence_id. There is intentionally no lookup by checkpoint alone, no
 // mutable latest pointer, and no enumeration-as-authority path. A caller must
 // already possess the exact expected evidence ID from an authoritative DPM log
 // or receipt and must still reauthenticate current runtime admission/capability
@@ -46,6 +47,22 @@ class FilesystemCapsuleRestoreEvidenceRepository final
       const Hash256& checkpoint_id, const Hash256& expected_evidence_id,
       const FreshWorkerAuthentication& authentication) const override;
 
+  absl::Status PutCaptureV3IfAbsent(
+      const CapsuleCaptureEvidenceV3& evidence,
+      const FreshWorkerAuthentication& authentication) override;
+
+  absl::StatusOr<CapsuleCaptureEvidenceV3> GetCaptureV3(
+      const Hash256& checkpoint_id, const Hash256& expected_evidence_id,
+      const FreshWorkerAuthentication& authentication) const override;
+
+  absl::Status PutRestoreV3IfAbsent(
+      const CapsuleRestoreEvidenceV3& evidence,
+      const FreshWorkerAuthentication& authentication) override;
+
+  absl::StatusOr<CapsuleRestoreEvidenceV3> GetRestoreV3(
+      const Hash256& checkpoint_id, const Hash256& expected_evidence_id,
+      const FreshWorkerAuthentication& authentication) const override;
+
  private:
   explicit FilesystemCapsuleRestoreEvidenceRepository(
       std::filesystem::path root);
@@ -57,6 +74,10 @@ class FilesystemCapsuleRestoreEvidenceRepository final
   std::filesystem::path version_directory_;
   std::filesystem::path records_directory_;
   std::filesystem::path lock_path_;
+  std::filesystem::path v3_version_directory_;
+  std::filesystem::path v3_capture_records_directory_;
+  std::filesystem::path v3_restore_records_directory_;
+  std::filesystem::path v3_lock_path_;
 };
 
 }  // namespace litert::lm

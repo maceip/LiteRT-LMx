@@ -277,6 +277,27 @@ absl::Status ValidateRepositoryTree(
                                  "Coverage V2 evidence records directory");
 }
 
+absl::Status ValidateV3RepositoryTree(
+    const std::filesystem::path& root,
+    const std::filesystem::path& product_directory,
+    const std::filesystem::path& version_directory,
+    const std::filesystem::path& capture_records_directory,
+    const std::filesystem::path& restore_records_directory) {
+  ABSL_RETURN_IF_ERROR(ValidateNoSymlinkPathComponents(root));
+  ABSL_RETURN_IF_ERROR(
+      ValidateSecureDirectory(root, "Coverage V3 evidence root"));
+  ABSL_RETURN_IF_ERROR(ValidateSecureDirectory(
+      product_directory, "Coverage V3 evidence product directory"));
+  ABSL_RETURN_IF_ERROR(ValidateSecureDirectory(
+      version_directory, "Coverage V3 evidence version directory"));
+  ABSL_RETURN_IF_ERROR(ValidateSecureDirectory(
+      capture_records_directory,
+      "Coverage V3 capture-evidence records directory"));
+  return ValidateSecureDirectory(
+      restore_records_directory,
+      "Coverage V3 restore-evidence records directory");
+}
+
 absl::Status WriteAll(int fd, absl::string_view bytes) {
   size_t offset = 0;
   while (offset < bytes.size()) {
@@ -516,6 +537,138 @@ absl::Status PublishCreateOnce(
   return SyncDirectory(directory);
 }
 
+static_assert(
+    kMaximumAuthenticatedCapsuleCaptureEvidenceV3EnvelopeBytes ==
+        kMaximumAuthenticatedCapsuleCaptureEvidenceV2EnvelopeBytes);
+static_assert(
+    kMaximumAuthenticatedCapsuleRestoreEvidenceV3EnvelopeBytes ==
+        kMaximumAuthenticatedCapsuleCaptureEvidenceV2EnvelopeBytes);
+
+std::filesystem::path CaptureV3RecordPath(
+    const std::filesystem::path& directory, const Hash256& checkpoint_id,
+    const Hash256& evidence_id) {
+  return directory /
+         absl::StrCat(checkpoint_id.ToHex(), "-", evidence_id.ToHex(),
+                      ".capture-v3");
+}
+
+std::filesystem::path RestoreV3RecordPath(
+    const std::filesystem::path& directory, const Hash256& checkpoint_id,
+    const Hash256& evidence_id) {
+  return directory /
+         absl::StrCat(checkpoint_id.ToHex(), "-", evidence_id.ToHex(),
+                      ".restore-v3");
+}
+
+absl::Status ValidateStoredCaptureV3Identity(
+    const CapsuleCaptureEvidenceV3& evidence,
+    const Hash256& checkpoint_id, const Hash256& evidence_id) {
+  if (evidence.checkpoint_id != checkpoint_id ||
+      evidence.evidence_id != evidence_id) {
+    return absl::DataLossError(
+        "Coverage V3 capture evidence does not match its composite "
+        "checkpoint/evidence storage key.");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateStoredRestoreV3Identity(
+    const CapsuleRestoreEvidenceV3& evidence,
+    const Hash256& checkpoint_id, const Hash256& evidence_id) {
+  if (evidence.plan.checkpoint_id != checkpoint_id ||
+      evidence.evidence_id != evidence_id) {
+    return absl::DataLossError(
+        "Coverage V3 restore evidence does not match its composite "
+        "checkpoint/evidence storage key.");
+  }
+  return absl::OkStatus();
+}
+
+template <typename Evidence, typename Decode, typename ValidateIdentity>
+absl::Status PublishCreateOnceV3(
+    const std::filesystem::path& directory,
+    const std::filesystem::path& final_path, absl::string_view bytes,
+    const Hash256& checkpoint_id, const Hash256& evidence_id,
+    const FreshWorkerAuthentication& authentication, Decode decode,
+    ValidateIdentity validate_identity, absl::string_view description) {
+  // All three evidence envelope bounds are deliberately identical. Reusing
+  // the V2 immutable reader preserves its owner-only, no-follow, bounded-read,
+  // and before/after inode checks without allowing V2/V3 wire reinterpretation.
+  absl::StatusOr<std::string> existing = ReadWholeFile(final_path);
+  if (existing.ok()) {
+    if (*existing == bytes) return absl::OkStatus();
+    ABSL_ASSIGN_OR_RETURN(const Evidence decoded,
+                          decode(*existing, authentication));
+    ABSL_RETURN_IF_ERROR(
+        validate_identity(decoded, checkpoint_id, evidence_id));
+    return absl::AlreadyExistsError(absl::StrCat(
+        "Conflicting authenticated bytes already exist for this ",
+        description, " checkpoint/evidence pair."));
+  }
+  if (!absl::IsNotFound(existing.status())) return existing.status();
+
+  ABSL_ASSIGN_OR_RETURN(
+      auto temporary,
+      CreateTempFile(directory,
+                     absl::StrCat(checkpoint_id.ToHex(), "-",
+                                  evidence_id.ToHex())));
+  ScopedFd fd = std::move(temporary.first);
+  const std::filesystem::path temporary_path = std::move(temporary.second);
+  const auto remove_temporary = [&temporary_path]() {
+    int result;
+    do {
+      result = unlink(temporary_path.c_str());
+    } while (result != 0 && errno == EINTR);
+  };
+
+  absl::Status status = WriteAll(fd.get(), bytes);
+  if (status.ok()) {
+    int result;
+    do {
+      result = fchmod(fd.get(), S_IRUSR);
+    } while (result != 0 && errno == EINTR);
+    if (result != 0) {
+      status = absl::ErrnoToStatus(
+          errno, absl::StrCat("Unable to make ", description,
+                              " evidence read-only."));
+    }
+  }
+  if (status.ok()) {
+    status = SyncFd(fd.get(), absl::StrCat(description, " evidence"));
+  }
+  fd.Reset();
+  if (!status.ok()) {
+    remove_temporary();
+    return status;
+  }
+
+  int link_result;
+  do {
+    link_result = link(temporary_path.c_str(), final_path.c_str());
+  } while (link_result != 0 && errno == EINTR);
+  if (link_result != 0) {
+    const int saved_errno = errno;
+    remove_temporary();
+    if (saved_errno != EEXIST) {
+      return absl::ErrnoToStatus(
+          saved_errno,
+          absl::StrCat("Unable to publish ", description, " evidence."));
+    }
+    ABSL_ASSIGN_OR_RETURN(const std::string raced, ReadWholeFile(final_path));
+    if (raced == bytes) return absl::OkStatus();
+    ABSL_ASSIGN_OR_RETURN(const Evidence decoded,
+                          decode(raced, authentication));
+    ABSL_RETURN_IF_ERROR(
+        validate_identity(decoded, checkpoint_id, evidence_id));
+    return absl::AlreadyExistsError(absl::StrCat(
+        "Conflicting authenticated bytes won create-once publication for this ",
+        description, " checkpoint/evidence pair."));
+  }
+  ABSL_RETURN_IF_ERROR(SyncDirectory(directory));
+  remove_temporary();
+  return SyncDirectory(directory);
+}
+
 }  // namespace
 
 FilesystemCapsuleRestoreEvidenceRepository::
@@ -524,7 +677,13 @@ FilesystemCapsuleRestoreEvidenceRepository::
       product_directory_(root_ / "capsule-restore-evidence"),
       version_directory_(product_directory_ / "v2"),
       records_directory_(version_directory_ / "records"),
-      lock_path_(version_directory_ / "repository.lock") {}
+      lock_path_(version_directory_ / "repository.lock"),
+      v3_version_directory_(product_directory_ / "v3"),
+      v3_capture_records_directory_(v3_version_directory_ /
+                                    "capture-records"),
+      v3_restore_records_directory_(v3_version_directory_ /
+                                    "restore-records"),
+      v3_lock_path_(v3_version_directory_ / "repository.lock") {}
 
 absl::StatusOr<
     std::unique_ptr<FilesystemCapsuleRestoreEvidenceRepository>>
@@ -559,10 +718,29 @@ absl::Status FilesystemCapsuleRestoreEvidenceRepository::Initialize() {
   ABSL_RETURN_IF_ERROR(EnsureOwnedDirectory(
       version_directory_, records_directory_,
       "Coverage V2 evidence records directory"));
-  ABSL_ASSIGN_OR_RETURN(ScopedFileLock lock, AcquireLock(lock_path_, true));
-  ABSL_RETURN_IF_ERROR(ValidateRepositoryTree(
-      root_, product_directory_, version_directory_, records_directory_));
-  return SyncDirectory(version_directory_);
+  {
+    ABSL_ASSIGN_OR_RETURN(ScopedFileLock lock,
+                          AcquireLock(lock_path_, true));
+    ABSL_RETURN_IF_ERROR(ValidateRepositoryTree(
+        root_, product_directory_, version_directory_, records_directory_));
+    ABSL_RETURN_IF_ERROR(SyncDirectory(version_directory_));
+  }
+
+  ABSL_RETURN_IF_ERROR(EnsureOwnedDirectory(
+      product_directory_, v3_version_directory_,
+      "Coverage V3 evidence version directory"));
+  ABSL_RETURN_IF_ERROR(EnsureOwnedDirectory(
+      v3_version_directory_, v3_capture_records_directory_,
+      "Coverage V3 capture-evidence records directory"));
+  ABSL_RETURN_IF_ERROR(EnsureOwnedDirectory(
+      v3_version_directory_, v3_restore_records_directory_,
+      "Coverage V3 restore-evidence records directory"));
+  ABSL_ASSIGN_OR_RETURN(ScopedFileLock lock,
+                        AcquireLock(v3_lock_path_, true));
+  ABSL_RETURN_IF_ERROR(ValidateV3RepositoryTree(
+      root_, product_directory_, v3_version_directory_,
+      v3_capture_records_directory_, v3_restore_records_directory_));
+  return SyncDirectory(v3_version_directory_);
 }
 
 absl::Status FilesystemCapsuleRestoreEvidenceRepository::PutIfAbsent(
@@ -609,6 +787,118 @@ FilesystemCapsuleRestoreEvidenceRepository::Get(
       DecodeAuthenticatedCapsuleCaptureEvidenceV2(bytes, authentication));
   ABSL_RETURN_IF_ERROR(
       ValidateStoredIdentity(evidence, checkpoint_id, expected_evidence_id));
+  return evidence;
+}
+
+absl::Status
+FilesystemCapsuleRestoreEvidenceRepository::PutCaptureV3IfAbsent(
+    const CapsuleCaptureEvidenceV3& evidence,
+    const FreshWorkerAuthentication& authentication) {
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleCaptureEvidenceV3(evidence));
+  ABSL_RETURN_IF_ERROR(ValidateFreshWorkerAuthentication(authentication));
+  ABSL_ASSIGN_OR_RETURN(
+      const std::string bytes,
+      EncodeAuthenticatedCapsuleCaptureEvidenceV3(evidence, authentication));
+  ABSL_RETURN_IF_ERROR(ValidateV3RepositoryTree(
+      root_, product_directory_, v3_version_directory_,
+      v3_capture_records_directory_, v3_restore_records_directory_));
+  ABSL_ASSIGN_OR_RETURN(ScopedFileLock lock,
+                        AcquireLock(v3_lock_path_, true));
+  ABSL_RETURN_IF_ERROR(ValidateV3RepositoryTree(
+      root_, product_directory_, v3_version_directory_,
+      v3_capture_records_directory_, v3_restore_records_directory_));
+  const std::filesystem::path path = CaptureV3RecordPath(
+      v3_capture_records_directory_, evidence.checkpoint_id,
+      evidence.evidence_id);
+  return PublishCreateOnceV3<CapsuleCaptureEvidenceV3>(
+      v3_capture_records_directory_, path, bytes, evidence.checkpoint_id,
+      evidence.evidence_id, authentication,
+      &DecodeAuthenticatedCapsuleCaptureEvidenceV3,
+      &ValidateStoredCaptureV3Identity, "Coverage V3 capture evidence");
+}
+
+absl::StatusOr<CapsuleCaptureEvidenceV3>
+FilesystemCapsuleRestoreEvidenceRepository::GetCaptureV3(
+    const Hash256& checkpoint_id, const Hash256& expected_evidence_id,
+    const FreshWorkerAuthentication& authentication) const {
+  if (IsZeroHash(checkpoint_id) || IsZeroHash(expected_evidence_id)) {
+    return absl::InvalidArgumentError(
+        "Coverage V3 capture-evidence lookup requires exact nonzero "
+        "checkpoint and evidence IDs.");
+  }
+  ABSL_RETURN_IF_ERROR(ValidateFreshWorkerAuthentication(authentication));
+  ABSL_RETURN_IF_ERROR(ValidateV3RepositoryTree(
+      root_, product_directory_, v3_version_directory_,
+      v3_capture_records_directory_, v3_restore_records_directory_));
+  ABSL_ASSIGN_OR_RETURN(ScopedFileLock lock,
+                        AcquireLock(v3_lock_path_, false));
+  ABSL_RETURN_IF_ERROR(ValidateV3RepositoryTree(
+      root_, product_directory_, v3_version_directory_,
+      v3_capture_records_directory_, v3_restore_records_directory_));
+  const std::filesystem::path path = CaptureV3RecordPath(
+      v3_capture_records_directory_, checkpoint_id, expected_evidence_id);
+  ABSL_ASSIGN_OR_RETURN(const std::string bytes, ReadWholeFile(path));
+  ABSL_ASSIGN_OR_RETURN(
+      CapsuleCaptureEvidenceV3 evidence,
+      DecodeAuthenticatedCapsuleCaptureEvidenceV3(bytes, authentication));
+  ABSL_RETURN_IF_ERROR(ValidateStoredCaptureV3Identity(
+      evidence, checkpoint_id, expected_evidence_id));
+  return evidence;
+}
+
+absl::Status
+FilesystemCapsuleRestoreEvidenceRepository::PutRestoreV3IfAbsent(
+    const CapsuleRestoreEvidenceV3& evidence,
+    const FreshWorkerAuthentication& authentication) {
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreEvidenceV3(evidence));
+  ABSL_RETURN_IF_ERROR(ValidateFreshWorkerAuthentication(authentication));
+  ABSL_ASSIGN_OR_RETURN(
+      const std::string bytes,
+      EncodeAuthenticatedCapsuleRestoreEvidenceV3(evidence, authentication));
+  ABSL_RETURN_IF_ERROR(ValidateV3RepositoryTree(
+      root_, product_directory_, v3_version_directory_,
+      v3_capture_records_directory_, v3_restore_records_directory_));
+  ABSL_ASSIGN_OR_RETURN(ScopedFileLock lock,
+                        AcquireLock(v3_lock_path_, true));
+  ABSL_RETURN_IF_ERROR(ValidateV3RepositoryTree(
+      root_, product_directory_, v3_version_directory_,
+      v3_capture_records_directory_, v3_restore_records_directory_));
+  const std::filesystem::path path = RestoreV3RecordPath(
+      v3_restore_records_directory_, evidence.plan.checkpoint_id,
+      evidence.evidence_id);
+  return PublishCreateOnceV3<CapsuleRestoreEvidenceV3>(
+      v3_restore_records_directory_, path, bytes,
+      evidence.plan.checkpoint_id, evidence.evidence_id, authentication,
+      &DecodeAuthenticatedCapsuleRestoreEvidenceV3,
+      &ValidateStoredRestoreV3Identity, "Coverage V3 restore evidence");
+}
+
+absl::StatusOr<CapsuleRestoreEvidenceV3>
+FilesystemCapsuleRestoreEvidenceRepository::GetRestoreV3(
+    const Hash256& checkpoint_id, const Hash256& expected_evidence_id,
+    const FreshWorkerAuthentication& authentication) const {
+  if (IsZeroHash(checkpoint_id) || IsZeroHash(expected_evidence_id)) {
+    return absl::InvalidArgumentError(
+        "Coverage V3 restore-evidence lookup requires exact nonzero "
+        "checkpoint and evidence IDs.");
+  }
+  ABSL_RETURN_IF_ERROR(ValidateFreshWorkerAuthentication(authentication));
+  ABSL_RETURN_IF_ERROR(ValidateV3RepositoryTree(
+      root_, product_directory_, v3_version_directory_,
+      v3_capture_records_directory_, v3_restore_records_directory_));
+  ABSL_ASSIGN_OR_RETURN(ScopedFileLock lock,
+                        AcquireLock(v3_lock_path_, false));
+  ABSL_RETURN_IF_ERROR(ValidateV3RepositoryTree(
+      root_, product_directory_, v3_version_directory_,
+      v3_capture_records_directory_, v3_restore_records_directory_));
+  const std::filesystem::path path = RestoreV3RecordPath(
+      v3_restore_records_directory_, checkpoint_id, expected_evidence_id);
+  ABSL_ASSIGN_OR_RETURN(const std::string bytes, ReadWholeFile(path));
+  ABSL_ASSIGN_OR_RETURN(
+      CapsuleRestoreEvidenceV3 evidence,
+      DecodeAuthenticatedCapsuleRestoreEvidenceV3(bytes, authentication));
+  ABSL_RETURN_IF_ERROR(ValidateStoredRestoreV3Identity(
+      evidence, checkpoint_id, expected_evidence_id));
   return evidence;
 }
 

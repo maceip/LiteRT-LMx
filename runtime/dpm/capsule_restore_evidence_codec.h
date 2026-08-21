@@ -50,6 +50,36 @@ DecodeAuthenticatedCapsuleCaptureEvidenceV2(
     absl::string_view envelope,
     const FreshWorkerAuthentication& authentication);
 
+// V3 capture and restore records are separate authenticated artifacts. They
+// deliberately use distinct framing and HMAC domains from DPMCEV02, so a
+// legacy body can never be reinterpreted as explicit reauthentication proof.
+inline constexpr uint32_t
+    kAuthenticatedCapsuleCaptureEvidenceV3EnvelopeVersion = 3;
+inline constexpr uint32_t
+    kAuthenticatedCapsuleRestoreEvidenceV3EnvelopeVersion = 3;
+inline constexpr uint64_t
+    kMaximumAuthenticatedCapsuleCaptureEvidenceV3EnvelopeBytes =
+        uint64_t{256} * 1024 * 1024;
+inline constexpr uint64_t
+    kMaximumAuthenticatedCapsuleRestoreEvidenceV3EnvelopeBytes =
+        uint64_t{256} * 1024 * 1024;
+
+absl::StatusOr<std::string> EncodeAuthenticatedCapsuleCaptureEvidenceV3(
+    const CapsuleCaptureEvidenceV3& evidence,
+    const FreshWorkerAuthentication& authentication);
+absl::StatusOr<CapsuleCaptureEvidenceV3>
+DecodeAuthenticatedCapsuleCaptureEvidenceV3(
+    absl::string_view envelope,
+    const FreshWorkerAuthentication& authentication);
+
+absl::StatusOr<std::string> EncodeAuthenticatedCapsuleRestoreEvidenceV3(
+    const CapsuleRestoreEvidenceV3& evidence,
+    const FreshWorkerAuthentication& authentication);
+absl::StatusOr<CapsuleRestoreEvidenceV3>
+DecodeAuthenticatedCapsuleRestoreEvidenceV3(
+    absl::string_view envelope,
+    const FreshWorkerAuthentication& authentication);
+
 // Durable evidence is a disposable authenticated derivative. Implementations
 // must use the composite checkpoint/evidence identity and create-once
 // publication; callers must already have the exact expected evidence ID from
@@ -64,6 +94,26 @@ class CapsuleRestoreEvidenceRepository {
       const FreshWorkerAuthentication& authentication) = 0;
 
   virtual absl::StatusOr<CapsuleCaptureEvidenceV2> Get(
+      const Hash256& checkpoint_id, const Hash256& expected_evidence_id,
+      const FreshWorkerAuthentication& authentication) const = 0;
+
+  // Explicit V3 operations remain named separately from the legacy V2 API.
+  // Both record kinds use create-once composite checkpoint/evidence identity;
+  // `checkpoint_id` is the captured checkpoint for capture evidence and the
+  // consumed source checkpoint for restore evidence.
+  virtual absl::Status PutCaptureV3IfAbsent(
+      const CapsuleCaptureEvidenceV3& evidence,
+      const FreshWorkerAuthentication& authentication) = 0;
+
+  virtual absl::StatusOr<CapsuleCaptureEvidenceV3> GetCaptureV3(
+      const Hash256& checkpoint_id, const Hash256& expected_evidence_id,
+      const FreshWorkerAuthentication& authentication) const = 0;
+
+  virtual absl::Status PutRestoreV3IfAbsent(
+      const CapsuleRestoreEvidenceV3& evidence,
+      const FreshWorkerAuthentication& authentication) = 0;
+
+  virtual absl::StatusOr<CapsuleRestoreEvidenceV3> GetRestoreV3(
       const Hash256& checkpoint_id, const Hash256& expected_evidence_id,
       const FreshWorkerAuthentication& authentication) const = 0;
 };

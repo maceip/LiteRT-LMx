@@ -39,6 +39,14 @@ constexpr std::array<char, 8> kEnvelopeMagic = {
     'D', 'P', 'M', 'C', 'E', 'V', '0', '2'};
 constexpr absl::string_view kAuthenticationDomain =
     "LITERT_LMX_CAPSULE_CAPTURE_EVIDENCE_HMAC_SHA256_V2";
+constexpr std::array<char, 8> kCaptureEnvelopeV3Magic = {
+    'D', 'P', 'M', 'C', 'E', 'V', '0', '3'};
+constexpr std::array<char, 8> kRestoreEnvelopeV3Magic = {
+    'D', 'P', 'M', 'R', 'E', 'V', '0', '3'};
+constexpr absl::string_view kCaptureAuthenticationV3Domain =
+    "LITERT_LMX_CAPSULE_CAPTURE_EVIDENCE_HMAC_SHA256_V3";
+constexpr absl::string_view kRestoreAuthenticationV3Domain =
+    "LITERT_LMX_CAPSULE_RESTORE_EVIDENCE_HMAC_SHA256_V3";
 constexpr uint64_t kEnvelopeHeaderBytes = 8 + 4 + 4 + 8;
 constexpr uint64_t kAuthenticationTagBytes = 32;
 constexpr uint32_t kMaximumOperationEvidenceKeyIdBytes = 256;
@@ -574,6 +582,60 @@ absl::StatusOr<SessionContinuationStateWitness> ReadWitness(
   return witness;
 }
 
+void AppendReauthenticationEvidence(
+    const SessionHandoffReauthenticationEvidence& evidence,
+    std::string* output) {
+  AppendU32(evidence.format_version, output);
+  AppendHash(evidence.evidence_id, output);
+  AppendIdentity(evidence.session_identity, output);
+  AppendHash(evidence.canonical_continuation_state_hash, output);
+  AppendHash(evidence.source_envelope_hash, output);
+  AppendU64(evidence.source_envelope_size, output);
+  AppendString(evidence.source_key_id, output);
+  AppendHash(evidence.destination_envelope_hash, output);
+  AppendU64(evidence.destination_envelope_size, output);
+  AppendString(evidence.destination_key_id, output);
+  AppendHash(evidence.capsule_codec_contract_hash, output);
+  AppendHash(evidence.reauthentication_contract_hash, output);
+  AppendString(evidence.purpose, output);
+}
+
+absl::StatusOr<SessionHandoffReauthenticationEvidence>
+ReadReauthenticationEvidence(CanonicalReader* reader) {
+  SessionHandoffReauthenticationEvidence evidence;
+  ABSL_ASSIGN_OR_RETURN(evidence.format_version, reader->ReadU32());
+  ABSL_ASSIGN_OR_RETURN(evidence.evidence_id, reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(evidence.session_identity, ReadIdentity(reader));
+  ABSL_ASSIGN_OR_RETURN(evidence.canonical_continuation_state_hash,
+                        reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(evidence.source_envelope_hash, reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(evidence.source_envelope_size, reader->ReadU64());
+  ABSL_ASSIGN_OR_RETURN(
+      evidence.source_key_id,
+      reader->ReadString(kMaximumCapsuleEvidenceKeyIdBytes,
+                         "reauthentication source key ID"));
+  ABSL_ASSIGN_OR_RETURN(evidence.destination_envelope_hash,
+                        reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(evidence.destination_envelope_size,
+                        reader->ReadU64());
+  ABSL_ASSIGN_OR_RETURN(
+      evidence.destination_key_id,
+      reader->ReadString(kMaximumCapsuleEvidenceKeyIdBytes,
+                         "reauthentication destination key ID"));
+  ABSL_ASSIGN_OR_RETURN(evidence.capsule_codec_contract_hash,
+                        reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(evidence.reauthentication_contract_hash,
+                        reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(
+      evidence.purpose,
+      reader->ReadString(
+          kMaximumSessionHandoffReauthenticationPurposeBytes,
+          "reauthentication purpose"));
+  ABSL_RETURN_IF_ERROR(
+      ValidateSessionHandoffReauthenticationEvidence(evidence));
+  return evidence;
+}
+
 absl::Status AppendRestoreEvidence(const CapsuleRestoreEvidenceV2& evidence,
                                    std::string* output) {
   AppendU32(evidence.format_version, output);
@@ -654,6 +716,276 @@ absl::StatusOr<CapsuleCaptureEvidenceV2> DecodeCaptureEvidenceBody(
   }
   ABSL_RETURN_IF_ERROR(ValidateCapsuleCaptureEvidenceV2(evidence));
   return evidence;
+}
+
+absl::Status AppendRestoreEvidenceV3(
+    const CapsuleRestoreEvidenceV3& evidence, std::string* output) {
+  AppendU32(evidence.format_version, output);
+  AppendHash(evidence.evidence_id, output);
+  ABSL_RETURN_IF_ERROR(AppendRestorePlan(evidence.plan, output));
+  AppendReauthenticationEvidence(
+      evidence.durable_to_transient_reauthentication, output);
+  AppendWitness(evidence.target_post_import, output);
+  return absl::OkStatus();
+}
+
+absl::StatusOr<CapsuleRestoreEvidenceV3> ReadRestoreEvidenceV3(
+    CanonicalReader* reader) {
+  CapsuleRestoreEvidenceV3 evidence;
+  ABSL_ASSIGN_OR_RETURN(evidence.format_version, reader->ReadU32());
+  ABSL_ASSIGN_OR_RETURN(evidence.evidence_id, reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(evidence.plan, ReadRestorePlan(reader));
+  ABSL_ASSIGN_OR_RETURN(
+      evidence.durable_to_transient_reauthentication,
+      ReadReauthenticationEvidence(reader));
+  ABSL_ASSIGN_OR_RETURN(evidence.target_post_import, ReadWitness(reader));
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreEvidenceV3(evidence));
+  return evidence;
+}
+
+absl::StatusOr<std::string> EncodeRestoreEvidenceV3Body(
+    const CapsuleRestoreEvidenceV3& evidence) {
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreEvidenceV3(evidence));
+  std::string body;
+  ABSL_RETURN_IF_ERROR(AppendRestoreEvidenceV3(evidence, &body));
+  return body;
+}
+
+absl::StatusOr<CapsuleRestoreEvidenceV3> DecodeRestoreEvidenceV3Body(
+    absl::string_view body) {
+  CanonicalReader reader(body);
+  ABSL_ASSIGN_OR_RETURN(CapsuleRestoreEvidenceV3 evidence,
+                        ReadRestoreEvidenceV3(&reader));
+  if (!reader.empty()) {
+    return absl::DataLossError(
+        "Authenticated Coverage V3 restore evidence has trailing bytes.");
+  }
+  return evidence;
+}
+
+absl::StatusOr<std::string> EncodeCaptureEvidenceV3Body(
+    const CapsuleCaptureEvidenceV3& evidence) {
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleCaptureEvidenceV3(evidence));
+  std::string body;
+  AppendU32(evidence.format_version, &body);
+  AppendHash(evidence.evidence_id, &body);
+  ABSL_RETURN_IF_ERROR(AppendCapturePlan(evidence.plan, &body));
+  AppendHash(evidence.checkpoint_id, &body);
+  AppendHash(evidence.checkpoint_envelope_hash, &body);
+  AppendU64(evidence.checkpoint_envelope_size, &body);
+  AppendString(evidence.checkpoint_authentication_key_id, &body);
+  AppendHash(evidence.checkpoint_history_token_bytes_hash, &body);
+  AppendWitness(evidence.producer_before_export, &body);
+  AppendWitness(evidence.producer_after_export, &body);
+  AppendWitness(evidence.fresh_import_target, &body);
+  AppendReauthenticationEvidence(
+      evidence.transient_to_durable_reauthentication, &body);
+  AppendU8(evidence.parent_restore_evidence.has_value() ? 1 : 0, &body);
+  if (evidence.parent_restore_evidence.has_value()) {
+    ABSL_RETURN_IF_ERROR(
+        AppendRestoreEvidenceV3(*evidence.parent_restore_evidence, &body));
+  }
+  return body;
+}
+
+absl::StatusOr<CapsuleCaptureEvidenceV3> DecodeCaptureEvidenceV3Body(
+    absl::string_view body) {
+  CanonicalReader reader(body);
+  CapsuleCaptureEvidenceV3 evidence;
+  ABSL_ASSIGN_OR_RETURN(evidence.format_version, reader.ReadU32());
+  ABSL_ASSIGN_OR_RETURN(evidence.evidence_id, reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(evidence.plan, ReadCapturePlan(&reader));
+  ABSL_ASSIGN_OR_RETURN(evidence.checkpoint_id, reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(evidence.checkpoint_envelope_hash,
+                        reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(evidence.checkpoint_envelope_size,
+                        reader.ReadU64());
+  ABSL_ASSIGN_OR_RETURN(
+      evidence.checkpoint_authentication_key_id,
+      reader.ReadString(kMaximumCapsuleEvidenceKeyIdBytes,
+                        "V3 checkpoint authentication key ID"));
+  ABSL_ASSIGN_OR_RETURN(evidence.checkpoint_history_token_bytes_hash,
+                        reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(evidence.producer_before_export,
+                        ReadWitness(&reader));
+  ABSL_ASSIGN_OR_RETURN(evidence.producer_after_export,
+                        ReadWitness(&reader));
+  ABSL_ASSIGN_OR_RETURN(evidence.fresh_import_target, ReadWitness(&reader));
+  ABSL_ASSIGN_OR_RETURN(
+      evidence.transient_to_durable_reauthentication,
+      ReadReauthenticationEvidence(&reader));
+  uint8_t has_parent;
+  ABSL_ASSIGN_OR_RETURN(has_parent, reader.ReadU8());
+  if (has_parent > 1) {
+    return absl::DataLossError(
+        "Coverage V3 evidence has a noncanonical parent-restore flag.");
+  }
+  if (has_parent != 0) {
+    ABSL_ASSIGN_OR_RETURN(evidence.parent_restore_evidence,
+                          ReadRestoreEvidenceV3(&reader));
+  }
+  if (!reader.empty()) {
+    return absl::DataLossError(
+        "Authenticated Coverage V3 capture evidence has trailing bytes.");
+  }
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleCaptureEvidenceV3(evidence));
+  return evidence;
+}
+
+bool OperationKeyCollidesWithRestoreEvidenceV3(
+    absl::string_view operation_key_id,
+    const CapsuleRestoreEvidenceV3& evidence) {
+  const SessionHandoffReauthenticationEvidence& reauthentication =
+      evidence.durable_to_transient_reauthentication;
+  return operation_key_id ==
+             evidence.plan.checkpoint_authentication_key_id ||
+         operation_key_id == reauthentication.source_key_id ||
+         operation_key_id == reauthentication.destination_key_id ||
+         operation_key_id == evidence.target_post_import.key_id;
+}
+
+absl::Status ValidateOperationAuthenticationBindingV3(
+    const CapsuleRestoreEvidenceV3& evidence,
+    const FreshWorkerAuthentication& authentication) {
+  ABSL_RETURN_IF_ERROR(ValidateFreshWorkerAuthentication(authentication));
+  if (OperationKeyCollidesWithRestoreEvidenceV3(authentication.key_id,
+                                                 evidence)) {
+    return absl::InvalidArgumentError(
+        "Coverage V3 operation evidence, durable checkpoint, and transient "
+        "restore envelopes require distinct authentication key IDs.");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateOperationAuthenticationBindingV3(
+    const CapsuleCaptureEvidenceV3& evidence,
+    const FreshWorkerAuthentication& authentication) {
+  ABSL_RETURN_IF_ERROR(ValidateFreshWorkerAuthentication(authentication));
+  const SessionHandoffReauthenticationEvidence& reauthentication =
+      evidence.transient_to_durable_reauthentication;
+  if (authentication.key_id ==
+          evidence.plan.checkpoint_authentication_key_id ||
+      authentication.key_id == evidence.checkpoint_authentication_key_id ||
+      authentication.key_id == reauthentication.source_key_id ||
+      authentication.key_id == reauthentication.destination_key_id ||
+      authentication.key_id == evidence.producer_before_export.key_id ||
+      (evidence.parent_restore_evidence.has_value() &&
+       OperationKeyCollidesWithRestoreEvidenceV3(
+           authentication.key_id, *evidence.parent_restore_evidence))) {
+    return absl::InvalidArgumentError(
+        "Coverage V3 operation evidence, durable checkpoints, and transient "
+        "capsules require distinct authentication key IDs.");
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<std::string> EncodeAuthenticatedV3Envelope(
+    absl::string_view body, const std::array<char, 8>& magic,
+    uint32_t version, absl::string_view authentication_domain,
+    uint64_t maximum_envelope_bytes,
+    const FreshWorkerAuthentication& authentication,
+    absl::string_view description) {
+  ABSL_RETURN_IF_ERROR(ValidateFreshWorkerAuthentication(authentication));
+  if (authentication.key_id.size() >
+          (std::numeric_limits<uint32_t>::max)() ||
+      kEnvelopeHeaderBytes + kAuthenticationTagBytes >
+          maximum_envelope_bytes ||
+      authentication.key_id.size() >
+          maximum_envelope_bytes - kEnvelopeHeaderBytes -
+              kAuthenticationTagBytes ||
+      body.size() > maximum_envelope_bytes - kEnvelopeHeaderBytes -
+                        kAuthenticationTagBytes -
+                        authentication.key_id.size()) {
+    return absl::ResourceExhaustedError(
+        absl::StrCat("Authenticated ", description,
+                     " exceeds its envelope bound."));
+  }
+
+  std::string envelope;
+  envelope.reserve(static_cast<size_t>(
+      kEnvelopeHeaderBytes + authentication.key_id.size() + body.size() +
+      kAuthenticationTagBytes));
+  envelope.append(magic.data(), magic.size());
+  AppendU32(version, &envelope);
+  AppendU32(static_cast<uint32_t>(authentication.key_id.size()), &envelope);
+  AppendU64(body.size(), &envelope);
+  envelope.append(authentication.key_id);
+  envelope.append(body.data(), body.size());
+  const Hash256 tag = HmacSha256(
+      authentication.authentication_key,
+      {authentication_domain, envelope});
+  AppendHash(tag, &envelope);
+  return envelope;
+}
+
+absl::StatusOr<absl::string_view> DecodeAuthenticatedV3EnvelopeBody(
+    absl::string_view envelope, const std::array<char, 8>& magic,
+    uint32_t expected_version, absl::string_view authentication_domain,
+    uint64_t maximum_envelope_bytes,
+    const FreshWorkerAuthentication& authentication,
+    absl::string_view description) {
+  ABSL_RETURN_IF_ERROR(ValidateFreshWorkerAuthentication(authentication));
+  if (envelope.size() < kEnvelopeHeaderBytes + kAuthenticationTagBytes ||
+      envelope.size() > maximum_envelope_bytes) {
+    return absl::ResourceExhaustedError(absl::StrCat(
+        "Authenticated ", description,
+        " envelope is outside its size bounds."));
+  }
+  if (std::memcmp(envelope.data(), magic.data(), magic.size()) != 0) {
+    return absl::DataLossError(
+        absl::StrCat("Authenticated ", description, " magic is invalid."));
+  }
+
+  CanonicalReader header(envelope.substr(magic.size()));
+  ABSL_ASSIGN_OR_RETURN(const uint32_t version, header.ReadU32());
+  ABSL_ASSIGN_OR_RETURN(const uint32_t key_id_size, header.ReadU32());
+  ABSL_ASSIGN_OR_RETURN(const uint64_t body_size, header.ReadU64());
+  if (version != expected_version) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "Authenticated ", description, " version is unsupported."));
+  }
+  if (key_id_size > kMaximumOperationEvidenceKeyIdBytes ||
+      body_size > maximum_envelope_bytes ||
+      key_id_size > maximum_envelope_bytes - kEnvelopeHeaderBytes -
+                        kAuthenticationTagBytes ||
+      body_size > maximum_envelope_bytes - kEnvelopeHeaderBytes -
+                      kAuthenticationTagBytes - key_id_size) {
+    return absl::DataLossError(
+        absl::StrCat("Authenticated ", description,
+                     " framing is invalid."));
+  }
+  const uint64_t authenticated_size =
+      kEnvelopeHeaderBytes + key_id_size + body_size;
+  if (authenticated_size >
+          maximum_envelope_bytes - kAuthenticationTagBytes ||
+      envelope.size() != authenticated_size + kAuthenticationTagBytes) {
+    return absl::DataLossError(
+        absl::StrCat("Authenticated ", description,
+                     " length is noncanonical."));
+  }
+
+  const absl::string_view encoded_key =
+      envelope.substr(kEnvelopeHeaderBytes, key_id_size);
+  if (encoded_key != authentication.key_id) {
+    return absl::UnauthenticatedError(absl::StrCat(
+        description, " authentication key ID does not match."));
+  }
+  Hash256 encoded_tag;
+  std::memcpy(encoded_tag.bytes.data(),
+              envelope.data() + static_cast<size_t>(authenticated_size),
+              encoded_tag.bytes.size());
+  const absl::string_view authenticated_bytes =
+      envelope.substr(0, static_cast<size_t>(authenticated_size));
+  const Hash256 expected_tag = HmacSha256(
+      authentication.authentication_key,
+      {authentication_domain, authenticated_bytes});
+  if (!ConstantTimeHashEquals(encoded_tag, expected_tag)) {
+    return absl::UnauthenticatedError(
+        absl::StrCat(description, " envelope authentication failed."));
+  }
+  const size_t body_offset =
+      static_cast<size_t>(kEnvelopeHeaderBytes + key_id_size);
+  return envelope.substr(body_offset, static_cast<size_t>(body_size));
 }
 
 absl::Status ValidateOperationAuthenticationBinding(
@@ -797,6 +1129,90 @@ DecodeAuthenticatedCapsuleCaptureEvidenceV2(
   if (canonical != envelope) {
     return absl::DataLossError(
         "Authenticated Coverage V2 capture evidence is not canonically "
+        "encoded.");
+  }
+  return evidence;
+}
+
+absl::StatusOr<std::string> EncodeAuthenticatedCapsuleCaptureEvidenceV3(
+    const CapsuleCaptureEvidenceV3& evidence,
+    const FreshWorkerAuthentication& authentication) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateOperationAuthenticationBindingV3(evidence, authentication));
+  ABSL_ASSIGN_OR_RETURN(const std::string body,
+                        EncodeCaptureEvidenceV3Body(evidence));
+  return EncodeAuthenticatedV3Envelope(
+      body, kCaptureEnvelopeV3Magic,
+      kAuthenticatedCapsuleCaptureEvidenceV3EnvelopeVersion,
+      kCaptureAuthenticationV3Domain,
+      kMaximumAuthenticatedCapsuleCaptureEvidenceV3EnvelopeBytes,
+      authentication, "Coverage V3 capture evidence");
+}
+
+absl::StatusOr<CapsuleCaptureEvidenceV3>
+DecodeAuthenticatedCapsuleCaptureEvidenceV3(
+    absl::string_view envelope,
+    const FreshWorkerAuthentication& authentication) {
+  ABSL_ASSIGN_OR_RETURN(
+      const absl::string_view body,
+      DecodeAuthenticatedV3EnvelopeBody(
+          envelope, kCaptureEnvelopeV3Magic,
+          kAuthenticatedCapsuleCaptureEvidenceV3EnvelopeVersion,
+          kCaptureAuthenticationV3Domain,
+          kMaximumAuthenticatedCapsuleCaptureEvidenceV3EnvelopeBytes,
+          authentication, "Coverage V3 capture evidence"));
+  ABSL_ASSIGN_OR_RETURN(CapsuleCaptureEvidenceV3 evidence,
+                        DecodeCaptureEvidenceV3Body(body));
+  ABSL_RETURN_IF_ERROR(
+      ValidateOperationAuthenticationBindingV3(evidence, authentication));
+  ABSL_ASSIGN_OR_RETURN(
+      const std::string canonical,
+      EncodeAuthenticatedCapsuleCaptureEvidenceV3(evidence, authentication));
+  if (canonical != envelope) {
+    return absl::DataLossError(
+        "Authenticated Coverage V3 capture evidence is not canonically "
+        "encoded.");
+  }
+  return evidence;
+}
+
+absl::StatusOr<std::string> EncodeAuthenticatedCapsuleRestoreEvidenceV3(
+    const CapsuleRestoreEvidenceV3& evidence,
+    const FreshWorkerAuthentication& authentication) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateOperationAuthenticationBindingV3(evidence, authentication));
+  ABSL_ASSIGN_OR_RETURN(const std::string body,
+                        EncodeRestoreEvidenceV3Body(evidence));
+  return EncodeAuthenticatedV3Envelope(
+      body, kRestoreEnvelopeV3Magic,
+      kAuthenticatedCapsuleRestoreEvidenceV3EnvelopeVersion,
+      kRestoreAuthenticationV3Domain,
+      kMaximumAuthenticatedCapsuleRestoreEvidenceV3EnvelopeBytes,
+      authentication, "Coverage V3 restore evidence");
+}
+
+absl::StatusOr<CapsuleRestoreEvidenceV3>
+DecodeAuthenticatedCapsuleRestoreEvidenceV3(
+    absl::string_view envelope,
+    const FreshWorkerAuthentication& authentication) {
+  ABSL_ASSIGN_OR_RETURN(
+      const absl::string_view body,
+      DecodeAuthenticatedV3EnvelopeBody(
+          envelope, kRestoreEnvelopeV3Magic,
+          kAuthenticatedCapsuleRestoreEvidenceV3EnvelopeVersion,
+          kRestoreAuthenticationV3Domain,
+          kMaximumAuthenticatedCapsuleRestoreEvidenceV3EnvelopeBytes,
+          authentication, "Coverage V3 restore evidence"));
+  ABSL_ASSIGN_OR_RETURN(CapsuleRestoreEvidenceV3 evidence,
+                        DecodeRestoreEvidenceV3Body(body));
+  ABSL_RETURN_IF_ERROR(
+      ValidateOperationAuthenticationBindingV3(evidence, authentication));
+  ABSL_ASSIGN_OR_RETURN(
+      const std::string canonical,
+      EncodeAuthenticatedCapsuleRestoreEvidenceV3(evidence, authentication));
+  if (canonical != envelope) {
+    return absl::DataLossError(
+        "Authenticated Coverage V3 restore evidence is not canonically "
         "encoded.");
   }
   return evidence;

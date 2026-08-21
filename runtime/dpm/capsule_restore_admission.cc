@@ -38,6 +38,7 @@
 #include "runtime/dpm/dpm_capabilities.h"
 #include "runtime/dpm/dpm_prepared_prefill_plan.h"
 #include "runtime/dpm/exact_decode_evidence.h"
+#include "runtime/dpm/fresh_worker_process.h"
 #include "runtime/engine/exact_litert_decode.h"
 #include "runtime/engine/io_types.h"
 #include "runtime/engine/session_handoff_codec_contract.h"
@@ -482,10 +483,18 @@ absl::Status ValidateStateWitnessOperationalDomainFields(
       kMaximumCheckpointKeyIdBytes,
       "CapsuleRestore Coverage V2 operation-evidence authentication"));
   if (domain.checkpoint_authentication_key_id ==
-      domain.operation_evidence_authentication_key_id) {
+          domain.operation_evidence_authentication_key_id ||
+      domain.checkpoint_authentication_key_id ==
+          kFreshWorkerTransientRestoreKeyId ||
+      domain.checkpoint_authentication_key_id ==
+          kFreshWorkerTransientProducingKeyId ||
+      domain.operation_evidence_authentication_key_id ==
+          kFreshWorkerTransientRestoreKeyId ||
+      domain.operation_evidence_authentication_key_id ==
+          kFreshWorkerTransientProducingKeyId) {
     return absl::FailedPreconditionError(
-        "CapsuleRestore Coverage V2 checkpoint and operation evidence must "
-        "use distinct key IDs.");
+        "CapsuleRestore Coverage V2 checkpoint, operation evidence, and "
+        "fixed request-transient capsules must use distinct key IDs.");
   }
   return ValidateStateWitnessQualificationPolicyFields(
       domain.qualification_policy);
@@ -2026,9 +2035,9 @@ absl::Status ValidateCapsuleRestoreStateWitnessOperationalContracts(
       domain.session_continuation_state_witness_contract_hash !=
           GetSessionContinuationStateWitnessContractHash() ||
       domain.capture_evidence_contract_hash !=
-          GetCapsuleRestoreCaptureEvidenceV2ContractHash() ||
+          GetCapsuleRestoreCaptureEvidenceV3ContractHash() ||
       domain.restore_evidence_contract_hash !=
-          GetCapsuleRestoreRestoreEvidenceV2ContractHash() ||
+          GetCapsuleRestoreRestoreEvidenceV3ContractHash() ||
       domain.deterministic_prefill_plan_contract_hash !=
           GetDPMPreparedPrefillPlanContractHash() ||
       domain.execution_shape_class_contract_hash !=
