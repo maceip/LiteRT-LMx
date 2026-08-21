@@ -43,6 +43,8 @@
 
 namespace litert::lm {
 
+class EngineAdvancedImpl;
+
 // SessionAdvanced is an implementation of SessionInterface. The
 // underlying prefill/decode use the LLM Execution Manager's advanced resource
 // management to support efficient multi-sessions and session cloning features.
@@ -88,11 +90,7 @@ class SessionAdvanced : public SessionInterface {
       support::Tokenizer* absl_nonnull tokenizer,
       const SessionConfig& session_config,
       std::optional<BenchmarkInfo> benchmark_info,
-      std::atomic<int>* living_sessions_count = nullptr,
-      std::optional<SessionHandoffIdentity> session_handoff_identity =
-          std::nullopt,
-      std::optional<ExactLiteRtLogitsFrameContract>
-          exact_litert_logits_frame_contract = std::nullopt);
+      std::atomic<int>* living_sessions_count = nullptr);
 
   // Destroys the SessionAdvanced object. It will wait for all tasks to be
   // done and release the session from the execution manager.
@@ -258,6 +256,32 @@ class SessionAdvanced : public SessionInterface {
       ABSL_LOCKS_EXCLUDED(mutex_);
 
  private:
+  friend class EngineAdvancedImpl;
+
+  // Creates a session with identity and logits-frame evidence derived by the
+  // loaded Engine. This factory is private so callers cannot mint an identity
+  // for a SessionAdvanced; EngineAdvancedImpl is the sole identity authority.
+  static absl::StatusOr<std::unique_ptr<SessionAdvanced>>
+  CreateWithEngineOwnedIdentity(
+      std::weak_ptr<ExecutionManager> execution_manager,
+      support::Tokenizer* absl_nonnull tokenizer,
+      const SessionConfig& session_config,
+      std::optional<BenchmarkInfo> benchmark_info,
+      std::atomic<int>* living_sessions_count,
+      std::optional<SessionHandoffIdentity> session_handoff_identity,
+      std::optional<ExactLiteRtLogitsFrameContract>
+          exact_litert_logits_frame_contract);
+
+  static absl::StatusOr<std::unique_ptr<SessionAdvanced>> CreateInternal(
+      std::weak_ptr<ExecutionManager> execution_manager,
+      support::Tokenizer* absl_nonnull tokenizer,
+      const SessionConfig& session_config,
+      std::optional<BenchmarkInfo> benchmark_info,
+      std::atomic<int>* living_sessions_count,
+      std::optional<SessionHandoffIdentity> session_handoff_identity,
+      std::optional<ExactLiteRtLogitsFrameContract>
+          exact_litert_logits_frame_contract);
+
   // The state of the session.
   // * `kFresh` means the session is just created and
   //   hasn't been prefilled yet.

@@ -142,6 +142,37 @@ absl::StatusOr<std::unique_ptr<SessionAdvanced>> SessionAdvanced::Create(
     support::Tokenizer* absl_nonnull tokenizer,
     const SessionConfig& session_config,
     std::optional<BenchmarkInfo> benchmark_info,
+    std::atomic<int>* living_sessions_count) {
+  return CreateInternal(execution_manager, tokenizer, session_config,
+                        std::move(benchmark_info), living_sessions_count,
+                        /*session_handoff_identity=*/std::nullopt,
+                        /*exact_litert_logits_frame_contract=*/std::nullopt);
+}
+
+// static
+absl::StatusOr<std::unique_ptr<SessionAdvanced>>
+SessionAdvanced::CreateWithEngineOwnedIdentity(
+    std::weak_ptr<ExecutionManager> execution_manager,
+    support::Tokenizer* absl_nonnull tokenizer,
+    const SessionConfig& session_config,
+    std::optional<BenchmarkInfo> benchmark_info,
+    std::atomic<int>* living_sessions_count,
+    std::optional<SessionHandoffIdentity> session_handoff_identity,
+    std::optional<ExactLiteRtLogitsFrameContract>
+        exact_litert_logits_frame_contract) {
+  return CreateInternal(execution_manager, tokenizer, session_config,
+                        std::move(benchmark_info), living_sessions_count,
+                        std::move(session_handoff_identity),
+                        std::move(exact_litert_logits_frame_contract));
+}
+
+// static
+absl::StatusOr<std::unique_ptr<SessionAdvanced>>
+SessionAdvanced::CreateInternal(
+    std::weak_ptr<ExecutionManager> execution_manager,
+    support::Tokenizer* absl_nonnull tokenizer,
+    const SessionConfig& session_config,
+    std::optional<BenchmarkInfo> benchmark_info,
     std::atomic<int>* living_sessions_count,
     std::optional<SessionHandoffIdentity> session_handoff_identity,
     std::optional<ExactLiteRtLogitsFrameContract>

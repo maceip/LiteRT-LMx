@@ -165,11 +165,11 @@ class EngineAdvancedImpl : public Engine {
 
     ABSL_ASSIGN_OR_RETURN(
         auto session,
-        SessionAdvanced::Create(execution_manager_, tokenizer_.get(), config,
-                                std::move(session_benchmark_info),
-                                &living_sessions_,
-                                std::move(session_handoff_identity),
-                                std::move(exact_logits_frame_contract)));
+        SessionAdvanced::CreateWithEngineOwnedIdentity(
+            execution_manager_, tokenizer_.get(), config,
+            std::move(session_benchmark_info), &living_sessions_,
+            std::move(session_handoff_identity),
+            std::move(exact_logits_frame_contract)));
 
     if (benchmark_info_.has_value()) {
       auto session_benchmark_info_or = session->GetMutableBenchmarkInfo();
