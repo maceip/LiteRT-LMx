@@ -45,6 +45,17 @@ class FilesystemCapsuleRestoreAdmissionRepository final
       const CapsuleRestoreQualificationSpec& spec,
       const FreshWorkerAuthentication& authentication) const override;
 
+  absl::Status PutStateWitnessedOwnPositionIfAbsent(
+      const CapsuleRestoreStateWitnessAdmissionRecord& record,
+      const FreshWorkerAuthentication& authentication) override;
+
+  absl::StatusOr<CapsuleRestoreStateWitnessAdmissionRecord>
+  GetStateWitnessedOwnPosition(
+      const ExactLiteRtProfile& runtime_derived_profile,
+      const SessionHandoffCapability& runtime_derived_capability,
+      const Hash256& expected_coverage_id,
+      const FreshWorkerAuthentication& authentication) const override;
+
  private:
   explicit FilesystemCapsuleRestoreAdmissionRepository(
       std::filesystem::path root);
@@ -54,6 +65,9 @@ class FilesystemCapsuleRestoreAdmissionRepository final
   std::filesystem::path directory_;
   std::filesystem::path records_directory_;
   std::filesystem::path lock_path_;
+  std::filesystem::path state_witness_directory_;
+  std::filesystem::path state_witness_records_directory_;
+  std::filesystem::path state_witness_lock_path_;
 };
 
 }  // namespace litert::lm

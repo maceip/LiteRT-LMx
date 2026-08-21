@@ -380,6 +380,14 @@ absl::StatusOr<Hash256> LookupKeyForRecord(
       record.capability.capability_id, record.qualification_spec_hash);
 }
 
+absl::StatusOr<Hash256> LookupKeyForStateWitnessRecord(
+    const CapsuleRestoreStateWitnessAdmissionRecord& record) {
+  return ComputeCapsuleRestoreStateWitnessAdmissionLookupKey(
+      record.operational_coverage.runtime_derived_profile.profile_id,
+      record.operational_coverage.runtime_derived_capability.capability_id,
+      record.operational_coverage.coverage_id);
+}
+
 }  // namespace
 
 FilesystemCapsuleRestoreAdmissionRepository::
@@ -387,7 +395,11 @@ FilesystemCapsuleRestoreAdmissionRepository::
     : root_(std::move(root)),
       directory_(root_ / "capsule-restore-admission" / "v1"),
       records_directory_(directory_ / "records"),
-      lock_path_(directory_ / "repository.lock") {}
+      lock_path_(directory_ / "repository.lock"),
+      state_witness_directory_(root_ / "capsule-restore-admission" / "v2"),
+      state_witness_records_directory_(state_witness_directory_ / "records"),
+      state_witness_lock_path_(state_witness_directory_ /
+                               "repository.lock") {}
 
 absl::StatusOr<
     std::unique_ptr<FilesystemCapsuleRestoreAdmissionRepository>>
@@ -424,8 +436,20 @@ absl::Status FilesystemCapsuleRestoreAdmissionRepository::Initialize() {
       product, directory_, "admission version directory"));
   ABSL_RETURN_IF_ERROR(EnsureOwnedDirectory(
       directory_, records_directory_, "admission records directory"));
+  ABSL_RETURN_IF_ERROR(EnsureOwnedDirectory(
+      product, state_witness_directory_,
+      "Coverage V2 admission version directory"));
+  ABSL_RETURN_IF_ERROR(EnsureOwnedDirectory(
+      state_witness_directory_, state_witness_records_directory_,
+      "Coverage V2 admission records directory"));
   ABSL_ASSIGN_OR_RETURN(ScopedFileLock lock, AcquireLock(lock_path_, true));
-  return ValidateRepositoryTree(root_, directory_, records_directory_);
+  ABSL_RETURN_IF_ERROR(
+      ValidateRepositoryTree(root_, directory_, records_directory_));
+  ABSL_ASSIGN_OR_RETURN(
+      ScopedFileLock state_witness_lock,
+      AcquireLock(state_witness_lock_path_, true));
+  return ValidateRepositoryTree(root_, state_witness_directory_,
+                                state_witness_records_directory_);
 }
 
 absl::Status FilesystemCapsuleRestoreAdmissionRepository::PutIfAbsent(
@@ -569,6 +593,185 @@ FilesystemCapsuleRestoreAdmissionRepository::Get(
     return absl::DataLossError(
         "CapsuleRestore admission record is stored under the wrong composite "
         "lookup key.");
+  }
+  return record;
+}
+
+absl::Status FilesystemCapsuleRestoreAdmissionRepository::
+    PutStateWitnessedOwnPositionIfAbsent(
+        const CapsuleRestoreStateWitnessAdmissionRecord& record,
+        const FreshWorkerAuthentication& authentication) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateCapsuleRestoreStateWitnessAdmissionRecord(record));
+  ABSL_ASSIGN_OR_RETURN(const Hash256 lookup_key,
+                        LookupKeyForStateWitnessRecord(record));
+  ABSL_ASSIGN_OR_RETURN(
+      const std::string bytes,
+      EncodeCapsuleRestoreStateWitnessAdmissionRecord(record,
+                                                       authentication));
+  ABSL_RETURN_IF_ERROR(ValidateRepositoryTree(
+      root_, state_witness_directory_, state_witness_records_directory_));
+  ABSL_ASSIGN_OR_RETURN(
+      ScopedFileLock lock,
+      AcquireLock(state_witness_lock_path_, true));
+  ABSL_RETURN_IF_ERROR(ValidateRepositoryTree(
+      root_, state_witness_directory_, state_witness_records_directory_));
+  const std::filesystem::path final_path =
+      RecordPath(state_witness_records_directory_, lookup_key);
+
+  std::error_code exists_error;
+  if (std::filesystem::exists(final_path, exists_error)) {
+    if (exists_error) {
+      return absl::FailedPreconditionError(
+          "Unable to inspect existing CapsuleRestore Coverage V2 admission "
+          "record.");
+    }
+    ABSL_ASSIGN_OR_RETURN(const std::string existing,
+                          ReadWholeFile(final_path));
+    if (existing == bytes) return absl::OkStatus();
+    ABSL_ASSIGN_OR_RETURN(
+        const CapsuleRestoreStateWitnessAdmissionRecord existing_record,
+        DecodeCapsuleRestoreStateWitnessAdmissionRecord(existing,
+                                                         authentication));
+    ABSL_ASSIGN_OR_RETURN(
+        const Hash256 existing_lookup_key,
+        LookupKeyForStateWitnessRecord(existing_record));
+    if (existing_lookup_key != lookup_key) {
+      return absl::DataLossError(
+          "Existing CapsuleRestore Coverage V2 admission is stored under "
+          "the wrong composite lookup key.");
+    }
+    return absl::AlreadyExistsError(
+        "Conflicting CapsuleRestore Coverage V2 admission already exists "
+        "for this profile, capability, and coverage ID.");
+  }
+  if (exists_error) {
+    return absl::FailedPreconditionError(
+        "Unable to inspect CapsuleRestore Coverage V2 admission record "
+        "path.");
+  }
+
+  ABSL_ASSIGN_OR_RETURN(
+      auto temporary,
+      CreateTempFile(state_witness_records_directory_, lookup_key.ToHex()));
+  ScopedFd temp_fd = std::move(temporary.first);
+  const std::filesystem::path temp_path = std::move(temporary.second);
+  const auto remove_temp = [&temp_path]() {
+    while (unlink(temp_path.c_str()) != 0 && errno == EINTR) {
+    }
+  };
+
+  absl::Status write_status = WriteAll(temp_fd.get(), bytes);
+  if (write_status.ok()) {
+    int chmod_result;
+    do {
+      chmod_result = fchmod(temp_fd.get(), S_IRUSR);
+    } while (chmod_result != 0 && errno == EINTR);
+    if (chmod_result != 0) {
+      write_status = absl::ErrnoToStatus(
+          errno,
+          "Unable to make CapsuleRestore Coverage V2 admission record "
+          "read-only.");
+    }
+  }
+  if (write_status.ok()) {
+    write_status = SyncFd(
+        temp_fd.get(), "CapsuleRestore Coverage V2 admission record");
+  }
+  temp_fd.Reset();
+  if (!write_status.ok()) {
+    remove_temp();
+    return write_status;
+  }
+
+  int link_result;
+  do {
+    link_result = link(temp_path.c_str(), final_path.c_str());
+  } while (link_result != 0 && errno == EINTR);
+  if (link_result != 0) {
+    const int saved_errno = errno;
+    remove_temp();
+    if (saved_errno == EEXIST) {
+      ABSL_ASSIGN_OR_RETURN(const std::string existing,
+                            ReadWholeFile(final_path));
+      if (existing == bytes) return absl::OkStatus();
+      ABSL_ASSIGN_OR_RETURN(
+          const CapsuleRestoreStateWitnessAdmissionRecord existing_record,
+          DecodeCapsuleRestoreStateWitnessAdmissionRecord(existing,
+                                                           authentication));
+      ABSL_ASSIGN_OR_RETURN(
+          const Hash256 existing_lookup_key,
+          LookupKeyForStateWitnessRecord(existing_record));
+      if (existing_lookup_key != lookup_key) {
+        return absl::DataLossError(
+            "Concurrent CapsuleRestore Coverage V2 admission is stored "
+            "under the wrong composite lookup key.");
+      }
+      return absl::AlreadyExistsError(
+          "Conflicting CapsuleRestore Coverage V2 admission was "
+          "concurrently published for this profile, capability, and "
+          "coverage ID.");
+    }
+    return absl::ErrnoToStatus(
+        saved_errno,
+        "Unable to publish CapsuleRestore Coverage V2 admission record.");
+  }
+  ABSL_RETURN_IF_ERROR(SyncDirectory(state_witness_records_directory_));
+  remove_temp();
+  return absl::OkStatus();
+}
+
+absl::StatusOr<CapsuleRestoreStateWitnessAdmissionRecord>
+FilesystemCapsuleRestoreAdmissionRepository::
+    GetStateWitnessedOwnPosition(
+        const ExactLiteRtProfile& runtime_derived_profile,
+        const SessionHandoffCapability& runtime_derived_capability,
+        const Hash256& expected_coverage_id,
+        const FreshWorkerAuthentication& authentication) const {
+  ABSL_RETURN_IF_ERROR(ValidateFreshWorkerAuthentication(authentication));
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactLiteRtProfile(runtime_derived_profile));
+  ABSL_RETURN_IF_ERROR(
+      ValidateSessionHandoffCapability(runtime_derived_capability));
+  if (runtime_derived_profile.backend != ExactLiteRtBackend::kCpu ||
+      runtime_derived_capability.backend != ExactLiteRtBackend::kCpu ||
+      runtime_derived_capability.exact_profile_id !=
+          runtime_derived_profile.profile_id ||
+      runtime_derived_capability.session_identity !=
+          runtime_derived_profile.session_identity) {
+    return absl::FailedPreconditionError(
+        "CapsuleRestore Coverage V2 repository lookup requires one "
+        "agreeing runtime-derived CPU profile and capability.");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 lookup_key,
+      ComputeCapsuleRestoreStateWitnessAdmissionLookupKey(
+          runtime_derived_profile.profile_id,
+          runtime_derived_capability.capability_id, expected_coverage_id));
+  ABSL_RETURN_IF_ERROR(ValidateRepositoryTree(
+      root_, state_witness_directory_, state_witness_records_directory_));
+  ABSL_ASSIGN_OR_RETURN(
+      ScopedFileLock lock,
+      AcquireLock(state_witness_lock_path_, false));
+  ABSL_RETURN_IF_ERROR(ValidateRepositoryTree(
+      root_, state_witness_directory_, state_witness_records_directory_));
+  const std::filesystem::path path =
+      RecordPath(state_witness_records_directory_, lookup_key);
+  ABSL_ASSIGN_OR_RETURN(const std::string bytes, ReadWholeFile(path));
+  ABSL_ASSIGN_OR_RETURN(
+      CapsuleRestoreStateWitnessAdmissionRecord record,
+      DecodeCapsuleRestoreStateWitnessAdmissionRecord(bytes,
+                                                       authentication));
+  ABSL_RETURN_IF_ERROR(
+      ValidateCapsuleRestoreStateWitnessAdmissionRecordForRuntime(
+          record, runtime_derived_profile, runtime_derived_capability,
+          expected_coverage_id));
+  ABSL_ASSIGN_OR_RETURN(const Hash256 stored_lookup_key,
+                        LookupKeyForStateWitnessRecord(record));
+  if (stored_lookup_key != lookup_key) {
+    return absl::DataLossError(
+        "CapsuleRestore Coverage V2 admission is stored under the wrong "
+        "composite lookup key.");
   }
   return record;
 }
