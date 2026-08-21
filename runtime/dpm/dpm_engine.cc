@@ -755,8 +755,16 @@ absl::Status DPMEngine::ValidateConfiguration() const {
   ABSL_RETURN_IF_ERROR(agent_runtime_->ValidateSupport());
   ABSL_RETURN_IF_ERROR(agent_runtime_->ValidateGenerationLimit(
       static_cast<uint32_t>(config_.max_decision_tokens)));
+  ABSL_ASSIGN_OR_RETURN(const DPMReplayMode projection_replay_mode,
+                        projection_provider_->GetReplayMode());
+  ABSL_RETURN_IF_ERROR(ValidateDPMReplayMode(projection_replay_mode));
   const DPMReplayMode agent_replay_mode = agent_runtime_->GetReplayMode();
   ABSL_RETURN_IF_ERROR(ValidateDPMReplayMode(agent_replay_mode));
+  if (projection_replay_mode != agent_replay_mode) {
+    return absl::FailedPreconditionError(
+        "DPM projection and agent stages must use the same named replay "
+        "guarantee before any authoritative input is appended.");
+  }
   ABSL_ASSIGN_OR_RETURN(const std::optional<Hash256> exact_profile_id,
                         agent_runtime_->GetExactProfileId());
   if ((agent_replay_mode == DPMReplayMode::kCanonicalWinnerReplay &&

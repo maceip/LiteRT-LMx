@@ -78,6 +78,14 @@ class DPMProjectionProvider {
     return absl::UnimplementedError(
         "DPM projection provider does not support preflight admission.");
   }
+  // Returns the provider's immutable named replay guarantee without running
+  // projection. DPMEngine requires this to match the agent stage before it
+  // appends a recoverable input event; a provider that cannot disclose its
+  // mode fails closed through the default implementation.
+  virtual absl::StatusOr<DPMReplayMode> GetReplayMode() const {
+    return absl::UnimplementedError(
+        "DPM projection provider does not expose its replay mode.");
+  }
   virtual absl::StatusOr<DPMProjectionOutcome> Project(
       const DPMProjectionRequest& request) = 0;
 };

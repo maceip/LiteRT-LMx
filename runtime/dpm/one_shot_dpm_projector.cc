@@ -70,6 +70,16 @@ absl::Status OneShotDPMProjector::ValidateSupport() const {
   return absl::OkStatus();
 }
 
+absl::StatusOr<DPMReplayMode> OneShotDPMProjector::GetReplayMode() const {
+  if (runtime_ == nullptr) {
+    return absl::FailedPreconditionError(
+        "One-shot DPM projection has no resolved replay runtime.");
+  }
+  const DPMReplayMode replay_mode = runtime_->GetReplayMode();
+  ABSL_RETURN_IF_ERROR(ValidateDPMReplayMode(replay_mode));
+  return replay_mode;
+}
+
 absl::StatusOr<DPMLogSnapshot>
 OneShotDPMProjector::ResolveAuthoritativeSnapshot(
     const DPMProjectionRequest& request) const {

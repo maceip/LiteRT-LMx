@@ -38,6 +38,7 @@ class OneShotDPMProjector final : public DPMProjectionProvider {
                       DPMProjectionConfig config);
 
   absl::Status ValidateSupport() const override;
+  absl::StatusOr<DPMReplayMode> GetReplayMode() const override;
 
   // Performs exactly one product replay execution and no repair stage.
   // WinnerReplay may use a prior authenticated winner without inference;
