@@ -43,9 +43,13 @@ namespace {
 
 constexpr std::array<char, 8> kAgentExecutionMagic = {'D', 'P', 'M', 'A',
                                                        'G', 'N', '0', '1'};
+constexpr std::array<char, 8> kAgentDeltaExecutionMagic = {
+    'D', 'P', 'M', 'D', 'L', 'T', '0', '1'};
 constexpr std::array<char, 8> kAgentDecisionMagic = {'D', 'P', 'M', 'D',
                                                       'E', 'C', '0', '1'};
 constexpr uint64_t kAgentExecutionFixedBytes = 8 + 4 + 32 + 32 + 4 + 4;
+constexpr uint64_t kAgentDeltaExecutionFixedBytes =
+    8 + 4 + 32 + 32 + 32 + 8 + 32 + 4 + 4;
 constexpr uint64_t kAgentChunkFramingBytes = 1 + 8;
 constexpr uint64_t kCanonicalTokenFramingBytes = 8 + 4 + 4;
 constexpr absl::string_view kWinnerAgentEvidenceDomain =
@@ -638,6 +642,239 @@ absl::StatusOr<DPMAgentExecutionRequest> DecodeDPMAgentExecutionRequest(
         "Canonical DPM agent execution is not canonically encoded.");
   }
   return request;
+}
+
+absl::Status ValidateDPMAgentDeltaExecutionRequest(
+    const DPMAgentDeltaExecutionRequest& request) {
+  if (request.format_version !=
+          kDPMAgentDeltaExecutionRequestFormatVersion ||
+      IsZeroHash(request.logical_agent_request_hash) ||
+      IsZeroHash(request.correction_digest) ||
+      IsZeroHash(request.restore_checkpoint_id) ||
+      request.restored_response_event_index == 0 ||
+      IsZeroHash(request.restored_agent_transcript_hash) ||
+      request.max_output_tokens == 0 ||
+      request.max_output_tokens > kMaximumDPMGenerationTokens ||
+      request.canonical_delta_prefill_chunks.empty() ||
+      request.canonical_delta_prefill_chunks.size() >
+          kMaximumFreshWorkerTokenIds) {
+    return absl::InvalidArgumentError(
+        "Canonical DPM agent delta request is incomplete or oversized.");
+  }
+
+  uint64_t encoded_size = kAgentDeltaExecutionFixedBytes;
+  uint64_t total_token_ids = 0;
+  for (const auto& chunk : request.canonical_delta_prefill_chunks) {
+    ABSL_RETURN_IF_ERROR(ValidateChunk(chunk));
+    uint64_t payload_size = 0;
+    if (chunk.encoding ==
+        DPMAgentGenerationRequest::PrefillChunk::Encoding::kUtf8Text) {
+      payload_size = chunk.text.size();
+    } else {
+      if (chunk.token_ids.size() >
+          kMaximumFreshWorkerTokenIds - total_token_ids) {
+        return absl::ResourceExhaustedError(
+            "Canonical DPM agent delta exceeds the token-input limit.");
+      }
+      total_token_ids += chunk.token_ids.size();
+      payload_size = kCanonicalTokenFramingBytes +
+                     uint64_t{4} * chunk.token_ids.size();
+    }
+    if (encoded_size > kMaximumFreshWorkerRequestPayloadBytes ||
+        kAgentChunkFramingBytes >
+            kMaximumFreshWorkerRequestPayloadBytes - encoded_size ||
+        payload_size > kMaximumFreshWorkerRequestPayloadBytes -
+                           encoded_size - kAgentChunkFramingBytes) {
+      return absl::ResourceExhaustedError(
+          "Canonical DPM agent delta cannot fit its execution-plan "
+          "payload.");
+    }
+    encoded_size += kAgentChunkFramingBytes + payload_size;
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<std::string> EncodeDPMAgentDeltaExecutionRequest(
+    const DPMAgentDeltaExecutionRequest& request) {
+  ABSL_RETURN_IF_ERROR(ValidateDPMAgentDeltaExecutionRequest(request));
+  std::string encoded;
+  encoded.reserve(static_cast<size_t>(kAgentDeltaExecutionFixedBytes));
+  encoded.append(kAgentDeltaExecutionMagic.data(),
+                 kAgentDeltaExecutionMagic.size());
+  AppendU32(request.format_version, &encoded);
+  AppendHash(request.logical_agent_request_hash, &encoded);
+  AppendHash(request.correction_digest, &encoded);
+  AppendHash(request.restore_checkpoint_id, &encoded);
+  AppendU64(request.restored_response_event_index, &encoded);
+  AppendHash(request.restored_agent_transcript_hash, &encoded);
+  AppendU32(request.max_output_tokens, &encoded);
+  AppendU32(
+      static_cast<uint32_t>(request.canonical_delta_prefill_chunks.size()),
+      &encoded);
+
+  for (const auto& chunk : request.canonical_delta_prefill_chunks) {
+    std::string token_payload;
+    absl::string_view payload;
+    if (chunk.encoding ==
+        DPMAgentGenerationRequest::PrefillChunk::Encoding::kUtf8Text) {
+      payload = chunk.text;
+    } else {
+      std::vector<int32_t> token_ids;
+      token_ids.reserve(chunk.token_ids.size());
+      for (int token_id : chunk.token_ids) {
+        token_ids.push_back(static_cast<int32_t>(token_id));
+      }
+      ABSL_ASSIGN_OR_RETURN(token_payload,
+                            EncodeFreshWorkerTokenIds(token_ids));
+      payload = token_payload;
+    }
+    if (encoded.size() > kMaximumFreshWorkerRequestPayloadBytes ||
+        kAgentChunkFramingBytes >
+            kMaximumFreshWorkerRequestPayloadBytes - encoded.size() ||
+        payload.size() > kMaximumFreshWorkerRequestPayloadBytes -
+                             encoded.size() - kAgentChunkFramingBytes) {
+      return absl::ResourceExhaustedError(
+          "Canonical DPM agent delta exceeds its execution-plan limit.");
+    }
+    encoded.push_back(static_cast<char>(chunk.encoding));
+    AppendU64(payload.size(), &encoded);
+    encoded.append(payload.data(), payload.size());
+  }
+  return encoded;
+}
+
+absl::StatusOr<DPMAgentDeltaExecutionRequest>
+DecodeDPMAgentDeltaExecutionRequest(absl::string_view bytes) {
+  if (bytes.size() < kAgentDeltaExecutionFixedBytes ||
+      bytes.size() > kMaximumFreshWorkerRequestPayloadBytes ||
+      std::memcmp(bytes.data(), kAgentDeltaExecutionMagic.data(),
+                  kAgentDeltaExecutionMagic.size()) != 0) {
+    return absl::DataLossError(
+        "Canonical DPM agent delta framing is invalid.");
+  }
+  Reader reader(bytes.substr(kAgentDeltaExecutionMagic.size()));
+  DPMAgentDeltaExecutionRequest request;
+  ABSL_ASSIGN_OR_RETURN(request.format_version, reader.ReadU32());
+  ABSL_ASSIGN_OR_RETURN(request.logical_agent_request_hash,
+                        reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(request.correction_digest, reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(request.restore_checkpoint_id, reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(request.restored_response_event_index,
+                        reader.ReadU64());
+  ABSL_ASSIGN_OR_RETURN(request.restored_agent_transcript_hash,
+                        reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(request.max_output_tokens, reader.ReadU32());
+  uint32_t chunk_count;
+  ABSL_ASSIGN_OR_RETURN(chunk_count, reader.ReadU32());
+  if (chunk_count == 0 || chunk_count > kMaximumFreshWorkerTokenIds ||
+      chunk_count >
+          reader.remaining() / (kAgentChunkFramingBytes + uint64_t{1})) {
+    return absl::DataLossError(
+        "Canonical DPM agent delta has an invalid chunk count.");
+  }
+  request.canonical_delta_prefill_chunks.reserve(chunk_count);
+  uint64_t total_token_ids = 0;
+  for (uint32_t index = 0; index < chunk_count; ++index) {
+    uint8_t encoding;
+    ABSL_ASSIGN_OR_RETURN(encoding, reader.ReadU8());
+    uint64_t payload_size;
+    ABSL_ASSIGN_OR_RETURN(payload_size, reader.ReadU64());
+    absl::string_view payload;
+    ABSL_ASSIGN_OR_RETURN(payload, reader.ReadBytes(payload_size));
+    DPMAgentGenerationRequest::PrefillChunk chunk;
+    chunk.encoding = static_cast<
+        DPMAgentGenerationRequest::PrefillChunk::Encoding>(encoding);
+    switch (chunk.encoding) {
+      case DPMAgentGenerationRequest::PrefillChunk::Encoding::kUtf8Text:
+        chunk.text.assign(payload.data(), payload.size());
+        break;
+      case DPMAgentGenerationRequest::PrefillChunk::Encoding::kTokenIds: {
+        ABSL_ASSIGN_OR_RETURN(const std::vector<int32_t> token_ids,
+                              DecodeFreshWorkerTokenIds(payload));
+        if (token_ids.size() >
+            kMaximumFreshWorkerTokenIds - total_token_ids) {
+          return absl::ResourceExhaustedError(
+              "Canonical DPM agent delta exceeds the token-input limit.");
+        }
+        total_token_ids += token_ids.size();
+        chunk.token_ids.reserve(token_ids.size());
+        for (int32_t token_id : token_ids) chunk.token_ids.push_back(token_id);
+        break;
+      }
+      default:
+        return absl::DataLossError(
+            "Canonical DPM agent delta has an unknown chunk encoding.");
+    }
+    request.canonical_delta_prefill_chunks.push_back(std::move(chunk));
+  }
+  if (reader.remaining() != 0) {
+    return absl::DataLossError(
+        "Canonical DPM agent delta has trailing bytes.");
+  }
+  ABSL_RETURN_IF_ERROR(ValidateDPMAgentDeltaExecutionRequest(request));
+  ABSL_ASSIGN_OR_RETURN(const std::string canonical,
+                        EncodeDPMAgentDeltaExecutionRequest(request));
+  if (canonical != bytes) {
+    return absl::DataLossError(
+        "Canonical DPM agent delta is not canonically encoded.");
+  }
+  return request;
+}
+
+absl::Status ValidateDPMAgentDeltaExecutionBinding(
+    const DPMAgentExecutionRequest& logical_request,
+    const FreshWorkerExecutionPlan& execution_plan,
+    const DPMAgentDeltaExecutionRequest& delta_request) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateDPMAgentExecutionRequest(logical_request));
+  ABSL_RETURN_IF_ERROR(
+      ValidateFreshWorkerExecutionPlan(execution_plan));
+  ABSL_RETURN_IF_ERROR(
+      ValidateDPMAgentDeltaExecutionRequest(delta_request));
+  if (execution_plan.prefill_mode !=
+          FreshWorkerPrefillMode::kOwnPositionCapsuleDelta ||
+      !execution_plan.restore_checkpoint_id.has_value() ||
+      delta_request.logical_agent_request_hash !=
+          logical_request.logical_agent_request_hash ||
+      delta_request.correction_digest != logical_request.correction_digest ||
+      delta_request.max_output_tokens != logical_request.max_output_tokens ||
+      delta_request.restore_checkpoint_id !=
+          *execution_plan.restore_checkpoint_id) {
+    return absl::FailedPreconditionError(
+        "DPM agent delta does not match its complete logical request and "
+        "authenticated restore plan.");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      const std::string canonical_delta,
+      EncodeDPMAgentDeltaExecutionRequest(delta_request));
+  if (canonical_delta != execution_plan.canonical_execution_payload) {
+    return absl::DataLossError(
+        "DPM agent delta bytes differ from the authenticated execution "
+        "plan.");
+  }
+  if (delta_request.canonical_delta_prefill_chunks.size() >
+      logical_request.full_canonical_prefill_chunks.size()) {
+    return absl::FailedPreconditionError(
+        "DPM agent delta contains more chunks than the logical request.");
+  }
+  const size_t suffix_start =
+      logical_request.full_canonical_prefill_chunks.size() -
+      delta_request.canonical_delta_prefill_chunks.size();
+  for (size_t index = 0;
+       index < delta_request.canonical_delta_prefill_chunks.size();
+       ++index) {
+    const auto& full =
+        logical_request.full_canonical_prefill_chunks[suffix_start + index];
+    const auto& delta =
+        delta_request.canonical_delta_prefill_chunks[index];
+    if (full.encoding != delta.encoding || full.text != delta.text ||
+        full.token_ids != delta.token_ids) {
+      return absl::FailedPreconditionError(
+          "DPM agent delta is not an exact chunk-preserving suffix of the "
+          "complete logical request.");
+    }
+  }
+  return absl::OkStatus();
 }
 
 absl::Status ValidateDPMAgentDecisionEnvelope(

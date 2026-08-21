@@ -38,6 +38,7 @@
 namespace litert::lm {
 
 inline constexpr uint32_t kDPMAgentExecutionRequestFormatVersion = 1;
+inline constexpr uint32_t kDPMAgentDeltaExecutionRequestFormatVersion = 1;
 inline constexpr uint32_t kDPMAgentDecisionEnvelopeFormatVersion = 1;
 inline constexpr absl::string_view kDPMAgentReplayContractVersion =
     "litert-lmx-dpm-agent-decision-v1";
@@ -67,6 +68,39 @@ absl::StatusOr<std::string> EncodeDPMAgentExecutionRequest(
     const DPMAgentExecutionRequest& request);
 absl::StatusOr<DPMAgentExecutionRequest> DecodeDPMAgentExecutionRequest(
     absl::string_view bytes);
+
+// Physical own-position continuation plan for a fresh exact worker. The
+// complete DPMAgentExecutionRequest remains in the logical replay envelope;
+// this separately authenticated value binds only the selected checkpoint and
+// exact post-checkpoint chunks that replace full prefill work.
+struct DPMAgentDeltaExecutionRequest {
+  uint32_t format_version =
+      kDPMAgentDeltaExecutionRequestFormatVersion;
+  Hash256 logical_agent_request_hash;
+  Hash256 correction_digest;
+  Hash256 restore_checkpoint_id;
+  uint64_t restored_response_event_index = 0;
+  Hash256 restored_agent_transcript_hash;
+  uint32_t max_output_tokens = 0;
+  std::vector<DPMAgentGenerationRequest::PrefillChunk>
+      canonical_delta_prefill_chunks;
+};
+
+absl::Status ValidateDPMAgentDeltaExecutionRequest(
+    const DPMAgentDeltaExecutionRequest& request);
+absl::StatusOr<std::string> EncodeDPMAgentDeltaExecutionRequest(
+    const DPMAgentDeltaExecutionRequest& request);
+absl::StatusOr<DPMAgentDeltaExecutionRequest>
+DecodeDPMAgentDeltaExecutionRequest(absl::string_view bytes);
+// Cross-object worker admission. This proves that the physical delta is an
+// unchanged suffix of the complete logical agent input and is bound to the
+// authenticated restore plan. Repository-descriptor/artifact validation is a
+// separate parent-side requirement because those authority objects are never
+// sent to the child.
+absl::Status ValidateDPMAgentDeltaExecutionBinding(
+    const DPMAgentExecutionRequest& logical_request,
+    const FreshWorkerExecutionPlan& execution_plan,
+    const DPMAgentDeltaExecutionRequest& delta_request);
 
 // Canonical catalog/worker output. Visible text and exact executor token IDs
 // remain distinct so stop/EOS and byte-fallback tokens cannot be reconstructed
