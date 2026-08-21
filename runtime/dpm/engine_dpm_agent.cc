@@ -181,6 +181,16 @@ bool IsValidUtf8(const std::string& text) {
   return true;
 }
 
+bool HasSameStateWitnessAdmissionAuthority(
+    const AuthenticatedCapsuleRestoreStateWitnessAdmission& lhs,
+    const AuthenticatedCapsuleRestoreStateWitnessAdmission& rhs) {
+  return lhs.record.record_id == rhs.record.record_id &&
+         lhs.profile == rhs.profile && lhs.capability == rhs.capability &&
+         lhs.operational_coverage == rhs.operational_coverage &&
+         lhs.record.operational_coverage == lhs.operational_coverage &&
+         rhs.record.operational_coverage == rhs.operational_coverage;
+}
+
 }  // namespace
 
 absl::StatusOr<std::unique_ptr<EngineDPMAgentRuntime>>
@@ -188,7 +198,7 @@ EngineDPMAgentRuntime::Create(
     Engine* engine, SessionConfig session_config,
     std::optional<SessionHandoffIdentity> expected_identity) {
   return CreateInternal(engine, std::move(session_config), std::nullopt,
-                        expected_identity);
+                        std::nullopt, expected_identity);
 }
 
 absl::StatusOr<std::unique_ptr<EngineDPMAgentRuntime>>
@@ -200,6 +210,19 @@ EngineDPMAgentRuntime::Create(
       engine, std::move(session_config),
       std::optional<CapsuleRestoreAdmissionBinding>(
           std::move(capsule_restore_admission)),
+      std::nullopt, expected_identity);
+}
+
+absl::StatusOr<std::unique_ptr<EngineDPMAgentRuntime>>
+EngineDPMAgentRuntime::Create(
+    Engine* engine, SessionConfig session_config,
+    CapsuleRestoreStateWitnessAdmissionBinding
+        capsule_restore_state_witness_admission,
+    std::optional<SessionHandoffIdentity> expected_identity) {
+  return CreateInternal(
+      engine, std::move(session_config), std::nullopt,
+      std::optional<CapsuleRestoreStateWitnessAdmissionBinding>(
+          std::move(capsule_restore_state_witness_admission)),
       expected_identity);
 }
 
@@ -208,10 +231,18 @@ EngineDPMAgentRuntime::CreateInternal(
     Engine* engine, SessionConfig session_config,
     std::optional<CapsuleRestoreAdmissionBinding>
         capsule_restore_admission,
+    std::optional<CapsuleRestoreStateWitnessAdmissionBinding>
+        capsule_restore_state_witness_admission,
     std::optional<SessionHandoffIdentity> expected_identity) {
   if (engine == nullptr) {
     return absl::InvalidArgumentError(
         "DPM agent runtime requires a loaded Engine.");
+  }
+  if (capsule_restore_admission.has_value() &&
+      capsule_restore_state_witness_admission.has_value()) {
+    return absl::InvalidArgumentError(
+        "DPM agent runtime cannot combine Coverage V1 and Coverage V2 "
+        "CapsuleRestore admission bindings.");
   }
   ABSL_RETURN_IF_ERROR(
       ValidateDPMEngineSettings(engine->GetEngineSettings()));
@@ -319,6 +350,31 @@ EngineDPMAgentRuntime::CreateInternal(
         std::move(admission.operational_coverage);
   }
 
+  std::optional<AuthenticatedCapsuleRestoreStateWitnessAdmission>
+      initial_capsule_restore_state_witness_admission;
+  if (capsule_restore_state_witness_admission.has_value()) {
+    ABSL_ASSIGN_OR_RETURN(
+        AuthenticatedCapsuleRestoreStateWitnessAdmission admission,
+        ResolveAuthenticatedCapsuleRestoreStateWitnessAdmission(
+            engine, session_config,
+            *capsule_restore_state_witness_admission));
+    if (admission.profile.session_identity != authoritative_identity ||
+        admission.capability.session_identity != authoritative_identity ||
+        admission.operational_coverage.runtime_derived_session_identity !=
+            authoritative_identity ||
+        admission.operational_coverage.runtime_derived_profile !=
+            admission.profile ||
+        admission.operational_coverage.runtime_derived_capability !=
+            admission.capability ||
+        admission.record.operational_coverage !=
+            admission.operational_coverage) {
+      return absl::FailedPreconditionError(
+          "CapsuleRestore Coverage V2 admission does not match the live "
+          "parent runtime's Engine-derived authority.");
+    }
+    initial_capsule_restore_state_witness_admission = std::move(admission);
+  }
+
   auto runtime = std::unique_ptr<EngineDPMAgentRuntime>(
       new EngineDPMAgentRuntime(
           engine, std::move(session_config), authoritative_identity,
@@ -326,9 +382,12 @@ EngineDPMAgentRuntime::CreateInternal(
           std::move(capsule_restore_profile),
           capsule_restore_admission_record_id,
           std::move(session_handoff_capability),
-          std::move(capsule_restore_operational_coverage)));
+          std::move(capsule_restore_operational_coverage),
+          std::move(capsule_restore_state_witness_admission),
+          std::move(initial_capsule_restore_state_witness_admission)));
   ABSL_RETURN_IF_ERROR(runtime->ValidateRuntimeSupport());
-  if (runtime->capsule_restore_admission_.has_value()) {
+  if (runtime->capsule_restore_admission_.has_value() ||
+      runtime->capsule_restore_state_witness_admission_.has_value()) {
     ABSL_RETURN_IF_ERROR(runtime->ValidateSessionHandoffSupport());
   }
   return runtime;
@@ -349,19 +408,37 @@ absl::Status EngineDPMAgentRuntime::ValidateRuntimeSupport() const {
     return absl::FailedPreconditionError(
         "Loaded Engine identity changed after DPM agent admission.");
   }
-  const bool has_binding = capsule_restore_admission_.has_value();
-  if (has_binding != capsule_restore_profile_.has_value() ||
-      has_binding != capsule_restore_admission_record_id_.has_value() ||
-      has_binding != session_handoff_capability_.has_value() ||
-      has_binding != capsule_restore_operational_coverage_.has_value()) {
+  const bool has_v1_binding = capsule_restore_admission_.has_value();
+  const bool has_v2_binding =
+      capsule_restore_state_witness_admission_.has_value();
+  const bool has_v2_initial_authority =
+      initial_capsule_restore_state_witness_admission_.has_value();
+  if (has_v1_binding != capsule_restore_profile_.has_value() ||
+      has_v1_binding !=
+          capsule_restore_admission_record_id_.has_value() ||
+      has_v1_binding != session_handoff_capability_.has_value() ||
+      has_v1_binding !=
+          capsule_restore_operational_coverage_.has_value() ||
+      has_v2_binding != has_v2_initial_authority) {
     return absl::InternalError(
         "DPM agent CapsuleRestore admission binding is internally "
         "inconsistent.");
   }
-  if (has_binding) {
+  if (has_v1_binding && has_v2_binding) {
+    return absl::InternalError(
+        "DPM agent runtime contains mutually exclusive Coverage V1 and V2 "
+        "authorities.");
+  }
+  if (has_v1_binding) {
     ABSL_ASSIGN_OR_RETURN(
         const AuthenticatedCapsuleRestoreAdmission current,
         ResolveCurrentCapsuleRestoreAdmission());
+    (void)current;
+  }
+  if (has_v2_binding) {
+    ABSL_ASSIGN_OR_RETURN(
+        const AuthenticatedCapsuleRestoreStateWitnessAdmission current,
+        ResolveCurrentCapsuleRestoreStateWitnessAdmission());
     (void)current;
   }
   return absl::OkStatus();
@@ -374,25 +451,47 @@ absl::Status EngineDPMAgentRuntime::ValidateSupport() const {
 absl::Status EngineDPMAgentRuntime::ValidateSessionHandoffSupport() const {
   ABSL_RETURN_IF_ERROR(ValidateRuntimeSupport());
 
+  const bool has_v1_binding = capsule_restore_admission_.has_value();
+  const bool has_v2_binding =
+      capsule_restore_state_witness_admission_.has_value();
+  if (!has_v1_binding && !has_v2_binding) {
+    return absl::FailedPreconditionError(
+        "DPM agent runtime was constructed without CapsuleRestore "
+        "admission.");
+  }
+
   // CapsuleRestore is a separate capability from generation and
   // CanonicalWinnerReplay. Exercise the authenticated fresh-state
   // export/import surface only when the product configuration enables
   // checkpoint restore or capture. This probe does not establish
-  // own-position continuation equality; CapsuleRestore admission remains
-  // responsible for that stronger claim.
+  // own-position continuation equality. V1 retains its scoped admission;
+  // Coverage V2 additionally requires authenticated capture and restore
+  // evidence at the later operation gate.
   ABSL_RETURN_IF_ERROR(ProbeSessionHandoffSupport());
-  ABSL_ASSIGN_OR_RETURN(
-      const AuthenticatedCapsuleRestoreAdmission after,
-      ResolveCurrentCapsuleRestoreAdmission());
-  if (after.record.record_id !=
-          *capsule_restore_admission_record_id_ ||
-      after.profile != *capsule_restore_profile_ ||
-      after.capability != *session_handoff_capability_ ||
-      after.operational_coverage !=
-          *capsule_restore_operational_coverage_) {
-    return absl::AbortedError(
-        "CapsuleRestore admission changed during live-runtime support "
-        "validation.");
+  if (has_v1_binding) {
+    ABSL_ASSIGN_OR_RETURN(
+        const AuthenticatedCapsuleRestoreAdmission after,
+        ResolveCurrentCapsuleRestoreAdmission());
+    if (after.record.record_id !=
+            *capsule_restore_admission_record_id_ ||
+        after.profile != *capsule_restore_profile_ ||
+        after.capability != *session_handoff_capability_ ||
+        after.operational_coverage !=
+            *capsule_restore_operational_coverage_) {
+      return absl::AbortedError(
+          "CapsuleRestore admission changed during live-runtime support "
+          "validation.");
+    }
+  } else {
+    ABSL_ASSIGN_OR_RETURN(
+        const AuthenticatedCapsuleRestoreStateWitnessAdmission after,
+        ResolveCurrentCapsuleRestoreStateWitnessAdmission());
+    if (!HasSameStateWitnessAdmissionAuthority(
+            after, *initial_capsule_restore_state_witness_admission_)) {
+      return absl::AbortedError(
+          "CapsuleRestore Coverage V2 authority changed during live-runtime "
+          "support validation.");
+    }
   }
   return absl::OkStatus();
 }
@@ -403,7 +502,9 @@ EngineDPMAgentRuntime::ResolveCurrentCapsuleRestoreAdmission() const {
   if (has_binding != capsule_restore_profile_.has_value() ||
       has_binding != capsule_restore_admission_record_id_.has_value() ||
       has_binding != session_handoff_capability_.has_value() ||
-      has_binding != capsule_restore_operational_coverage_.has_value()) {
+      has_binding != capsule_restore_operational_coverage_.has_value() ||
+      capsule_restore_state_witness_admission_.has_value() ||
+      initial_capsule_restore_state_witness_admission_.has_value()) {
     return absl::InternalError(
         "DPM agent CapsuleRestore authority is internally inconsistent.");
   }
@@ -427,6 +528,48 @@ EngineDPMAgentRuntime::ResolveCurrentCapsuleRestoreAdmission() const {
     return absl::AbortedError(
         "Authenticated CapsuleRestore admission, profile, or capability "
         "changed after live-runtime construction.");
+  }
+  return current;
+}
+
+absl::StatusOr<AuthenticatedCapsuleRestoreStateWitnessAdmission>
+EngineDPMAgentRuntime::ResolveCurrentCapsuleRestoreStateWitnessAdmission()
+    const {
+  const bool has_binding =
+      capsule_restore_state_witness_admission_.has_value();
+  const bool has_initial_authority =
+      initial_capsule_restore_state_witness_admission_.has_value();
+  const bool has_any_v1_authority =
+      capsule_restore_admission_.has_value() ||
+      capsule_restore_profile_.has_value() ||
+      capsule_restore_admission_record_id_.has_value() ||
+      session_handoff_capability_.has_value() ||
+      capsule_restore_operational_coverage_.has_value();
+  if (has_binding != has_initial_authority || has_any_v1_authority) {
+    return absl::InternalError(
+        "DPM agent CapsuleRestore Coverage V2 authority is internally "
+        "inconsistent.");
+  }
+  if (!has_binding) {
+    return absl::FailedPreconditionError(
+        "DPM agent runtime was constructed without CapsuleRestore Coverage V2 "
+        "admission.");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      AuthenticatedCapsuleRestoreStateWitnessAdmission current,
+      ResolveAuthenticatedCapsuleRestoreStateWitnessAdmission(
+          engine_, resolved_session_config_,
+          *capsule_restore_state_witness_admission_));
+  const AuthenticatedCapsuleRestoreStateWitnessAdmission& initial =
+      *initial_capsule_restore_state_witness_admission_;
+  if (!HasSameStateWitnessAdmissionAuthority(current, initial) ||
+      current.profile.session_identity != session_handoff_identity_ ||
+      current.capability.session_identity != session_handoff_identity_ ||
+      current.operational_coverage.runtime_derived_session_identity !=
+          session_handoff_identity_) {
+    return absl::AbortedError(
+        "Authenticated CapsuleRestore Coverage V2 authority changed after "
+        "live-runtime construction.");
   }
   return current;
 }
@@ -480,6 +623,22 @@ EngineDPMAgentRuntime::GetCapsuleRestoreOperationalCoverage() const {
       current.operational_coverage));
   return std::optional<CapsuleRestoreOperationalCoverage>(
       current.operational_coverage);
+}
+
+absl::StatusOr<std::optional<
+    AuthenticatedCapsuleRestoreStateWitnessAdmission>>
+EngineDPMAgentRuntime::GetAuthenticatedCapsuleRestoreStateWitnessAdmission()
+    const {
+  ABSL_RETURN_IF_ERROR(ValidateRuntimeSupport());
+  if (!capsule_restore_state_witness_admission_.has_value()) {
+    return std::optional<
+        AuthenticatedCapsuleRestoreStateWitnessAdmission>();
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      AuthenticatedCapsuleRestoreStateWitnessAdmission current,
+      ResolveCurrentCapsuleRestoreStateWitnessAdmission());
+  return std::optional<AuthenticatedCapsuleRestoreStateWitnessAdmission>(
+      std::move(current));
 }
 
 absl::Status EngineDPMAgentRuntime::ValidateSession(
@@ -559,6 +718,11 @@ EngineDPMAgentRuntime::CreateSession() {
         const AuthenticatedCapsuleRestoreAdmission current,
         ResolveCurrentCapsuleRestoreAdmission());
     (void)current;
+  } else if (capsule_restore_state_witness_admission_.has_value()) {
+    ABSL_ASSIGN_OR_RETURN(
+        const AuthenticatedCapsuleRestoreStateWitnessAdmission current,
+        ResolveCurrentCapsuleRestoreStateWitnessAdmission());
+    (void)current;
   }
   return session;
 }
@@ -590,8 +754,22 @@ absl::StatusOr<DPMAgentGenerationOutcome> EngineDPMAgentRuntime::Generate(
         "witness.");
   }
 
+  std::optional<AuthenticatedCapsuleRestoreStateWitnessAdmission>
+      state_witness_operation_authority;
+  if (capsule_restore_state_witness_admission_.has_value()) {
+    ABSL_ASSIGN_OR_RETURN(
+        state_witness_operation_authority,
+        ResolveCurrentCapsuleRestoreStateWitnessAdmission());
+  }
+
   std::optional<AuthenticatedCapsuleRestoreAdmission> restore_admission;
   if (request.restore_checkpoint_id.has_value()) {
+    if (state_witness_operation_authority.has_value()) {
+      return absl::FailedPreconditionError(
+          "CapsuleRestore Coverage V2 cannot authorize restore-shaped "
+          "generation without the operation's authenticated source-capture "
+          "and restore evidence.");
+    }
     if (!capsule_restore_admission_.has_value()) {
       return absl::FailedPreconditionError(
           "DPM agent restore-shaped generation requires an authenticated "
@@ -712,6 +890,17 @@ absl::StatusOr<DPMAgentGenerationOutcome> EngineDPMAgentRuntime::Generate(
             restore_admission->operational_coverage) {
       return absl::AbortedError(
           "CapsuleRestore admission changed during restored DPM generation.");
+    }
+  }
+  if (state_witness_operation_authority.has_value()) {
+    ABSL_ASSIGN_OR_RETURN(
+        const AuthenticatedCapsuleRestoreStateWitnessAdmission current,
+        ResolveCurrentCapsuleRestoreStateWitnessAdmission());
+    if (!HasSameStateWitnessAdmissionAuthority(
+            current, *state_witness_operation_authority)) {
+      return absl::AbortedError(
+          "CapsuleRestore Coverage V2 authority changed during DPM "
+          "generation.");
     }
   }
 

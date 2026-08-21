@@ -46,6 +46,14 @@ class EngineDPMAgentRuntime final : public DPMAgentRuntime {
       Engine* engine, SessionConfig session_config,
       CapsuleRestoreAdmissionBinding capsule_restore_admission,
       std::optional<SessionHandoffIdentity> expected_identity = std::nullopt);
+  // Enables Coverage V2 through one complete state-witness admission. This
+  // overload is mutually exclusive with the V1 binding above; both preserve
+  // the loaded Engine as the sole source of runtime identity and capability.
+  static absl::StatusOr<std::unique_ptr<EngineDPMAgentRuntime>> Create(
+      Engine* engine, SessionConfig session_config,
+      CapsuleRestoreStateWitnessAdmissionBinding
+          capsule_restore_state_witness_admission,
+      std::optional<SessionHandoffIdentity> expected_identity = std::nullopt);
 
   const SessionHandoffIdentity& GetSessionHandoffIdentity() const override {
     return session_handoff_identity_;
@@ -61,6 +69,9 @@ class EngineDPMAgentRuntime final : public DPMAgentRuntime {
   GetSessionHandoffCapability() const override;
   absl::StatusOr<std::optional<CapsuleRestoreOperationalCoverage>>
   GetCapsuleRestoreOperationalCoverage() const override;
+  absl::StatusOr<std::optional<
+      AuthenticatedCapsuleRestoreStateWitnessAdmission>>
+  GetAuthenticatedCapsuleRestoreStateWitnessAdmission() const override;
 
   absl::StatusOr<std::unique_ptr<Engine::Session>> CreateSession() override;
 
@@ -73,6 +84,8 @@ class EngineDPMAgentRuntime final : public DPMAgentRuntime {
       Engine* engine, SessionConfig session_config,
       std::optional<CapsuleRestoreAdmissionBinding>
           capsule_restore_admission,
+      std::optional<CapsuleRestoreStateWitnessAdmissionBinding>
+          capsule_restore_state_witness_admission,
       std::optional<SessionHandoffIdentity> expected_identity);
 
   EngineDPMAgentRuntime(
@@ -84,7 +97,11 @@ class EngineDPMAgentRuntime final : public DPMAgentRuntime {
       std::optional<Hash256> capsule_restore_admission_record_id,
       std::optional<SessionHandoffCapability> session_handoff_capability,
       std::optional<CapsuleRestoreOperationalCoverage>
-          capsule_restore_operational_coverage)
+          capsule_restore_operational_coverage,
+      std::optional<CapsuleRestoreStateWitnessAdmissionBinding>
+          capsule_restore_state_witness_admission,
+      std::optional<AuthenticatedCapsuleRestoreStateWitnessAdmission>
+          initial_capsule_restore_state_witness_admission)
       : engine_(engine),
         resolved_session_config_(std::move(resolved_session_config)),
         session_handoff_identity_(session_handoff_identity),
@@ -95,7 +112,11 @@ class EngineDPMAgentRuntime final : public DPMAgentRuntime {
         session_handoff_capability_(
             std::move(session_handoff_capability)),
         capsule_restore_operational_coverage_(
-            std::move(capsule_restore_operational_coverage)) {}
+            std::move(capsule_restore_operational_coverage)),
+        capsule_restore_state_witness_admission_(
+            std::move(capsule_restore_state_witness_admission)),
+        initial_capsule_restore_state_witness_admission_(
+            std::move(initial_capsule_restore_state_witness_admission)) {}
 
   absl::Status ValidateSession(const Engine::Session& session) const;
   // Generation/profile support is deliberately separate from capsule
@@ -105,6 +126,8 @@ class EngineDPMAgentRuntime final : public DPMAgentRuntime {
   absl::Status ProbeSessionHandoffSupport() const;
   absl::StatusOr<AuthenticatedCapsuleRestoreAdmission>
   ResolveCurrentCapsuleRestoreAdmission() const;
+  absl::StatusOr<AuthenticatedCapsuleRestoreStateWitnessAdmission>
+  ResolveCurrentCapsuleRestoreStateWitnessAdmission() const;
 
   Engine* const engine_;
   const SessionConfig resolved_session_config_;
@@ -117,6 +140,10 @@ class EngineDPMAgentRuntime final : public DPMAgentRuntime {
       session_handoff_capability_;
   const std::optional<CapsuleRestoreOperationalCoverage>
       capsule_restore_operational_coverage_;
+  const std::optional<CapsuleRestoreStateWitnessAdmissionBinding>
+      capsule_restore_state_witness_admission_;
+  const std::optional<AuthenticatedCapsuleRestoreStateWitnessAdmission>
+      initial_capsule_restore_state_witness_admission_;
 };
 
 }  // namespace litert::lm

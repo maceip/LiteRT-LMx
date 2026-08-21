@@ -25,6 +25,7 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
+#include "runtime/dpm/capsule_restore_admission.h"
 #include "runtime/dpm/dpm_event_log.h"
 #include "runtime/dpm/dpm_capabilities.h"
 #include "runtime/dpm/dpm_prepared_prefill_plan.h"
@@ -158,9 +159,10 @@ class DPMAgentRuntime {
     return absl::UnimplementedError(
         "DPM agent runtime does not support exact session handoff.");
   }
-  // A mode-independent, currently reauthenticated CapsuleRestore authority.
-  // Generation-only runtimes return nullopt. These accessors are read-only and
-  // never accept caller-supplied identity labels.
+  // Coverage V1's mode-independent, currently reauthenticated CapsuleRestore
+  // authority. Generation-only and Coverage V2 runtimes return nullopt from
+  // these V1 accessors. They are read-only and never accept caller-supplied
+  // identity labels.
   virtual absl::StatusOr<std::optional<Hash256>>
   GetCapsuleRestoreAdmissionRecordId() const {
     return std::optional<Hash256>();
@@ -177,6 +179,16 @@ class DPMAgentRuntime {
       std::optional<CapsuleRestoreOperationalCoverage>>
   GetCapsuleRestoreOperationalCoverage() const {
     return std::optional<CapsuleRestoreOperationalCoverage>();
+  }
+  // Coverage V2 is intentionally exposed as one complete authenticated object,
+  // not detachable record/capability/coverage hashes. Implementations must
+  // freshly derive and reauthenticate it at each call. Generation-only and V1
+  // runtimes return nullopt.
+  virtual absl::StatusOr<std::optional<
+      AuthenticatedCapsuleRestoreStateWitnessAdmission>>
+  GetAuthenticatedCapsuleRestoreStateWitnessAdmission() const {
+    return std::optional<
+        AuthenticatedCapsuleRestoreStateWitnessAdmission>();
   }
   virtual absl::StatusOr<std::unique_ptr<Engine::Session>> CreateSession() = 0;
   virtual absl::StatusOr<DPMAgentGenerationOutcome> Generate(
