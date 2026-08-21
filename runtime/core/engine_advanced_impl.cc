@@ -108,6 +108,8 @@ class EngineAdvancedImpl : public Engine {
                          loaded_exact_litert_evidence,
                      absl::StatusOr<ExactLiteRtLogitsFrameContract>
                          loaded_exact_logits_frame_contract,
+                     absl::StatusOr<Hash256>
+                         loaded_complete_session_handoff_state_inventory_hash,
                      absl::StatusOr<LoadedRuntimeIdentity>
                          loaded_runtime_identity)
       : engine_settings_(std::move(engine_settings)),
@@ -123,6 +125,9 @@ class EngineAdvancedImpl : public Engine {
             std::move(loaded_exact_litert_evidence)),
         loaded_exact_logits_frame_contract_(
             std::move(loaded_exact_logits_frame_contract)),
+        loaded_complete_session_handoff_state_inventory_hash_(
+            std::move(
+                loaded_complete_session_handoff_state_inventory_hash)),
         loaded_runtime_identity_(std::move(loaded_runtime_identity)) {}
 
   // Method to create the Session.
@@ -450,6 +455,86 @@ class EngineAdvancedImpl : public Engine {
     return profile;
   }
 
+  absl::StatusOr<SessionHandoffCapability>
+  ResolveSessionHandoffCapability(
+      const SessionConfig& session_config,
+      const SessionHandoffCapabilityAssertion& assertion) const override {
+    SessionConfig resolved = session_config;
+    ABSL_RETURN_IF_ERROR(resolved.MaybeUpdateAndValidate(engine_settings_));
+
+    const Backend configured_backend =
+        engine_settings_.GetMainExecutorSettings().GetBackend();
+    if (configured_backend == Backend::NPU) {
+      return absl::UnimplementedError(
+          "Session handoff capability remains unimplemented for NPU until "
+          "the compiler plugin, device-native continuation state, sampler, "
+          "and all backend buffers are authoritatively inventoried.");
+    }
+    if (configured_backend != Backend::CPU &&
+        configured_backend != Backend::GPU) {
+      return absl::UnimplementedError(
+          "The loaded Engine backend has no session handoff capability.");
+    }
+    if (!loaded_complete_session_handoff_state_inventory_hash_.ok()) {
+      if (configured_backend == Backend::GPU) {
+        return absl::UnimplementedError(absl::StrCat(
+            "Session handoff capability is unavailable for Metal because "
+            "the loaded executor has no complete GPU/native continuation "
+            "state inventory: ",
+            loaded_complete_session_handoff_state_inventory_hash_.status()
+                .message()));
+      }
+      return loaded_complete_session_handoff_state_inventory_hash_.status();
+    }
+    if (*loaded_complete_session_handoff_state_inventory_hash_ == Hash256{}) {
+      return absl::FailedPreconditionError(
+          "The executor-derived complete session-state inventory hash is "
+          "zero.");
+    }
+
+    // Capability derivation depends on an exact profile, never the reverse.
+    // This keeps cold exact-profile identity available even for a runtime that
+    // cannot yet export a complete capsule.
+    ABSL_ASSIGN_OR_RETURN(
+        const ExactLiteRtProfile exact_profile,
+        ResolveExactLiteRtProfile(resolved, ExactLiteRtProfileAssertion{}));
+    ABSL_ASSIGN_OR_RETURN(const SessionHandoffIdentity session_identity,
+                          ResolveSessionHandoffIdentity(resolved));
+    if (exact_profile.session_identity != session_identity) {
+      return absl::FailedPreconditionError(
+          "Engine-derived exact profile and session handoff identity "
+          "disagree.");
+    }
+    if (configured_backend == Backend::CPU &&
+        exact_profile.backend != ExactLiteRtBackend::kCpu) {
+      return absl::FailedPreconditionError(
+          "Loaded CPU Engine derived a non-CPU exact profile.");
+    }
+    if (configured_backend == Backend::GPU &&
+        exact_profile.backend != ExactLiteRtBackend::kMetalGpu) {
+      return absl::FailedPreconditionError(
+          "Loaded GPU Engine did not derive a concrete Metal profile.");
+    }
+
+    SessionHandoffCapability capability{
+        .version = SessionHandoffCapability::kFormatVersion,
+        .session_identity = session_identity,
+        .exact_profile_id = exact_profile.profile_id,
+        .backend = exact_profile.backend,
+        .complete_state_inventory_hash =
+            *loaded_complete_session_handoff_state_inventory_hash_,
+        .capsule_codec_contract_hash =
+            GetSessionHandoffCapsuleCodecContractHash(),
+    };
+    ABSL_ASSIGN_OR_RETURN(
+        capability.capability_id,
+        ComputeSessionHandoffCapabilityId(capability));
+    ABSL_RETURN_IF_ERROR(ValidateSessionHandoffCapability(capability));
+    ABSL_RETURN_IF_ERROR(
+        ValidateSessionHandoffCapabilityAssertion(capability, assertion));
+    return capability;
+  }
+
   absl::StatusOr<AudioExecutorProperties> GetAudioExecutorProperties()
       const override {
     return GetAudioExecutorPropertiesFromModelResources(
@@ -503,6 +588,13 @@ class EngineAdvancedImpl : public Engine {
   // capsule eligibility and broader exact-profile admission.
   const absl::StatusOr<ExactLiteRtLogitsFrameContract>
       loaded_exact_logits_frame_contract_;
+
+  // Captured separately from loaded runtime/profile identity so failure to
+  // inventory a complete capsule cannot disable cold exact-profile
+  // derivation. In particular, Metal remains a profile-evidence problem and a
+  // capsule-inventory problem rather than silently inheriting CPU support.
+  const absl::StatusOr<Hash256>
+      loaded_complete_session_handoff_state_inventory_hash_;
 
   // Measured runtime/delegate evidence and canonical concrete executor
   // profile. Unsupported platforms/backends retain the failure status so
@@ -743,6 +835,13 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
         "tokenizer vocabulary.");
   }
 
+  // Capsule inventory is intentionally measured through a separate hook from
+  // exact-profile runtime evidence. A failure is retained for fail-closed
+  // capability discovery without disabling ordinary or cold exact inference.
+  absl::StatusOr<Hash256>
+      loaded_complete_session_handoff_state_inventory_hash =
+          executor->GetCompleteSessionHandoffStateInventoryHash();
+
   // Capture the ordered tokenizer contract and the exact embedded LiteRT
   // prefill/decode bytecode after all lazy model/tokenizer reads have
   // completed. Failure is retained as exact-profile capability evidence and
@@ -893,6 +992,7 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
       std::move(model_artifact_post_load_status),
       std::move(loaded_exact_litert_evidence),
       std::move(loaded_exact_logits_frame_contract),
+      std::move(loaded_complete_session_handoff_state_inventory_hash),
       std::move(loaded_runtime_identity));
 
   return llm_impl;

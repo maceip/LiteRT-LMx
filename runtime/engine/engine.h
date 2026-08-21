@@ -34,6 +34,7 @@
 #include "runtime/engine/exact_litert_profile.h"
 #include "runtime/engine/io_types.h"
 #include "runtime/engine/session_handoff.h"
+#include "runtime/engine/session_handoff_capability.h"
 #include "runtime/util/byte_stream.h"
 #include "support/tokenizer/tokenizer.h"
 
@@ -481,6 +482,20 @@ class EngineT {
     (void)assertion;
     return absl::UnimplementedError(
         "Engine-derived exact LiteRT profile is not available.");
+  }
+
+  // Derives the complete session-capsule capability from the loaded Engine,
+  // a fully-resolved SessionConfig, the exact profile for that configuration,
+  // and executor-owned state inventory evidence. Assertions can only reject
+  // the result; they cannot supply or upgrade capability evidence.
+  virtual absl::StatusOr<SessionHandoffCapability>
+  ResolveSessionHandoffCapability(
+      const SessionConfig& session_config,
+      const SessionHandoffCapabilityAssertion& assertion = {}) const {
+    (void)session_config;
+    (void)assertion;
+    return absl::UnimplementedError(
+        "Engine-derived session handoff capability is not available.");
   }
 
   // Get the audio model properties for the session. This is only available

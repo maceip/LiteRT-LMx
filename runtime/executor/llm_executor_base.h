@@ -245,6 +245,18 @@ class LlmExecutorBase {
                      ExecutorBackendName()));
   }
 
+  // Returns an executor-derived digest of the complete mutable and
+  // reconstructible continuation-state inventory. Implementations must first
+  // validate actual handoff support; a backend/configuration label is not
+  // evidence that its capsule is complete.
+  virtual absl::StatusOr<Hash256>
+  GetCompleteSessionHandoffStateInventoryHash() const {
+    return absl::UnimplementedError(absl::StrCat(
+        "Complete session handoff state inventory is not implemented for "
+        "backend: ",
+        ExecutorBackendName()));
+  }
+
   // Provides synchronous access to active backend-native state while the
   // caller owns the executor lock. Implementations must not silently replace
   // accelerator state with a host clone.

@@ -61,9 +61,6 @@ constexpr int kDynamicDimValue = -1;
 // This state format intentionally has a distinct magic from the older
 // LitertKVCache format because LitertState also carries generalized state
 // kinds and allocation policies.
-constexpr std::array<char, 8> kSnapshotMagic = {'L', 'R', 'T', 'S',
-                                                'T', '0', '0', '1'};
-constexpr uint32_t kSnapshotVersion = 1;
 constexpr size_t kSnapshotDigestSize = 32;
 
 using SnapshotDigest = Hash256;
@@ -650,6 +647,125 @@ absl::Status LitertState::ValidateSessionHandoffSupport() const {
   return ValidateStateInventory(/*allow_gpu_optimized=*/false);
 }
 
+absl::StatusOr<Hash256>
+LitertState::GetSessionHandoffStateInventoryHash() const {
+  RETURN_IF_ERROR(ValidateSessionHandoffSupport());
+
+  std::string inventory;
+  const auto append_frame = [&inventory](absl::string_view value) {
+    AppendU64(value.size(), inventory);
+    inventory.append(value.data(), value.size());
+  };
+  append_frame("LITERT_LM_LRTST001_COMPLETE_STATE_INVENTORY_V1");
+  append_frame(absl::string_view(kLiteRtStateSnapshotMagic.data(),
+                                 kLiteRtStateSnapshotMagic.size()));
+  AppendU32(kLiteRtStateSnapshotVersion, inventory);
+  AppendU32(static_cast<uint32_t>(allocation_policy_), inventory);
+  AppendI32(batch_size_, inventory);
+  AppendI32(num_entries_, inventory);
+  AppendU8(authoritative_state_inventory_ ? 1 : 0, inventory);
+  // LRTST001 serializes the logical active state into whichever bank is
+  // active in the fresh import target. Physical bank identity is not a
+  // continuation fact, but both possible physical schemas are.
+  append_frame("LOGICAL_ACTIVE_STATE_WITH_FRESH_TARGET_BANK_V1");
+
+  const uint32_t bank_count = bank_2_state_buffers_.has_value() ? 2 : 1;
+  AppendU32(bank_count, inventory);
+  const auto append_bank =
+      [this, &inventory](
+          uint32_t bank_index,
+          const absl::flat_hash_map<std::string, StateBuffer>& bank)
+      -> absl::Status {
+    if (bank.size() != bank_1_state_buffers_.size() ||
+        bank.size() > std::numeric_limits<uint32_t>::max()) {
+      return absl::FailedPreconditionError(
+          "LiteRT state inventory banks have different tensor counts.");
+    }
+    std::vector<std::string> names;
+    names.reserve(bank.size());
+    for (const auto& [name, _] : bank) names.push_back(name);
+    std::sort(names.begin(), names.end());
+
+    AppendU32(bank_index, inventory);
+    AppendU32(static_cast<uint32_t>(names.size()), inventory);
+    for (const std::string& name : names) {
+      const auto physical = bank.find(name);
+      const auto canonical = bank_1_state_buffers_.find(name);
+      if (physical == bank.end() || canonical == bank_1_state_buffers_.end()) {
+        return absl::FailedPreconditionError(
+            "LiteRT state inventory banks have different tensor names.");
+      }
+      if (name.empty() ||
+          name.size() > std::numeric_limits<uint32_t>::max()) {
+        return absl::FailedPreconditionError(
+            "LiteRT state inventory contains an invalid tensor name.");
+      }
+      const StateBuffer& buffer = physical->second;
+      if (buffer.type != canonical->second.type) {
+        return absl::FailedPreconditionError(
+            "LiteRT state inventory banks disagree about tensor type.");
+      }
+      LITERT_ASSIGN_OR_RETURN(const TensorBufferType buffer_type,
+                              buffer.buffer.BufferType());
+      LITERT_ASSIGN_OR_RETURN(const RankedTensorType tensor_type,
+                              buffer.buffer.TensorType());
+      LITERT_ASSIGN_OR_RETURN(const size_t packed_size,
+                              buffer.buffer.PackedSize());
+      LITERT_ASSIGN_OR_RETURN(const size_t size, buffer.buffer.Size());
+      LITERT_ASSIGN_OR_RETURN(const size_t offset, buffer.buffer.Offset());
+      RETURN_IF_ERROR(
+          ValidateBufferByteRange(packed_size, size, offset, name));
+      const Layout& layout = tensor_type.Layout();
+      if (layout.Rank() > std::numeric_limits<uint32_t>::max()) {
+        return absl::ResourceExhaustedError(
+            "LiteRT state inventory tensor rank exceeds uint32.");
+      }
+
+      AppendU32(static_cast<uint32_t>(name.size()), inventory);
+      inventory.append(name);
+      AppendI32(static_cast<int32_t>(buffer.type), inventory);
+      // LRTST001 uses the primary bank's dynamic dimension as the logical
+      // snapshot contract. A ping-pong output bank may intentionally carry no
+      // resize marker of its own, so bind both facts instead of conflating
+      // them or silently discarding the physical-bank metadata.
+      AppendI32(
+          canonical->second.dynamic_dim.value_or(kDynamicDimValue),
+          inventory);
+      AppendI32(buffer.dynamic_dim.value_or(kDynamicDimValue), inventory);
+      AppendU32(static_cast<uint32_t>(buffer_type), inventory);
+      AppendU32(static_cast<uint32_t>(tensor_type.ElementType()), inventory);
+      AppendU32(layout.Rank(), inventory);
+      for (int dimension : layout.Dimensions()) {
+        AppendI32(dimension, inventory);
+      }
+      AppendU8(layout.HasStrides() ? 1 : 0, inventory);
+      if (layout.HasStrides()) {
+        for (uint32_t stride : layout.Strides()) {
+          AppendU32(stride, inventory);
+        }
+      }
+      AppendU64(packed_size, inventory);
+      AppendU64(size, inventory);
+      AppendU64(offset, inventory);
+      AppendU8(buffer.buffer.IsMetalMemory() ? 1 : 0, inventory);
+    }
+    return absl::OkStatus();
+  };
+
+  RETURN_IF_ERROR(append_bank(/*bank_index=*/0, bank_1_state_buffers_));
+  if (bank_2_state_buffers_.has_value()) {
+    RETURN_IF_ERROR(append_bank(/*bank_index=*/1, *bank_2_state_buffers_));
+  }
+
+  Sha256Hasher hasher;
+  const Hash256 inventory_hash = hasher.OneShot(inventory);
+  if (inventory_hash == Hash256{}) {
+    return absl::InternalError(
+        "LiteRT state inventory produced a zero digest.");
+  }
+  return inventory_hash;
+}
+
 absl::Status LitertState::ValidateDeterministicProjectionResetSupport() const {
   return ValidateStateInventory(/*allow_gpu_optimized=*/true);
 }
@@ -826,7 +942,8 @@ absl::StatusOr<uint64_t> LitertState::SerializedSize() const {
         "LiteRT state has an invalid active tensor bank");
   }
 
-  uint64_t total = kSnapshotMagic.size() + 5 * sizeof(uint32_t);
+  uint64_t total =
+      kLiteRtStateSnapshotMagic.size() + 5 * sizeof(uint32_t);
   auto add = [&total](uint64_t bytes) -> absl::Status {
     if (bytes > std::numeric_limits<uint64_t>::max() - total) {
       return absl::ResourceExhaustedError(
@@ -988,8 +1105,9 @@ absl::Status LitertState::SerializeTo(ByteSink* sink) const {
   }
 
   DigestingByteSink writer(sink);
-  std::string header(kSnapshotMagic.data(), kSnapshotMagic.size());
-  AppendU32(kSnapshotVersion, header);
+  std::string header(kLiteRtStateSnapshotMagic.data(),
+                     kLiteRtStateSnapshotMagic.size());
+  AppendU32(kLiteRtStateSnapshotVersion, header);
   AppendU32(static_cast<uint32_t>(allocation_policy_), header);
   AppendU32(static_cast<uint32_t>(batch_size_), header);
   AppendU32(static_cast<uint32_t>(num_entries_), header);
@@ -1078,19 +1196,20 @@ absl::Status LitertState::ValidateSnapshotHeaderForImport(
         "Required LiteRT state entry count must not be negative.");
   }
   constexpr uint64_t kSnapshotHeaderSize =
-      kSnapshotMagic.size() + 5 * sizeof(uint32_t);
+      kLiteRtStateSnapshotMagic.size() + 5 * sizeof(uint32_t);
   if (source.Size() < kSnapshotHeaderSize + kSnapshotDigestSize) {
     return absl::DataLossError("Truncated LiteRT state snapshot");
   }
 
   SourceSnapshotReader reader(source, source.Size() - kSnapshotDigestSize);
-  std::array<char, kSnapshotMagic.size()> magic;
+  std::array<char, kLiteRtStateSnapshotMagic.size()> magic;
   RETURN_IF_ERROR(reader.ReadBytes(absl::MakeSpan(magic)));
-  if (!std::equal(magic.begin(), magic.end(), kSnapshotMagic.begin())) {
+  if (!std::equal(magic.begin(), magic.end(),
+                  kLiteRtStateSnapshotMagic.begin())) {
     return absl::DataLossError("Invalid LiteRT state snapshot magic");
   }
   ABSL_ASSIGN_OR_RETURN(const uint32_t version, reader.ReadU32());
-  if (version != kSnapshotVersion) {
+  if (version != kLiteRtStateSnapshotVersion) {
     return IncompatibleSnapshot("format version");
   }
   ABSL_ASSIGN_OR_RETURN(const uint32_t allocation_policy, reader.ReadU32());
@@ -1225,13 +1344,14 @@ absl::Status LitertState::LoadFrom(const ByteSource& source,
   SortSnapshotBuffers(expected_buffers);
 
   SourceSnapshotReader reader(source, encoded_size);
-  std::array<char, kSnapshotMagic.size()> magic;
+  std::array<char, kLiteRtStateSnapshotMagic.size()> magic;
   RETURN_IF_ERROR(reader.ReadBytes(absl::MakeSpan(magic)));
-  if (!std::equal(magic.begin(), magic.end(), kSnapshotMagic.begin())) {
+  if (!std::equal(magic.begin(), magic.end(),
+                  kLiteRtStateSnapshotMagic.begin())) {
     return absl::DataLossError("Invalid LiteRT state snapshot magic");
   }
   ABSL_ASSIGN_OR_RETURN(uint32_t version, reader.ReadU32());
-  if (version != kSnapshotVersion) {
+  if (version != kLiteRtStateSnapshotVersion) {
     return IncompatibleSnapshot("format version");
   }
   ABSL_ASSIGN_OR_RETURN(uint32_t allocation_policy, reader.ReadU32());

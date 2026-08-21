@@ -78,6 +78,7 @@
 #include "runtime/executor/llm_litert_compiled_model_cache_utils.h"
 #include "runtime/executor/llm_litert_mtp_drafter.h"
 #include "runtime/executor/state_interface.h"
+#include "runtime/platform/hash/sha256_hasher.h"
 #include "runtime/util/convert_tensor_buffer.h"
 #include "runtime/util/log_tensor_buffer.h"
 #include "runtime/util/lora_util.h"
@@ -2558,8 +2559,8 @@ LlmLiteRtCompiledModelExecutorBase::ResetForDeterministicProjection() {
   return absl::OkStatus();
 }
 
-absl::Status
-LlmLiteRtCompiledModelExecutorBase::ValidateSessionHandoffSupport() const {
+absl::Status LlmLiteRtCompiledModelExecutorBase::
+    ValidateStaticSessionHandoffInventorySupport() const {
   if (compiled_model_ == nullptr) {
     return absl::FailedPreconditionError(
         "Session handoff has no loaded compiled LiteRT model.");
@@ -2582,14 +2583,6 @@ LlmLiteRtCompiledModelExecutorBase::ValidateSessionHandoffSupport() const {
     return absl::FailedPreconditionError(
         "Mutable executor settings no longer match the compiled backend.");
   }
-  if (llm_context_ == nullptr) {
-    return absl::FailedPreconditionError(
-        "LiteRT session handoff has no active context.");
-  }
-  if (llm_context_->processed_context().lora_id().has_value()) {
-    return absl::UnimplementedError(
-        "Session handoff does not support LoRA state.");
-  }
   if (mtp_drafter_ != nullptr) {
     return absl::UnimplementedError(
         "Session handoff does not support speculative/MTP decoder state.");
@@ -2597,6 +2590,12 @@ LlmLiteRtCompiledModelExecutorBase::ValidateSessionHandoffSupport() const {
   if (HasGraphRunCallbacks()) {
     return absl::UnimplementedError(
         "Session handoff does not support graph callback state.");
+  }
+  if (settings.GetAdvancedSettings().has_value() &&
+      settings.GetAdvancedSettings()->enable_speculative_decoding) {
+    return absl::UnimplementedError(
+        "Session handoff does not support speculative decode even when no "
+        "optional drafter artifact was loaded.");
   }
   ABSL_RETURN_IF_ERROR(ValidateLoadedModelStatefulness(model_));
 
@@ -2618,6 +2617,58 @@ LlmLiteRtCompiledModelExecutorBase::ValidateSessionHandoffSupport() const {
     ABSL_RETURN_IF_ERROR(decode_state->ValidateSessionHandoffSupport());
     ABSL_RETURN_IF_ERROR(ValidateAuthoritativeStateMetadata(
         executor_metadata_, *decode_state, "LiteRT decode state"));
+  }
+
+  ABSL_ASSIGN_OR_RETURN(const Backend configured_sampler_backend,
+                        GetSamplerBackend(settings));
+  if (configured_sampler_backend != Backend::CPU) {
+    return absl::UnimplementedError(
+        "Session handoff requires an executor configured for CPU sampling.");
+  }
+  const auto is_reconstructible_decode_input =
+      [this](absl::string_view name) {
+        return name == signatures_.input_tokens ||
+               name == signatures_.input_positions ||
+               (signatures_.input_attn_mask.has_value() &&
+                name == *signatures_.input_attn_mask) ||
+               (signatures_.input_attn_mask_local.has_value() &&
+                name == *signatures_.input_attn_mask_local) ||
+               (signatures_.input_embeddings.has_value() &&
+                name == *signatures_.input_embeddings) ||
+               (signatures_.input_per_layer_embeddings.has_value() &&
+                name == *signatures_.input_per_layer_embeddings) ||
+               (signatures_.input_int32_param.has_value() &&
+                name == *signatures_.input_int32_param);
+      };
+  for (const auto& [name, _] : decode_input_buffers_) {
+    if (!is_reconstructible_decode_input(name)) {
+      return absl::UnimplementedError(absl::StrCat(
+          "Session handoff cannot reconstruct decode input buffer: ", name));
+    }
+  }
+  return absl::OkStatus();
+}
+
+absl::Status
+LlmLiteRtCompiledModelExecutorBase::ValidateSessionHandoffSupport() const {
+  ABSL_RETURN_IF_ERROR(ValidateStaticSessionHandoffInventorySupport());
+  LlmExecutorSettings settings = [this]() {
+    absl::MutexLock lock(executor_settings_mutex_);
+    return executor_settings_;
+  }();
+  if (llm_context_ == nullptr) {
+    return absl::FailedPreconditionError(
+        "LiteRT session handoff has no active context.");
+  }
+  if (llm_context_->processed_context().lora_id().has_value()) {
+    return absl::UnimplementedError(
+        "Session handoff does not support LoRA state.");
+  }
+
+  const auto* state = dynamic_cast<const LitertState*>(state_.get());
+  if (state == nullptr) {
+    return absl::UnimplementedError(
+        "Session handoff requires an inventoried LitertState allocation.");
   }
 
   const RuntimeState& runtime_state = llm_context_->runtime_state();
@@ -2683,27 +2734,86 @@ LlmLiteRtCompiledModelExecutorBase::ValidateSessionHandoffSupport() const {
     return absl::UnimplementedError(
         "Session handoff does not preserve sampler-managed decode inputs.");
   }
-  const auto is_derived_decode_input = [this](absl::string_view name) {
-    return name == signatures_.input_tokens ||
-           name == signatures_.input_positions ||
-           (signatures_.input_attn_mask.has_value() &&
-            name == *signatures_.input_attn_mask) ||
-           (signatures_.input_attn_mask_local.has_value() &&
-            name == *signatures_.input_attn_mask_local) ||
-           (signatures_.input_embeddings.has_value() &&
-            name == *signatures_.input_embeddings) ||
-           (signatures_.input_per_layer_embeddings.has_value() &&
-            name == *signatures_.input_per_layer_embeddings) ||
-           (signatures_.input_int32_param.has_value() &&
-            name == *signatures_.input_int32_param);
-  };
-  for (const auto& [name, _] : decode_input_buffers_) {
-    if (!is_derived_decode_input(name)) {
-      return absl::UnimplementedError(absl::StrCat(
-          "Session handoff cannot reconstruct decode input buffer: ", name));
-    }
-  }
   return absl::OkStatus();
+}
+
+absl::StatusOr<Hash256> LlmLiteRtCompiledModelExecutorBase::
+    GetCompleteSessionHandoffStateInventoryHash() const {
+  ABSL_RETURN_IF_ERROR(ValidateStaticSessionHandoffInventorySupport());
+  if (compiled_backend_ != Backend::CPU) {
+    return absl::UnimplementedError(
+        "Complete session handoff inventory is not implemented for "
+        "backend-native GPU or NPU state.");
+  }
+
+  const auto* state = dynamic_cast<const LitertState*>(state_.get());
+  if (state == nullptr) {
+    return absl::UnimplementedError(
+        "Complete session handoff inventory requires LitertState.");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 primary_state_inventory_hash,
+      state->GetSessionHandoffStateInventoryHash());
+  const auto* decode_state =
+      dynamic_cast<const LitertState*>(decode_state_.get());
+  if (decode_state_ != nullptr && decode_state == nullptr) {
+    return absl::UnimplementedError(
+        "Complete session handoff inventory cannot classify decode state.");
+  }
+  std::optional<Hash256> decode_state_inventory_hash;
+  if (decode_state != nullptr) {
+    ABSL_ASSIGN_OR_RETURN(decode_state_inventory_hash,
+                          decode_state->GetSessionHandoffStateInventoryHash());
+  }
+
+  std::string inventory;
+  AppendRuntimeBytes(
+      "LITERT_LM_COMPLETE_EXECUTOR_SESSION_CAPSULE_INVENTORY_V1",
+      &inventory);
+  AppendRuntimeI32(static_cast<int32_t>(compiled_backend_), &inventory);
+  AppendRuntimeBytes(
+      absl::string_view(reinterpret_cast<const char*>(
+                            primary_state_inventory_hash.bytes.data()),
+                        primary_state_inventory_hash.bytes.size()),
+      &inventory);
+  AppendRuntimeBool(decode_state_inventory_hash.has_value(), &inventory);
+  if (decode_state_inventory_hash.has_value()) {
+    AppendRuntimeBytes(
+        absl::string_view(reinterpret_cast<const char*>(
+                              decode_state_inventory_hash->bytes.data()),
+                          decode_state_inventory_hash->bytes.size()),
+        &inventory);
+  }
+
+  // These labels are the exhaustive continuation contract implemented by
+  // ResourceManager, LRTSESS1, and ImportSessionStateFrom. Values are encoded
+  // in each authenticated capsule; this digest binds which values exist and
+  // which live objects are reconstructed rather than serialized.
+  AppendRuntimeBytes("EXECUTOR_CURRENT_STEP_I32_V1", &inventory);
+  AppendRuntimeBytes("EXECUTOR_RAN_DECODE_BOOL_V1", &inventory);
+  AppendRuntimeBytes("EXECUTOR_RANDOM_ENGINE_TEXT_STATE_V1", &inventory);
+  AppendRuntimeBytes("PROCESSED_AND_PENDING_TOKEN_IDS_V1", &inventory);
+  AppendRuntimeBytes("RESOLVED_RUNTIME_CONFIG_V1", &inventory);
+  AppendRuntimeBytes("SESSION_MANAGER_LAST_PREFILL_TOKEN_ID_V1", &inventory);
+  AppendRuntimeBytes("CPU_GREEDY_SAMPLER_REBUILT_FROM_CONFIG_AND_RNG_V1",
+                     &inventory);
+  AppendRuntimeBytes("DECODE_INPUTS_REBUILT_WITH_FORCE_PREPARE_V1",
+                     &inventory);
+  AppendRuntimeBytes("FRESH_TARGET_CONTEXT_REQUIRED_V1", &inventory);
+  AppendRuntimeBytes(
+      "CAPSULE_REJECTS_LORA_AUDIO_MTP_CALLBACK_AND_PENDING_EMBEDDINGS_V1",
+      &inventory);
+  ABSL_RETURN_IF_ERROR(AppendFixedTensorMapContract(
+      "RECONSTRUCTIBLE_DECODE_INPUT_BUFFER_SCHEMA_V1", decode_input_buffers_,
+      &inventory));
+
+  Sha256Hasher hasher;
+  const Hash256 inventory_hash = hasher.OneShot(inventory);
+  if (inventory_hash == Hash256{}) {
+    return absl::InternalError(
+        "Complete executor session inventory produced a zero digest.");
+  }
+  return inventory_hash;
 }
 
 absl::Status LlmLiteRtCompiledModelExecutorBase::VisitSessionState(

@@ -16,6 +16,7 @@
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_EXECUTOR_LITERT_STATE_H_
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -28,7 +29,9 @@
 #include "litert/cc/litert_compiled_model.h"  // from @litert
 #include "litert/cc/litert_environment.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
+#include "runtime/engine/session_handoff_codec_contract.h"
 #include "runtime/executor/state_interface.h"
+#include "runtime/platform/hash/hasher.h"
 #include "runtime/proto/executor_metadata.pb.h"
 
 namespace litert::lm {
@@ -75,6 +78,12 @@ class LitertState : public StateInterface {
   // buffer type are admitted for exact session handoff. Heuristic KV discovery
   // is deliberately insufficient proof of complete continuation state.
   absl::Status ValidateSessionHandoffSupport() const;
+
+  // Returns a canonical digest of the complete, executor-metadata-backed
+  // LRTST001 state schema. Payload bytes and the mutable active-bank selector
+  // are deliberately excluded; both ping-pong banks and their layouts are
+  // included so the digest describes the full restorable structure.
+  absl::StatusOr<Hash256> GetSessionHandoffStateInventoryHash() const;
 
   // Fails closed unless every history-dependent buffer is authoritatively
   // inventoried and can be replaced as one reset transaction. Unlike session

@@ -22,6 +22,7 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "runtime/engine/session_handoff.h"
+#include "runtime/engine/session_handoff_codec_contract.h"
 #include "runtime/executor/llm_executor_io_types.h"
 #include "runtime/executor/state_interface.h"
 #include "runtime/util/byte_stream.h"

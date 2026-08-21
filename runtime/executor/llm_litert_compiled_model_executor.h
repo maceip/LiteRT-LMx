@@ -106,6 +106,9 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
 
   absl::Status ValidateSessionHandoffSupport() const override;
 
+  absl::StatusOr<Hash256>
+  GetCompleteSessionHandoffStateInventoryHash() const override;
+
   absl::Status ValidateDeterministicProjectionSupport() const override;
 
   absl::Status ResetForDeterministicProjection() override;
@@ -409,6 +412,12 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
   // Returns the vocabulary dimension of the immutable loaded decode logits
   // allocation, without consulting mutable executor settings.
   absl::StatusOr<int> GetLoadedVocabularySizeForSessionHandoff() const;
+
+  // Validates loaded, session-independent capsule inventory. Per-session
+  // sampler/runtime values are validated after a context is installed and by
+  // Engine exact-profile resolution; keeping this seam separate lets Engine
+  // measure structural evidence before its first Session exists.
+  absl::Status ValidateStaticSessionHandoffInventorySupport() const;
 
   // Gets the LiteRT run options based on the current executor settings.
   litert::Options GetRunOptions() const;

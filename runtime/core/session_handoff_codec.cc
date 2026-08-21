@@ -43,8 +43,6 @@
 namespace litert::lm {
 namespace {
 
-constexpr std::array<char, 8> kMagic = {'L', 'R', 'T', 'S', 'E', 'S', 'S', '1'};
-constexpr uint32_t kVersion = 1;
 constexpr size_t kMacSize = 32;
 constexpr size_t kHmacBlockSize = 64;
 constexpr size_t kMinimumKeySize = 32;
@@ -435,8 +433,9 @@ absl::Status EncodeSessionHandoffParts(
   HmacSha256State hmac(options.authentication_key);
   AuthenticatedByteSink body(sink, &hmac);
   ABSL_RETURN_IF_ERROR(
-      body.Append(absl::string_view(kMagic.data(), kMagic.size())));
-  ABSL_RETURN_IF_ERROR(WriteU32(&body, kVersion));
+      body.Append(absl::string_view(kSessionHandoffEnvelopeMagic.data(),
+                                   kSessionHandoffEnvelopeMagic.size())));
+  ABSL_RETURN_IF_ERROR(WriteU32(&body, kSessionHandoffEnvelopeVersion));
   ABSL_RETURN_IF_ERROR(
       WriteHash(&body, authoritative_identity.model_artifact_hash));
   ABSL_RETURN_IF_ERROR(
@@ -696,7 +695,7 @@ absl::StatusOr<DecodedSessionHandoff> DecodeSessionHandoffFrom(
   ABSL_RETURN_IF_ERROR(
       ValidateOptions(authoritative_identity, options));
   constexpr uint64_t kMinimumEnvelopeSize =
-      kMagic.size() + sizeof(uint32_t) + kMacSize;
+      kSessionHandoffEnvelopeMagic.size() + sizeof(uint32_t) + kMacSize;
   if (envelope.Size() < kMinimumEnvelopeSize) {
     return absl::DataLossError("Session handoff envelope is truncated.");
   }
@@ -712,13 +711,13 @@ absl::StatusOr<DecodedSessionHandoff> DecodeSessionHandoffFrom(
   }
 
   SourceReader reader(envelope, body_size);
-  std::array<char, kMagic.size()> magic;
+  std::array<char, kSessionHandoffEnvelopeMagic.size()> magic;
   ABSL_RETURN_IF_ERROR(reader.Read(absl::MakeSpan(magic)));
-  if (magic != kMagic) {
+  if (magic != kSessionHandoffEnvelopeMagic) {
     return absl::DataLossError("Session handoff envelope has invalid magic.");
   }
   ABSL_ASSIGN_OR_RETURN(uint32_t version, reader.U32());
-  if (version != kVersion) {
+  if (version != kSessionHandoffEnvelopeVersion) {
     return absl::UnimplementedError(
         absl::StrCat("Unsupported session handoff version: ", version));
   }
