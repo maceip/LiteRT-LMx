@@ -660,13 +660,25 @@ LitertState::GetSessionHandoffStateInventoryHash() const {
     AppendU64(value.size(), inventory);
     inventory.append(value.data(), value.size());
   };
-  append_frame("LITERT_LM_LRTST001_COMPLETE_STATE_INVENTORY_V1");
+  append_frame("LITERT_LM_LRTST001_COMPLETE_STATE_INVENTORY_V2");
   append_frame(absl::string_view(kLiteRtStateSnapshotMagic.data(),
                                  kLiteRtStateSnapshotMagic.size()));
   AppendU32(kLiteRtStateSnapshotVersion, inventory);
   AppendU32(static_cast<uint32_t>(allocation_policy_), inventory);
   AppendI32(batch_size_, inventory);
-  AppendI32(num_entries_, inventory);
+  const bool has_dynamic_capacity =
+      std::any_of(bank_1_state_buffers_.begin(),
+                  bank_1_state_buffers_.end(), [](const auto& named_buffer) {
+                    return named_buffer.second.dynamic_dim.has_value();
+                  });
+  AppendU8(has_dynamic_capacity ? 1 : 0, inventory);
+  if (has_dynamic_capacity) {
+    append_frame(
+        "DYNAMIC_CAPACITY_NORMALIZED_AXIS_AND_PACKED_BYTES_PER_ENTRY_V2");
+  } else {
+    append_frame("FIXED_CAPACITY_EXACT_EXTENT_V2");
+    AppendI32(num_entries_, inventory);
+  }
   AppendU8(authoritative_state_inventory_ ? 1 : 0, inventory);
   // LRTST001 serializes the logical active state into whichever bank is
   // active in the fresh import target. Physical bank identity is not a
@@ -676,7 +688,7 @@ LitertState::GetSessionHandoffStateInventoryHash() const {
   const uint32_t bank_count = bank_2_state_buffers_.has_value() ? 2 : 1;
   AppendU32(bank_count, inventory);
   const auto append_bank =
-      [this, &inventory](
+      [this, &inventory, &append_frame](
           uint32_t bank_index,
           const absl::flat_hash_map<std::string, StateBuffer>& bank)
       -> absl::Status {
@@ -724,6 +736,18 @@ LitertState::GetSessionHandoffStateInventoryHash() const {
         return absl::ResourceExhaustedError(
             "LiteRT state inventory tensor rank exceeds uint32.");
       }
+      const int logical_dynamic_dim =
+          canonical->second.dynamic_dim.value_or(kDynamicDimValue);
+      if (logical_dynamic_dim >= 0 &&
+          static_cast<uint32_t>(logical_dynamic_dim) >= layout.Rank()) {
+        return absl::FailedPreconditionError(
+            "LiteRT state inventory contains an invalid dynamic axis.");
+      }
+      if (logical_dynamic_dim >= 0 && layout.HasStrides()) {
+        return absl::UnimplementedError(
+            "Dynamic strided LiteRT state has no capacity-invariant session "
+            "handoff inventory contract.");
+      }
 
       AppendU32(static_cast<uint32_t>(name.size()), inventory);
       inventory.append(name);
@@ -732,15 +756,18 @@ LitertState::GetSessionHandoffStateInventoryHash() const {
       // snapshot contract. A ping-pong output bank may intentionally carry no
       // resize marker of its own, so bind both facts instead of conflating
       // them or silently discarding the physical-bank metadata.
-      AppendI32(
-          canonical->second.dynamic_dim.value_or(kDynamicDimValue),
-          inventory);
+      AppendI32(logical_dynamic_dim, inventory);
       AppendI32(buffer.dynamic_dim.value_or(kDynamicDimValue), inventory);
       AppendU32(static_cast<uint32_t>(buffer_type), inventory);
       AppendU32(static_cast<uint32_t>(tensor_type.ElementType()), inventory);
       AppendU32(layout.Rank(), inventory);
-      for (int dimension : layout.Dimensions()) {
-        AppendI32(dimension, inventory);
+      for (uint32_t dimension_index = 0; dimension_index < layout.Rank();
+           ++dimension_index) {
+        AppendI32(logical_dynamic_dim ==
+                          static_cast<int>(dimension_index)
+                      ? kDynamicDimValue
+                      : layout.Dimensions()[dimension_index],
+                  inventory);
       }
       AppendU8(layout.HasStrides() ? 1 : 0, inventory);
       if (layout.HasStrides()) {
@@ -748,9 +775,28 @@ LitertState::GetSessionHandoffStateInventoryHash() const {
           AppendU32(stride, inventory);
         }
       }
-      AppendU64(packed_size, inventory);
-      AppendU64(size, inventory);
-      AppendU64(offset, inventory);
+      if (logical_dynamic_dim >= 0) {
+        LITERT_ASSIGN_OR_RETURN(const size_t logical_packed_size,
+                                tensor_type.Bytes());
+        if (packed_size != logical_packed_size || num_entries_ <= 0 ||
+            packed_size % static_cast<size_t>(num_entries_) != 0 ||
+            size != packed_size || offset != 0) {
+          return absl::FailedPreconditionError(
+              "Dynamic LiteRT state does not have a canonical tight "
+              "bytes-per-entry contract.");
+        }
+        // The capability binds only capacity-invariant structure. The nested
+        // LRTST001 snapshot continues to bind the live dimensions, packed
+        // size, backing size, offset, payload, and digest for each capsule.
+        append_frame(
+            "DYNAMIC_TIGHT_BUFFER_CONCRETE_LAYOUT_BOUND_BY_LRTST001_V2");
+        AppendU64(packed_size / static_cast<size_t>(num_entries_), inventory);
+      } else {
+        append_frame("FIXED_BUFFER_CONCRETE_LAYOUT_V2");
+        AppendU64(packed_size, inventory);
+        AppendU64(size, inventory);
+        AppendU64(offset, inventory);
+      }
       AppendU8(buffer.buffer.IsMetalMemory() ? 1 : 0, inventory);
     }
     return absl::OkStatus();

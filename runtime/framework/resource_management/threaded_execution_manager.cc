@@ -421,7 +421,10 @@ absl::Status ThreadedExecutionManager::ImportSessionSnapshotFrom(
     }
     if (session_info->session_config.GetMemoryStrategy() ==
         SessionConfig::MemoryStrategy::kStatelessDeterministicProjection) {
-      session_info->deterministic_projection_ready = false;
+      return absl::UnimplementedError(
+          "Stateless deterministic-projection sessions do not admit session "
+          "handoff; use a stateful session for authenticated capsule "
+          "restore.");
     }
     session_info->handoff_in_progress = true;
   }

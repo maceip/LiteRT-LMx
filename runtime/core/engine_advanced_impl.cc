@@ -461,6 +461,19 @@ class EngineAdvancedImpl : public Engine {
       const SessionHandoffCapabilityAssertion& assertion) const override {
     SessionConfig resolved = session_config;
     ABSL_RETURN_IF_ERROR(resolved.MaybeUpdateAndValidate(engine_settings_));
+    switch (resolved.GetMemoryStrategy()) {
+      case SessionConfig::MemoryStrategy::kStateful:
+        break;
+      case SessionConfig::MemoryStrategy::kStatelessDeterministicProjection:
+        return absl::UnimplementedError(
+            "Session handoff capability is unavailable for stateless "
+            "deterministic-projection sessions; capsule capture and restore "
+            "require a stateful session.");
+      default:
+        return absl::InvalidArgumentError(
+            "Session handoff capability received an unknown memory "
+            "strategy.");
+    }
 
     const Backend configured_backend =
         engine_settings_.GetMainExecutorSettings().GetBackend();
@@ -836,7 +849,10 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
   }
 
   // Capsule inventory is intentionally measured through a separate hook from
-  // exact-profile runtime evidence. A failure is retained for fail-closed
+  // exact-profile runtime evidence. Its dynamic-buffer schema is capacity
+  // invariant, so this load-time commitment remains authoritative after a
+  // supported KV-capacity growth; each LRTST001 capsule separately binds the
+  // resulting concrete extent. A failure is retained for fail-closed
   // capability discovery without disabling ordinary or cold exact inference.
   absl::StatusOr<Hash256>
       loaded_complete_session_handoff_state_inventory_hash =

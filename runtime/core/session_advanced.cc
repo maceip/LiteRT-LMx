@@ -263,6 +263,18 @@ absl::StatusOr<SessionContinuationStateWitness> BuildContinuationWitness(
 }
 
 absl::Status ValidateSessionHandoffConfig(const SessionConfig& config) {
+  switch (config.GetMemoryStrategy()) {
+    case SessionConfig::MemoryStrategy::kStateful:
+      break;
+    case SessionConfig::MemoryStrategy::kStatelessDeterministicProjection:
+      return absl::UnimplementedError(
+          "Stateless deterministic-projection sessions do not admit session "
+          "handoff; DPM capsule capture and restore require a stateful agent "
+          "session.");
+    default:
+      return absl::InvalidArgumentError(
+          "Session handoff received an unknown memory strategy.");
+  }
   if (config.UseExternalSampler()) {
     return absl::UnimplementedError(
         "Session handoff does not support external sampler state.");
@@ -1172,6 +1184,10 @@ absl::Status SessionAdvanced::ImportHandoffFrom(
 absl::StatusOr<SessionContinuationStateWitness>
 SessionAdvanced::ImportHandoffFromWithWitness(
     const ByteSource& envelope, const SessionHandoffOptions& expected) {
+  // Reject locally unsupported session semantics before reading an envelope.
+  // The same validation is repeated under the session lock before commit.
+  ABSL_RETURN_IF_ERROR(
+      ValidateSessionHandoffConfig(session_info_->session_config));
   ABSL_ASSIGN_OR_RETURN(SessionHandoffIdentity authoritative_identity,
                         GetSessionHandoffIdentity());
   const uint64_t incoming_envelope_size = envelope.Size();

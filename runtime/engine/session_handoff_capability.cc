@@ -124,7 +124,7 @@ absl::StatusOr<Hash256> ComputeSessionHandoffCapabilityId(
     const SessionHandoffCapability& capability) {
   ABSL_RETURN_IF_ERROR(ValidateCapabilityFields(capability));
   Sha256Hasher hasher;
-  HashFrame("LITERT_LM_SESSION_HANDOFF_CAPABILITY_V1", &hasher);
+  HashFrame("LITERT_LM_SESSION_HANDOFF_CAPABILITY_V2", &hasher);
   HashU32(capability.version, &hasher);
   HashDigest(capability.session_identity.model_artifact_hash, &hasher);
   HashDigest(capability.session_identity.runtime_artifact_hash, &hasher);

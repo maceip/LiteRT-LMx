@@ -3270,7 +3270,7 @@ absl::StatusOr<Hash256> LlmLiteRtCompiledModelExecutorBase::
 
   std::string inventory;
   AppendRuntimeBytes(
-      "LITERT_LM_COMPLETE_EXECUTOR_SESSION_CAPSULE_INVENTORY_V1",
+      "LITERT_LM_COMPLETE_EXECUTOR_SESSION_CAPSULE_INVENTORY_V2",
       &inventory);
   AppendRuntimeI32(static_cast<int32_t>(compiled_backend_), &inventory);
   AppendRuntimeBytes(
@@ -3356,7 +3356,7 @@ absl::StatusOr<Hash256> LlmLiteRtCompiledModelExecutorBase::
 
   std::string complete_inventory;
   AppendRuntimeBytes(
-      "LITERT_LM_COMPLETE_METAL_SESSION_CAPSULE_INVENTORY_V1",
+      "LITERT_LM_COMPLETE_METAL_SESSION_CAPSULE_INVENTORY_V2",
       &complete_inventory);
   AppendRuntimeBytes(
       absl::string_view(reinterpret_cast<const char*>(

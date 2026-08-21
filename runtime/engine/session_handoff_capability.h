@@ -30,8 +30,9 @@ namespace litert::lm {
 // Version of the canonical capability identity below. This is deliberately
 // independent of the LRTSESS1 and LRTST001 wire-format versions: changing
 // either wire contract changes `capsule_codec_contract_hash`, while changing
-// the capability field set changes this version.
-inline constexpr uint32_t kSessionHandoffCapabilityVersion = 1;
+// the capability field set or an authoritative field's semantics changes this
+// version.
+inline constexpr uint32_t kSessionHandoffCapabilityVersion = 2;
 
 // Engine-derived proof that a concrete exact LiteRT profile can export and
 // restore the complete execution capsule represented by the named codec
@@ -51,8 +52,10 @@ struct SessionHandoffCapability {
   ExactLiteRtBackend backend = ExactLiteRtBackend::kUnsupported;
 
   // Executor-owned digest of every admitted mutable or reconstructible state
-  // element needed for continuation. A backend cannot derive this digest
-  // merely from a requested backend or model label.
+  // element needed for continuation. Dynamic buffers bind their structural
+  // axis and per-entry layout, while each capsule's codec binds its concrete
+  // live capacity. A backend cannot derive this digest merely from a
+  // requested backend or model label.
   Hash256 complete_state_inventory_hash;
 
   // Canonical identity of the authenticated LRTSESS1 envelope and its nested

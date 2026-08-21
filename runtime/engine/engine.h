@@ -352,7 +352,9 @@ class SessionInterface {
   }
 
   // Exports a canonical authenticated snapshot for exact continuation by a
-  // fresh session with the same model, runtime build, and inference profile.
+  // fresh stateful session with the same model, runtime build, and inference
+  // profile. Stateless deterministic-projection sessions intentionally do not
+  // admit capsule handoff.
   virtual absl::StatusOr<std::string> ExportHandoff(
       const SessionHandoffOptions& options) {
     std::string envelope;
@@ -384,7 +386,7 @@ class SessionInterface {
     return witness.ok() ? absl::OkStatus() : witness.status();
   }
 
-  // Imports into a fresh compatible session after authenticating and
+  // Imports into a fresh compatible stateful session after authenticating and
   // validating the complete envelope.
   virtual absl::Status ImportHandoff(absl::string_view envelope,
                                      const SessionHandoffOptions& expected) {

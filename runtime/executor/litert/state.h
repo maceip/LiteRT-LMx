@@ -85,9 +85,14 @@ class LitertState : public StateInterface {
   absl::Status ValidateSessionHandoffSupport() const;
 
   // Returns a canonical digest of the complete, executor-metadata-backed
-  // LRTST001 state schema. Payload bytes and the mutable active-bank selector
-  // are deliberately excluded; both ping-pong banks and their layouts are
-  // included so the digest describes the full restorable structure.
+  // LRTST001 state schema. Dynamic capacity is represented by its axis and
+  // tightly packed bytes-per-entry contract rather than a live extent, so
+  // resizing an otherwise identical state does not relabel its capability.
+  // LRTST001 still commits the concrete extent and byte layout of every
+  // individual capsule.
+  // Payload bytes and the mutable active-bank selector are deliberately
+  // excluded; both ping-pong banks and their layouts are included so the
+  // digest describes the full restorable structure.
   absl::StatusOr<Hash256> GetSessionHandoffStateInventoryHash() const;
 
   // Fails closed unless every history-dependent buffer is authoritatively
