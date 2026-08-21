@@ -870,6 +870,11 @@ absl::Status ValidateExactExecutorConfig(
     const Engine* engine,
     const ExactProfileAdmissionRepository* admission_repository,
     const ExactRegenerationExecutorConfig& config) {
+#ifdef LITERT_LM_DEBUGGER_ENABLED
+  return absl::UnimplementedError(
+      "ExactRegeneration does not support debugger-installed graph "
+      "callbacks.");
+#endif
   if (engine == nullptr || admission_repository == nullptr) {
     return absl::InvalidArgumentError(
         "ExactRegeneration requires a loaded Engine and admission "
@@ -1067,83 +1072,32 @@ ExactRegenerationExecutor::GetProfileAdmissionRecordId() const {
   return admission.record_id;
 }
 
-absl::StatusOr<ExactRegenerationAuthenticatedCapsuleRestoreAdmission>
+absl::StatusOr<AuthenticatedCapsuleRestoreAdmission>
 ExactRegenerationExecutor::GetAuthenticatedCapsuleRestoreAdmission(
-    const ExactRegenerationCapsuleRestoreAdmissionBinding& binding) const {
-  if (binding.repository == nullptr) {
-    return absl::InvalidArgumentError(
-        "Exact CapsuleRestore admission binding has no repository.");
-  }
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreQualificationSpec(
-      binding.qualification_spec));
-  ABSL_RETURN_IF_ERROR(
-      ValidateFreshWorkerAuthentication(binding.record_authentication));
+    const CapsuleRestoreAdmissionBinding& binding) const {
   ABSL_RETURN_IF_ERROR(ValidateSupport());
   ABSL_ASSIGN_OR_RETURN(const ExactLiteRtProfile current_executor_profile,
                         ResolveCurrentProfile());
-
-  SessionConfig resolved_capsule_config =
-      binding.qualification_spec.session_config;
-  ABSL_RETURN_IF_ERROR(resolved_capsule_config.MaybeUpdateAndValidate(
-      engine_->GetEngineSettings()));
   ABSL_ASSIGN_OR_RETURN(
-      const ExactLiteRtProfile capsule_profile,
-      engine_->ResolveExactLiteRtProfile(
-          resolved_capsule_config,
-          binding.qualification_spec.exact_profile_assertion));
-  if (capsule_profile != current_executor_profile ||
-      capsule_profile != derived_profile_) {
+      AuthenticatedCapsuleRestoreAdmission admission,
+      ResolveAuthenticatedCapsuleRestoreAdmission(
+          engine_, resolved_session_config_, binding));
+  if (admission.profile != current_executor_profile ||
+      admission.profile != derived_profile_ ||
+      admission.capability.exact_profile_id != derived_profile_.profile_id ||
+      admission.capability.session_identity !=
+          derived_profile_.session_identity ||
+      admission.capability.backend != derived_profile_.backend ||
+      admission.operational_coverage.capsule_restore_capability_id !=
+          admission.capability.capability_id ||
+      admission.operational_coverage
+              .capsule_restore_admission_record_id !=
+          admission.record.record_id) {
     return absl::FailedPreconditionError(
-        "CapsuleRestore qualification SessionConfig does not resolve to the "
-        "exact executor's immutable profile and session semantics.");
+        "CapsuleRestore admission does not agree with the exact executor's "
+        "immutable Engine-derived profile.");
   }
-
-  ABSL_ASSIGN_OR_RETURN(
-      const SessionHandoffIdentity capsule_session_identity,
-      engine_->ResolveSessionHandoffIdentity(resolved_capsule_config));
-  ABSL_ASSIGN_OR_RETURN(
-      const SessionHandoffIdentity executor_session_identity,
-      engine_->ResolveSessionHandoffIdentity(resolved_session_config_));
-  if (capsule_session_identity != executor_session_identity ||
-      capsule_session_identity != derived_profile_.session_identity) {
-    return absl::FailedPreconditionError(
-        "CapsuleRestore qualification and exact executor SessionConfigs "
-        "have different Engine-derived semantics.");
-  }
-
-  ABSL_ASSIGN_OR_RETURN(
-      const SessionHandoffCapability capability,
-      engine_->ResolveSessionHandoffCapability(
-          resolved_capsule_config,
-          binding.qualification_spec.capability_assertion));
-  ABSL_RETURN_IF_ERROR(ValidateSessionHandoffCapability(capability));
-  if (capability.exact_profile_id != derived_profile_.profile_id ||
-      capability.session_identity != derived_profile_.session_identity ||
-      capability.backend != derived_profile_.backend) {
-    return absl::FailedPreconditionError(
-        "Engine-derived CapsuleRestore capability does not agree with the "
-        "exact executor profile, backend, and session identity.");
-  }
-
-  ABSL_ASSIGN_OR_RETURN(
-      CapsuleRestoreAdmissionRecord record,
-      binding.repository->Get(
-          capsule_profile, capability, binding.qualification_spec,
-          binding.record_authentication));
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreAdmissionRecordForRuntime(
-      record, capsule_profile, capability,
-      binding.qualification_spec));
-  if (record.record_authentication_key_id !=
-          binding.record_authentication.key_id ||
-      record.capability != capability || IsZeroHash(record.record_id)) {
-    return absl::DataLossError(
-        "Authenticated CapsuleRestore admission record is not bound to the "
-        "current Engine capability and record key.");
-  }
-  return ExactRegenerationAuthenticatedCapsuleRestoreAdmission{
-      .record = std::move(record),
-      .capability = capability,
-  };
+  return admission;
 }
 
 absl::Status ExactRegenerationExecutor::ValidateSupport() const {
@@ -1196,8 +1150,7 @@ absl::StatusOr<ExactRegenerationExecution>
 ExactRegenerationExecutor::RunPhysical(
     const DPMCanonicalReplayRequest& request,
     const ExactRegenerationExecutionInput& input,
-    const ExactRegenerationCapsuleRestoreAdmissionBinding&
-        capsule_restore_admission) const {
+    const CapsuleRestoreAdmissionBinding& capsule_restore_admission) const {
   return RunWithExecutionInput(request, input, false,
                                &capsule_restore_admission);
 }
@@ -1207,8 +1160,7 @@ ExactRegenerationExecutor::RunWithExecutionInput(
     const DPMCanonicalReplayRequest& request,
     const ExactRegenerationExecutionInput& input,
     bool capsule_free_convenience,
-    const ExactRegenerationCapsuleRestoreAdmissionBinding*
-        capsule_restore_admission) const {
+    const CapsuleRestoreAdmissionBinding* capsule_restore_admission) const {
   // Reject cross-stage and cross-limit requests before touching the
   // repository and, critically, before any worker process is born.
   ABSL_RETURN_IF_ERROR(ValidateBoundRequest(request));
@@ -1244,7 +1196,7 @@ ExactRegenerationExecutor::RunWithExecutionInput(
         "CapsuleRestore admission; physical transport alone is not "
         "support.");
   }
-  std::optional<ExactRegenerationAuthenticatedCapsuleRestoreAdmission>
+  std::optional<AuthenticatedCapsuleRestoreAdmission>
       capsule_admission_before;
   if (capsule_restore_admission != nullptr) {
     ABSL_ASSIGN_OR_RETURN(
@@ -1484,14 +1436,17 @@ ExactRegenerationExecutor::RunWithExecutionInput(
   }
   if (capsule_admission_before.has_value()) {
     ABSL_ASSIGN_OR_RETURN(
-        const ExactRegenerationAuthenticatedCapsuleRestoreAdmission
-            capsule_admission_after,
+        const AuthenticatedCapsuleRestoreAdmission capsule_admission_after,
         GetAuthenticatedCapsuleRestoreAdmission(
             *capsule_restore_admission));
     if (capsule_admission_after.record.record_id !=
             capsule_admission_before->record.record_id ||
+        capsule_admission_after.profile !=
+            capsule_admission_before->profile ||
         capsule_admission_after.capability !=
-            capsule_admission_before->capability) {
+            capsule_admission_before->capability ||
+        capsule_admission_after.operational_coverage !=
+            capsule_admission_before->operational_coverage) {
       return absl::AbortedError(
           "CapsuleRestore admission or Engine-derived capability changed "
           "during physical regeneration.");

@@ -22,6 +22,7 @@
 
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
+#include "runtime/dpm/capsule_restore_admission.h"
 #include "runtime/dpm/dpm_replay_mode.h"
 #include "runtime/engine/exact_litert_profile.h"
 #include "runtime/engine/session_handoff.h"
@@ -106,10 +107,16 @@ struct DPMAgentCheckpointCapabilities {
   uint32_t capture_interval_turns = 0;
   bool capture_required_at_milestone = false;
 
-  // Exact-only formal capability/admission. WinnerReplay may still use a
-  // validated disposable live-session cache without claiming CapsuleRestore.
+  // Mode-independent formal CapsuleRestore capability/admission. A
+  // WinnerReplay runtime may expose this without gaining any exact-profile or
+  // independent-regeneration claim.
   std::optional<SessionHandoffCapability> session_handoff_capability;
   std::optional<Hash256> capsule_restore_admission_record_id;
+  // Coverage V1 is exact-workload scoped. Its presence proves that an
+  // authenticated admission can be matched, not that arbitrary operations
+  // are already covered. Consumers must compare the concrete operation before
+  // claiming or using CapsuleRestore.
+  std::optional<CapsuleRestoreOperationalCoverage> operational_coverage;
 };
 
 struct DPMGuaranteeAvailability {

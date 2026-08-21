@@ -44,7 +44,7 @@ absl::Status ValidateOptionalHash(const std::optional<Hash256>& hash,
   return absl::OkStatus();
 }
 
-bool HasVersionFourOnlyFields(const DPMTurnReceipt& receipt) {
+bool HasPostVersionThreeFields(const DPMTurnReceipt& receipt) {
   return receipt.restored_from_session_checkpoint_id.has_value() ||
          receipt.checkpoint_capture_origin !=
              DPMCheckpointCaptureOrigin::kNone ||
@@ -52,7 +52,49 @@ bool HasVersionFourOnlyFields(const DPMTurnReceipt& receipt) {
              DPMCheckpointWorkerPrefillMode::kNone ||
          !IsZeroHash(receipt.agent_physical_execution_plan_hash) ||
          receipt.agent_capsule_restore_admission_record_id.has_value() ||
+         receipt.agent_capsule_restore_capability_id.has_value() ||
+         receipt.agent_capsule_restore_coverage_id.has_value() ||
          receipt.agent_exact_worker_checkpoint_provenance.has_value();
+}
+
+absl::Status ValidateVersionedCapsuleRestoreProvenance(
+    const DPMTurnReceipt& receipt) {
+  const bool has_capability =
+      receipt.agent_capsule_restore_capability_id.has_value();
+  const bool has_admission =
+      receipt.agent_capsule_restore_admission_record_id.has_value();
+  const bool has_coverage =
+      receipt.agent_capsule_restore_coverage_id.has_value();
+  switch (receipt.format_version) {
+    case DPMTurnReceipt::kLegacyFormatVersion:
+      if (has_capability || has_admission || has_coverage) {
+        return absl::InvalidArgumentError(
+            "Version 3 DPM receipts cannot carry CapsuleRestore "
+            "provenance.");
+      }
+      return absl::OkStatus();
+    case DPMTurnReceipt::kPreviousFormatVersion:
+      if (has_capability || has_coverage) {
+        return absl::InvalidArgumentError(
+            "Version 4 DPM receipts cannot carry a version 5 "
+            "CapsuleRestore capability or coverage ID.");
+      }
+      return absl::OkStatus();
+    case DPMTurnReceipt::kFormatVersion: {
+      const bool uses_capsule =
+          receipt.restored_from_session_checkpoint_id.has_value() ||
+          receipt.session_checkpoint_id.has_value();
+      if (uses_capsule != has_capability || uses_capsule != has_admission ||
+          uses_capsule != has_coverage) {
+        return absl::InvalidArgumentError(
+            "Version 5 capsule use requires matching CapsuleRestore "
+            "capability, admission, and operational-coverage provenance.");
+      }
+      return absl::OkStatus();
+    }
+  }
+  return absl::FailedPreconditionError(
+      "Unsupported DPM turn receipt format version.");
 }
 
 absl::Status ValidateCaptureOrigin(DPMCheckpointCaptureOrigin origin) {
@@ -124,11 +166,16 @@ absl::Status ValidateWinnerReplayReceipt(const DPMTurnReceipt& receipt) {
   if (receipt.agent_worker_prefill_mode !=
           DPMCheckpointWorkerPrefillMode::kNone ||
       !IsZeroHash(receipt.agent_physical_execution_plan_hash) ||
-      receipt.agent_capsule_restore_admission_record_id.has_value() ||
       receipt.agent_exact_worker_checkpoint_provenance.has_value()) {
     return absl::InvalidArgumentError(
-        "WinnerReplay agent receipt contains exact physical-execution or "
-        "capsule-admission evidence.");
+        "WinnerReplay agent receipt contains exact physical-execution "
+        "evidence.");
+  }
+  if (receipt.format_version == DPMTurnReceipt::kPreviousFormatVersion &&
+      receipt.agent_capsule_restore_admission_record_id.has_value()) {
+    return absl::InvalidArgumentError(
+        "Version 4 WinnerReplay receipts cannot claim CapsuleRestore "
+        "admission.");
   }
   if (receipt.restored_from_session_checkpoint_id.has_value() &&
       !receipt.agent_producing_session_matched_output) {
@@ -195,7 +242,7 @@ absl::Status ValidateExactRegenerationReceipt(
       receipt.agent_execution_evidence_hash ==
           receipt.agent_physical_execution_plan_hash) {
     return absl::InvalidArgumentError(
-        "Version 4 ExactRegeneration receipt substituted reusable profile, "
+        "ExactRegeneration receipt substituted reusable profile, "
         "output, or plan evidence for its request-scoped execution ID.");
   }
   switch (receipt.agent_worker_prefill_mode) {
@@ -215,22 +262,24 @@ absl::Status ValidateExactRegenerationReceipt(
       break;
     case DPMCheckpointWorkerPrefillMode::kNone:
       return absl::InvalidArgumentError(
-          "Version 4 ExactRegeneration receipt is missing its worker prefill "
+          "ExactRegeneration receipt is missing its worker prefill "
           "mode.");
     default:
       return absl::InvalidArgumentError(
-          "Version 4 ExactRegeneration receipt has an unknown worker "
+          "ExactRegeneration receipt has an unknown worker "
           "prefill mode.");
   }
 
-  const bool uses_capsule =
-      receipt.restored_from_session_checkpoint_id.has_value() ||
-      receipt.session_checkpoint_id.has_value();
-  if (uses_capsule !=
-      receipt.agent_capsule_restore_admission_record_id.has_value()) {
-    return absl::InvalidArgumentError(
-        "ExactRegeneration capsule use and CapsuleRestore admission do not "
-        "match.");
+  if (receipt.format_version == DPMTurnReceipt::kPreviousFormatVersion) {
+    const bool uses_capsule =
+        receipt.restored_from_session_checkpoint_id.has_value() ||
+        receipt.session_checkpoint_id.has_value();
+    if (uses_capsule !=
+        receipt.agent_capsule_restore_admission_record_id.has_value()) {
+      return absl::InvalidArgumentError(
+          "Version 4 ExactRegeneration capsule use and CapsuleRestore "
+          "admission do not match.");
+    }
   }
   if (receipt.session_checkpoint_id.has_value()) {
     if (receipt.checkpoint_capture_origin !=
@@ -259,6 +308,7 @@ absl::Status ValidateExactRegenerationReceipt(
 absl::Status ValidateDPMTurnReceiptReplayEvidence(
     const DPMTurnReceipt& receipt) {
   if (receipt.format_version != DPMTurnReceipt::kLegacyFormatVersion &&
+      receipt.format_version != DPMTurnReceipt::kPreviousFormatVersion &&
       receipt.format_version != DPMTurnReceipt::kFormatVersion) {
     return absl::FailedPreconditionError(
         "Unsupported DPM turn receipt format version.");
@@ -275,6 +325,15 @@ absl::Status ValidateDPMTurnReceiptReplayEvidence(
       receipt.agent_capsule_restore_admission_record_id,
       "DPM turn receipt contains an empty CapsuleRestore admission "
       "identity."));
+  ABSL_RETURN_IF_ERROR(ValidateOptionalHash(
+      receipt.agent_capsule_restore_capability_id,
+      "DPM turn receipt contains an empty CapsuleRestore capability "
+      "identity."));
+  ABSL_RETURN_IF_ERROR(ValidateOptionalHash(
+      receipt.agent_capsule_restore_coverage_id,
+      "DPM turn receipt contains an empty CapsuleRestore operational "
+      "coverage identity."));
+  ABSL_RETURN_IF_ERROR(ValidateVersionedCapsuleRestoreProvenance(receipt));
   if (receipt.session_checkpoint_id.has_value() &&
       receipt.restored_from_session_checkpoint_id.has_value() &&
       *receipt.session_checkpoint_id ==
@@ -290,11 +349,12 @@ absl::Status ValidateDPMTurnReceiptReplayEvidence(
         "execution evidence.");
   }
   if (receipt.format_version == DPMTurnReceipt::kLegacyFormatVersion &&
-      HasVersionFourOnlyFields(receipt)) {
+      HasPostVersionThreeFields(receipt)) {
     return absl::InvalidArgumentError(
         "Version 3 DPM receipt contains version 4 physical provenance.");
   }
-  if (receipt.format_version == DPMTurnReceipt::kFormatVersion) {
+  if (receipt.format_version == DPMTurnReceipt::kPreviousFormatVersion ||
+      receipt.format_version == DPMTurnReceipt::kFormatVersion) {
     ABSL_RETURN_IF_ERROR(
         ValidateCaptureOrigin(receipt.checkpoint_capture_origin));
     ABSL_RETURN_IF_ERROR(

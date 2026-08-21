@@ -558,13 +558,23 @@ absl::StatusOr<std::string> EncodeStoredDescriptor(
   AppendU64(descriptor.envelope_size, &bytes);
   AppendI64(descriptor.created_unix_micros, &bytes);
   if (descriptor.format_version ==
-      DPMSessionCheckpointDescriptor::kFormatVersion) {
+          DPMSessionCheckpointDescriptor::kPreviousFormatVersion ||
+      descriptor.format_version ==
+          DPMSessionCheckpointDescriptor::kFormatVersion) {
     bytes.push_back(static_cast<char>(descriptor.replay_mode));
     bytes.push_back(static_cast<char>(descriptor.capture_origin));
     AppendOptionalHash(descriptor.restored_from_checkpoint_id, &bytes);
     AppendOptionalHash(descriptor.exact_profile_id, &bytes);
     AppendHash(descriptor.exact_profile_admission_record_id, &bytes);
+    if (descriptor.format_version ==
+        DPMSessionCheckpointDescriptor::kFormatVersion) {
+      AppendHash(descriptor.capsule_restore_capability_id, &bytes);
+    }
     AppendHash(descriptor.capsule_restore_admission_record_id, &bytes);
+    if (descriptor.format_version ==
+        DPMSessionCheckpointDescriptor::kFormatVersion) {
+      AppendHash(descriptor.capsule_restore_coverage_id, &bytes);
+    }
     AppendHash(descriptor.exact_request_execution_evidence_id, &bytes);
     bytes.push_back(static_cast<char>(descriptor.worker_prefill_mode));
     AppendHash(descriptor.execution_plan_hash, &bytes);
@@ -641,6 +651,7 @@ absl::StatusOr<DPMSessionCheckpointDescriptor> DecodeStoredDescriptor(
           DPMCheckpointCaptureOrigin::kLiveParentSession;
       break;
 
+    case DPMSessionCheckpointDescriptor::kPreviousFormatVersion:
     case DPMSessionCheckpointDescriptor::kFormatVersion: {
       uint8_t replay_mode;
       ABSL_ASSIGN_OR_RETURN(replay_mode, reader.ReadU8());
@@ -655,8 +666,18 @@ absl::StatusOr<DPMSessionCheckpointDescriptor> DecodeStoredDescriptor(
                             reader.ReadOptionalHash());
       ABSL_ASSIGN_OR_RETURN(descriptor.exact_profile_admission_record_id,
                             reader.ReadHash());
+      if (descriptor.format_version ==
+          DPMSessionCheckpointDescriptor::kFormatVersion) {
+        ABSL_ASSIGN_OR_RETURN(descriptor.capsule_restore_capability_id,
+                              reader.ReadHash());
+      }
       ABSL_ASSIGN_OR_RETURN(descriptor.capsule_restore_admission_record_id,
                             reader.ReadHash());
+      if (descriptor.format_version ==
+          DPMSessionCheckpointDescriptor::kFormatVersion) {
+        ABSL_ASSIGN_OR_RETURN(descriptor.capsule_restore_coverage_id,
+                              reader.ReadHash());
+      }
       ABSL_ASSIGN_OR_RETURN(descriptor.exact_request_execution_evidence_id,
                             reader.ReadHash());
       uint8_t worker_prefill_mode;

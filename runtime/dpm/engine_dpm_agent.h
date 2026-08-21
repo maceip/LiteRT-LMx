@@ -21,6 +21,7 @@
 
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
+#include "runtime/dpm/capsule_restore_admission.h"
 #include "runtime/dpm/dpm_engine.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_settings.h"
@@ -39,6 +40,12 @@ class EngineDPMAgentRuntime final : public DPMAgentRuntime {
   static absl::StatusOr<std::unique_ptr<EngineDPMAgentRuntime>> Create(
       Engine* engine, SessionConfig session_config,
       std::optional<SessionHandoffIdentity> expected_identity = std::nullopt);
+  // Enables the independent CapsuleRestore guarantee for the exact same
+  // resolved stateful SessionConfig used by this live parent runtime.
+  static absl::StatusOr<std::unique_ptr<EngineDPMAgentRuntime>> Create(
+      Engine* engine, SessionConfig session_config,
+      CapsuleRestoreAdmissionBinding capsule_restore_admission,
+      std::optional<SessionHandoffIdentity> expected_identity = std::nullopt);
 
   const SessionHandoffIdentity& GetSessionHandoffIdentity() const override {
     return session_handoff_identity_;
@@ -46,6 +53,14 @@ class EngineDPMAgentRuntime final : public DPMAgentRuntime {
 
   absl::Status ValidateSupport() const override;
   absl::Status ValidateSessionHandoffSupport() const override;
+  absl::StatusOr<std::optional<Hash256>>
+  GetCapsuleRestoreAdmissionRecordId() const override;
+  absl::StatusOr<std::optional<Hash256>>
+  GetSessionHandoffCapabilityId() const override;
+  absl::StatusOr<std::optional<SessionHandoffCapability>>
+  GetSessionHandoffCapability() const override;
+  absl::StatusOr<std::optional<CapsuleRestoreOperationalCoverage>>
+  GetCapsuleRestoreOperationalCoverage() const override;
 
   absl::StatusOr<std::unique_ptr<Engine::Session>> CreateSession() override;
 
@@ -54,11 +69,33 @@ class EngineDPMAgentRuntime final : public DPMAgentRuntime {
       const DPMAgentGenerationRequest& request) override;
 
  private:
-  EngineDPMAgentRuntime(Engine* engine, SessionConfig resolved_session_config,
-                        SessionHandoffIdentity session_handoff_identity)
+  static absl::StatusOr<std::unique_ptr<EngineDPMAgentRuntime>> CreateInternal(
+      Engine* engine, SessionConfig session_config,
+      std::optional<CapsuleRestoreAdmissionBinding>
+          capsule_restore_admission,
+      std::optional<SessionHandoffIdentity> expected_identity);
+
+  EngineDPMAgentRuntime(
+      Engine* engine, SessionConfig resolved_session_config,
+      SessionHandoffIdentity session_handoff_identity,
+      std::optional<CapsuleRestoreAdmissionBinding>
+          capsule_restore_admission,
+      std::optional<ExactLiteRtProfile> capsule_restore_profile,
+      std::optional<Hash256> capsule_restore_admission_record_id,
+      std::optional<SessionHandoffCapability> session_handoff_capability,
+      std::optional<CapsuleRestoreOperationalCoverage>
+          capsule_restore_operational_coverage)
       : engine_(engine),
         resolved_session_config_(std::move(resolved_session_config)),
-        session_handoff_identity_(session_handoff_identity) {}
+        session_handoff_identity_(session_handoff_identity),
+        capsule_restore_admission_(std::move(capsule_restore_admission)),
+        capsule_restore_profile_(std::move(capsule_restore_profile)),
+        capsule_restore_admission_record_id_(
+            capsule_restore_admission_record_id),
+        session_handoff_capability_(
+            std::move(session_handoff_capability)),
+        capsule_restore_operational_coverage_(
+            std::move(capsule_restore_operational_coverage)) {}
 
   absl::Status ValidateSession(const Engine::Session& session) const;
   // Generation/profile support is deliberately separate from capsule
@@ -66,10 +103,20 @@ class EngineDPMAgentRuntime final : public DPMAgentRuntime {
   // when the resolved session cannot export a complete handoff envelope.
   absl::Status ValidateRuntimeSupport() const;
   absl::Status ProbeSessionHandoffSupport() const;
+  absl::StatusOr<AuthenticatedCapsuleRestoreAdmission>
+  ResolveCurrentCapsuleRestoreAdmission() const;
 
   Engine* const engine_;
   const SessionConfig resolved_session_config_;
   const SessionHandoffIdentity session_handoff_identity_;
+  const std::optional<CapsuleRestoreAdmissionBinding>
+      capsule_restore_admission_;
+  const std::optional<ExactLiteRtProfile> capsule_restore_profile_;
+  const std::optional<Hash256> capsule_restore_admission_record_id_;
+  const std::optional<SessionHandoffCapability>
+      session_handoff_capability_;
+  const std::optional<CapsuleRestoreOperationalCoverage>
+      capsule_restore_operational_coverage_;
 };
 
 }  // namespace litert::lm

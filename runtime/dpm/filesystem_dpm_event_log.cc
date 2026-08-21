@@ -691,6 +691,7 @@ absl::Status ValidateEvent(const DPMEvent& event,
   }
   const DPMTurnReceipt& receipt = *event.turn_receipt;
   if (receipt.format_version != DPMTurnReceipt::kLegacyFormatVersion &&
+      receipt.format_version != DPMTurnReceipt::kPreviousFormatVersion &&
       receipt.format_version != DPMTurnReceipt::kFormatVersion) {
     return absl::FailedPreconditionError(
         "Unsupported DPM turn receipt format version.");
@@ -881,7 +882,8 @@ absl::StatusOr<std::string> EncodeEventCanonical(const DPMEvent& event) {
   if (receipt.session_checkpoint_id.has_value()) {
     AppendHash(*receipt.session_checkpoint_id, &bytes);
   }
-  if (receipt.format_version == DPMTurnReceipt::kFormatVersion) {
+  if (receipt.format_version == DPMTurnReceipt::kPreviousFormatVersion ||
+      receipt.format_version == DPMTurnReceipt::kFormatVersion) {
     bytes.push_back(
         receipt.restored_from_session_checkpoint_id.has_value() ? 1 : 0);
     if (receipt.restored_from_session_checkpoint_id.has_value()) {
@@ -908,6 +910,18 @@ absl::StatusOr<std::string> EncodeEventCanonical(const DPMEvent& event) {
       AppendU64(provenance.transient_envelope_size, &bytes);
       AppendHash(provenance.transient_envelope_hash, &bytes);
       AppendHash(provenance.output_evidence_hash, &bytes);
+    }
+    if (receipt.format_version == DPMTurnReceipt::kFormatVersion) {
+      bytes.push_back(
+          receipt.agent_capsule_restore_capability_id.has_value() ? 1 : 0);
+      if (receipt.agent_capsule_restore_capability_id.has_value()) {
+        AppendHash(*receipt.agent_capsule_restore_capability_id, &bytes);
+      }
+      bytes.push_back(
+          receipt.agent_capsule_restore_coverage_id.has_value() ? 1 : 0);
+      if (receipt.agent_capsule_restore_coverage_id.has_value()) {
+        AppendHash(*receipt.agent_capsule_restore_coverage_id, &bytes);
+      }
     }
   }
   return bytes;
@@ -944,6 +958,7 @@ absl::StatusOr<DPMEvent> DecodeEventCanonical(absl::string_view bytes) {
     DPMTurnReceipt receipt;
     ABSL_ASSIGN_OR_RETURN(receipt.format_version, reader.ReadU32());
     if (receipt.format_version != DPMTurnReceipt::kLegacyFormatVersion &&
+        receipt.format_version != DPMTurnReceipt::kPreviousFormatVersion &&
         receipt.format_version != DPMTurnReceipt::kFormatVersion) {
       return absl::FailedPreconditionError(
           "Unsupported canonical DPM turn receipt version.");
@@ -1042,7 +1057,8 @@ absl::StatusOr<DPMEvent> DecodeEventCanonical(absl::string_view bytes) {
       ABSL_ASSIGN_OR_RETURN(Hash256 checkpoint_id, reader.ReadHash());
       receipt.session_checkpoint_id = checkpoint_id;
     }
-    if (receipt.format_version == DPMTurnReceipt::kFormatVersion) {
+    if (receipt.format_version == DPMTurnReceipt::kPreviousFormatVersion ||
+        receipt.format_version == DPMTurnReceipt::kFormatVersion) {
       ABSL_ASSIGN_OR_RETURN(uint8_t has_restored_checkpoint, reader.ReadU8());
       if (has_restored_checkpoint > 1) {
         return absl::DataLossError(
@@ -1097,6 +1113,32 @@ absl::StatusOr<DPMEvent> DecodeEventCanonical(absl::string_view bytes) {
         ABSL_ASSIGN_OR_RETURN(provenance.output_evidence_hash,
                               reader.ReadHash());
         receipt.agent_exact_worker_checkpoint_provenance = provenance;
+      }
+      if (receipt.format_version == DPMTurnReceipt::kFormatVersion) {
+        ABSL_ASSIGN_OR_RETURN(uint8_t has_capsule_restore_capability,
+                              reader.ReadU8());
+        if (has_capsule_restore_capability > 1) {
+          return absl::DataLossError(
+              "Non-canonical DPM CapsuleRestore-capability-presence flag.");
+        }
+        if (has_capsule_restore_capability == 1) {
+          ABSL_ASSIGN_OR_RETURN(Hash256 capsule_restore_capability,
+                                reader.ReadHash());
+          receipt.agent_capsule_restore_capability_id =
+              capsule_restore_capability;
+        }
+        ABSL_ASSIGN_OR_RETURN(uint8_t has_capsule_restore_coverage,
+                              reader.ReadU8());
+        if (has_capsule_restore_coverage > 1) {
+          return absl::DataLossError(
+              "Non-canonical DPM CapsuleRestore-coverage-presence flag.");
+        }
+        if (has_capsule_restore_coverage == 1) {
+          ABSL_ASSIGN_OR_RETURN(Hash256 capsule_restore_coverage,
+                                reader.ReadHash());
+          receipt.agent_capsule_restore_coverage_id =
+              capsule_restore_coverage;
+        }
       }
     }
     ABSL_RETURN_IF_ERROR(ValidateDPMTurnReceiptReplayEvidence(receipt));

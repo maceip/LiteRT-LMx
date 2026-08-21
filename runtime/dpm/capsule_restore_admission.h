@@ -40,6 +40,8 @@ inline constexpr uint64_t kMaximumCapsuleRestorePrefillTextBytes =
 inline constexpr uint32_t kMaximumCapsuleRestorePrefillTokenIds = 1'000'000;
 inline constexpr uint64_t kMaximumCapsuleRestoreAdmissionEnvelopeBytes =
     kMaximumFreshWorkerEnvelopeBytes;
+inline constexpr uint64_t kMaximumCapsuleRestoreCheckpointBytes =
+    uint64_t{8} * 1024 * 1024 * 1024;
 
 // One exact prefill boundary. Text is retained as canonical UTF-8 bytes;
 // token IDs are retained as explicit nonnegative int32 values and are never
@@ -132,6 +134,71 @@ struct CapsuleRestoreAdmissionRecord {
   std::string record_authentication_key_id;
 };
 
+// Operational scope certified by one CapsuleRestore admission. Version 1 is
+// intentionally an exact-workload contract: it authorizes only the precise
+// checkpoint-producing request and the precise own-position continuation
+// request used by qualification. It is not a range, profile-wide lease, or a
+// claim about arbitrary checkpoint steps. Later coverage versions may describe
+// a rigorously qualified bounded domain without changing the durable DPM
+// descriptor/receipt fields, which bind only coverage_id.
+enum class CapsuleRestoreCoverageKind : uint32_t {
+  kExactWorkload = 1,
+};
+
+struct CapsuleRestoreOperationalCoverage {
+  static constexpr uint32_t kFormatVersion = 1;
+
+  uint32_t format_version = kFormatVersion;
+  CapsuleRestoreCoverageKind kind =
+      CapsuleRestoreCoverageKind::kExactWorkload;
+  Hash256 coverage_id;
+  Hash256 capsule_restore_capability_id;
+  Hash256 capsule_restore_admission_record_id;
+  Hash256 qualification_spec_hash;
+
+  // Canonical hashes include every ordered text/token chunk boundary and the
+  // corresponding generation limit. Matching bytes with different chunking
+  // are deliberately different workloads.
+  Hash256 checkpoint_capture_workload_hash;
+  Hash256 restore_continuation_workload_hash;
+
+  // These observations bind the only checkpoint state qualified by Coverage
+  // V1. The exact token history remains private to the admission record; its
+  // canonical DPMTOK01 digest is sufficient for live-parent capture checks.
+  uint64_t checkpoint_step = 0;
+  Hash256 checkpoint_history_token_bytes_hash;
+  uint64_t checkpoint_envelope_size = 0;
+  std::string checkpoint_authentication_key_id;
+  uint32_t checkpoint_output_tokens = 0;
+  uint32_t continuation_output_tokens = 0;
+
+  bool operator==(const CapsuleRestoreOperationalCoverage& other) const {
+    return format_version == other.format_version && kind == other.kind &&
+           coverage_id == other.coverage_id &&
+           capsule_restore_capability_id ==
+               other.capsule_restore_capability_id &&
+           capsule_restore_admission_record_id ==
+               other.capsule_restore_admission_record_id &&
+           qualification_spec_hash == other.qualification_spec_hash &&
+           checkpoint_capture_workload_hash ==
+               other.checkpoint_capture_workload_hash &&
+           restore_continuation_workload_hash ==
+               other.restore_continuation_workload_hash &&
+           checkpoint_step == other.checkpoint_step &&
+           checkpoint_history_token_bytes_hash ==
+               other.checkpoint_history_token_bytes_hash &&
+           checkpoint_envelope_size == other.checkpoint_envelope_size &&
+           checkpoint_authentication_key_id ==
+               other.checkpoint_authentication_key_id &&
+           checkpoint_output_tokens == other.checkpoint_output_tokens &&
+           continuation_output_tokens ==
+               other.continuation_output_tokens;
+  }
+  bool operator!=(const CapsuleRestoreOperationalCoverage& other) const {
+    return !(*this == other);
+  }
+};
+
 absl::Status ValidateCapsuleRestoreQualificationSpec(
     const CapsuleRestoreQualificationSpec& spec);
 
@@ -152,6 +219,25 @@ absl::StatusOr<Hash256> ComputeCapsuleRestoreAdmissionRecordId(
 absl::Status ValidateCapsuleRestoreAdmissionRecord(
     const CapsuleRestoreAdmissionRecord& record);
 absl::Status ValidateCapsuleRestoreAdmissionRecordForRuntime(
+    const CapsuleRestoreAdmissionRecord& record,
+    const ExactLiteRtProfile& runtime_derived_profile,
+    const SessionHandoffCapability& runtime_derived_capability,
+    const CapsuleRestoreQualificationSpec& spec);
+
+// Versioned workload hashes used both to construct Coverage V1 and to match a
+// concrete DPM operation before any capsule bytes are imported or exported.
+absl::StatusOr<Hash256> ComputeCapsuleRestoreCheckpointWorkloadHash(
+    const std::vector<CapsuleRestorePrefillChunk>& chunks,
+    uint32_t max_output_tokens);
+absl::StatusOr<Hash256> ComputeCapsuleRestoreContinuationWorkloadHash(
+    const std::vector<CapsuleRestorePrefillChunk>& chunks,
+    uint32_t max_output_tokens);
+absl::StatusOr<Hash256> ComputeCapsuleRestoreOperationalCoverageId(
+    const CapsuleRestoreOperationalCoverage& coverage);
+absl::Status ValidateCapsuleRestoreOperationalCoverage(
+    const CapsuleRestoreOperationalCoverage& coverage);
+absl::StatusOr<CapsuleRestoreOperationalCoverage>
+ComputeCapsuleRestoreOperationalCoverage(
     const CapsuleRestoreAdmissionRecord& record,
     const ExactLiteRtProfile& runtime_derived_profile,
     const SessionHandoffCapability& runtime_derived_capability,
@@ -186,6 +272,40 @@ class CapsuleRestoreAdmissionRepository {
       const CapsuleRestoreQualificationSpec& spec,
       const FreshWorkerAuthentication& authentication) const = 0;
 };
+
+// Immutable authority for the CapsuleRestore guarantee. This binding is
+// deliberately independent of replay mode: it can admit own-position capsule
+// use for either CanonicalWinnerReplay's live parent session or an
+// ExactRegeneration fresh worker. The loaded Engine, not the caller, derives
+// the profile, capability, backend, and session identity. Assertions in the
+// qualification spec can only reject that runtime-owned evidence.
+struct CapsuleRestoreAdmissionBinding {
+  const CapsuleRestoreAdmissionRepository* repository = nullptr;
+  CapsuleRestoreQualificationSpec qualification_spec;
+  FreshWorkerAuthentication record_authentication;
+};
+
+// One freshly reauthenticated admission together with the exact runtime
+// evidence from which it was selected. Keeping the profile here prevents a
+// capability ID from being detached from the concrete SessionConfig that will
+// actually create, restore, or capture the session.
+struct AuthenticatedCapsuleRestoreAdmission {
+  CapsuleRestoreAdmissionRecord record;
+  ExactLiteRtProfile profile;
+  SessionHandoffCapability capability;
+  CapsuleRestoreOperationalCoverage operational_coverage;
+};
+
+// Resolves `runtime_session_config` and the qualification specification
+// independently through the same loaded Engine, requires their complete
+// profile/capability/session semantics to agree, and reauthenticates the
+// durable admission record. Call this at every support, capability, restore,
+// capture, and publication boundary; construction-time success is not a
+// permanent admission lease.
+absl::StatusOr<AuthenticatedCapsuleRestoreAdmission>
+ResolveAuthenticatedCapsuleRestoreAdmission(
+    const Engine* engine, const SessionConfig& runtime_session_config,
+    const CapsuleRestoreAdmissionBinding& binding);
 
 class CapsuleRestoreQualifier {
  public:

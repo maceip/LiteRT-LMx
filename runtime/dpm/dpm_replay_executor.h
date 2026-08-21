@@ -144,23 +144,6 @@ struct ExactRegenerationExecutorConfig {
   uint32_t independent_run_count = 2;
 };
 
-// Optional immutable CapsuleRestore admission authority for an exact runtime.
-// The caller supplies no model, profile, capability, backend, or session
-// identity. The loaded Engine derives all of those from qualification_spec's
-// concrete SessionConfig; the assertions inside that spec can only reject the
-// result. `record_authentication` authenticates admission evidence and is
-// deliberately separate from each checkpoint's LRTSESS1 authentication.
-struct ExactRegenerationCapsuleRestoreAdmissionBinding {
-  const CapsuleRestoreAdmissionRepository* repository = nullptr;
-  CapsuleRestoreQualificationSpec qualification_spec;
-  FreshWorkerAuthentication record_authentication;
-};
-
-struct ExactRegenerationAuthenticatedCapsuleRestoreAdmission {
-  CapsuleRestoreAdmissionRecord record;
-  SessionHandoffCapability capability;
-};
-
 // Capture is deliberately a request-scoped physical-execution policy rather
 // than part of the model-affecting execution-plan hash. When capture is
 // requested, only run zero may export a producing capsule; the remaining
@@ -318,9 +301,9 @@ class ExactRegenerationExecutor final {
   // requires its complete exact profile/session semantics to equal the
   // executor's immutable profile, derives the handoff capability, and asks
   // the repository to reauthenticate and revalidate the bound record.
-  absl::StatusOr<ExactRegenerationAuthenticatedCapsuleRestoreAdmission>
+  absl::StatusOr<AuthenticatedCapsuleRestoreAdmission>
   GetAuthenticatedCapsuleRestoreAdmission(
-      const ExactRegenerationCapsuleRestoreAdmissionBinding& binding) const;
+      const CapsuleRestoreAdmissionBinding& binding) const;
 
   absl::StatusOr<ExactRegenerationExecution> Run(
       const DPMCanonicalReplayRequest& request) const;
@@ -339,8 +322,7 @@ class ExactRegenerationExecutor final {
   absl::StatusOr<ExactRegenerationExecution> RunPhysical(
       const DPMCanonicalReplayRequest& request,
       const ExactRegenerationExecutionInput& input,
-      const ExactRegenerationCapsuleRestoreAdmissionBinding&
-          capsule_restore_admission) const;
+      const CapsuleRestoreAdmissionBinding& capsule_restore_admission) const;
 
  private:
   ExactRegenerationExecutor(
@@ -364,8 +346,7 @@ class ExactRegenerationExecutor final {
       const DPMCanonicalReplayRequest& request,
       const ExactRegenerationExecutionInput& input,
       bool capsule_free_convenience,
-      const ExactRegenerationCapsuleRestoreAdmissionBinding*
-          capsule_restore_admission) const;
+      const CapsuleRestoreAdmissionBinding* capsule_restore_admission) const;
 
   const Engine* const engine_;
   const FreshWorkerProcessRunner worker_runner_;

@@ -58,6 +58,12 @@ constexpr absl::string_view kAdmissionRecordDomain =
     "LITERT_LMX_CAPSULE_RESTORE_ADMISSION_RECORD_SHA256_V1";
 constexpr absl::string_view kAdmissionMacDomain =
     "LITERT_LMX_CAPSULE_RESTORE_ADMISSION_HMAC_SHA256_V1";
+constexpr absl::string_view kCheckpointWorkloadDomain =
+    "LITERT_LMX_CAPSULE_RESTORE_CHECKPOINT_WORKLOAD_SHA256_V1";
+constexpr absl::string_view kContinuationWorkloadDomain =
+    "LITERT_LMX_CAPSULE_RESTORE_CONTINUATION_WORKLOAD_SHA256_V1";
+constexpr absl::string_view kOperationalCoverageDomain =
+    "LITERT_LMX_CAPSULE_RESTORE_OPERATIONAL_COVERAGE_SHA256_V1";
 
 bool IsZeroHash(const Hash256& hash) {
   uint8_t combined = 0;
@@ -317,6 +323,127 @@ void AppendChunks(const std::vector<CapsuleRestorePrefillChunk>& chunks,
   }
 }
 
+absl::Status ValidateCoverageWorkload(
+    const std::vector<CapsuleRestorePrefillChunk>& chunks,
+    uint32_t max_output_tokens) {
+  if (chunks.empty() ||
+      chunks.size() > kMaximumCapsuleRestorePrefillChunks) {
+    return absl::InvalidArgumentError(
+        "CapsuleRestore operational workload requires a bounded nonempty "
+        "chunk sequence.");
+  }
+  if (max_output_tokens == 0 ||
+      max_output_tokens > kMaximumFreshWorkerLogitFrames ||
+      max_output_tokens >
+          static_cast<uint32_t>((std::numeric_limits<int>::max)())) {
+    return absl::InvalidArgumentError(
+        "CapsuleRestore operational workload has an invalid generation "
+        "limit.");
+  }
+  uint64_t text_bytes = 0;
+  uint64_t token_ids = 0;
+  for (const CapsuleRestorePrefillChunk& chunk : chunks) {
+    ABSL_RETURN_IF_ERROR(ValidateChunk(chunk));
+    if (chunk.utf8_text.size() >
+        kMaximumCapsuleRestorePrefillTextBytes - text_bytes) {
+      return absl::ResourceExhaustedError(
+          "CapsuleRestore operational workload text exceeds its limit.");
+    }
+    text_bytes += chunk.utf8_text.size();
+    if (chunk.token_ids.size() >
+        kMaximumCapsuleRestorePrefillTokenIds - token_ids) {
+      return absl::ResourceExhaustedError(
+          "CapsuleRestore operational workload token IDs exceed their "
+          "limit.");
+    }
+    token_ids += chunk.token_ids.size();
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<Hash256> ComputeWorkloadHash(
+    absl::string_view domain,
+    const std::vector<CapsuleRestorePrefillChunk>& chunks,
+    uint32_t max_output_tokens) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateCoverageWorkload(chunks, max_output_tokens));
+  std::string canonical;
+  AppendU32(CapsuleRestoreOperationalCoverage::kFormatVersion, &canonical);
+  AppendChunks(chunks, &canonical);
+  AppendU32(max_output_tokens, &canonical);
+  Sha256Hasher hasher;
+  hasher.Update(domain);
+  hasher.Update(canonical);
+  const Hash256 result = hasher.Finalize();
+  if (IsZeroHash(result)) {
+    return absl::InternalError(
+        "CapsuleRestore operational workload produced a zero hash.");
+  }
+  return result;
+}
+
+absl::Status ValidateOperationalCoverageFields(
+    const CapsuleRestoreOperationalCoverage& coverage,
+    bool require_canonical_id) {
+  if (coverage.format_version !=
+          CapsuleRestoreOperationalCoverage::kFormatVersion ||
+      coverage.kind != CapsuleRestoreCoverageKind::kExactWorkload) {
+    return absl::FailedPreconditionError(
+        "Unsupported CapsuleRestore operational coverage version or kind.");
+  }
+  if ((require_canonical_id && IsZeroHash(coverage.coverage_id)) ||
+      IsZeroHash(coverage.capsule_restore_capability_id) ||
+      IsZeroHash(coverage.capsule_restore_admission_record_id) ||
+      IsZeroHash(coverage.qualification_spec_hash) ||
+      IsZeroHash(coverage.checkpoint_capture_workload_hash) ||
+      IsZeroHash(coverage.restore_continuation_workload_hash) ||
+      coverage.checkpoint_step == 0 ||
+      coverage.checkpoint_step >
+          static_cast<uint64_t>((std::numeric_limits<int>::max)()) ||
+      IsZeroHash(coverage.checkpoint_history_token_bytes_hash) ||
+      coverage.checkpoint_envelope_size == 0 ||
+      coverage.checkpoint_envelope_size >
+          kMaximumCapsuleRestoreCheckpointBytes ||
+      coverage.checkpoint_output_tokens == 0 ||
+      coverage.checkpoint_output_tokens > kMaximumFreshWorkerLogitFrames ||
+      coverage.continuation_output_tokens == 0 ||
+      coverage.continuation_output_tokens >
+          kMaximumFreshWorkerLogitFrames) {
+    return absl::InvalidArgumentError(
+        "CapsuleRestore exact-workload coverage is incomplete or outside "
+        "its product bounds.");
+  }
+  return ValidatePublicKeyId(
+      coverage.checkpoint_authentication_key_id,
+      kMaximumCheckpointKeyIdBytes,
+      "CapsuleRestore operational coverage checkpoint authentication");
+}
+
+std::string EncodeOperationalCoverageFields(
+    const CapsuleRestoreOperationalCoverage& coverage) {
+  std::string canonical;
+  canonical.reserve(4 * 5 + 32 * 7 + 24 +
+                    coverage.checkpoint_authentication_key_id.size());
+  AppendU32(coverage.format_version, &canonical);
+  AppendU32(static_cast<uint32_t>(coverage.kind), &canonical);
+  AppendHash(coverage.capsule_restore_capability_id, &canonical);
+  AppendHash(coverage.capsule_restore_admission_record_id, &canonical);
+  AppendHash(coverage.qualification_spec_hash, &canonical);
+  AppendHash(coverage.checkpoint_capture_workload_hash, &canonical);
+  AppendHash(coverage.restore_continuation_workload_hash, &canonical);
+  AppendU64(coverage.checkpoint_step, &canonical);
+  AppendHash(coverage.checkpoint_history_token_bytes_hash, &canonical);
+  AppendU64(coverage.checkpoint_envelope_size, &canonical);
+  AppendU32(
+      static_cast<uint32_t>(
+          coverage.checkpoint_authentication_key_id.size()),
+      &canonical);
+  canonical.append(coverage.checkpoint_authentication_key_id);
+  AppendU32(coverage.checkpoint_output_tokens, &canonical);
+  AppendU32(coverage.continuation_output_tokens, &canonical);
+  return canonical;
+}
+
 absl::Status ValidateContinuationEvidence(
     const CapsuleRestoreContinuationEvidence& evidence) {
   if (evidence.visible_output.size() >
@@ -447,6 +574,8 @@ absl::Status ValidateRecordFields(const CapsuleRestoreAdmissionRecord& record,
           kMaximumFreshWorkerTokenBytes ||
       IsZeroHash(record.checkpoint_envelope_hash) ||
       record.checkpoint_envelope_size == 0 ||
+      record.checkpoint_envelope_size >
+          kMaximumCapsuleRestoreCheckpointBytes ||
       record.qualified_unix_micros <= 0) {
     return absl::InvalidArgumentError(
         "CapsuleRestore admission checkpoint or timestamp metadata is "
@@ -739,7 +868,7 @@ struct ResolvedQualification {
 };
 
 absl::StatusOr<ResolvedQualification> ResolveQualification(
-    Engine* engine, const CapsuleRestoreQualificationSpec& spec) {
+    const Engine* engine, const CapsuleRestoreQualificationSpec& spec) {
   if (engine == nullptr) {
     return absl::FailedPreconditionError(
         "CapsuleRestore qualification has no authoritative loaded Engine.");
@@ -1082,6 +1211,95 @@ absl::Status ValidateCapsuleRestoreAdmissionRecordForRuntime(
       spec.continuation_output_tokens);
 }
 
+absl::StatusOr<Hash256> ComputeCapsuleRestoreCheckpointWorkloadHash(
+    const std::vector<CapsuleRestorePrefillChunk>& chunks,
+    uint32_t max_output_tokens) {
+  return ComputeWorkloadHash(kCheckpointWorkloadDomain, chunks,
+                             max_output_tokens);
+}
+
+absl::StatusOr<Hash256> ComputeCapsuleRestoreContinuationWorkloadHash(
+    const std::vector<CapsuleRestorePrefillChunk>& chunks,
+    uint32_t max_output_tokens) {
+  return ComputeWorkloadHash(kContinuationWorkloadDomain, chunks,
+                             max_output_tokens);
+}
+
+absl::StatusOr<Hash256> ComputeCapsuleRestoreOperationalCoverageId(
+    const CapsuleRestoreOperationalCoverage& coverage) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateOperationalCoverageFields(coverage, false));
+  Sha256Hasher hasher;
+  hasher.Update(kOperationalCoverageDomain);
+  hasher.Update(EncodeOperationalCoverageFields(coverage));
+  const Hash256 result = hasher.Finalize();
+  if (IsZeroHash(result)) {
+    return absl::InternalError(
+        "CapsuleRestore operational coverage produced a zero ID.");
+  }
+  return result;
+}
+
+absl::Status ValidateCapsuleRestoreOperationalCoverage(
+    const CapsuleRestoreOperationalCoverage& coverage) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateOperationalCoverageFields(coverage, true));
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 expected_id,
+      ComputeCapsuleRestoreOperationalCoverageId(coverage));
+  if (coverage.coverage_id != expected_id) {
+    return absl::DataLossError(
+        "CapsuleRestore operational coverage ID is not canonical.");
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<CapsuleRestoreOperationalCoverage>
+ComputeCapsuleRestoreOperationalCoverage(
+    const CapsuleRestoreAdmissionRecord& record,
+    const ExactLiteRtProfile& runtime_derived_profile,
+    const SessionHandoffCapability& runtime_derived_capability,
+    const CapsuleRestoreQualificationSpec& spec) {
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreAdmissionRecordForRuntime(
+      record, runtime_derived_profile, runtime_derived_capability, spec));
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 canonical_record_id,
+      ComputeCapsuleRestoreAdmissionRecordId(record));
+  if (record.record_id != canonical_record_id) {
+    return absl::DataLossError(
+        "CapsuleRestore operational coverage requires a canonical admission "
+        "record ID.");
+  }
+  CapsuleRestoreOperationalCoverage coverage;
+  coverage.capsule_restore_capability_id =
+      runtime_derived_capability.capability_id;
+  coverage.capsule_restore_admission_record_id = record.record_id;
+  coverage.qualification_spec_hash = record.qualification_spec_hash;
+  ABSL_ASSIGN_OR_RETURN(
+      coverage.checkpoint_capture_workload_hash,
+      ComputeCapsuleRestoreCheckpointWorkloadHash(
+          spec.checkpoint_prefix_chunks, spec.checkpoint_output_tokens));
+  ABSL_ASSIGN_OR_RETURN(
+      coverage.restore_continuation_workload_hash,
+      ComputeCapsuleRestoreContinuationWorkloadHash(
+          spec.delta_chunks, spec.continuation_output_tokens));
+  coverage.checkpoint_step = record.checkpoint_step;
+  coverage.checkpoint_history_token_bytes_hash =
+      Sha256(record.checkpoint_history_token_bytes);
+  coverage.checkpoint_envelope_size = record.checkpoint_envelope_size;
+  coverage.checkpoint_authentication_key_id =
+      record.checkpoint_authentication_key_id;
+  coverage.checkpoint_output_tokens = spec.checkpoint_output_tokens;
+  coverage.continuation_output_tokens =
+      spec.continuation_output_tokens;
+  ABSL_ASSIGN_OR_RETURN(
+      coverage.coverage_id,
+      ComputeCapsuleRestoreOperationalCoverageId(coverage));
+  ABSL_RETURN_IF_ERROR(
+      ValidateCapsuleRestoreOperationalCoverage(coverage));
+  return coverage;
+}
+
 absl::StatusOr<std::string> EncodeCapsuleRestoreAdmissionRecord(
     const CapsuleRestoreAdmissionRecord& record,
     const FreshWorkerAuthentication& authentication) {
@@ -1192,6 +1410,98 @@ DecodeCapsuleRestoreAdmissionRecord(
         "CapsuleRestore admission envelope record ID is inconsistent.");
   }
   return record;
+}
+
+absl::StatusOr<AuthenticatedCapsuleRestoreAdmission>
+ResolveAuthenticatedCapsuleRestoreAdmission(
+    const Engine* engine, const SessionConfig& runtime_session_config,
+    const CapsuleRestoreAdmissionBinding& binding) {
+  if (engine == nullptr) {
+    return absl::InvalidArgumentError(
+        "CapsuleRestore admission requires a loaded authoritative Engine.");
+  }
+  if (binding.repository == nullptr) {
+    return absl::InvalidArgumentError(
+        "CapsuleRestore admission binding has no repository.");
+  }
+  ABSL_RETURN_IF_ERROR(
+      ValidateCapsuleRestoreQualificationSpec(binding.qualification_spec));
+  ABSL_RETURN_IF_ERROR(
+      ValidateFreshWorkerAuthentication(binding.record_authentication));
+
+  SessionConfig resolved_runtime_config = runtime_session_config;
+  ABSL_RETURN_IF_ERROR(resolved_runtime_config.MaybeUpdateAndValidate(
+      engine->GetEngineSettings()));
+  ABSL_RETURN_IF_ERROR(
+      ValidateResolvedSessionConfig(resolved_runtime_config, *engine));
+
+  ExactLiteRtProfile runtime_profile;
+  ABSL_ASSIGN_OR_RETURN(
+      runtime_profile,
+      engine->ResolveExactLiteRtProfile(
+          resolved_runtime_config,
+          binding.qualification_spec.exact_profile_assertion));
+  SessionHandoffCapability runtime_capability;
+  ABSL_ASSIGN_OR_RETURN(
+      runtime_capability,
+      engine->ResolveSessionHandoffCapability(
+          resolved_runtime_config,
+          binding.qualification_spec.capability_assertion));
+  SessionHandoffIdentity runtime_identity;
+  ABSL_ASSIGN_OR_RETURN(
+      runtime_identity,
+      engine->ResolveSessionHandoffIdentity(resolved_runtime_config));
+  ABSL_RETURN_IF_ERROR(
+      ValidateProfileCapabilityAgreement(runtime_profile, runtime_capability));
+  if (runtime_identity != runtime_profile.session_identity ||
+      runtime_identity != runtime_capability.session_identity) {
+    return absl::FailedPreconditionError(
+        "Runtime SessionConfig identity disagrees with its Engine-derived "
+        "CapsuleRestore profile or capability.");
+  }
+
+  ABSL_ASSIGN_OR_RETURN(
+      const ResolvedQualification qualified,
+      ResolveQualification(engine, binding.qualification_spec));
+  if (qualified.profile != runtime_profile ||
+      qualified.capability != runtime_capability ||
+      qualified.identity != runtime_identity) {
+    return absl::FailedPreconditionError(
+        "CapsuleRestore qualification and runtime SessionConfigs do not "
+        "resolve to identical Engine-owned session semantics.");
+  }
+
+  CapsuleRestoreAdmissionRecord record;
+  ABSL_ASSIGN_OR_RETURN(
+      record,
+      binding.repository->Get(runtime_profile, runtime_capability,
+                              binding.qualification_spec,
+                              binding.record_authentication));
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreAdmissionRecordForRuntime(
+      record, runtime_profile, runtime_capability,
+      binding.qualification_spec));
+  Hash256 canonical_record_id;
+  ABSL_ASSIGN_OR_RETURN(canonical_record_id,
+                        ComputeCapsuleRestoreAdmissionRecordId(record));
+  if (IsZeroHash(record.record_id) || record.record_id != canonical_record_id ||
+      record.record_authentication_key_id !=
+          binding.record_authentication.key_id ||
+      record.capability != runtime_capability) {
+    return absl::DataLossError(
+        "Authenticated CapsuleRestore admission is not canonically bound to "
+        "the current Engine capability and record key.");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      CapsuleRestoreOperationalCoverage operational_coverage,
+      ComputeCapsuleRestoreOperationalCoverage(
+          record, runtime_profile, runtime_capability,
+          binding.qualification_spec));
+  return AuthenticatedCapsuleRestoreAdmission{
+      .record = std::move(record),
+      .profile = std::move(runtime_profile),
+      .capability = std::move(runtime_capability),
+      .operational_coverage = std::move(operational_coverage),
+  };
 }
 
 absl::StatusOr<CapsuleRestoreAdmissionRecord>

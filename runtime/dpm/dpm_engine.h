@@ -32,6 +32,7 @@
 #include "runtime/dpm/session_checkpoint.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/session_handoff.h"
+#include "runtime/engine/session_handoff_capability.h"
 #include "runtime/platform/hash/hasher.h"
 
 namespace litert::lm {
@@ -144,6 +145,26 @@ class DPMAgentRuntime {
     return absl::UnimplementedError(
         "DPM agent runtime does not support exact session handoff.");
   }
+  // A mode-independent, currently reauthenticated CapsuleRestore authority.
+  // Generation-only runtimes return nullopt. These accessors are read-only and
+  // never accept caller-supplied identity labels.
+  virtual absl::StatusOr<std::optional<Hash256>>
+  GetCapsuleRestoreAdmissionRecordId() const {
+    return std::optional<Hash256>();
+  }
+  virtual absl::StatusOr<std::optional<Hash256>>
+  GetSessionHandoffCapabilityId() const {
+    return std::optional<Hash256>();
+  }
+  virtual absl::StatusOr<std::optional<SessionHandoffCapability>>
+  GetSessionHandoffCapability() const {
+    return std::optional<SessionHandoffCapability>();
+  }
+  virtual absl::StatusOr<
+      std::optional<CapsuleRestoreOperationalCoverage>>
+  GetCapsuleRestoreOperationalCoverage() const {
+    return std::optional<CapsuleRestoreOperationalCoverage>();
+  }
   virtual absl::StatusOr<std::unique_ptr<Engine::Session>> CreateSession() = 0;
   virtual absl::StatusOr<DPMAgentGenerationOutcome> Generate(
       Engine::Session* session, const DPMAgentGenerationRequest& request) = 0;
@@ -152,11 +173,13 @@ class DPMAgentRuntime {
 struct DPMEngineConfig {
   // Zero disables new automatic captures. Restore remains independently
   // controlled so an existing disposable checkpoint cache can still be used.
+  // Both default off: a default-constructed engine config therefore remains
+  // valid without a repository, transport keys, or CapsuleRestore admission.
   // A captured milestone is an own-position prefill boundary: subsequent
   // turns restore it and prefill only the exact response-event suffix. The
   // interval therefore changes inference work, not merely checkpoint names.
-  uint32_t checkpoint_interval_turns = 1;
-  bool restore_session_checkpoints = true;
+  uint32_t checkpoint_interval_turns = 0;
+  bool restore_session_checkpoints = false;
   // Optional by default because CanonicalWinnerReplay may recover an
   // authenticated catalog winner that its current backend cannot independently
   // rematerialize byte-for-byte. Setting this true makes that condition and any
@@ -212,6 +235,8 @@ struct DPMTurnResult {
       DPMCheckpointWorkerPrefillMode::kNone;
   Hash256 agent_physical_execution_plan_hash;
   std::optional<Hash256> agent_capsule_restore_admission_record_id;
+  std::optional<Hash256> agent_capsule_restore_capability_id;
+  std::optional<Hash256> agent_capsule_restore_coverage_id;
   std::optional<DPMExactWorkerCheckpointProvenance>
       agent_exact_worker_checkpoint_provenance;
   bool restored_session_checkpoint = false;
@@ -254,6 +279,12 @@ class DPMEngine {
       const DPMCorrectionRequest& request);
 
  private:
+  struct CapsuleRestoreAuthority {
+    SessionHandoffCapability capability;
+    Hash256 admission_record_id;
+    CapsuleRestoreOperationalCoverage operational_coverage;
+  };
+
   struct RestoreCandidate {
     DPMTurnReceipt receipt;
     DPMSessionCheckpointArtifact artifact;
@@ -268,6 +299,8 @@ class DPMEngine {
       const DPMLogSnapshot& current,
       const DPMProjectionOutcome& projection,
       const RestoreCandidate& candidate) const;
+  absl::StatusOr<CapsuleRestoreAuthority>
+  RequireCurrentCapsuleRestoreAuthority() const;
   absl::StatusOr<std::vector<DPMAgentGenerationRequest::PrefillChunk>>
   BuildFullTranscriptChunks(
       const DPMLogSnapshot& snapshot,
@@ -294,6 +327,10 @@ class DPMEngine {
       const Hash256& agent_request_hash,
       const Hash256& transcript_hash,
       const std::optional<Hash256>& restored_from_checkpoint_id,
+      const CapsuleRestoreAuthority& capsule_restore_authority,
+      const std::vector<DPMAgentGenerationRequest::PrefillChunk>&
+          full_canonical_prefill_chunks,
+      uint32_t max_output_tokens,
       int64_t created_unix_micros) const;
   absl::StatusOr<DPMSessionCheckpointArtifact>
   BuildExactWorkerCheckpointArtifact(
@@ -302,7 +339,10 @@ class DPMEngine {
       const DPMLogSnapshot& source_snapshot, uint64_t response_event_index,
       const DPMProjectionOutcome& projection,
       const Hash256& agent_request_hash, const Hash256& transcript_hash,
-      const Hash256& capsule_restore_admission_record_id,
+      const CapsuleRestoreAuthority& capsule_restore_authority,
+      const std::vector<DPMAgentGenerationRequest::PrefillChunk>&
+          full_canonical_prefill_chunks,
+      uint32_t max_output_tokens,
       int64_t created_unix_micros) const;
 
   DPMEventLog* log_;

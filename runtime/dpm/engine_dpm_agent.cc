@@ -41,6 +41,11 @@ namespace litert::lm {
 namespace {
 
 absl::Status ValidateDPMEngineSettings(const EngineSettings& settings) {
+#ifdef LITERT_LM_DEBUGGER_ENABLED
+  return absl::UnimplementedError(
+      "DPM agent generation does not support debugger-installed graph "
+      "callbacks.");
+#endif
   if (settings.IsBenchmarkEnabled() ||
       settings.GetVisionExecutorSettings().has_value() ||
       settings.GetAudioExecutorSettings().has_value()) {
@@ -181,6 +186,28 @@ absl::StatusOr<std::unique_ptr<EngineDPMAgentRuntime>>
 EngineDPMAgentRuntime::Create(
     Engine* engine, SessionConfig session_config,
     std::optional<SessionHandoffIdentity> expected_identity) {
+  return CreateInternal(engine, std::move(session_config), std::nullopt,
+                        expected_identity);
+}
+
+absl::StatusOr<std::unique_ptr<EngineDPMAgentRuntime>>
+EngineDPMAgentRuntime::Create(
+    Engine* engine, SessionConfig session_config,
+    CapsuleRestoreAdmissionBinding capsule_restore_admission,
+    std::optional<SessionHandoffIdentity> expected_identity) {
+  return CreateInternal(
+      engine, std::move(session_config),
+      std::optional<CapsuleRestoreAdmissionBinding>(
+          std::move(capsule_restore_admission)),
+      expected_identity);
+}
+
+absl::StatusOr<std::unique_ptr<EngineDPMAgentRuntime>>
+EngineDPMAgentRuntime::CreateInternal(
+    Engine* engine, SessionConfig session_config,
+    std::optional<CapsuleRestoreAdmissionBinding>
+        capsule_restore_admission,
+    std::optional<SessionHandoffIdentity> expected_identity) {
   if (engine == nullptr) {
     return absl::InvalidArgumentError(
         "DPM agent runtime requires a loaded Engine.");
@@ -267,10 +294,42 @@ EngineDPMAgentRuntime::Create(
         "DPM agent identity assertion does not match the loaded Engine.");
   }
 
+  std::optional<ExactLiteRtProfile> capsule_restore_profile;
+  std::optional<Hash256> capsule_restore_admission_record_id;
+  std::optional<SessionHandoffCapability> session_handoff_capability;
+  std::optional<CapsuleRestoreOperationalCoverage>
+      capsule_restore_operational_coverage;
+  if (capsule_restore_admission.has_value()) {
+    ABSL_ASSIGN_OR_RETURN(
+        AuthenticatedCapsuleRestoreAdmission admission,
+        ResolveAuthenticatedCapsuleRestoreAdmission(
+            engine, session_config, *capsule_restore_admission));
+    if (admission.profile.session_identity != authoritative_identity ||
+        admission.capability.session_identity != authoritative_identity ||
+        admission.record.capability != admission.capability) {
+      return absl::FailedPreconditionError(
+          "CapsuleRestore admission does not match the live parent runtime's "
+          "resolved session identity.");
+    }
+    capsule_restore_profile = std::move(admission.profile);
+    capsule_restore_admission_record_id = admission.record.record_id;
+    session_handoff_capability = std::move(admission.capability);
+    capsule_restore_operational_coverage =
+        std::move(admission.operational_coverage);
+  }
+
   auto runtime = std::unique_ptr<EngineDPMAgentRuntime>(
-      new EngineDPMAgentRuntime(engine, std::move(session_config),
-                                authoritative_identity));
+      new EngineDPMAgentRuntime(
+          engine, std::move(session_config), authoritative_identity,
+          std::move(capsule_restore_admission),
+          std::move(capsule_restore_profile),
+          capsule_restore_admission_record_id,
+          std::move(session_handoff_capability),
+          std::move(capsule_restore_operational_coverage)));
   ABSL_RETURN_IF_ERROR(runtime->ValidateRuntimeSupport());
+  if (runtime->capsule_restore_admission_.has_value()) {
+    ABSL_RETURN_IF_ERROR(runtime->ValidateSessionHandoffSupport());
+  }
   return runtime;
 }
 
@@ -289,6 +348,21 @@ absl::Status EngineDPMAgentRuntime::ValidateRuntimeSupport() const {
     return absl::FailedPreconditionError(
         "Loaded Engine identity changed after DPM agent admission.");
   }
+  const bool has_binding = capsule_restore_admission_.has_value();
+  if (has_binding != capsule_restore_profile_.has_value() ||
+      has_binding != capsule_restore_admission_record_id_.has_value() ||
+      has_binding != session_handoff_capability_.has_value() ||
+      has_binding != capsule_restore_operational_coverage_.has_value()) {
+    return absl::InternalError(
+        "DPM agent CapsuleRestore admission binding is internally "
+        "inconsistent.");
+  }
+  if (has_binding) {
+    ABSL_ASSIGN_OR_RETURN(
+        const AuthenticatedCapsuleRestoreAdmission current,
+        ResolveCurrentCapsuleRestoreAdmission());
+    (void)current;
+  }
   return absl::OkStatus();
 }
 
@@ -303,9 +377,108 @@ absl::Status EngineDPMAgentRuntime::ValidateSessionHandoffSupport() const {
   // CanonicalWinnerReplay. Exercise the authenticated fresh-state
   // export/import surface only when the product configuration enables
   // checkpoint restore or capture. This probe does not establish
-  // own-position continuation equality; profile admission remains
+  // own-position continuation equality; CapsuleRestore admission remains
   // responsible for that stronger claim.
-  return ProbeSessionHandoffSupport();
+  ABSL_RETURN_IF_ERROR(ProbeSessionHandoffSupport());
+  ABSL_ASSIGN_OR_RETURN(
+      const AuthenticatedCapsuleRestoreAdmission after,
+      ResolveCurrentCapsuleRestoreAdmission());
+  if (after.record.record_id !=
+          *capsule_restore_admission_record_id_ ||
+      after.profile != *capsule_restore_profile_ ||
+      after.capability != *session_handoff_capability_ ||
+      after.operational_coverage !=
+          *capsule_restore_operational_coverage_) {
+    return absl::AbortedError(
+        "CapsuleRestore admission changed during live-runtime support "
+        "validation.");
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<AuthenticatedCapsuleRestoreAdmission>
+EngineDPMAgentRuntime::ResolveCurrentCapsuleRestoreAdmission() const {
+  const bool has_binding = capsule_restore_admission_.has_value();
+  if (has_binding != capsule_restore_profile_.has_value() ||
+      has_binding != capsule_restore_admission_record_id_.has_value() ||
+      has_binding != session_handoff_capability_.has_value() ||
+      has_binding != capsule_restore_operational_coverage_.has_value()) {
+    return absl::InternalError(
+        "DPM agent CapsuleRestore authority is internally inconsistent.");
+  }
+  if (!has_binding) {
+    return absl::FailedPreconditionError(
+        "DPM agent runtime was constructed without CapsuleRestore "
+        "admission.");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      AuthenticatedCapsuleRestoreAdmission current,
+      ResolveAuthenticatedCapsuleRestoreAdmission(
+          engine_, resolved_session_config_, *capsule_restore_admission_));
+  if (current.record.record_id !=
+          *capsule_restore_admission_record_id_ ||
+      current.profile != *capsule_restore_profile_ ||
+      current.capability != *session_handoff_capability_ ||
+      current.operational_coverage !=
+          *capsule_restore_operational_coverage_ ||
+      current.record.capability != current.capability ||
+      current.capability.session_identity != session_handoff_identity_) {
+    return absl::AbortedError(
+        "Authenticated CapsuleRestore admission, profile, or capability "
+        "changed after live-runtime construction.");
+  }
+  return current;
+}
+
+absl::StatusOr<std::optional<Hash256>>
+EngineDPMAgentRuntime::GetCapsuleRestoreAdmissionRecordId() const {
+  ABSL_RETURN_IF_ERROR(ValidateRuntimeSupport());
+  if (!capsule_restore_admission_.has_value()) {
+    return std::optional<Hash256>();
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      const AuthenticatedCapsuleRestoreAdmission current,
+      ResolveCurrentCapsuleRestoreAdmission());
+  return std::optional<Hash256>(current.record.record_id);
+}
+
+absl::StatusOr<std::optional<Hash256>>
+EngineDPMAgentRuntime::GetSessionHandoffCapabilityId() const {
+  ABSL_RETURN_IF_ERROR(ValidateRuntimeSupport());
+  if (!capsule_restore_admission_.has_value()) {
+    return std::optional<Hash256>();
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      const AuthenticatedCapsuleRestoreAdmission current,
+      ResolveCurrentCapsuleRestoreAdmission());
+  return std::optional<Hash256>(current.capability.capability_id);
+}
+
+absl::StatusOr<std::optional<SessionHandoffCapability>>
+EngineDPMAgentRuntime::GetSessionHandoffCapability() const {
+  ABSL_RETURN_IF_ERROR(ValidateRuntimeSupport());
+  if (!capsule_restore_admission_.has_value()) {
+    return std::optional<SessionHandoffCapability>();
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      const AuthenticatedCapsuleRestoreAdmission current,
+      ResolveCurrentCapsuleRestoreAdmission());
+  return std::optional<SessionHandoffCapability>(current.capability);
+}
+
+absl::StatusOr<std::optional<CapsuleRestoreOperationalCoverage>>
+EngineDPMAgentRuntime::GetCapsuleRestoreOperationalCoverage() const {
+  ABSL_RETURN_IF_ERROR(ValidateRuntimeSupport());
+  if (!capsule_restore_admission_.has_value()) {
+    return std::optional<CapsuleRestoreOperationalCoverage>();
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      const AuthenticatedCapsuleRestoreAdmission current,
+      ResolveCurrentCapsuleRestoreAdmission());
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreOperationalCoverage(
+      current.operational_coverage));
+  return std::optional<CapsuleRestoreOperationalCoverage>(
+      current.operational_coverage);
 }
 
 absl::Status EngineDPMAgentRuntime::ValidateSession(
@@ -380,11 +553,18 @@ EngineDPMAgentRuntime::CreateSession() {
       std::vector<std::vector<int>> fresh_history,
       session->GetExactProcessedTokenHistory());
   ABSL_RETURN_IF_ERROR(ValidateFreshExactHistory(fresh_history));
+  if (capsule_restore_admission_.has_value()) {
+    ABSL_ASSIGN_OR_RETURN(
+        const AuthenticatedCapsuleRestoreAdmission current,
+        ResolveCurrentCapsuleRestoreAdmission());
+    (void)current;
+  }
   return session;
 }
 
 absl::StatusOr<DPMAgentGenerationOutcome> EngineDPMAgentRuntime::Generate(
     Engine::Session* session, const DPMAgentGenerationRequest& request) {
+  ABSL_RETURN_IF_ERROR(ValidateRuntimeSupport());
   if (session == nullptr) {
     return absl::InvalidArgumentError(
         "DPM agent generation requires a live producing session.");

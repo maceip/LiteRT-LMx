@@ -70,7 +70,8 @@ struct DPMExactWorkerCheckpointProvenance {
 // produced it. A matching model/profile alone is intentionally insufficient.
 struct DPMSessionCheckpointDescriptor {
   static constexpr uint32_t kLegacyFormatVersion = 1;
-  static constexpr uint32_t kFormatVersion = 2;
+  static constexpr uint32_t kPreviousFormatVersion = 2;
+  static constexpr uint32_t kFormatVersion = 3;
 
   uint32_t format_version = kFormatVersion;
   Hash256 descriptor_id;
@@ -97,7 +98,7 @@ struct DPMSessionCheckpointDescriptor {
   uint64_t envelope_size = 0;
   int64_t created_unix_micros = 0;
 
-  // Version 2 provenance. Version 1 descriptors infer
+  // Version 2+ provenance. Version 1 descriptors infer
   // CanonicalWinnerReplay plus a live-parent capture and serialize none of
   // these fields. A restored-from ID points backward to an already-published
   // descriptor and is therefore safe to include in this descriptor's content
@@ -107,12 +108,23 @@ struct DPMSessionCheckpointDescriptor {
       DPMCheckpointCaptureOrigin::kLiveParentSession;
   std::optional<Hash256> restored_from_checkpoint_id;
 
+  // Mode-independent CapsuleRestore provenance added in version 3. Both IDs
+  // are required for every newly published checkpoint, whether its replay
+  // mode is WinnerReplay or ExactRegeneration. Version 2 exact descriptors
+  // carry only the admission record ID for backward compatibility; version 2
+  // Winner descriptors carry neither and are never upgraded implicitly.
+  Hash256 capsule_restore_capability_id;
+  Hash256 capsule_restore_admission_record_id;
+  // Generic versioned operational-coverage identity. Version 3 binds the
+  // exact coverage contract matched at capture; future coverage versions keep
+  // this durable field stable.
+  Hash256 capsule_restore_coverage_id;
+
   // ExactRegeneration-only identities. exact_profile_id is optional at the
   // type level so WinnerReplay can prove its absence; every exact descriptor
   // must populate it and every following digest.
   std::optional<Hash256> exact_profile_id;
   Hash256 exact_profile_admission_record_id;
-  Hash256 capsule_restore_admission_record_id;
   Hash256 exact_request_execution_evidence_id;
   DPMCheckpointWorkerPrefillMode worker_prefill_mode =
       DPMCheckpointWorkerPrefillMode::kNone;

@@ -50,7 +50,8 @@ inline constexpr size_t kMaximumDPMCanonicalAgentInputBytes =
 // projections, and manifests are disposable derivatives of these events.
 struct DPMTurnReceipt {
   static constexpr uint32_t kLegacyFormatVersion = 3;
-  static constexpr uint32_t kFormatVersion = 4;
+  static constexpr uint32_t kPreviousFormatVersion = 4;
+  static constexpr uint32_t kFormatVersion = 5;
 
   uint32_t format_version = kFormatVersion;
   std::string operation_id;
@@ -124,10 +125,16 @@ struct DPMTurnReceipt {
       DPMCheckpointWorkerPrefillMode::kNone;
   Hash256 agent_physical_execution_plan_hash;
 
-  // CapsuleRestore admission is separate from exact-profile admission. It is
-  // required whenever ExactRegeneration consumes or publishes a capsule and
-  // absent from WinnerReplay and legacy receipts.
+  // CapsuleRestore is separate from exact-profile admission. Version 5 binds
+  // the Engine-derived capability, current authenticated admission, and the
+  // concrete versioned operational coverage matched whenever either replay
+  // mode consumes or publishes a capsule. Version 4 exact receipts carried
+  // only the admission ID; version 4 Winner receipts carried neither and are
+  // never upgraded implicitly. The capability and generic coverage IDs are
+  // appended after the complete version 4 durable encoding.
   std::optional<Hash256> agent_capsule_restore_admission_record_id;
+  std::optional<Hash256> agent_capsule_restore_capability_id;
+  std::optional<Hash256> agent_capsule_restore_coverage_id;
 
   // Authenticated transient-capsule provenance for an exact checkpoint. The
   // durable checkpoint descriptor binds the later rewrap, keeping the

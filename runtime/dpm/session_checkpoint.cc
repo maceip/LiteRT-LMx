@@ -35,6 +35,10 @@ constexpr std::array<char, 8> kDescriptorV1Magic = {'D', 'P', 'M', 'K',
 // container deliberately remains DPMDSC01/version 1.
 constexpr std::array<char, 8> kDescriptorV2Magic = {'D', 'P', 'M', 'K',
                                                      'V', '0', '0', '2'};
+// Version 3 independently binds mode-neutral CapsuleRestore capability and
+// admission provenance. Older hash domains remain immutable.
+constexpr std::array<char, 8> kDescriptorV3Magic = {'D', 'P', 'M', 'K',
+                                                     'V', '0', '0', '3'};
 constexpr uint64_t kMaximumCheckpointCapsuleBytes =
     uint64_t{8} * 1024 * 1024 * 1024;
 
@@ -80,16 +84,23 @@ bool HasZeroOrMissingHash(const std::optional<Hash256>& hash) {
   return !hash.has_value() || IsZeroHash(*hash);
 }
 
-bool HasNoExactFields(const DPMSessionCheckpointDescriptor& descriptor) {
+bool HasNoExactRegenerationFields(
+    const DPMSessionCheckpointDescriptor& descriptor) {
   return !descriptor.exact_profile_id.has_value() &&
          IsZeroHash(descriptor.exact_profile_admission_record_id) &&
-         IsZeroHash(descriptor.capsule_restore_admission_record_id) &&
          IsZeroHash(descriptor.exact_request_execution_evidence_id) &&
          descriptor.worker_prefill_mode ==
              DPMCheckpointWorkerPrefillMode::kNone &&
          IsZeroHash(descriptor.execution_plan_hash) &&
          IsZeroHash(descriptor.exact_output_evidence_hash) &&
          !descriptor.worker_provenance.has_value();
+}
+
+bool HasNoCapsuleRestoreProvenance(
+    const DPMSessionCheckpointDescriptor& descriptor) {
+  return IsZeroHash(descriptor.capsule_restore_capability_id) &&
+         IsZeroHash(descriptor.capsule_restore_admission_record_id) &&
+         IsZeroHash(descriptor.capsule_restore_coverage_id);
 }
 
 absl::Status ValidateCommonDescriptorFields(
@@ -178,7 +189,8 @@ absl::Status ValidateDescriptorFields(
           descriptor.capture_origin !=
               DPMCheckpointCaptureOrigin::kLiveParentSession ||
           descriptor.restored_from_checkpoint_id.has_value() ||
-          !HasNoExactFields(descriptor)) {
+          !HasNoExactRegenerationFields(descriptor) ||
+          !HasNoCapsuleRestoreProvenance(descriptor)) {
         return absl::InvalidArgumentError(
             "Legacy DPM checkpoint descriptors are inferred "
             "WinnerReplay/live-parent artifacts and cannot carry version 2 "
@@ -186,6 +198,7 @@ absl::Status ValidateDescriptorFields(
       }
       return absl::OkStatus();
 
+    case DPMSessionCheckpointDescriptor::kPreviousFormatVersion:
     case DPMSessionCheckpointDescriptor::kFormatVersion:
       break;
 
@@ -196,7 +209,25 @@ absl::Status ValidateDescriptorFields(
 
   if (descriptor.envelope_size > kMaximumCheckpointCapsuleBytes) {
     return absl::ResourceExhaustedError(
-        "DPM checkpoint durable capsule exceeds the version 2 limit.");
+        "DPM checkpoint durable capsule exceeds its versioned size limit.");
+  }
+
+  const bool is_previous_version =
+      descriptor.format_version ==
+      DPMSessionCheckpointDescriptor::kPreviousFormatVersion;
+  if (is_previous_version) {
+    if (!IsZeroHash(descriptor.capsule_restore_capability_id) ||
+        !IsZeroHash(descriptor.capsule_restore_coverage_id)) {
+      return absl::InvalidArgumentError(
+          "Version 2 DPM checkpoints cannot carry a version 3 "
+          "CapsuleRestore capability or coverage ID.");
+    }
+  } else if (IsZeroHash(descriptor.capsule_restore_capability_id) ||
+             IsZeroHash(descriptor.capsule_restore_admission_record_id) ||
+             IsZeroHash(descriptor.capsule_restore_coverage_id)) {
+    return absl::InvalidArgumentError(
+        "Version 3 DPM checkpoints require complete CapsuleRestore "
+        "capability, admission, and operational-coverage provenance.");
   }
 
   ABSL_RETURN_IF_ERROR(ValidateDPMReplayMode(descriptor.replay_mode));
@@ -216,10 +247,13 @@ absl::Status ValidateDescriptorFields(
     case DPMReplayMode::kCanonicalWinnerReplay:
       if (descriptor.capture_origin !=
               DPMCheckpointCaptureOrigin::kLiveParentSession ||
-          !HasNoExactFields(descriptor)) {
+          !HasNoExactRegenerationFields(descriptor) ||
+          (is_previous_version &&
+           !HasNoCapsuleRestoreProvenance(descriptor))) {
         return absl::InvalidArgumentError(
             "WinnerReplay checkpoints require a live-parent capture and "
-            "cannot carry exact-worker provenance.");
+            "cannot carry exact-worker provenance; legacy version 2 winners "
+            "also cannot claim CapsuleRestore admission.");
       }
       return absl::OkStatus();
 
@@ -351,6 +385,59 @@ absl::StatusOr<std::string> EncodeDescriptorV2ForHash(
   return bytes;
 }
 
+absl::StatusOr<std::string> EncodeDescriptorV3ForHash(
+    const DPMSessionCheckpointDescriptor& descriptor) {
+  std::string bytes;
+  bytes.reserve(928 + descriptor.log_id.size() + descriptor.key_id.size());
+  bytes.append(kDescriptorV3Magic.data(), kDescriptorV3Magic.size());
+  AppendU32(descriptor.format_version, &bytes);
+  ABSL_RETURN_IF_ERROR(AppendString(descriptor.log_id, &bytes));
+  bytes.push_back(static_cast<char>(descriptor.stage));
+  AppendU64(descriptor.source_event_count, &bytes);
+  AppendHash(descriptor.source_prefix_hash, &bytes);
+  AppendU64(descriptor.response_event_index, &bytes);
+  AppendHash(descriptor.projection_request_hash, &bytes);
+  AppendHash(descriptor.projection_manifest_hash, &bytes);
+  AppendHash(descriptor.correction_digest, &bytes);
+  AppendHash(descriptor.agent_request_hash, &bytes);
+  AppendHash(descriptor.agent_transcript_hash, &bytes);
+  AppendHash(descriptor.session_identity.model_artifact_hash, &bytes);
+  AppendHash(descriptor.session_identity.runtime_artifact_hash, &bytes);
+  AppendHash(descriptor.session_identity.inference_profile_hash, &bytes);
+  ABSL_RETURN_IF_ERROR(AppendString(descriptor.key_id, &bytes));
+  AppendHash(descriptor.envelope_hash, &bytes);
+  AppendU64(descriptor.envelope_size, &bytes);
+  AppendI64(descriptor.created_unix_micros, &bytes);
+
+  bytes.push_back(static_cast<char>(descriptor.replay_mode));
+  bytes.push_back(static_cast<char>(descriptor.capture_origin));
+  ABSL_RETURN_IF_ERROR(
+      AppendOptionalHash(descriptor.restored_from_checkpoint_id, &bytes));
+  ABSL_RETURN_IF_ERROR(
+      AppendOptionalHash(descriptor.exact_profile_id, &bytes));
+  AppendHash(descriptor.exact_profile_admission_record_id, &bytes);
+  AppendHash(descriptor.capsule_restore_capability_id, &bytes);
+  AppendHash(descriptor.capsule_restore_admission_record_id, &bytes);
+  AppendHash(descriptor.capsule_restore_coverage_id, &bytes);
+  AppendHash(descriptor.exact_request_execution_evidence_id, &bytes);
+  bytes.push_back(static_cast<char>(descriptor.worker_prefill_mode));
+  AppendHash(descriptor.execution_plan_hash, &bytes);
+  AppendHash(descriptor.exact_output_evidence_hash, &bytes);
+  bytes.push_back(descriptor.worker_provenance.has_value() ? '\1' : '\0');
+  if (descriptor.worker_provenance.has_value()) {
+    const DPMExactWorkerCheckpointProvenance& provenance =
+        *descriptor.worker_provenance;
+    AppendU32(provenance.run_index, &bytes);
+    AppendHash(provenance.execution_plan_hash, &bytes);
+    AppendHash(provenance.request_envelope_hash, &bytes);
+    AppendHash(provenance.result_envelope_hash, &bytes);
+    AppendU64(provenance.transient_envelope_size, &bytes);
+    AppendHash(provenance.transient_envelope_hash, &bytes);
+    AppendHash(provenance.output_evidence_hash, &bytes);
+  }
+  return bytes;
+}
+
 absl::StatusOr<std::string> EncodeDescriptorForHash(
     const DPMSessionCheckpointDescriptor& descriptor) {
   ABSL_RETURN_IF_ERROR(ValidateDescriptorFields(descriptor));
@@ -358,7 +445,11 @@ absl::StatusOr<std::string> EncodeDescriptorForHash(
       DPMSessionCheckpointDescriptor::kLegacyFormatVersion) {
     return EncodeDescriptorV1ForHash(descriptor);
   }
-  return EncodeDescriptorV2ForHash(descriptor);
+  if (descriptor.format_version ==
+      DPMSessionCheckpointDescriptor::kPreviousFormatVersion) {
+    return EncodeDescriptorV2ForHash(descriptor);
+  }
+  return EncodeDescriptorV3ForHash(descriptor);
 }
 
 Hash256 Sha256(absl::string_view bytes) {
