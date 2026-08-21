@@ -584,6 +584,7 @@ absl::StatusOr<Hash256> ComputeReceiptAgentReplayRequestHash(
                         EncodeDPMAgentExecutionRequest(logical_request));
   DPMCanonicalReplayRequest replay_request{
       .stage = DPMReplayStage::kAgentDecision,
+      .max_output_tokens = receipt.max_decision_tokens,
       .request_contract_version = std::string(kDPMAgentReplayContractVersion),
       .canonical_payload = std::move(encoded),
   };
@@ -740,6 +741,8 @@ absl::Status DPMEngine::ValidateConfiguration() const {
   }
   ABSL_RETURN_IF_ERROR(projection_provider_->ValidateSupport());
   ABSL_RETURN_IF_ERROR(agent_runtime_->ValidateSupport());
+  ABSL_RETURN_IF_ERROR(agent_runtime_->ValidateGenerationLimit(
+      static_cast<uint32_t>(config_.max_decision_tokens)));
   const DPMReplayMode agent_replay_mode = agent_runtime_->GetReplayMode();
   ABSL_RETURN_IF_ERROR(ValidateDPMReplayMode(agent_replay_mode));
   ABSL_ASSIGN_OR_RETURN(const std::optional<Hash256> exact_profile_id,

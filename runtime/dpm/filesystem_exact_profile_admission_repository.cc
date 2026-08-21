@@ -381,7 +381,10 @@ std::filesystem::path RecordPath(const std::filesystem::path& directory,
 FilesystemExactProfileAdmissionRepository::
     FilesystemExactProfileAdmissionRepository(std::filesystem::path root)
     : root_(std::move(root)),
-      directory_(root_ / "exact-profile-admission" / "v1"),
+      // Admission v2 binds the authenticated full-prefill execution plan and
+      // worker protocol v2. Keep it in a disjoint create-once namespace so a
+      // disposable v1 admission can never block or masquerade as v2 proof.
+      directory_(root_ / "exact-profile-admission" / "v2"),
       records_directory_(directory_ / "records"),
       lock_path_(directory_ / "repository.lock") {}
 

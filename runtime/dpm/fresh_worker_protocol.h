@@ -16,17 +16,23 @@
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_DPM_FRESH_WORKER_PROTOCOL_H_
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "runtime/engine/session_handoff.h"
 #include "runtime/platform/hash/hasher.h"
 
 namespace litert::lm {
 
-inline constexpr uint32_t kFreshWorkerProtocolVersion = 1;
+inline constexpr uint32_t kFreshWorkerProtocolVersion = 2;
+// DPMTOK01 is an independent canonical product format. Worker-envelope
+// evolution must not silently change already-recorded exact token bytes.
+inline constexpr uint32_t kFreshWorkerTokenEncodingVersion = 1;
+inline constexpr uint32_t kFreshWorkerExecutionPlanFormatVersion = 1;
 inline constexpr uint32_t kMaximumFreshWorkerRuns = 64;
 inline constexpr uint64_t kMaximumFreshWorkerRequestPayloadBytes =
     uint64_t{16} * 1024 * 1024;
@@ -47,6 +53,46 @@ struct FreshWorkerAuthentication {
   std::string authentication_key;
 };
 
+// Physical prefill work is deliberately separate from the complete logical
+// replay request. A checkpoint can therefore change work without changing the
+// logical replay key. Off-position grafting is not represented.
+enum class FreshWorkerPrefillMode : uint32_t {
+  kFullCanonicalPrefill = 1,
+  kOwnPositionCapsuleDelta = 2,
+};
+
+struct FreshWorkerExecutionPlan {
+  uint32_t format_version = kFreshWorkerExecutionPlanFormatVersion;
+
+  // SHA-256 of every canonical model-affecting field below except this digest
+  // itself. `capture_producing_capsule` is also excluded because capture runs
+  // only after output has been finalized; the enclosing request HMAC still
+  // authenticates that policy bit.
+  Hash256 plan_hash;
+  FreshWorkerPrefillMode prefill_mode =
+      FreshWorkerPrefillMode::kFullCanonicalPrefill;
+
+  // SHA-256 of FreshWorkerRequest::request_payload. The payload remains the
+  // complete canonical logical replay request in both prefill modes.
+  Hash256 logical_replay_request_hash;
+
+  // Restore-only bindings. Full-prefill plans must leave all of them empty or
+  // zero. The capsule bytes are transported separately and never enter the
+  // authenticated request envelope.
+  std::optional<Hash256> restore_checkpoint_id;
+  SessionHandoffIdentity session_identity;
+  Hash256 restore_durable_envelope_hash;
+  uint64_t restore_durable_envelope_size = 0;
+  std::string canonical_execution_payload;
+
+  bool capture_producing_capsule = false;
+};
+
+absl::Status ValidateFreshWorkerExecutionPlan(
+    const FreshWorkerExecutionPlan& plan);
+absl::StatusOr<Hash256> ComputeFreshWorkerExecutionPlanHash(
+    const FreshWorkerExecutionPlan& plan);
+
 // One independently launched worker consumes exactly one request. The exact
 // profile digest must be derived by the loaded runtime; this protocol treats it
 // only as an opaque binding and never lets it stand in for runtime derivation.
@@ -58,6 +104,7 @@ struct FreshWorkerRequest {
   uint32_t run_count = 0;
   Hash256 challenge_nonce;
   std::string request_payload;
+  FreshWorkerExecutionPlan execution_plan;
 };
 
 // Stable wire identity for the element representation hashed in a logits
@@ -123,6 +170,23 @@ enum class FreshWorkerReplayIsolation : uint32_t {
   kEmptyCatalogs = 1,
 };
 
+// Authenticated evidence for a producing-session capsule streamed separately
+// from the bounded result envelope. The transient envelope uses a per-request
+// key; the parent must authenticate and rewrap it before durable publication.
+struct FreshWorkerProducingCapsuleEvidence {
+  SessionHandoffIdentity session_identity;
+  uint64_t transient_envelope_size = 0;
+  Hash256 transient_envelope_hash;
+  Hash256 output_evidence_hash;
+
+  bool operator==(const FreshWorkerProducingCapsuleEvidence& other) const {
+    return session_identity == other.session_identity &&
+           transient_envelope_size == other.transient_envelope_size &&
+           transient_envelope_hash == other.transient_envelope_hash &&
+           output_evidence_hash == other.output_evidence_hash;
+  }
+};
+
 // An authenticated observation, not a claim that a profile is universally
 // deterministic. A non-OK result carries no model output and cannot be used by
 // admission.
@@ -135,6 +199,10 @@ struct FreshWorkerResult {
   Hash256 challenge_nonce;
   Hash256 request_envelope_hash;
   Hash256 worker_instance_nonce;
+  Hash256 execution_plan_hash;
+  std::optional<Hash256> restored_checkpoint_id;
+  std::optional<FreshWorkerProducingCapsuleEvidence>
+      producing_capsule_evidence;
   FreshWorkerReplayIsolation replay_isolation =
       FreshWorkerReplayIsolation::kUnverified;
   absl::StatusCode status_code = absl::StatusCode::kOk;
@@ -150,12 +218,16 @@ absl::Status ValidateFreshWorkerRequest(const FreshWorkerRequest& request);
 absl::Status ValidateFreshWorkerExecutionOutput(
     const FreshWorkerExecutionOutput& output);
 absl::Status ValidateFreshWorkerResult(const FreshWorkerResult& result);
+// Cross-checks a self-valid result against the authenticated request plan.
+// Failure results carry the plan hash but no claimed restore or capsule.
+absl::Status ValidateFreshWorkerResultForRequest(
+    const FreshWorkerResult& result, const FreshWorkerRequest& request);
 absl::Status ValidateFreshWorkerLogitFrameEvidence(
     const FreshWorkerLogitFrameEvidence& frame);
 
 // The sole admitted generated-token representation. DPMTOK01 is:
-// 8-byte magic, big-endian uint32 version, big-endian uint32 count, followed
-// by exactly `count` nonnegative big-endian int32 token IDs. Decode rejects
+// 8-byte magic, explicit version 1, big-endian uint32 count, followed by
+// exactly `count` nonnegative big-endian int32 token IDs. Decode rejects
 // out-of-range counts, negative IDs, truncation, and trailing bytes.
 absl::StatusOr<std::string> EncodeFreshWorkerTokenIds(
     const std::vector<int32_t>& token_ids);

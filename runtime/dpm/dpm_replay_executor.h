@@ -16,6 +16,7 @@
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_DPM_DPM_REPLAY_EXECUTOR_H_
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -36,10 +37,11 @@
 
 namespace litert::lm {
 
-inline constexpr uint32_t kDPMCanonicalReplayRequestFormatVersion = 1;
-// Magic, format version, stage, contract byte length, and payload byte length.
+inline constexpr uint32_t kDPMCanonicalReplayRequestFormatVersion = 2;
+// Magic, format version, stage, maximum output tokens, contract byte length,
+// and payload byte length.
 inline constexpr uint64_t kDPMCanonicalReplayRequestFramingBytes =
-    8 + 4 + 4 + 4 + 8;
+    8 + 4 + 4 + 4 + 4 + 8;
 
 // Stage-aware request bytes supplied to exactly one of the two disjoint replay
 // executors below. `canonical_payload` is the complete stage request, not an
@@ -47,6 +49,10 @@ inline constexpr uint64_t kDPMCanonicalReplayRequestFramingBytes =
 struct DPMCanonicalReplayRequest {
   uint32_t format_version = kDPMCanonicalReplayRequestFormatVersion;
   DPMReplayStage stage = DPMReplayStage::kProjection;
+  // Authenticated outer binding for parent-side admission before spawning a
+  // worker. Stage codecs must independently require this to equal the limit
+  // carried by their complete canonical payload.
+  uint32_t max_output_tokens = 0;
   std::string request_contract_version;
   std::string canonical_payload;
 };
@@ -128,7 +134,9 @@ class CanonicalWinnerReplayExecutor final {
 };
 
 struct ExactRegenerationExecutorConfig {
-  SessionConfig session_config;
+  DPMReplayStage stage = DPMReplayStage::kProjection;
+  uint32_t max_output_tokens = 0;
+  FreshWorkerProcessOptions worker_process;
   ExactLiteRtProfileAssertion profile_assertion;
   FreshWorkerAuthentication authentication;
   uint32_t independent_run_count = 2;
@@ -161,39 +169,62 @@ struct ExactRegenerationExecution {
 // adapter; the generic worker callback cannot establish that fact by itself.
 class ExactRegenerationExecutor final {
  public:
-  ExactRegenerationExecutor(
-      const Engine* engine, const FreshWorkerProcessRunner* worker_runner,
+  // Admission is an explicit operation because Create accepts only an
+  // already-admitted profile. This path still owns the concrete process
+  // runner locally and cannot be redirected to the lower-level runner seam.
+  static absl::StatusOr<ExactProfileAdmissionRecord> QualifyAndAdmit(
+      const Engine* engine,
       ExactProfileAdmissionRepository* admission_repository,
-      ExactRegenerationExecutorConfig config)
-      : engine_(engine),
-        worker_runner_(worker_runner),
-        admission_repository_(admission_repository),
-        config_(std::move(config)) {}
+      const ExactRegenerationExecutorConfig& config,
+      const DPMCanonicalReplayRequest& qualification_request);
+
+  // Constructs the product executor only after resolving the stage-bound
+  // Engine profile and authenticating its durable admission. The owned
+  // FreshWorkerProcessRunner spawns one new process per observed run.
+  static absl::StatusOr<std::unique_ptr<ExactRegenerationExecutor>> Create(
+      const Engine* engine,
+      ExactProfileAdmissionRepository* admission_repository,
+      ExactRegenerationExecutorConfig config);
 
   absl::Status ValidateSupport() const;
 
-  // Returns only the current Engine-derived candidate identity. It does not
-  // imply that an admission exists or that exact execution has succeeded.
-  absl::StatusOr<ExactLiteRtProfile> GetDerivedProfile() const;
+  DPMReplayStage GetReplayStage() const { return config_.stage; }
+  uint32_t GetMaxOutputTokens() const { return config_.max_output_tokens; }
 
-  // Explicitly records one narrowly scoped qualification for the current
-  // runtime-derived profile. This is a profile admission operation, not a
-  // product request lookup, and the record states the exact request it proved.
-  absl::StatusOr<ExactProfileAdmissionRecord> AdmitProfile(
-      const DPMCanonicalReplayRequest& qualification_request) const;
+  // Returns the current Engine-derived identity pinned at Create. Create has
+  // already authenticated admission, but the profile alone still does not
+  // imply that a particular product request regenerated exactly.
+  absl::StatusOr<ExactLiteRtProfile> GetDerivedProfile() const;
 
   absl::StatusOr<ExactRegenerationExecution> Run(
       const DPMCanonicalReplayRequest& request) const;
 
  private:
+  ExactRegenerationExecutor(
+      const Engine* engine,
+      ExactProfileAdmissionRepository* admission_repository,
+      ExactRegenerationExecutorConfig config,
+      SessionConfig resolved_session_config,
+      ExactLiteRtProfile derived_profile)
+      : engine_(engine),
+        worker_runner_(config.worker_process),
+        admission_repository_(admission_repository),
+        config_(std::move(config)),
+        resolved_session_config_(std::move(resolved_session_config)),
+        derived_profile_(std::move(derived_profile)) {}
+
+  absl::Status ValidateBoundRequest(
+      const DPMCanonicalReplayRequest& request) const;
   absl::StatusOr<ExactLiteRtProfile> ResolveCurrentProfile() const;
   ExactProfileQualificationSpec MakeQualificationSpec(
       absl::string_view encoded_request) const;
 
   const Engine* const engine_;
-  const FreshWorkerProcessRunner* const worker_runner_;
+  const FreshWorkerProcessRunner worker_runner_;
   ExactProfileAdmissionRepository* const admission_repository_;
   const ExactRegenerationExecutorConfig config_;
+  const SessionConfig resolved_session_config_;
+  const ExactLiteRtProfile derived_profile_;
 };
 
 }  // namespace litert::lm

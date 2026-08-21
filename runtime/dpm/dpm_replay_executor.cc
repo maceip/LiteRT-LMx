@@ -29,7 +29,9 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "runtime/dpm/canonical_replay_catalog.h"
+#include "runtime/dpm/dpm_event_log.h"
 #include "runtime/dpm/dpm_replay_mode.h"
+#include "runtime/dpm/engine_fresh_worker_contract.h"
 #include "runtime/dpm/exact_profile_admission.h"
 #include "runtime/dpm/fresh_worker_protocol.h"
 #include "runtime/platform/hash/sha256_hasher.h"
@@ -38,7 +40,7 @@ namespace litert::lm {
 namespace {
 
 constexpr std::array<char, 8> kCanonicalRequestMagic = {'D', 'P', 'M', 'R',
-                                                        'E', 'Q', '0', '1'};
+                                                        'E', 'Q', '0', '2'};
 
 bool IsZeroHash(const Hash256& hash) {
   uint8_t combined = 0;
@@ -171,6 +173,12 @@ absl::Status ValidateDPMCanonicalReplayRequest(
         "Canonical DPM replay request version is unsupported.");
   }
   ABSL_RETURN_IF_ERROR(ValidateDPMReplayStage(request.stage));
+  if (request.max_output_tokens == 0 ||
+      request.max_output_tokens > kMaximumDPMGenerationTokens) {
+    return absl::InvalidArgumentError(
+        "Canonical DPM replay request token limit is outside the product "
+        "bound.");
+  }
   if (request.request_contract_version.empty() ||
       request.request_contract_version.size() >
           kMaximumCanonicalReplayContractBytes ||
@@ -214,6 +222,7 @@ absl::StatusOr<std::string> EncodeDPMCanonicalReplayRequest(
   encoded.append(kCanonicalRequestMagic.data(), kCanonicalRequestMagic.size());
   AppendU32(request.format_version, &encoded);
   AppendU32(static_cast<uint32_t>(request.stage), &encoded);
+  AppendU32(request.max_output_tokens, &encoded);
   AppendU32(static_cast<uint32_t>(request.request_contract_version.size()),
             &encoded);
   AppendU64(request.canonical_payload.size(), &encoded);
@@ -237,6 +246,7 @@ absl::StatusOr<DPMCanonicalReplayRequest> DecodeDPMCanonicalReplayRequest(
   uint32_t stage;
   ABSL_ASSIGN_OR_RETURN(stage, reader.ReadU32());
   request.stage = static_cast<DPMReplayStage>(stage);
+  ABSL_ASSIGN_OR_RETURN(request.max_output_tokens, reader.ReadU32());
   uint32_t contract_size;
   ABSL_ASSIGN_OR_RETURN(contract_size, reader.ReadU32());
   uint64_t payload_size;
@@ -371,14 +381,174 @@ CanonicalWinnerReplayExecutor::Run(
   };
 }
 
+namespace {
+
+struct ResolvedExactExecutorProfile {
+  SessionConfig session_config;
+  ExactLiteRtProfile profile;
+};
+
+absl::Status ValidateExactExecutorConfig(
+    const Engine* engine,
+    const ExactProfileAdmissionRepository* admission_repository,
+    const ExactRegenerationExecutorConfig& config) {
+  if (engine == nullptr || admission_repository == nullptr) {
+    return absl::InvalidArgumentError(
+        "ExactRegeneration requires a loaded Engine and admission "
+        "repository.");
+  }
+  ABSL_RETURN_IF_ERROR(ValidateDPMReplayStage(config.stage));
+  if (config.independent_run_count < 2 ||
+      config.independent_run_count > kMaximumFreshWorkerRuns) {
+    return absl::InvalidArgumentError(
+        "ExactRegeneration requires 2 to 64 cold runs per request.");
+  }
+  ABSL_RETURN_IF_ERROR(
+      ValidateFreshWorkerAuthentication(config.authentication));
+  if (config.worker_process.executable_path.empty() ||
+      !config.worker_process.executable_path.is_absolute()) {
+    return absl::InvalidArgumentError(
+        "ExactRegeneration requires an absolute concrete worker executable "
+        "path.");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      SessionConfig ignored,
+      MakeEngineFreshWorkerSessionConfig(config.stage,
+                                         config.max_output_tokens));
+  (void)ignored;
+  return absl::OkStatus();
+}
+
+absl::StatusOr<ResolvedExactExecutorProfile> ResolveExactExecutorProfile(
+    const Engine* engine, const ExactRegenerationExecutorConfig& config) {
+  ABSL_ASSIGN_OR_RETURN(
+      SessionConfig session_config,
+      MakeEngineFreshWorkerSessionConfig(config.stage,
+                                         config.max_output_tokens));
+  ABSL_RETURN_IF_ERROR(
+      session_config.MaybeUpdateAndValidate(engine->GetEngineSettings()));
+  ABSL_ASSIGN_OR_RETURN(
+      ExactLiteRtProfile profile,
+      engine->ResolveExactLiteRtProfile(session_config,
+                                        config.profile_assertion));
+  return ResolvedExactExecutorProfile{
+      .session_config = std::move(session_config),
+      .profile = std::move(profile),
+  };
+}
+
+absl::Status ValidateAdmissionForExactProfile(
+    const ExactProfileAdmissionRecord& admission,
+    const ExactLiteRtProfile& profile,
+    const FreshWorkerAuthentication& authentication) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactProfileAdmissionRecordForProfile(admission, profile));
+  if (admission.authentication_key_id != authentication.key_id ||
+      admission.replay_isolation !=
+          FreshWorkerReplayIsolation::kEmptyCatalogs) {
+    return absl::FailedPreconditionError(
+        "Authenticated admission does not match the Engine-derived exact "
+        "profile and empty-catalog contract.");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateRequestForExactExecutorConfig(
+    const DPMCanonicalReplayRequest& request,
+    const ExactRegenerationExecutorConfig& config) {
+  ABSL_RETURN_IF_ERROR(ValidateDPMCanonicalReplayRequest(request));
+  if (request.stage != config.stage ||
+      request.max_output_tokens != config.max_output_tokens) {
+    return absl::FailedPreconditionError(
+        "Canonical replay request stage or token limit differs from the "
+        "immutable exact-worker profile.");
+  }
+  return absl::OkStatus();
+}
+
+ExactProfileQualificationSpec MakeExactQualificationSpec(
+    const SessionConfig& session_config,
+    const ExactRegenerationExecutorConfig& config,
+    absl::string_view encoded_request) {
+  ExactProfileQualificationSpec spec;
+  spec.session_config = session_config;
+  spec.profile_assertion = config.profile_assertion;
+  spec.canonical_request_payload.assign(encoded_request.data(),
+                                        encoded_request.size());
+  spec.independent_run_count = config.independent_run_count;
+  return spec;
+}
+
+}  // namespace
+
+absl::StatusOr<ExactProfileAdmissionRecord>
+ExactRegenerationExecutor::QualifyAndAdmit(
+    const Engine* engine,
+    ExactProfileAdmissionRepository* admission_repository,
+    const ExactRegenerationExecutorConfig& config,
+    const DPMCanonicalReplayRequest& qualification_request) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactExecutorConfig(engine, admission_repository, config));
+  ABSL_RETURN_IF_ERROR(
+      ValidateRequestForExactExecutorConfig(qualification_request, config));
+  ABSL_ASSIGN_OR_RETURN(ResolvedExactExecutorProfile resolved,
+                        ResolveExactExecutorProfile(engine, config));
+  ABSL_ASSIGN_OR_RETURN(
+      const std::string encoded_request,
+      EncodeDPMCanonicalReplayRequest(qualification_request));
+  FreshWorkerProcessRunner worker_runner(config.worker_process);
+  ExactProfileQualifier qualifier(engine, &worker_runner);
+  ABSL_ASSIGN_OR_RETURN(
+      ExactProfileAdmissionRecord admission,
+      qualifier.QualifyAndAdmit(
+          MakeExactQualificationSpec(resolved.session_config, config,
+                                     encoded_request),
+          config.authentication, admission_repository));
+  ABSL_RETURN_IF_ERROR(ValidateAdmissionForExactProfile(
+      admission, resolved.profile, config.authentication));
+  return admission;
+}
+
+absl::StatusOr<std::unique_ptr<ExactRegenerationExecutor>>
+ExactRegenerationExecutor::Create(
+    const Engine* engine,
+    ExactProfileAdmissionRepository* admission_repository,
+    ExactRegenerationExecutorConfig config) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactExecutorConfig(engine, admission_repository, config));
+  ABSL_ASSIGN_OR_RETURN(ResolvedExactExecutorProfile resolved,
+                        ResolveExactExecutorProfile(engine, config));
+  ABSL_ASSIGN_OR_RETURN(
+      const ExactProfileAdmissionRecord admission,
+      admission_repository->Get(resolved.profile, config.authentication));
+  ABSL_RETURN_IF_ERROR(ValidateAdmissionForExactProfile(
+      admission, resolved.profile, config.authentication));
+  return std::unique_ptr<ExactRegenerationExecutor>(
+      new ExactRegenerationExecutor(
+          engine, admission_repository, std::move(config),
+          std::move(resolved.session_config), std::move(resolved.profile)));
+}
+
+absl::Status ExactRegenerationExecutor::ValidateBoundRequest(
+    const DPMCanonicalReplayRequest& request) const {
+  return ValidateRequestForExactExecutorConfig(request, config_);
+}
+
 absl::StatusOr<ExactLiteRtProfile>
 ExactRegenerationExecutor::ResolveCurrentProfile() const {
   if (engine_ == nullptr) {
     return absl::InvalidArgumentError(
         "ExactRegeneration requires a loaded authoritative Engine.");
   }
-  return engine_->ResolveExactLiteRtProfile(config_.session_config,
-                                            config_.profile_assertion);
+  ABSL_ASSIGN_OR_RETURN(
+      ExactLiteRtProfile current,
+      engine_->ResolveExactLiteRtProfile(resolved_session_config_,
+                                         config_.profile_assertion));
+  if (current != derived_profile_) {
+    return absl::FailedPreconditionError(
+        "Engine-derived exact profile changed after executor construction.");
+  }
+  return current;
 }
 
 absl::StatusOr<ExactLiteRtProfile>
@@ -389,66 +559,32 @@ ExactRegenerationExecutor::GetDerivedProfile() const {
 ExactProfileQualificationSpec
 ExactRegenerationExecutor::MakeQualificationSpec(
     absl::string_view encoded_request) const {
-  ExactProfileQualificationSpec spec;
-  spec.session_config = config_.session_config;
-  spec.profile_assertion = config_.profile_assertion;
-  spec.canonical_request_payload.assign(encoded_request.data(),
-                                        encoded_request.size());
-  spec.independent_run_count = config_.independent_run_count;
-  return spec;
+  return MakeExactQualificationSpec(resolved_session_config_, config_,
+                                    encoded_request);
 }
 
 absl::Status ExactRegenerationExecutor::ValidateSupport() const {
-  if (worker_runner_ == nullptr || admission_repository_ == nullptr) {
+  if (engine_ == nullptr || admission_repository_ == nullptr) {
     return absl::InvalidArgumentError(
-        "ExactRegeneration requires a process runner and admission "
+        "ExactRegeneration requires a loaded Engine and admission "
         "repository.");
   }
-  if (config_.independent_run_count < 2 ||
-      config_.independent_run_count > kMaximumFreshWorkerRuns) {
-    return absl::InvalidArgumentError(
-        "ExactRegeneration requires 2 to 64 cold runs per request.");
-  }
   ABSL_RETURN_IF_ERROR(
-      ValidateFreshWorkerAuthentication(config_.authentication));
+      ValidateExactExecutorConfig(engine_, admission_repository_, config_));
   ABSL_ASSIGN_OR_RETURN(const ExactLiteRtProfile profile,
                         ResolveCurrentProfile());
   ABSL_ASSIGN_OR_RETURN(
       const ExactProfileAdmissionRecord admission,
       admission_repository_->Get(profile, config_.authentication));
-  ABSL_RETURN_IF_ERROR(
-      ValidateExactProfileAdmissionRecordForProfile(admission, profile));
-  if (admission.authentication_key_id != config_.authentication.key_id ||
-      admission.replay_isolation != FreshWorkerReplayIsolation::kEmptyCatalogs) {
-    return absl::FailedPreconditionError(
-        "Authenticated admission does not match the Engine-derived exact "
-        "profile.");
-  }
-  return absl::OkStatus();
-}
-
-absl::StatusOr<ExactProfileAdmissionRecord>
-ExactRegenerationExecutor::AdmitProfile(
-    const DPMCanonicalReplayRequest& qualification_request) const {
-  ABSL_RETURN_IF_ERROR(
-      ValidateDPMCanonicalReplayRequest(qualification_request));
-  if (engine_ == nullptr || worker_runner_ == nullptr ||
-      admission_repository_ == nullptr) {
-    return absl::InvalidArgumentError(
-        "Exact profile admission requires Engine, worker, and repository.");
-  }
-  ABSL_ASSIGN_OR_RETURN(
-      const std::string encoded_request,
-      EncodeDPMCanonicalReplayRequest(qualification_request));
-  ExactProfileQualifier qualifier(engine_, worker_runner_);
-  return qualifier.QualifyAndAdmit(MakeQualificationSpec(encoded_request),
-                                   config_.authentication,
-                                   admission_repository_);
+  return ValidateAdmissionForExactProfile(admission, profile,
+                                          config_.authentication);
 }
 
 absl::StatusOr<ExactRegenerationExecution> ExactRegenerationExecutor::Run(
     const DPMCanonicalReplayRequest& request) const {
-  ABSL_RETURN_IF_ERROR(ValidateDPMCanonicalReplayRequest(request));
+  // Reject cross-stage and cross-limit requests before ValidateSupport can
+  // touch the repository and, critically, before any worker process is born.
+  ABSL_RETURN_IF_ERROR(ValidateBoundRequest(request));
   ABSL_RETURN_IF_ERROR(ValidateSupport());
   ABSL_ASSIGN_OR_RETURN(const ExactLiteRtProfile profile_before,
                         ResolveCurrentProfile());
@@ -461,16 +597,10 @@ absl::StatusOr<ExactRegenerationExecution> ExactRegenerationExecutor::Run(
                         ComputeDPMCanonicalReplayRequestHash(request));
   const ExactProfileQualificationSpec qualification_spec =
       MakeQualificationSpec(encoded_request);
-  ABSL_RETURN_IF_ERROR(ValidateExactProfileAdmissionRecordForProfile(
-      admission, profile_before));
-  if (admission.authentication_key_id != config_.authentication.key_id ||
-      admission.replay_isolation != FreshWorkerReplayIsolation::kEmptyCatalogs) {
-    return absl::FailedPreconditionError(
-        "Authenticated admission changed or no longer matches the "
-        "Engine-derived exact profile.");
-  }
+  ABSL_RETURN_IF_ERROR(ValidateAdmissionForExactProfile(
+      admission, profile_before, config_.authentication));
 
-  ExactProfileQualifier qualifier(engine_, worker_runner_);
+  ExactProfileQualifier qualifier(engine_, &worker_runner_);
   ABSL_ASSIGN_OR_RETURN(
       ExactProfileAdmissionRecord cold_run,
       qualifier.Qualify(qualification_spec, config_.authentication));

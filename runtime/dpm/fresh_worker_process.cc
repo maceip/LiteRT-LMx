@@ -73,7 +73,7 @@ constexpr absl::Duration kMaximumTerminationGrace = absl::Seconds(5);
 constexpr absl::string_view kLaunchSpecDomain =
     "LITERT_LMX_FRESH_WORKER_LAUNCH_SPEC_SHA256_V1";
 constexpr absl::string_view kTransportKeyDomain =
-    "LITERT_LMX_FRESH_WORKER_PER_REQUEST_TRANSPORT_KEY_HMAC_SHA256_V1";
+    "LITERT_LMX_FRESH_WORKER_PER_REQUEST_TRANSPORT_KEY_HMAC_SHA256_V2";
 
 bool IsZeroHash(const Hash256& hash) {
   uint8_t combined = 0;
@@ -244,7 +244,7 @@ absl::StatusOr<FreshWorkerAuthentication> DeriveTransportAuthentication(
   const Hash256 payload_hash = payload_hasher.Finalize();
 
   std::string binding;
-  binding.reserve(4 + 32 + 32 + 4 + 4 + 32 + 4 +
+  binding.reserve(4 + 32 + 32 + 4 + 4 + 32 + 32 + 4 + 4 +
                   master_authentication.key_id.size() + 8 + 32);
   AppendU32(request.format_version, &binding);
   AppendHash(request.exact_profile_hash, &binding);
@@ -252,6 +252,9 @@ absl::StatusOr<FreshWorkerAuthentication> DeriveTransportAuthentication(
   AppendU32(request.run_index, &binding);
   AppendU32(request.run_count, &binding);
   AppendHash(request.challenge_nonce, &binding);
+  AppendHash(request.execution_plan.plan_hash, &binding);
+  AppendU32(request.execution_plan.capture_producing_capsule ? 1 : 0,
+            &binding);
   AppendU32(static_cast<uint32_t>(master_authentication.key_id.size()),
             &binding);
   binding.append(master_authentication.key_id);
@@ -873,6 +876,7 @@ FreshWorkerResult MakeFailureResult(const FreshWorkerRequest& request,
   result.challenge_nonce = request.challenge_nonce;
   result.request_envelope_hash = request_envelope_hash;
   result.worker_instance_nonce = worker_nonce;
+  result.execution_plan_hash = request.execution_plan.plan_hash;
   result.status_code = status.ok() ? absl::StatusCode::kInternal : status.code();
   result.status_message = status.ok() ? "Worker execution failed."
                                       : std::string(status.message());
@@ -895,6 +899,13 @@ absl::StatusOr<FreshWorkerProcessObservation> FreshWorkerProcessRunner::Run(
 #if defined(__APPLE__) || defined(__linux__) || defined(__unix__)
   ABSL_RETURN_IF_ERROR(ValidateProcessOptions(options_));
   ABSL_RETURN_IF_ERROR(ValidateFreshWorkerRequest(request));
+  if (request.execution_plan.prefill_mode !=
+          FreshWorkerPrefillMode::kFullCanonicalPrefill ||
+      request.execution_plan.capture_producing_capsule) {
+    return absl::UnimplementedError(
+        "The ordinary fresh-worker runner does not transport session "
+        "capsules; use the authenticated capsule-stream path.");
+  }
   ABSL_RETURN_IF_ERROR(ValidateFreshWorkerAuthentication(authentication));
   ABSL_ASSIGN_OR_RETURN(
       const std::string executable_path,
@@ -960,12 +971,15 @@ absl::StatusOr<FreshWorkerProcessObservation> FreshWorkerProcessRunner::Run(
   ABSL_ASSIGN_OR_RETURN(
       FreshWorkerResult result,
       DecodeFreshWorkerResult(result_envelope, transport_authentication));
+  ABSL_RETURN_IF_ERROR(
+      ValidateFreshWorkerResultForRequest(result, request));
   if (result.exact_profile_hash != request.exact_profile_hash ||
       result.qualification_id != request.qualification_id ||
       result.run_index != request.run_index ||
       result.run_count != request.run_count ||
       result.challenge_nonce != request.challenge_nonce ||
-      result.request_envelope_hash != request_envelope_hash) {
+      result.request_envelope_hash != request_envelope_hash ||
+      result.execution_plan_hash != request.execution_plan.plan_hash) {
     return absl::UnauthenticatedError(
         "Fresh-worker result is not bound to its exact request.");
   }
@@ -1006,7 +1020,15 @@ absl::Status RunFreshWorkerOnce(
                         GenerateFreshWorkerNonce());
 
   FreshWorkerResult result;
-  absl::StatusOr<FreshWorkerDerivedExecution> execution = execute(request);
+  absl::StatusOr<FreshWorkerDerivedExecution> execution =
+      request.execution_plan.prefill_mode ==
+                  FreshWorkerPrefillMode::kFullCanonicalPrefill &&
+              !request.execution_plan.capture_producing_capsule
+          ? execute(request)
+          : absl::StatusOr<FreshWorkerDerivedExecution>(
+                absl::UnimplementedError(
+                    "Fresh-worker capsule restore/capture requires the "
+                    "authenticated capsule-stream boundary."));
   if (!execution.ok()) {
     result = MakeFailureResult(request, request_envelope_hash, worker_nonce,
                                execution.status());
@@ -1036,6 +1058,7 @@ absl::Status RunFreshWorkerOnce(
       result.challenge_nonce = request.challenge_nonce;
       result.request_envelope_hash = request_envelope_hash;
       result.worker_instance_nonce = worker_nonce;
+      result.execution_plan_hash = request.execution_plan.plan_hash;
       result.replay_isolation = execution->replay_isolation;
       result.canonical_output = std::move(execution->output.canonical_output);
       result.token_bytes = std::move(execution->output.token_bytes);

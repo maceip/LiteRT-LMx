@@ -16,7 +16,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -33,6 +32,7 @@
 #include "runtime/dpm/dpm_projection_replay_runtime.h"
 #include "runtime/dpm/dpm_replay_executor.h"
 #include "runtime/dpm/dpm_replay_mode.h"
+#include "runtime/dpm/engine_fresh_worker_contract.h"
 #include "runtime/dpm/fresh_worker_process.h"
 #include "runtime/dpm/fresh_worker_protocol.h"
 #include "runtime/engine/engine.h"
@@ -258,10 +258,11 @@ absl::StatusOr<DecodedWorkerInvocation> DecodeCanonicalInvocation(
   }
   if (invocation.max_output_tokens == 0 ||
       invocation.max_output_tokens > kMaximumDPMGenerationTokens ||
+      replay_request.max_output_tokens != invocation.max_output_tokens ||
       invocation.projection.has_value() == invocation.agent.has_value()) {
     return absl::InvalidArgumentError(
-        "Fresh worker stage request is incomplete or has an invalid token "
-        "limit.");
+        "Fresh worker stage request is incomplete or its authenticated "
+        "outer token limit differs from the canonical stage payload.");
   }
   return invocation;
 }
@@ -518,6 +519,13 @@ absl::StatusOr<FreshWorkerDerivedExecution> ExecuteEngineFreshWorkerRequest(
   // select artifacts or allocate an inference runtime.
   ABSL_ASSIGN_OR_RETURN(const DecodedWorkerInvocation invocation,
                         DecodeCanonicalInvocation(request));
+  if (request.execution_plan.prefill_mode !=
+          FreshWorkerPrefillMode::kFullCanonicalPrefill ||
+      request.execution_plan.capture_producing_capsule) {
+    return absl::UnimplementedError(
+        "Exact Engine worker capsule restore/capture requires the separate "
+        "authenticated capsule-stream capability.");
+  }
   ABSL_RETURN_IF_ERROR(
       ValidateFixedEngineSettings(fixed_engine_settings));
 
@@ -624,39 +632,6 @@ absl::StatusOr<FreshWorkerDerivedExecution> ExecuteEngineFreshWorkerRequest(
 }
 
 }  // namespace
-
-absl::StatusOr<SessionConfig> MakeEngineFreshWorkerSessionConfig(
-    DPMReplayStage stage, uint32_t max_output_tokens) {
-  ABSL_RETURN_IF_ERROR(ValidateDPMReplayStage(stage));
-  if (max_output_tokens == 0 ||
-      max_output_tokens > kMaximumDPMGenerationTokens ||
-      max_output_tokens >
-          static_cast<uint32_t>((std::numeric_limits<int>::max)())) {
-    return absl::InvalidArgumentError(
-        "Exact-worker max output tokens are outside the product limit.");
-  }
-
-  SessionConfig config = SessionConfig::CreateDefault();
-  config.SetAudioModalityEnabled(false);
-  config.SetVisionModalityEnabled(false);
-  config.SetUseExternalSampler(false);
-  config.SetNumOutputCandidates(1);
-  config.SetSamplerBackend(Backend::CPU);
-  config.SetApplyPromptTemplateInSession(false);
-  config.SetMaxOutputTokens(static_cast<int>(max_output_tokens));
-  config.SetMemoryStrategy(
-      stage == DPMReplayStage::kProjection
-          ? SessionConfig::MemoryStrategy::kStatelessDeterministicProjection
-          : SessionConfig::MemoryStrategy::kStateful);
-  proto::SamplerParameters& sampler = config.GetMutableSamplerParams();
-  sampler.set_type(proto::SamplerParameters::GREEDY);
-  sampler.set_backend(proto::SamplerParameters::CPU);
-  sampler.set_k(0);
-  sampler.set_p(0.0f);
-  sampler.set_temperature(0.0f);
-  sampler.clear_seed();
-  return config;
-}
 
 absl::Status RunEngineFreshWorkerOnce(
     EngineSettings fixed_engine_settings) {

@@ -67,7 +67,7 @@ struct ExactProfileAdmissionRunEvidence {
 // deterministic. The product admission surface must control record production;
 // consumers must key lookups by the complete Engine-derived profile.
 struct ExactProfileAdmissionRecord {
-  static constexpr uint32_t kFormatVersion = 1;
+  static constexpr uint32_t kFormatVersion = 2;
 
   uint32_t format_version = kFormatVersion;
   Hash256 record_id;
@@ -80,6 +80,11 @@ struct ExactProfileAdmissionRecord {
   Hash256 qualification_request_hash;
   Hash256 request_payload_hash;
   uint64_t request_payload_size = 0;
+  // Canonical full-prefill plan used by every admission run. Profile
+  // admission is deliberately capsule-free; a restore or capture plan can
+  // never be serialized as profile qualification evidence.
+  Hash256 execution_plan_hash;
+  bool capture_producing_capsule = false;
   uint32_t independent_run_count = 0;
   int64_t qualified_unix_micros = 0;
   std::string authentication_key_id;

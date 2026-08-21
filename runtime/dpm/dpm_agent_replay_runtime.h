@@ -126,6 +126,12 @@ class DPMAgentReplayRuntime {
   // loaded session cannot export a complete handoff.
   virtual absl::Status ValidateSupport() const = 0;
 
+  // Preflights the DPMEngine decision limit before the authoritative input is
+  // appended. ExactRegeneration requires equality with its immutable worker
+  // profile; WinnerReplay admits any ordinary bounded product request.
+  virtual absl::Status ValidateGenerationLimit(
+      uint32_t max_output_tokens) const = 0;
+
   // Optional, separately admitted CapsuleRestore capability. DPMEngine calls
   // this only when checkpoint restore or capture is enabled. Exact agent
   // execution currently fails here because its producing session is isolated
@@ -162,6 +168,8 @@ class CanonicalWinnerDPMAgentRuntime final : public DPMAgentReplayRuntime {
   }
   absl::StatusOr<std::optional<Hash256>> GetExactProfileId() const override;
   absl::Status ValidateSupport() const override;
+  absl::Status ValidateGenerationLimit(
+      uint32_t max_output_tokens) const override;
   absl::Status ValidateSessionHandoffSupport() const override;
   absl::StatusOr<std::unique_ptr<Engine::Session>> CreateSession() override;
   absl::StatusOr<DPMAgentReplayExecution> Generate(
@@ -196,6 +204,8 @@ class ExactRegenerationDPMAgentRuntime final : public DPMAgentReplayRuntime {
   }
   absl::StatusOr<std::optional<Hash256>> GetExactProfileId() const override;
   absl::Status ValidateSupport() const override;
+  absl::Status ValidateGenerationLimit(
+      uint32_t max_output_tokens) const override;
   absl::Status ValidateSessionHandoffSupport() const override;
   absl::StatusOr<std::unique_ptr<Engine::Session>> CreateSession() override;
   absl::StatusOr<DPMAgentReplayExecution> Generate(

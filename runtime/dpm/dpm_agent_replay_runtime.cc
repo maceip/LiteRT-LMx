@@ -370,6 +370,7 @@ class WinnerAgentInvocation final : public CanonicalWinnerReplayGenerator {
     }
     generate_called_ = true;
     if (request.stage != DPMReplayStage::kAgentDecision ||
+        request.max_output_tokens != logical_request_->max_output_tokens ||
         request.request_contract_version != kDPMAgentReplayContractVersion) {
       return absl::InvalidArgumentError(
           "WinnerReplay agent invocation received another request contract.");
@@ -444,9 +445,11 @@ class WinnerAgentInvocation final : public CanonicalWinnerReplayGenerator {
   Hash256 generated_evidence_hash_;
 };
 
-DPMCanonicalReplayRequest MakeReplayRequest(std::string encoded) {
+DPMCanonicalReplayRequest MakeReplayRequest(std::string encoded,
+                                            uint32_t max_output_tokens) {
   return DPMCanonicalReplayRequest{
       .stage = DPMReplayStage::kAgentDecision,
+      .max_output_tokens = max_output_tokens,
       .request_contract_version = std::string(kDPMAgentReplayContractVersion),
       .canonical_payload = std::move(encoded),
   };
@@ -851,6 +854,17 @@ absl::Status CanonicalWinnerDPMAgentRuntime::ValidateSupport() const {
   return absl::OkStatus();
 }
 
+absl::Status CanonicalWinnerDPMAgentRuntime::ValidateGenerationLimit(
+    uint32_t max_output_tokens) const {
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  if (max_output_tokens == 0 ||
+      max_output_tokens > kMaximumDPMGenerationTokens) {
+    return absl::InvalidArgumentError(
+        "WinnerReplay agent token limit is outside the product bound.");
+  }
+  return absl::OkStatus();
+}
+
 absl::Status
 CanonicalWinnerDPMAgentRuntime::ValidateSessionHandoffSupport() const {
   ABSL_RETURN_IF_ERROR(ValidateSupport());
@@ -894,7 +908,8 @@ CanonicalWinnerDPMAgentRuntime::Generate(
   ABSL_ASSIGN_OR_RETURN(std::string encoded,
                         EncodeDPMAgentExecutionRequest(logical_request));
   const DPMCanonicalReplayRequest replay_request =
-      MakeReplayRequest(std::move(encoded));
+      MakeReplayRequest(std::move(encoded),
+                        logical_request.max_output_tokens);
   ABSL_ASSIGN_OR_RETURN(
       const Hash256 expected_request_hash,
       ComputeDPMCanonicalReplayRequestHash(replay_request));
@@ -971,6 +986,11 @@ ExactRegenerationDPMAgentRuntime::Create(
     return absl::InvalidArgumentError(
         "Exact agent requires an ExactRegeneration executor.");
   }
+  if (exact_executor->GetReplayStage() !=
+      DPMReplayStage::kAgentDecision) {
+    return absl::FailedPreconditionError(
+        "Exact agent executor is bound to another replay stage.");
+  }
   ABSL_ASSIGN_OR_RETURN(ExactLiteRtProfile profile,
                         exact_executor->GetDerivedProfile());
   ABSL_RETURN_IF_ERROR(ValidateRuntimeIdentity(profile.session_identity));
@@ -996,6 +1016,13 @@ absl::Status ExactRegenerationDPMAgentRuntime::ValidateSupport() const {
     return absl::InvalidArgumentError(
         "Exact agent has no regeneration executor.");
   }
+  if (exact_executor_->GetReplayStage() !=
+          DPMReplayStage::kAgentDecision ||
+      exact_executor_->GetMaxOutputTokens() == 0) {
+    return absl::FailedPreconditionError(
+        "Exact agent executor is not bound to a valid agent-decision "
+        "profile.");
+  }
   ABSL_RETURN_IF_ERROR(exact_executor_->ValidateSupport());
   ABSL_ASSIGN_OR_RETURN(const ExactLiteRtProfile current,
                         exact_executor_->GetDerivedProfile());
@@ -1007,6 +1034,17 @@ absl::Status ExactRegenerationDPMAgentRuntime::ValidateSupport() const {
   if (IsZeroHash(current.profile_id)) {
     return absl::FailedPreconditionError(
         "Exact agent Engine returned an empty derived profile ID.");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ExactRegenerationDPMAgentRuntime::ValidateGenerationLimit(
+    uint32_t max_output_tokens) const {
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  if (max_output_tokens != exact_executor_->GetMaxOutputTokens()) {
+    return absl::FailedPreconditionError(
+        "DPM agent token limit differs from the immutable exact-worker "
+        "profile.");
   }
   return absl::OkStatus();
 }
@@ -1036,6 +1074,8 @@ ExactRegenerationDPMAgentRuntime::Generate(
   ABSL_RETURN_IF_ERROR(ValidateSupport());
   ABSL_RETURN_IF_ERROR(ValidateDPMAgentExecutionRequest(logical_request));
   ABSL_RETURN_IF_ERROR(ValidateGenerationRequest(execution_request));
+  ABSL_RETURN_IF_ERROR(
+      ValidateGenerationLimit(logical_request.max_output_tokens));
   if (producing_session != nullptr ||
       static_cast<uint32_t>(execution_request.max_output_tokens) !=
           logical_request.max_output_tokens ||
@@ -1048,7 +1088,8 @@ ExactRegenerationDPMAgentRuntime::Generate(
   ABSL_ASSIGN_OR_RETURN(std::string encoded,
                         EncodeDPMAgentExecutionRequest(logical_request));
   const DPMCanonicalReplayRequest replay_request =
-      MakeReplayRequest(std::move(encoded));
+      MakeReplayRequest(std::move(encoded),
+                        logical_request.max_output_tokens);
   ABSL_ASSIGN_OR_RETURN(
       const Hash256 expected_request_hash,
       ComputeDPMCanonicalReplayRequestHash(replay_request));

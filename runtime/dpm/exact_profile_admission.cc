@@ -37,20 +37,20 @@ namespace litert::lm {
 namespace {
 
 constexpr std::array<char, 8> kAdmissionMagic = {'D', 'P', 'M', 'A', 'D', 'M',
-                                                  '0', '1'};
-constexpr uint32_t kAdmissionEnvelopeVersion = 1;
+                                                  '0', '2'};
+constexpr uint32_t kAdmissionEnvelopeVersion = 2;
 constexpr uint64_t kMaximumAdmissionEnvelopeBytes =
     kMaximumFreshWorkerEnvelopeBytes;
 constexpr uint64_t kAdmissionEnvelopeFixedBytes = 8 + 4 + 4 + 8 + 32;
 constexpr uint64_t kMaximumAdmissionKeyIdBytes = 256;
 constexpr absl::string_view kQualificationRequestDomain =
-    "LITERT_LMX_EXACT_PROFILE_QUALIFICATION_REQUEST_SHA256_V1";
+    "LITERT_LMX_EXACT_PROFILE_QUALIFICATION_REQUEST_SHA256_V2";
 constexpr absl::string_view kOutputEvidenceDomain =
     "LITERT_LMX_FRESH_WORKER_OUTPUT_EVIDENCE_SHA256_V1";
 constexpr absl::string_view kAdmissionRecordDomain =
-    "LITERT_LMX_EXACT_PROFILE_ADMISSION_RECORD_SHA256_V1";
+    "LITERT_LMX_EXACT_PROFILE_ADMISSION_RECORD_SHA256_V2";
 constexpr absl::string_view kAdmissionMacDomain =
-    "LITERT_LMX_EXACT_PROFILE_ADMISSION_HMAC_SHA256_V1";
+    "LITERT_LMX_EXACT_PROFILE_ADMISSION_HMAC_SHA256_V2";
 
 bool IsZeroHash(const Hash256& hash) {
   uint8_t combined = 0;
@@ -123,9 +123,25 @@ Hash256 ComputeQualificationRequestHashFromDigest(
   return hasher.Finalize();
 }
 
+absl::StatusOr<FreshWorkerExecutionPlan> MakeAdmissionExecutionPlan(
+    const Hash256& logical_replay_request_hash) {
+  if (IsZeroHash(logical_replay_request_hash)) {
+    return absl::InvalidArgumentError(
+        "Exact-profile admission logical request hash is empty.");
+  }
+  FreshWorkerExecutionPlan plan;
+  plan.prefill_mode = FreshWorkerPrefillMode::kFullCanonicalPrefill;
+  plan.logical_replay_request_hash = logical_replay_request_hash;
+  plan.capture_producing_capsule = false;
+  ABSL_ASSIGN_OR_RETURN(plan.plan_hash,
+                        ComputeFreshWorkerExecutionPlanHash(plan));
+  ABSL_RETURN_IF_ERROR(ValidateFreshWorkerExecutionPlan(plan));
+  return plan;
+}
+
 std::string EncodeRecordFields(const ExactProfileAdmissionRecord& record) {
   std::string body;
-  body.reserve(4 + 32 * 8 + 4 * 4 + 8 * 3 +
+  body.reserve(4 + 32 * 9 + 4 * 5 + 8 * 3 +
                record.authentication_key_id.size() +
                record.runs.size() * (4 + 8 + 32 * 6) +
                record.token_bytes.size() +
@@ -138,6 +154,8 @@ std::string EncodeRecordFields(const ExactProfileAdmissionRecord& record) {
   AppendHash(record.qualification_request_hash, &body);
   AppendHash(record.request_payload_hash, &body);
   AppendU64(record.request_payload_size, &body);
+  AppendHash(record.execution_plan_hash, &body);
+  AppendU32(record.capture_producing_capsule ? 1 : 0, &body);
   AppendU32(record.independent_run_count, &body);
   AppendU64(static_cast<uint64_t>(record.qualified_unix_micros), &body);
   AppendU32(static_cast<uint32_t>(record.authentication_key_id.size()), &body);
@@ -184,12 +202,14 @@ absl::Status ValidateAdmissionRecordFields(
   if (IsZeroHash(record.exact_profile_hash) ||
       IsZeroHash(record.qualification_id) ||
       IsZeroHash(record.qualification_request_hash) ||
-      IsZeroHash(record.request_payload_hash)) {
+      IsZeroHash(record.request_payload_hash) ||
+      IsZeroHash(record.execution_plan_hash)) {
     return absl::InvalidArgumentError(
         "Exact-profile admission record identity is incomplete.");
   }
   if (record.request_payload_size >
           kMaximumFreshWorkerRequestPayloadBytes ||
+      record.capture_producing_capsule ||
       record.independent_run_count < 2 ||
       record.independent_run_count > kMaximumFreshWorkerRuns ||
       record.runs.size() != record.independent_run_count ||
@@ -210,6 +230,14 @@ absl::Status ValidateAdmissionRecordFields(
   if (record.qualification_request_hash != expected_request_hash) {
     return absl::DataLossError(
         "Exact-profile qualification request hash is inconsistent.");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      const FreshWorkerExecutionPlan expected_plan,
+      MakeAdmissionExecutionPlan(record.request_payload_hash));
+  if (record.execution_plan_hash != expected_plan.plan_hash) {
+    return absl::DataLossError(
+        "Exact-profile admission did not use the canonical capsule-free "
+        "full-prefill plan.");
   }
 
   FreshWorkerExecutionOutput output{.canonical_output = record.canonical_output,
@@ -348,6 +376,15 @@ absl::StatusOr<ExactProfileAdmissionRecord> DecodeRecordFields(
   ABSL_ASSIGN_OR_RETURN(record.qualification_request_hash, reader.ReadHash());
   ABSL_ASSIGN_OR_RETURN(record.request_payload_hash, reader.ReadHash());
   ABSL_ASSIGN_OR_RETURN(record.request_payload_size, reader.ReadU64());
+  ABSL_ASSIGN_OR_RETURN(record.execution_plan_hash, reader.ReadHash());
+  uint32_t capture_producing_capsule;
+  ABSL_ASSIGN_OR_RETURN(capture_producing_capsule, reader.ReadU32());
+  if (capture_producing_capsule > 1) {
+    return absl::DataLossError(
+        "Exact-profile admission capture policy is invalid.");
+  }
+  record.capture_producing_capsule =
+      capture_producing_capsule != 0;
   ABSL_ASSIGN_OR_RETURN(record.independent_run_count, reader.ReadU32());
   ABSL_ASSIGN_OR_RETURN(const uint64_t encoded_time, reader.ReadU64());
   if (encoded_time >
@@ -766,6 +803,8 @@ absl::StatusOr<ExactProfileAdmissionRecord> ExactProfileQualifier::Qualify(
   const Hash256 qualification_request_hash =
       ComputeExactProfileQualificationRequestHash(derived_profile, spec);
   const Hash256 payload_hash = Sha256(spec.canonical_request_payload);
+  ABSL_ASSIGN_OR_RETURN(const FreshWorkerExecutionPlan execution_plan,
+                        MakeAdmissionExecutionPlan(payload_hash));
 
   ExactProfileAdmissionRecord record;
   record.exact_profile_hash = derived_profile.profile_id;
@@ -773,6 +812,8 @@ absl::StatusOr<ExactProfileAdmissionRecord> ExactProfileQualifier::Qualify(
   record.qualification_request_hash = qualification_request_hash;
   record.request_payload_hash = payload_hash;
   record.request_payload_size = spec.canonical_request_payload.size();
+  record.execution_plan_hash = execution_plan.plan_hash;
+  record.capture_producing_capsule = false;
   record.independent_run_count = spec.independent_run_count;
   record.authentication_key_id = authentication.key_id;
   record.runs.reserve(spec.independent_run_count);
@@ -793,20 +834,26 @@ absl::StatusOr<ExactProfileAdmissionRecord> ExactProfileQualifier::Qualify(
     request.run_count = spec.independent_run_count;
     request.challenge_nonce = challenge;
     request.request_payload = spec.canonical_request_payload;
+    request.execution_plan = execution_plan;
 
     ABSL_ASSIGN_OR_RETURN(
         FreshWorkerProcessObservation observation,
         runner_->Run(request, authentication));
-    ABSL_RETURN_IF_ERROR(ValidateFreshWorkerResult(observation.result));
+    ABSL_RETURN_IF_ERROR(
+        ValidateFreshWorkerResultForRequest(observation.result, request));
     if (observation.result.exact_profile_hash != derived_profile.profile_id ||
         observation.result.qualification_id != qualification_id ||
         observation.result.run_index != run_index ||
         observation.result.run_count != spec.independent_run_count ||
         observation.result.challenge_nonce != challenge ||
         observation.result.request_envelope_hash !=
-            observation.request_envelope_hash) {
+            observation.request_envelope_hash ||
+        observation.result.execution_plan_hash != execution_plan.plan_hash ||
+        observation.result.restored_checkpoint_id.has_value() ||
+        observation.result.producing_capsule_evidence.has_value()) {
       return absl::UnauthenticatedError(
-          "Fresh-worker observation is not bound to its qualification run.");
+          "Fresh-worker observation is not bound to its capsule-free "
+          "qualification run.");
     }
     if (observation.result.status_code != absl::StatusCode::kOk) {
       return absl::Status(observation.result.status_code,

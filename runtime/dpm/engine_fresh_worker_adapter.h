@@ -15,22 +15,11 @@
 #ifndef THIRD_PARTY_ODML_LITERT_LM_RUNTIME_DPM_ENGINE_FRESH_WORKER_ADAPTER_H_
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_DPM_ENGINE_FRESH_WORKER_ADAPTER_H_
 
-#include <cstdint>
-
 #include "absl/status/status.h"  // from @com_google_absl
-#include "absl/status/statusor.h"  // from @com_google_absl
-#include "runtime/dpm/dpm_replay_mode.h"
+#include "runtime/dpm/engine_fresh_worker_contract.h"
 #include "runtime/engine/engine_settings.h"
 
 namespace litert::lm {
-
-// Constructs the only SessionConfig admitted by the concrete exact worker for
-// `stage`. The parent ExactRegenerationExecutor must derive its profile from
-// this same configuration. The request may select only its bounded generation
-// limit; model artifacts, backend settings, sampler identity, modalities, and
-// all other execution policy remain fixed by the worker executable.
-absl::StatusOr<SessionConfig> MakeEngineFreshWorkerSessionConfig(
-    DPMReplayStage stage, uint32_t max_output_tokens);
 
 // Concrete one-request worker entry point. `fixed_engine_settings` must be
 // assembled by the worker executable before this function reads stdin. The

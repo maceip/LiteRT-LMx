@@ -34,11 +34,13 @@ namespace litert::lm {
 namespace {
 
 constexpr std::array<char, 8> kRequestMagic = {'D', 'P', 'M', 'W', 'R', 'Q',
-                                                '0', '1'};
+                                                '0', '2'};
 constexpr std::array<char, 8> kResultMagic = {'D', 'P', 'M', 'W', 'R', 'S',
-                                               '0', '1'};
+                                               '0', '2'};
 constexpr std::array<char, 8> kTokenBytesMagic = {'D', 'P', 'M', 'T', 'O', 'K',
                                                    '0', '1'};
+constexpr std::array<char, 8> kExecutionPlanMagic = {
+    'D', 'P', 'M', 'P', 'L', 'N', '0', '1'};
 constexpr uint32_t kRequestKind = 1;
 constexpr uint32_t kResultKind = 2;
 constexpr uint64_t kMaximumResultStatusMessageBytes = 4096;
@@ -46,14 +48,30 @@ constexpr uint64_t kMaximumKeyIdBytes = 256;
 constexpr uint64_t kMaximumAuthenticationKeyBytes = 4096;
 constexpr uint64_t kEnvelopeFixedBytes = 8 + 4 + 4 + 4 + 8 + 32;
 constexpr absl::string_view kRequestMacDomain =
-    "LITERT_LMX_FRESH_WORKER_REQUEST_HMAC_SHA256_V1";
+    "LITERT_LMX_FRESH_WORKER_REQUEST_HMAC_SHA256_V2";
 constexpr absl::string_view kResultMacDomain =
-    "LITERT_LMX_FRESH_WORKER_RESULT_HMAC_SHA256_V1";
+    "LITERT_LMX_FRESH_WORKER_RESULT_HMAC_SHA256_V2";
+constexpr absl::string_view kExecutionPlanHashDomain =
+    "LITERT_LMX_FRESH_WORKER_EXECUTION_PLAN_SHA256_V1";
+constexpr absl::string_view kOutputEvidenceHashDomain =
+    "LITERT_LMX_FRESH_WORKER_OUTPUT_EVIDENCE_SHA256_V1";
 
 bool IsZeroHash(const Hash256& hash) {
   uint8_t combined = 0;
   for (uint8_t byte : hash.bytes) combined |= byte;
   return combined == 0;
+}
+
+bool IsZeroIdentity(const SessionHandoffIdentity& identity) {
+  return IsZeroHash(identity.model_artifact_hash) &&
+         IsZeroHash(identity.runtime_artifact_hash) &&
+         IsZeroHash(identity.inference_profile_hash);
+}
+
+bool IsCompleteIdentity(const SessionHandoffIdentity& identity) {
+  return !IsZeroHash(identity.model_artifact_hash) &&
+         !IsZeroHash(identity.runtime_artifact_hash) &&
+         !IsZeroHash(identity.inference_profile_hash);
 }
 
 bool HasControlByte(absl::string_view text) {
@@ -98,6 +116,128 @@ void AppendU64(uint64_t value, std::string* output) {
 void AppendHash(const Hash256& hash, std::string* output) {
   output->append(reinterpret_cast<const char*>(hash.bytes.data()),
                  hash.bytes.size());
+}
+
+void AppendIdentity(const SessionHandoffIdentity& identity,
+                    std::string* output) {
+  AppendHash(identity.model_artifact_hash, output);
+  AppendHash(identity.runtime_artifact_hash, output);
+  AppendHash(identity.inference_profile_hash, output);
+}
+
+Hash256 Sha256(absl::string_view bytes) {
+  Sha256Hasher hasher;
+  hasher.Update(bytes);
+  return hasher.Finalize();
+}
+
+void HashU32(uint32_t value, Sha256Hasher* hasher) {
+  std::string bytes;
+  AppendU32(value, &bytes);
+  hasher->Update(bytes);
+}
+
+void HashU64(uint64_t value, Sha256Hasher* hasher) {
+  std::string bytes;
+  AppendU64(value, &bytes);
+  hasher->Update(bytes);
+}
+
+void HashValue(const Hash256& value, Sha256Hasher* hasher) {
+  hasher->Update(absl::string_view(
+      reinterpret_cast<const char*>(value.bytes.data()), value.bytes.size()));
+}
+
+void HashFrame(absl::string_view bytes, Sha256Hasher* hasher) {
+  HashU64(bytes.size(), hasher);
+  hasher->Update(bytes);
+}
+
+Hash256 ComputeResultOutputEvidenceHash(const FreshWorkerResult& result) {
+  Sha256Hasher hasher;
+  hasher.Update(kOutputEvidenceHashDomain);
+  HashFrame(result.canonical_output, &hasher);
+  HashFrame(result.token_bytes, &hasher);
+  HashU32(static_cast<uint32_t>(result.logit_frames.size()), &hasher);
+  for (const FreshWorkerLogitFrameEvidence& frame : result.logit_frames) {
+    HashU32(static_cast<uint32_t>(frame.element_type), &hasher);
+    HashU32(frame.element_byte_width, &hasher);
+    HashU32(frame.batch_size, &hasher);
+    HashU32(frame.sequence_size, &hasher);
+    HashU32(frame.vocabulary_size, &hasher);
+    HashU64(frame.byte_count, &hasher);
+    HashValue(frame.sha256, &hasher);
+  }
+  return hasher.Finalize();
+}
+
+absl::Status ValidateExecutionPlanFields(
+    const FreshWorkerExecutionPlan& plan) {
+  if (plan.format_version != kFreshWorkerExecutionPlanFormatVersion) {
+    return absl::FailedPreconditionError(
+        "Fresh-worker execution-plan version is unsupported.");
+  }
+  if (IsZeroHash(plan.logical_replay_request_hash)) {
+    return absl::InvalidArgumentError(
+        "Fresh-worker execution plan requires a logical replay hash.");
+  }
+  if (plan.canonical_execution_payload.size() >
+      kMaximumFreshWorkerRequestPayloadBytes) {
+    return absl::ResourceExhaustedError(
+        "Fresh-worker physical execution payload exceeds the protocol "
+        "limit.");
+  }
+
+  switch (plan.prefill_mode) {
+    case FreshWorkerPrefillMode::kFullCanonicalPrefill:
+      if (plan.restore_checkpoint_id.has_value() ||
+          !IsZeroIdentity(plan.session_identity) ||
+          !IsZeroHash(plan.restore_durable_envelope_hash) ||
+          plan.restore_durable_envelope_size != 0 ||
+          !plan.canonical_execution_payload.empty()) {
+        return absl::InvalidArgumentError(
+            "Full-prefill execution plans cannot carry restore or delta "
+            "fields.");
+      }
+      break;
+    case FreshWorkerPrefillMode::kOwnPositionCapsuleDelta:
+      if (!plan.restore_checkpoint_id.has_value() ||
+          IsZeroHash(*plan.restore_checkpoint_id) ||
+          !IsCompleteIdentity(plan.session_identity) ||
+          IsZeroHash(plan.restore_durable_envelope_hash) ||
+          plan.restore_durable_envelope_size == 0 ||
+          plan.canonical_execution_payload.empty()) {
+        return absl::InvalidArgumentError(
+            "Own-position execution plans require complete checkpoint, "
+            "identity, envelope, and delta bindings.");
+      }
+      break;
+    default:
+      return absl::InvalidArgumentError(
+          "Fresh-worker execution plan has an unknown prefill mode.");
+  }
+  return absl::OkStatus();
+}
+
+std::string EncodeExecutionPlanHashFields(
+    const FreshWorkerExecutionPlan& plan) {
+  std::string fields;
+  fields.reserve(kExecutionPlanMagic.size() + 4 + 4 + 32 + 4 + 32 + 96 +
+                 32 + 8 + 8 + plan.canonical_execution_payload.size());
+  fields.append(kExecutionPlanMagic.data(), kExecutionPlanMagic.size());
+  AppendU32(plan.format_version, &fields);
+  AppendU32(static_cast<uint32_t>(plan.prefill_mode), &fields);
+  AppendHash(plan.logical_replay_request_hash, &fields);
+  AppendU32(plan.restore_checkpoint_id.has_value() ? 1 : 0, &fields);
+  if (plan.restore_checkpoint_id.has_value()) {
+    AppendHash(*plan.restore_checkpoint_id, &fields);
+  }
+  AppendIdentity(plan.session_identity, &fields);
+  AppendHash(plan.restore_durable_envelope_hash, &fields);
+  AppendU64(plan.restore_durable_envelope_size, &fields);
+  AppendU64(plan.canonical_execution_payload.size(), &fields);
+  fields.append(plan.canonical_execution_payload);
+  return fields;
 }
 
 class Reader {
@@ -152,6 +292,119 @@ class Reader {
   absl::string_view bytes_;
   size_t offset_ = 0;
 };
+
+absl::StatusOr<SessionHandoffIdentity> ReadIdentity(Reader* reader) {
+  if (reader == nullptr) {
+    return absl::InternalError(
+        "Fresh-worker protocol identity reader is null.");
+  }
+  SessionHandoffIdentity identity;
+  ABSL_ASSIGN_OR_RETURN(identity.model_artifact_hash, reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(identity.runtime_artifact_hash, reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(identity.inference_profile_hash, reader->ReadHash());
+  return identity;
+}
+
+absl::StatusOr<std::string> EncodeExecutionPlan(
+    const FreshWorkerExecutionPlan& plan) {
+  ABSL_RETURN_IF_ERROR(ValidateFreshWorkerExecutionPlan(plan));
+  std::string encoded;
+  encoded.reserve(kExecutionPlanMagic.size() + 4 + 32 + 4 + 32 + 4 + 32 +
+                  96 + 32 + 8 + 8 +
+                  plan.canonical_execution_payload.size() + 4);
+  encoded.append(kExecutionPlanMagic.data(), kExecutionPlanMagic.size());
+  AppendU32(plan.format_version, &encoded);
+  AppendHash(plan.plan_hash, &encoded);
+  AppendU32(static_cast<uint32_t>(plan.prefill_mode), &encoded);
+  AppendHash(plan.logical_replay_request_hash, &encoded);
+  AppendU32(plan.restore_checkpoint_id.has_value() ? 1 : 0, &encoded);
+  if (plan.restore_checkpoint_id.has_value()) {
+    AppendHash(*plan.restore_checkpoint_id, &encoded);
+  }
+  AppendIdentity(plan.session_identity, &encoded);
+  AppendHash(plan.restore_durable_envelope_hash, &encoded);
+  AppendU64(plan.restore_durable_envelope_size, &encoded);
+  AppendU64(plan.canonical_execution_payload.size(), &encoded);
+  encoded.append(plan.canonical_execution_payload);
+  AppendU32(plan.capture_producing_capsule ? 1 : 0, &encoded);
+  return encoded;
+}
+
+absl::StatusOr<FreshWorkerExecutionPlan> DecodeExecutionPlan(
+    absl::string_view encoded) {
+  constexpr uint64_t kMinimumPlanBytes =
+      8 + 4 + 32 + 4 + 32 + 4 + 96 + 32 + 8 + 8 + 4;
+  if (encoded.size() < kMinimumPlanBytes ||
+      encoded.size() > kMaximumFreshWorkerEnvelopeBytes ||
+      std::memcmp(encoded.data(), kExecutionPlanMagic.data(),
+                  kExecutionPlanMagic.size()) != 0) {
+    return absl::DataLossError(
+        "Fresh-worker execution-plan framing is invalid.");
+  }
+  Reader reader(encoded.substr(kExecutionPlanMagic.size()));
+  FreshWorkerExecutionPlan plan;
+  ABSL_ASSIGN_OR_RETURN(plan.format_version, reader.ReadU32());
+  ABSL_ASSIGN_OR_RETURN(plan.plan_hash, reader.ReadHash());
+  uint32_t prefill_mode;
+  ABSL_ASSIGN_OR_RETURN(prefill_mode, reader.ReadU32());
+  plan.prefill_mode = static_cast<FreshWorkerPrefillMode>(prefill_mode);
+  ABSL_ASSIGN_OR_RETURN(plan.logical_replay_request_hash, reader.ReadHash());
+  uint32_t has_restore_checkpoint;
+  ABSL_ASSIGN_OR_RETURN(has_restore_checkpoint, reader.ReadU32());
+  if (has_restore_checkpoint > 1) {
+    return absl::DataLossError(
+        "Fresh-worker execution-plan checkpoint flag is invalid.");
+  }
+  if (has_restore_checkpoint != 0) {
+    Hash256 checkpoint_id;
+    ABSL_ASSIGN_OR_RETURN(checkpoint_id, reader.ReadHash());
+    plan.restore_checkpoint_id = checkpoint_id;
+  }
+  ABSL_ASSIGN_OR_RETURN(plan.session_identity, ReadIdentity(&reader));
+  ABSL_ASSIGN_OR_RETURN(plan.restore_durable_envelope_hash,
+                        reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(plan.restore_durable_envelope_size,
+                        reader.ReadU64());
+  uint64_t execution_payload_size;
+  ABSL_ASSIGN_OR_RETURN(execution_payload_size, reader.ReadU64());
+  if (execution_payload_size > kMaximumFreshWorkerRequestPayloadBytes) {
+    return absl::ResourceExhaustedError(
+        "Fresh-worker physical execution payload exceeds the protocol "
+        "limit.");
+  }
+  absl::string_view execution_payload;
+  ABSL_ASSIGN_OR_RETURN(execution_payload,
+                        reader.ReadBytes(execution_payload_size));
+  plan.canonical_execution_payload.assign(execution_payload.data(),
+                                          execution_payload.size());
+  uint32_t capture_producing_capsule;
+  ABSL_ASSIGN_OR_RETURN(capture_producing_capsule, reader.ReadU32());
+  if (capture_producing_capsule > 1 || reader.remaining() != 0) {
+    return absl::DataLossError(
+        "Fresh-worker execution-plan capture flag or length is invalid.");
+  }
+  plan.capture_producing_capsule = capture_producing_capsule != 0;
+  ABSL_RETURN_IF_ERROR(ValidateFreshWorkerExecutionPlan(plan));
+  ABSL_ASSIGN_OR_RETURN(const std::string canonical,
+                        EncodeExecutionPlan(plan));
+  if (canonical != encoded) {
+    return absl::DataLossError(
+        "Fresh-worker execution plan is not canonically encoded.");
+  }
+  return plan;
+}
+
+absl::Status ValidateProducingCapsuleEvidence(
+    const FreshWorkerProducingCapsuleEvidence& evidence) {
+  if (!IsCompleteIdentity(evidence.session_identity) ||
+      evidence.transient_envelope_size == 0 ||
+      IsZeroHash(evidence.transient_envelope_hash) ||
+      IsZeroHash(evidence.output_evidence_hash)) {
+    return absl::InvalidArgumentError(
+        "Fresh-worker producing-capsule evidence is incomplete.");
+  }
+  return absl::OkStatus();
+}
 
 struct DecodedEnvelopeBody {
   absl::string_view body;
@@ -244,10 +497,13 @@ absl::StatusOr<DecodedEnvelopeBody> DecodeEnvelope(
       .body = envelope.substr(body_offset, static_cast<size_t>(body_size))};
 }
 
-std::string EncodeRequestBody(const FreshWorkerRequest& request) {
+absl::StatusOr<std::string> EncodeRequestBody(
+    const FreshWorkerRequest& request) {
+  ABSL_ASSIGN_OR_RETURN(const std::string execution_plan,
+                        EncodeExecutionPlan(request.execution_plan));
   std::string body;
   body.reserve(4 + 32 + 32 + 4 + 4 + 32 + 8 +
-               request.request_payload.size());
+               request.request_payload.size() + 8 + execution_plan.size());
   AppendU32(request.format_version, &body);
   AppendHash(request.exact_profile_hash, &body);
   AppendHash(request.qualification_id, &body);
@@ -256,6 +512,8 @@ std::string EncodeRequestBody(const FreshWorkerRequest& request) {
   AppendHash(request.challenge_nonce, &body);
   AppendU64(request.request_payload.size(), &body);
   body.append(request.request_payload);
+  AppendU64(execution_plan.size(), &body);
+  body.append(execution_plan);
   return body;
 }
 
@@ -275,18 +533,30 @@ absl::StatusOr<FreshWorkerRequest> DecodeRequestBody(absl::string_view body) {
   }
   ABSL_ASSIGN_OR_RETURN(const absl::string_view payload,
                         reader.ReadBytes(payload_size));
+  request.request_payload.assign(payload.data(), payload.size());
+  uint64_t execution_plan_size;
+  ABSL_ASSIGN_OR_RETURN(execution_plan_size, reader.ReadU64());
+  if (execution_plan_size > kMaximumFreshWorkerEnvelopeBytes) {
+    return absl::ResourceExhaustedError(
+        "Fresh-worker execution plan exceeds the envelope limit.");
+  }
+  absl::string_view execution_plan;
+  ABSL_ASSIGN_OR_RETURN(execution_plan,
+                        reader.ReadBytes(execution_plan_size));
   if (reader.remaining() != 0) {
     return absl::DataLossError(
         "Fresh-worker request body has trailing bytes.");
   }
-  request.request_payload.assign(payload.data(), payload.size());
+  ABSL_ASSIGN_OR_RETURN(request.execution_plan,
+                        DecodeExecutionPlan(execution_plan));
   ABSL_RETURN_IF_ERROR(ValidateFreshWorkerRequest(request));
   return request;
 }
 
 std::string EncodeResultBody(const FreshWorkerResult& result) {
   std::string body;
-  body.reserve(4 + 32 * 5 + 4 * 4 + 8 + result.status_message.size() +
+  body.reserve(4 + 32 * 10 + 96 + 8 + 4 * 6 + 8 +
+               result.status_message.size() +
                result.token_bytes.size() +
                result.logit_frames.size() * (5 * 4 + 8 + 32));
   AppendU32(result.format_version, &body);
@@ -297,6 +567,20 @@ std::string EncodeResultBody(const FreshWorkerResult& result) {
   AppendHash(result.challenge_nonce, &body);
   AppendHash(result.request_envelope_hash, &body);
   AppendHash(result.worker_instance_nonce, &body);
+  AppendHash(result.execution_plan_hash, &body);
+  AppendU32(result.restored_checkpoint_id.has_value() ? 1 : 0, &body);
+  if (result.restored_checkpoint_id.has_value()) {
+    AppendHash(*result.restored_checkpoint_id, &body);
+  }
+  AppendU32(result.producing_capsule_evidence.has_value() ? 1 : 0, &body);
+  if (result.producing_capsule_evidence.has_value()) {
+    const FreshWorkerProducingCapsuleEvidence& evidence =
+        *result.producing_capsule_evidence;
+    AppendIdentity(evidence.session_identity, &body);
+    AppendU64(evidence.transient_envelope_size, &body);
+    AppendHash(evidence.transient_envelope_hash, &body);
+    AppendHash(evidence.output_evidence_hash, &body);
+  }
   AppendU32(static_cast<uint32_t>(result.replay_isolation), &body);
   AppendU32(static_cast<uint32_t>(result.status_code), &body);
   AppendU32(static_cast<uint32_t>(result.status_message.size()), &body);
@@ -329,6 +613,36 @@ absl::StatusOr<FreshWorkerResult> DecodeResultBody(absl::string_view body) {
   ABSL_ASSIGN_OR_RETURN(result.challenge_nonce, reader.ReadHash());
   ABSL_ASSIGN_OR_RETURN(result.request_envelope_hash, reader.ReadHash());
   ABSL_ASSIGN_OR_RETURN(result.worker_instance_nonce, reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(result.execution_plan_hash, reader.ReadHash());
+  uint32_t has_restored_checkpoint;
+  ABSL_ASSIGN_OR_RETURN(has_restored_checkpoint, reader.ReadU32());
+  if (has_restored_checkpoint > 1) {
+    return absl::DataLossError(
+        "Fresh-worker restored-checkpoint flag is invalid.");
+  }
+  if (has_restored_checkpoint != 0) {
+    Hash256 checkpoint_id;
+    ABSL_ASSIGN_OR_RETURN(checkpoint_id, reader.ReadHash());
+    result.restored_checkpoint_id = checkpoint_id;
+  }
+  uint32_t has_producing_capsule;
+  ABSL_ASSIGN_OR_RETURN(has_producing_capsule, reader.ReadU32());
+  if (has_producing_capsule > 1) {
+    return absl::DataLossError(
+        "Fresh-worker producing-capsule flag is invalid.");
+  }
+  if (has_producing_capsule != 0) {
+    FreshWorkerProducingCapsuleEvidence evidence;
+    ABSL_ASSIGN_OR_RETURN(evidence.session_identity,
+                          ReadIdentity(&reader));
+    ABSL_ASSIGN_OR_RETURN(evidence.transient_envelope_size,
+                          reader.ReadU64());
+    ABSL_ASSIGN_OR_RETURN(evidence.transient_envelope_hash,
+                          reader.ReadHash());
+    ABSL_ASSIGN_OR_RETURN(evidence.output_evidence_hash,
+                          reader.ReadHash());
+    result.producing_capsule_evidence = evidence;
+  }
   ABSL_ASSIGN_OR_RETURN(const uint32_t replay_isolation, reader.ReadU32());
   result.replay_isolation =
       static_cast<FreshWorkerReplayIsolation>(replay_isolation);
@@ -389,6 +703,31 @@ absl::StatusOr<FreshWorkerResult> DecodeResultBody(absl::string_view body) {
 
 }  // namespace
 
+absl::StatusOr<Hash256> ComputeFreshWorkerExecutionPlanHash(
+    const FreshWorkerExecutionPlan& plan) {
+  ABSL_RETURN_IF_ERROR(ValidateExecutionPlanFields(plan));
+  Sha256Hasher hasher;
+  hasher.Update(kExecutionPlanHashDomain);
+  hasher.Update(EncodeExecutionPlanHashFields(plan));
+  return hasher.Finalize();
+}
+
+absl::Status ValidateFreshWorkerExecutionPlan(
+    const FreshWorkerExecutionPlan& plan) {
+  ABSL_RETURN_IF_ERROR(ValidateExecutionPlanFields(plan));
+  if (IsZeroHash(plan.plan_hash)) {
+    return absl::InvalidArgumentError(
+        "Fresh-worker execution plan requires a nonzero canonical hash.");
+  }
+  ABSL_ASSIGN_OR_RETURN(const Hash256 expected_hash,
+                        ComputeFreshWorkerExecutionPlanHash(plan));
+  if (plan.plan_hash != expected_hash) {
+    return absl::DataLossError(
+        "Fresh-worker execution-plan hash is not canonical.");
+  }
+  return absl::OkStatus();
+}
+
 absl::Status ValidateFreshWorkerAuthentication(
     const FreshWorkerAuthentication& authentication) {
   if (authentication.key_id.empty() ||
@@ -423,10 +762,22 @@ absl::Status ValidateFreshWorkerRequest(const FreshWorkerRequest& request) {
     return absl::InvalidArgumentError(
         "Fresh-worker run index or run count is invalid.");
   }
+  if (request.request_payload.empty()) {
+    return absl::InvalidArgumentError(
+        "Fresh-worker request payload must not be empty.");
+  }
   if (request.request_payload.size() >
       kMaximumFreshWorkerRequestPayloadBytes) {
     return absl::ResourceExhaustedError(
         "Fresh-worker request payload exceeds the protocol limit.");
+  }
+  ABSL_RETURN_IF_ERROR(
+      ValidateFreshWorkerExecutionPlan(request.execution_plan));
+  if (request.execution_plan.logical_replay_request_hash !=
+      Sha256(request.request_payload)) {
+    return absl::FailedPreconditionError(
+        "Fresh-worker execution plan is not bound to the complete logical "
+        "request payload.");
   }
   return absl::OkStatus();
 }
@@ -511,18 +862,36 @@ absl::Status ValidateFreshWorkerLogitFrameEvidence(
 }
 
 absl::Status ValidateFreshWorkerResult(const FreshWorkerResult& result) {
-  FreshWorkerRequest binding;
-  binding.format_version = result.format_version;
-  binding.exact_profile_hash = result.exact_profile_hash;
-  binding.qualification_id = result.qualification_id;
-  binding.run_index = result.run_index;
-  binding.run_count = result.run_count;
-  binding.challenge_nonce = result.challenge_nonce;
-  ABSL_RETURN_IF_ERROR(ValidateFreshWorkerRequest(binding));
+  if (result.format_version != kFreshWorkerProtocolVersion) {
+    return absl::FailedPreconditionError(
+        "Fresh-worker result version is unsupported.");
+  }
+  if (IsZeroHash(result.exact_profile_hash) ||
+      IsZeroHash(result.qualification_id) ||
+      IsZeroHash(result.challenge_nonce)) {
+    return absl::InvalidArgumentError(
+        "Fresh-worker result identity fields must be nonzero.");
+  }
+  if (result.run_count < 2 ||
+      result.run_count > kMaximumFreshWorkerRuns ||
+      result.run_index >= result.run_count) {
+    return absl::InvalidArgumentError(
+        "Fresh-worker result run index or run count is invalid.");
+  }
   if (IsZeroHash(result.request_envelope_hash) ||
-      IsZeroHash(result.worker_instance_nonce)) {
+      IsZeroHash(result.worker_instance_nonce) ||
+      IsZeroHash(result.execution_plan_hash)) {
     return absl::InvalidArgumentError(
         "Fresh-worker result evidence bindings must be nonzero.");
+  }
+  if (result.restored_checkpoint_id.has_value() &&
+      IsZeroHash(*result.restored_checkpoint_id)) {
+    return absl::InvalidArgumentError(
+        "Fresh-worker restored checkpoint ID must be nonzero.");
+  }
+  if (result.producing_capsule_evidence.has_value()) {
+    ABSL_RETURN_IF_ERROR(ValidateProducingCapsuleEvidence(
+        *result.producing_capsule_evidence));
   }
   if (!IsKnownStatusCode(result.status_code) ||
       result.status_message.size() > kMaximumResultStatusMessageBytes) {
@@ -539,17 +908,85 @@ absl::Status ValidateFreshWorkerResult(const FreshWorkerResult& result) {
       return absl::InvalidArgumentError(
           "Successful fresh-worker result must not carry an error message.");
     }
-    return ValidateFreshWorkerExecutionOutput(
+    ABSL_RETURN_IF_ERROR(ValidateFreshWorkerExecutionOutput(
         FreshWorkerExecutionOutput{.canonical_output = result.canonical_output,
                                    .token_bytes = result.token_bytes,
-                                   .logit_frames = result.logit_frames});
+                                   .logit_frames = result.logit_frames}));
+    if (result.producing_capsule_evidence.has_value() &&
+        result.producing_capsule_evidence->output_evidence_hash !=
+            ComputeResultOutputEvidenceHash(result)) {
+      return absl::DataLossError(
+          "Fresh-worker producing capsule is not bound to the returned "
+          "output evidence.");
+    }
+    return absl::OkStatus();
   }
   if (result.replay_isolation != FreshWorkerReplayIsolation::kUnverified ||
       result.status_message.empty() || !result.canonical_output.empty() ||
       !result.token_bytes.empty() ||
-      !result.logit_frames.empty()) {
+      !result.logit_frames.empty() ||
+      result.restored_checkpoint_id.has_value() ||
+      result.producing_capsule_evidence.has_value()) {
     return absl::InvalidArgumentError(
-        "Failed fresh-worker result has non-canonical output fields.");
+        "Failed fresh-worker result has non-canonical output, restore, or "
+        "capsule fields.");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateFreshWorkerResultForRequest(
+    const FreshWorkerResult& result, const FreshWorkerRequest& request) {
+  ABSL_RETURN_IF_ERROR(ValidateFreshWorkerRequest(request));
+  ABSL_RETURN_IF_ERROR(ValidateFreshWorkerResult(result));
+  if (result.format_version != request.format_version ||
+      result.exact_profile_hash != request.exact_profile_hash ||
+      result.qualification_id != request.qualification_id ||
+      result.run_index != request.run_index ||
+      result.run_count != request.run_count ||
+      result.challenge_nonce != request.challenge_nonce ||
+      result.execution_plan_hash != request.execution_plan.plan_hash) {
+    return absl::UnauthenticatedError(
+        "Fresh-worker result is not bound to its request and execution "
+        "plan.");
+  }
+  if (result.status_code != absl::StatusCode::kOk) {
+    return absl::OkStatus();
+  }
+
+  switch (request.execution_plan.prefill_mode) {
+    case FreshWorkerPrefillMode::kFullCanonicalPrefill:
+      if (result.restored_checkpoint_id.has_value()) {
+        return absl::DataLossError(
+            "Full-prefill worker result claims a restored checkpoint.");
+      }
+      break;
+    case FreshWorkerPrefillMode::kOwnPositionCapsuleDelta:
+      if (!result.restored_checkpoint_id.has_value() ||
+          result.restored_checkpoint_id !=
+              request.execution_plan.restore_checkpoint_id) {
+        return absl::DataLossError(
+            "Own-position worker result did not confirm its checkpoint.");
+      }
+      break;
+    default:
+      return absl::InternalError(
+          "Validated fresh-worker request lost its prefill mode.");
+  }
+
+  if (result.producing_capsule_evidence.has_value() !=
+      request.execution_plan.capture_producing_capsule) {
+    return absl::DataLossError(
+        "Fresh-worker result capsule evidence disagrees with capture "
+        "policy.");
+  }
+  if (result.producing_capsule_evidence.has_value() &&
+      request.execution_plan.prefill_mode ==
+          FreshWorkerPrefillMode::kOwnPositionCapsuleDelta &&
+      result.producing_capsule_evidence->session_identity !=
+          request.execution_plan.session_identity) {
+    return absl::DataLossError(
+        "Fresh-worker producing capsule identity differs from the restored "
+        "session identity.");
   }
   return absl::OkStatus();
 }
@@ -563,7 +1000,7 @@ absl::StatusOr<std::string> EncodeFreshWorkerTokenIds(
   std::string encoded;
   encoded.reserve(kTokenBytesMagic.size() + 4 + 4 + token_ids.size() * 4);
   encoded.append(kTokenBytesMagic.data(), kTokenBytesMagic.size());
-  AppendU32(kFreshWorkerProtocolVersion, &encoded);
+  AppendU32(kFreshWorkerTokenEncodingVersion, &encoded);
   AppendU32(static_cast<uint32_t>(token_ids.size()), &encoded);
   for (int32_t token_id : token_ids) {
     if (token_id < 0) {
@@ -588,7 +1025,7 @@ absl::StatusOr<std::vector<int32_t>> DecodeFreshWorkerTokenIds(
   Reader reader(canonical_token_bytes.substr(kTokenBytesMagic.size()));
   ABSL_ASSIGN_OR_RETURN(const uint32_t version, reader.ReadU32());
   ABSL_ASSIGN_OR_RETURN(const uint32_t token_count, reader.ReadU32());
-  if (version != kFreshWorkerProtocolVersion) {
+  if (version != kFreshWorkerTokenEncodingVersion) {
     return absl::FailedPreconditionError(
         "Fresh-worker token encoding version is unsupported.");
   }
@@ -644,8 +1081,9 @@ absl::StatusOr<std::string> EncodeFreshWorkerRequest(
     const FreshWorkerRequest& request,
     const FreshWorkerAuthentication& authentication) {
   ABSL_RETURN_IF_ERROR(ValidateFreshWorkerRequest(request));
+  ABSL_ASSIGN_OR_RETURN(const std::string body, EncodeRequestBody(request));
   return EncodeEnvelope(kRequestMagic, kRequestKind, kRequestMacDomain,
-                        EncodeRequestBody(request), authentication);
+                        body, authentication);
 }
 
 absl::StatusOr<FreshWorkerRequest> DecodeFreshWorkerRequest(

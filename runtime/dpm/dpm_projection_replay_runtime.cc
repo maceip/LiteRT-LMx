@@ -196,9 +196,10 @@ absl::Status ValidateCanonicalProjectionRequest(
 }
 
 DPMCanonicalReplayRequest MakeReplayRequest(
-    std::string encoded_projection_request) {
+    std::string encoded_projection_request, uint32_t max_output_tokens) {
   return DPMCanonicalReplayRequest{
       .stage = DPMReplayStage::kProjection,
+      .max_output_tokens = max_output_tokens,
       .request_contract_version =
           std::string(kDPMProjectionReplayContractVersion),
       .canonical_payload = std::move(encoded_projection_request),
@@ -468,6 +469,7 @@ CanonicalWinnerDPMProjectionRuntime::Generate(
     const DPMCanonicalReplayRequest& request) {
   ABSL_RETURN_IF_ERROR(ValidateDPMCanonicalReplayRequest(request));
   if (request.stage != DPMReplayStage::kProjection ||
+      request.max_output_tokens != config_.max_output_tokens ||
       request.request_contract_version !=
           kDPMProjectionReplayContractVersion) {
     return absl::InvalidArgumentError(
@@ -514,7 +516,7 @@ CanonicalWinnerDPMProjectionRuntime::Generate(
   ABSL_ASSIGN_OR_RETURN(std::string encoded,
                         EncodeDPMProjectionExecutionRequest(projection));
   const DPMCanonicalReplayRequest replay_request =
-      MakeReplayRequest(std::move(encoded));
+      MakeReplayRequest(std::move(encoded), config_.max_output_tokens);
   ABSL_ASSIGN_OR_RETURN(
       const Hash256 expected_replay_request_hash,
       ComputeDPMCanonicalReplayRequestHash(replay_request));
@@ -556,6 +558,12 @@ ExactRegenerationDPMProjectionRuntime::Create(
         "Exact projection requires an ExactRegeneration executor.");
   }
   ABSL_RETURN_IF_ERROR(ValidateDPMProjectionConfig(config));
+  if (exact_executor->GetReplayStage() != DPMReplayStage::kProjection ||
+      exact_executor->GetMaxOutputTokens() != config.max_output_tokens) {
+    return absl::FailedPreconditionError(
+        "Exact projection executor is bound to another stage or token "
+        "limit.");
+  }
   ABSL_ASSIGN_OR_RETURN(const ExactLiteRtProfile profile,
                         exact_executor->GetDerivedProfile());
   ABSL_RETURN_IF_ERROR(ValidateRuntimeIdentity(profile.session_identity));
@@ -572,6 +580,12 @@ absl::Status ExactRegenerationDPMProjectionRuntime::ValidateSupport() const {
         "Exact projection has no regeneration executor.");
   }
   ABSL_RETURN_IF_ERROR(ValidateDPMProjectionConfig(config_));
+  if (exact_executor_->GetReplayStage() != DPMReplayStage::kProjection ||
+      exact_executor_->GetMaxOutputTokens() != config_.max_output_tokens) {
+    return absl::FailedPreconditionError(
+        "Exact projection executor binding changed or does not match its "
+        "projection configuration.");
+  }
   ABSL_RETURN_IF_ERROR(
       ValidateRuntimeIdentity(derived_profile_.session_identity));
   ABSL_RETURN_IF_ERROR(exact_executor_->ValidateSupport());
@@ -606,7 +620,7 @@ ExactRegenerationDPMProjectionRuntime::Generate(
   ABSL_ASSIGN_OR_RETURN(std::string encoded,
                         EncodeDPMProjectionExecutionRequest(projection));
   const DPMCanonicalReplayRequest replay_request =
-      MakeReplayRequest(std::move(encoded));
+      MakeReplayRequest(std::move(encoded), config_.max_output_tokens);
   ABSL_ASSIGN_OR_RETURN(
       const Hash256 expected_replay_request_hash,
       ComputeDPMCanonicalReplayRequestHash(replay_request));
