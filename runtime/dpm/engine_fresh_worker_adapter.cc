@@ -33,6 +33,7 @@
 #include "runtime/dpm/dpm_replay_executor.h"
 #include "runtime/dpm/dpm_replay_mode.h"
 #include "runtime/dpm/engine_fresh_worker_contract.h"
+#include "runtime/dpm/exact_decode_evidence.h"
 #include "runtime/dpm/fresh_worker_process.h"
 #include "runtime/dpm/fresh_worker_protocol.h"
 #include "runtime/engine/engine.h"
@@ -55,11 +56,6 @@ struct DecodedWorkerInvocation {
   std::optional<DPMAgentExecutionRequest> agent;
   std::optional<DPMAgentDeltaExecutionRequest> agent_delta;
   uint32_t max_output_tokens = 0;
-};
-
-struct CanonicalExactEvidence {
-  std::string token_bytes;
-  std::vector<FreshWorkerLogitFrameEvidence> logit_frames;
 };
 
 bool IsValidUtf8(absl::string_view text) {
@@ -433,94 +429,14 @@ absl::Status ValidateImportedSession(
   return absl::OkStatus();
 }
 
-absl::StatusOr<FreshWorkerLogitElementType> ConvertElementType(
-    ExactLiteRtLogitsElementType element_type) {
-  switch (element_type) {
-    case ExactLiteRtLogitsElementType::kFloat16:
-      return FreshWorkerLogitElementType::kFloat16;
-    case ExactLiteRtLogitsElementType::kFloat32:
-      return FreshWorkerLogitElementType::kFloat32;
-    case ExactLiteRtLogitsElementType::kUnsupported:
-      break;
-  }
-  return absl::UnimplementedError(
-      "Exact worker produced an unsupported logits element type.");
-}
-
-absl::StatusOr<CanonicalExactEvidence> ConvertExactEvidence(
-    const ExactLiteRtDecodeEvidence& evidence,
-    const ExactLiteRtProfile& profile, uint32_t max_output_tokens) {
-  if (evidence.logits_frame_contract != profile.logits_frame ||
-      evidence.sampled_token_ids.empty() ||
-      evidence.sampled_token_ids.size() > max_output_tokens ||
-      evidence.sampled_token_ids.size() != evidence.logits_frames.size()) {
-    return absl::DataLossError(
-        "Exact decode evidence differs from the Engine-derived logits "
-        "contract or token limit.");
-  }
-  ABSL_ASSIGN_OR_RETURN(
-      const FreshWorkerLogitElementType element_type,
-      ConvertElementType(evidence.logits_frame_contract.element_type));
-  const uint32_t element_byte_width =
-      element_type == FreshWorkerLogitElementType::kFloat16 ? 2 : 4;
-
-  CanonicalExactEvidence canonical;
-  canonical.logit_frames.reserve(evidence.logits_frames.size());
-  for (size_t index = 0; index < evidence.logits_frames.size(); ++index) {
-    const ExactLiteRtLogitsFrameEvidence& frame =
-        evidence.logits_frames[index];
-    if (frame.frame_index != index ||
-        frame.contract != evidence.logits_frame_contract ||
-        frame.sampled_token_id != evidence.sampled_token_ids[index] ||
-        frame.sampled_token_id < 0 ||
-        static_cast<uint32_t>(frame.sampled_token_id) >=
-            evidence.logits_frame_contract.vocabulary_size) {
-      return absl::DataLossError(
-          "Exact decode logits frames are not ordered and paired with every "
-          "sampled token.");
-    }
-    FreshWorkerLogitFrameEvidence worker_frame{
-        .element_type = element_type,
-        .element_byte_width = element_byte_width,
-        .batch_size = evidence.logits_frame_contract.batch_size,
-        .sequence_size = evidence.logits_frame_contract.sequence_size,
-        .vocabulary_size = evidence.logits_frame_contract.vocabulary_size,
-        .byte_count = evidence.logits_frame_contract.byte_count,
-        .sha256 = frame.sha256,
-    };
-    ABSL_RETURN_IF_ERROR(
-        ValidateFreshWorkerLogitFrameEvidence(worker_frame));
-    canonical.logit_frames.push_back(worker_frame);
-  }
-  ABSL_ASSIGN_OR_RETURN(
-      canonical.token_bytes,
-      EncodeFreshWorkerTokenIds(evidence.sampled_token_ids));
-  return canonical;
-}
-
-absl::Status ValidateExactResponses(const Responses& responses) {
-  if (responses.GetTaskState() != TaskState::kDone &&
-      responses.GetTaskState() != TaskState::kMaxNumTokensReached) {
-    return absl::InternalError(
-        "Exact worker decode returned a non-success terminal state.");
-  }
-  if (responses.GetTexts().size() != 1 ||
-      !IsValidUtf8(responses.GetTexts().front())) {
-    return absl::DataLossError(
-        "Exact worker decode did not return one UTF-8 visible candidate.");
-  }
-  return absl::OkStatus();
-}
-
 absl::StatusOr<FreshWorkerExecutionOutput> BuildStageOutput(
     const DecodedWorkerInvocation& invocation,
     const ExactLiteRtDecodeResult& decoded,
     const ExactLiteRtProfile& profile) {
-  ABSL_RETURN_IF_ERROR(ValidateExactResponses(decoded.responses));
   ABSL_ASSIGN_OR_RETURN(
-      CanonicalExactEvidence evidence,
-      ConvertExactEvidence(decoded.evidence, profile,
-                           invocation.max_output_tokens));
+      CanonicalExactDecodeEvidence evidence,
+      CanonicalizeExactLiteRtDecodeEvidence(
+          decoded, profile, invocation.max_output_tokens));
 
   FreshWorkerExecutionOutput output;
   output.token_bytes = evidence.token_bytes;
@@ -537,7 +453,7 @@ absl::StatusOr<FreshWorkerExecutionOutput> BuildStageOutput(
       ABSL_ASSIGN_OR_RETURN(
           output.canonical_output,
           CanonicalizeDPMProjectionOutput(
-              decoded.responses.GetTexts().front(),
+              evidence.visible_output,
               invocation.projection->source_event_count,
               invocation.projection->projection_config));
       break;
@@ -553,7 +469,7 @@ absl::StatusOr<FreshWorkerExecutionOutput> BuildStageOutput(
       // corresponding full logits frame; re-tokenizing visible text is never
       // used as evidence.
       DPMAgentDecisionEnvelope envelope{
-          .decision_output = decoded.responses.GetTexts().front(),
+          .decision_output = evidence.visible_output,
           .canonical_token_bytes = output.token_bytes,
       };
       ABSL_ASSIGN_OR_RETURN(output.canonical_output,
