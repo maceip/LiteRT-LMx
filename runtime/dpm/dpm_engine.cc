@@ -365,7 +365,10 @@ absl::Status ValidateReceiptAndAdvance(const DPMLogSnapshot& snapshot,
             receipt.projection_manifest.correction_digest ||
         baseline.config_hash != receipt.projection_manifest.config_hash ||
         baseline.runtime_identity !=
-            receipt.projection_manifest.runtime_identity) {
+            receipt.projection_manifest.runtime_identity ||
+        baseline.replay_mode != receipt.projection_manifest.replay_mode ||
+        baseline.exact_profile_id !=
+            receipt.projection_manifest.exact_profile_id) {
       return absl::DataLossError(
           "DPM projection baseline hashes do not identify the compatible "
           "prior authoritative receipt.");
@@ -705,6 +708,13 @@ DPMEngine::RecoverCommittedTurn(const DPMLogSnapshot& snapshot,
   result.response_event_index = receipt.response_event_index;
   result.projection_manifest_hash =
       receipt.projection_manifest.manifest_hash;
+  result.projection_replay_mode = receipt.projection_manifest.replay_mode;
+  result.projection_execution_evidence_hash =
+      receipt.projection_manifest.execution_evidence_hash;
+  result.projection_exact_profile_id =
+      receipt.projection_manifest.exact_profile_id;
+  result.projection_exact_profile_admission_record_id =
+      receipt.projection_manifest.exact_profile_admission_record_id;
   result.session_checkpoint_id = receipt.session_checkpoint_id;
   result.recovered_committed_turn = true;
   return std::optional<DPMTurnResult>(std::move(result));
@@ -1411,6 +1421,12 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
   result.input_event_index = input_event_index;
   result.response_event_index = committed.event_index;
   result.projection_manifest_hash = projection.manifest.manifest_hash;
+  result.projection_replay_mode = projection.manifest.replay_mode;
+  result.projection_execution_evidence_hash =
+      projection.manifest.execution_evidence_hash;
+  result.projection_exact_profile_id = projection.manifest.exact_profile_id;
+  result.projection_exact_profile_admission_record_id =
+      projection.manifest.exact_profile_admission_record_id;
   result.session_checkpoint_id = checkpoint_id;
   result.restored_session_checkpoint = restored;
   return result;

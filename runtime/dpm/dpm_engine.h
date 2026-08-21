@@ -27,6 +27,7 @@
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
 #include "runtime/dpm/dpm_event_log.h"
 #include "runtime/dpm/dpm_projection_manifest.h"
+#include "runtime/dpm/dpm_replay_mode.h"
 #include "runtime/dpm/session_checkpoint.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/session_handoff.h"
@@ -156,6 +157,11 @@ struct DPMTurnResult {
   uint64_t input_event_index = 0;
   uint64_t response_event_index = 0;
   Hash256 projection_manifest_hash;
+  DPMReplayMode projection_replay_mode =
+      DPMReplayMode::kCanonicalWinnerReplay;
+  Hash256 projection_execution_evidence_hash;
+  std::optional<Hash256> projection_exact_profile_id;
+  std::optional<Hash256> projection_exact_profile_admission_record_id;
   std::optional<Hash256> session_checkpoint_id;
   bool restored_session_checkpoint = false;
   bool recovered_committed_turn = false;

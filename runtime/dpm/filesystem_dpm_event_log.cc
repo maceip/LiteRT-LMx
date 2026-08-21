@@ -46,11 +46,11 @@ namespace litert::lm {
 namespace {
 
 constexpr std::array<char, 8> kLogMagic = {'D', 'P', 'M', 'L', 'O', 'G',
-                                            '0', '2'};
+                                            '0', '3'};
 constexpr std::array<char, 8> kRecordMagic = {'D', 'P', 'M', 'E', 'V', 'T',
-                                               '0', '2'};
-constexpr uint32_t kLogFormatVersion = 2;
-constexpr uint32_t kEventFormatVersion = 2;
+                                               '0', '3'};
+constexpr uint32_t kLogFormatVersion = 3;
+constexpr uint32_t kEventFormatVersion = 3;
 // A maximum model-turn record contains three payload-sized strings (the event
 // payload, projected memory, and the receipt's decision output), the canonical
 // agent input, all repeated operation/case/manifest identities, the complete
@@ -63,8 +63,8 @@ constexpr uint64_t kMaxRecordBytes =
     uint64_t{kMaximumDPMGenerationTokens} * sizeof(int32_t) + 4 * 1024;
 constexpr uint64_t kRecordHeaderSize =
     kRecordMagic.size() + sizeof(uint64_t) + 32 + 32;
-constexpr absl::string_view kGenesisDomain = "DPM_EVENT_LOG_GENESIS_SHA256_V2";
-constexpr absl::string_view kRecordDomain = "DPM_EVENT_LOG_PREFIX_SHA256_V2";
+constexpr absl::string_view kGenesisDomain = "DPM_EVENT_LOG_GENESIS_SHA256_V3";
+constexpr absl::string_view kRecordDomain = "DPM_EVENT_LOG_PREFIX_SHA256_V3";
 static_assert(sizeof(size_t) <= sizeof(uint64_t));
 static_assert(sizeof(int) >= sizeof(int32_t));
 
@@ -510,6 +510,24 @@ absl::Status AppendProjectionManifest(
   AppendHash(manifest.runtime_identity.inference_profile_hash, output);
   AppendHash(manifest.request_hash, output);
   AppendHash(manifest.output_hash, output);
+  output->push_back(static_cast<char>(manifest.replay_mode));
+  AppendHash(manifest.replay_request_hash, output);
+  AppendHash(manifest.execution_evidence_hash, output);
+  output->push_back(manifest.exact_profile_id.has_value() ? 1 : 0);
+  if (manifest.exact_profile_id.has_value()) {
+    AppendHash(*manifest.exact_profile_id, output);
+  }
+  output->push_back(
+      manifest.exact_profile_admission_record_id.has_value() ? 1 : 0);
+  if (manifest.exact_profile_admission_record_id.has_value()) {
+    AppendHash(*manifest.exact_profile_admission_record_id, output);
+  }
+  output->push_back(manifest.exact_output_evidence_hash.has_value() ? 1 : 0);
+  if (manifest.exact_output_evidence_hash.has_value()) {
+    AppendHash(*manifest.exact_output_evidence_hash, output);
+  }
+  AppendU32(manifest.exact_logit_frame_count, output);
+  output->push_back(manifest.reused_canonical_winner ? 1 : 0);
   AppendHash(manifest.manifest_hash, output);
   return absl::OkStatus();
 }
@@ -559,6 +577,44 @@ absl::StatusOr<DPMProjectionManifest> ReadProjectionManifest(
                         reader->ReadHash());
   ABSL_ASSIGN_OR_RETURN(manifest.request_hash, reader->ReadHash());
   ABSL_ASSIGN_OR_RETURN(manifest.output_hash, reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(uint8_t replay_mode, reader->ReadU8());
+  manifest.replay_mode = static_cast<DPMReplayMode>(replay_mode);
+  ABSL_ASSIGN_OR_RETURN(manifest.replay_request_hash, reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(manifest.execution_evidence_hash, reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(uint8_t has_exact_profile, reader->ReadU8());
+  if (has_exact_profile > 1) {
+    return absl::DataLossError(
+        "Non-canonical DPM projection exact-profile-presence flag.");
+  }
+  if (has_exact_profile == 1) {
+    ABSL_ASSIGN_OR_RETURN(Hash256 exact_profile, reader->ReadHash());
+    manifest.exact_profile_id = exact_profile;
+  }
+  ABSL_ASSIGN_OR_RETURN(uint8_t has_exact_admission, reader->ReadU8());
+  if (has_exact_admission > 1) {
+    return absl::DataLossError(
+        "Non-canonical DPM projection exact-admission-presence flag.");
+  }
+  if (has_exact_admission == 1) {
+    ABSL_ASSIGN_OR_RETURN(Hash256 exact_admission, reader->ReadHash());
+    manifest.exact_profile_admission_record_id = exact_admission;
+  }
+  ABSL_ASSIGN_OR_RETURN(uint8_t has_exact_output_evidence, reader->ReadU8());
+  if (has_exact_output_evidence > 1) {
+    return absl::DataLossError(
+        "Non-canonical DPM projection exact-output-evidence-presence flag.");
+  }
+  if (has_exact_output_evidence == 1) {
+    ABSL_ASSIGN_OR_RETURN(Hash256 exact_output_evidence, reader->ReadHash());
+    manifest.exact_output_evidence_hash = exact_output_evidence;
+  }
+  ABSL_ASSIGN_OR_RETURN(manifest.exact_logit_frame_count, reader->ReadU32());
+  ABSL_ASSIGN_OR_RETURN(uint8_t reused_winner, reader->ReadU8());
+  if (reused_winner > 1) {
+    return absl::DataLossError(
+        "Non-canonical DPM projection winner-reuse flag.");
+  }
+  manifest.reused_canonical_winner = reused_winner == 1;
   ABSL_ASSIGN_OR_RETURN(manifest.manifest_hash, reader->ReadHash());
   ABSL_RETURN_IF_ERROR(ValidateDPMProjectionManifest(manifest));
   return manifest;
@@ -699,7 +755,9 @@ absl::Status ValidateEvent(const DPMEvent& event,
         baseline.output_hash != *projection.baseline_output_hash ||
         baseline.correction_digest != projection.correction_digest ||
         baseline.config_hash != projection.config_hash ||
-        baseline.runtime_identity != projection.runtime_identity) {
+        baseline.runtime_identity != projection.runtime_identity ||
+        baseline.replay_mode != projection.replay_mode ||
+        baseline.exact_profile_id != projection.exact_profile_id) {
       return absl::InvalidArgumentError(
           "DPM projection baseline lineage is not the compatible prior "
           "authoritative receipt named by its event range.");

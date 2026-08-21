@@ -23,7 +23,7 @@
 #include "runtime/dpm/dpm_event_log.h"
 #include "runtime/dpm/dpm_projection_manifest.h"
 #include "runtime/dpm/dpm_projection_prompt.h"
-#include "runtime/dpm/dpm_projection_runtime.h"
+#include "runtime/dpm/dpm_projection_replay_runtime.h"
 
 namespace litert::lm {
 
@@ -34,14 +34,16 @@ namespace litert::lm {
 class OneShotDPMProjector final : public DPMProjectionProvider {
  public:
   OneShotDPMProjector(DPMEventLog* authoritative_log,
-                      DPMProjectionRuntime* runtime,
+                      DPMProjectionReplayRuntime* runtime,
                       DPMProjectionConfig config);
 
   absl::Status ValidateSupport() const override;
 
-  // Performs exactly one DPMProjectionRuntime::GenerateFresh call and no
-  // repairs. request.log is only an identity assertion; any baseline is
-  // derived solely from a freshly fetched authoritative snapshot.
+  // Performs exactly one product replay execution and no repair stage.
+  // WinnerReplay may use a prior authenticated winner without inference;
+  // ExactRegeneration performs its configured independent cold processes.
+  // request.log is only an identity assertion; any baseline is derived solely
+  // from a freshly fetched authoritative snapshot.
   absl::StatusOr<DPMProjectionOutcome> Project(
       const DPMProjectionRequest& request) override;
 
@@ -52,15 +54,19 @@ class OneShotDPMProjector final : public DPMProjectionProvider {
   SelectNewestCompatibleBaseline(
       const DPMProjectionRequest& authoritative_request,
       const Hash256& correction_digest, const Hash256& config_hash,
-      const SessionHandoffIdentity& runtime_identity) const;
+      const SessionHandoffIdentity& runtime_identity,
+      DPMReplayMode replay_mode,
+      const std::optional<Hash256>& exact_profile_id) const;
   absl::Status ValidateBaseline(
       const DPMProjectionRequest& request,
       const Hash256& correction_digest, const Hash256& config_hash,
       const SessionHandoffIdentity& runtime_identity,
+      DPMReplayMode replay_mode,
+      const std::optional<Hash256>& exact_profile_id,
       const DPMProjectionBaselineArtifact& baseline) const;
 
   DPMEventLog* const authoritative_log_;
-  DPMProjectionRuntime* const runtime_;
+  DPMProjectionReplayRuntime* const runtime_;
   const DPMProjectionConfig config_;
 };
 

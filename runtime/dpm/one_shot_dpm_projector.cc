@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -26,16 +27,18 @@
 #include "runtime/dpm/correction_digest.h"
 #include "runtime/dpm/dpm_engine.h"
 #include "runtime/dpm/dpm_event_log.h"
+#include "runtime/dpm/exact_profile_admission.h"
 #include "runtime/dpm/dpm_projection_manifest.h"
 #include "runtime/dpm/dpm_projection_prompt.h"
-#include "runtime/dpm/dpm_projection_runtime.h"
+#include "runtime/dpm/dpm_projection_replay_runtime.h"
+#include "runtime/dpm/dpm_replay_mode.h"
 #include "runtime/engine/session_handoff.h"
 #include "runtime/platform/hash/hasher.h"
 
 namespace litert::lm {
 
 OneShotDPMProjector::OneShotDPMProjector(
-    DPMEventLog* authoritative_log, DPMProjectionRuntime* runtime,
+    DPMEventLog* authoritative_log, DPMProjectionReplayRuntime* runtime,
     DPMProjectionConfig config)
     : authoritative_log_(authoritative_log),
       runtime_(runtime),
@@ -51,7 +54,20 @@ absl::Status OneShotDPMProjector::ValidateSupport() const {
     return absl::FailedPreconditionError(
         "DPM projection runtime token limit differs from canonical config.");
   }
-  return runtime_->ValidateSupport();
+  ABSL_RETURN_IF_ERROR(runtime_->ValidateSupport());
+  const DPMReplayMode replay_mode = runtime_->GetReplayMode();
+  ABSL_RETURN_IF_ERROR(ValidateDPMReplayMode(replay_mode));
+  ABSL_ASSIGN_OR_RETURN(const std::optional<Hash256> exact_profile_id,
+                        runtime_->GetExactProfileId());
+  if ((replay_mode == DPMReplayMode::kCanonicalWinnerReplay &&
+       exact_profile_id.has_value()) ||
+      (replay_mode == DPMReplayMode::kExactRegeneration &&
+       (!exact_profile_id.has_value() || *exact_profile_id == Hash256{}))) {
+    return absl::FailedPreconditionError(
+        "DPM projection replay mode and derived exact-profile identity "
+        "disagree.");
+  }
+  return absl::OkStatus();
 }
 
 absl::StatusOr<DPMLogSnapshot>
@@ -90,6 +106,8 @@ absl::Status OneShotDPMProjector::ValidateBaseline(
     const DPMProjectionRequest& request,
     const Hash256& correction_digest, const Hash256& config_hash,
     const SessionHandoffIdentity& runtime_identity,
+    DPMReplayMode replay_mode,
+    const std::optional<Hash256>& exact_profile_id,
     const DPMProjectionBaselineArtifact& baseline) const {
   ABSL_RETURN_IF_ERROR(ValidateDPMProjectionManifest(baseline.manifest));
   if (baseline.manifest.log_id != request.log.log_id ||
@@ -100,7 +118,9 @@ absl::Status OneShotDPMProjector::ValidateBaseline(
           baseline.manifest.source_event_count ||
       baseline.manifest.correction_digest != correction_digest ||
       baseline.manifest.config_hash != config_hash ||
-      baseline.manifest.runtime_identity != runtime_identity) {
+      baseline.manifest.runtime_identity != runtime_identity ||
+      baseline.manifest.replay_mode != replay_mode ||
+      baseline.manifest.exact_profile_id != exact_profile_id) {
     return absl::FailedPreconditionError(
         "DPM projection baseline does not match the current log lineage and "
         "resolved projection profile.");
@@ -133,7 +153,9 @@ absl::StatusOr<std::optional<DPMProjectionBaselineArtifact>>
 OneShotDPMProjector::SelectNewestCompatibleBaseline(
     const DPMProjectionRequest& authoritative_request,
     const Hash256& correction_digest, const Hash256& config_hash,
-    const SessionHandoffIdentity& runtime_identity) const {
+    const SessionHandoffIdentity& runtime_identity,
+    DPMReplayMode replay_mode,
+    const std::optional<Hash256>& exact_profile_id) const {
   // Reverse durable response-event order is the unique selection rule. The
   // first compatible receipt is therefore the newest compatible ancestor for
   // every process observing this exact raw-log prefix.
@@ -183,7 +205,7 @@ OneShotDPMProjector::SelectNewestCompatibleBaseline(
     };
     const absl::Status compatibility = ValidateBaseline(
         authoritative_request, correction_digest, config_hash,
-        runtime_identity, candidate);
+        runtime_identity, replay_mode, exact_profile_id, candidate);
     if (compatibility.ok()) {
       return std::optional<DPMProjectionBaselineArtifact>(
           std::move(candidate));
@@ -212,10 +234,15 @@ absl::StatusOr<DPMProjectionOutcome> OneShotDPMProjector::Project(
                         ComputeDPMProjectionConfigHash(config_));
   const SessionHandoffIdentity runtime_identity =
       runtime_->GetRuntimeIdentity();
+  const DPMReplayMode replay_mode = runtime_->GetReplayMode();
+  ABSL_RETURN_IF_ERROR(ValidateDPMReplayMode(replay_mode));
+  ABSL_ASSIGN_OR_RETURN(const std::optional<Hash256> exact_profile_id,
+                        runtime_->GetExactProfileId());
   ABSL_ASSIGN_OR_RETURN(
       std::optional<DPMProjectionBaselineArtifact> baseline,
       SelectNewestCompatibleBaseline(authoritative_request, correction_digest,
-                                     config_hash, runtime_identity));
+                                     config_hash, runtime_identity,
+                                     replay_mode, exact_profile_id));
 
   ABSL_ASSIGN_OR_RETURN(
       CanonicalDPMProjectionRequest canonical_request,
@@ -230,16 +257,61 @@ absl::StatusOr<DPMProjectionOutcome> OneShotDPMProjector::Project(
         "Canonical DPM projection request changed before inference.");
   }
 
-  // The one-shot contract has exactly this single runtime call. Invalid model
-  // output is returned as an error below; there is no hidden repair inference.
+  // The one-shot contract has exactly this single product execution call.
+  // Invalid output is returned as an error below; there is no hidden repair
+  // inference. ExactRegeneration owns its N cold processes inside this call;
+  // WinnerReplay may resolve an authenticated existing winner with zero model
+  // calls.
   ABSL_ASSIGN_OR_RETURN(
-      std::string raw_output,
-      runtime_->GenerateFresh(canonical_request.prompt_bytes));
+      DPMProjectionReplayExecution execution,
+      runtime_->Generate(canonical_request));
+  ABSL_RETURN_IF_ERROR(ValidateDPMProjectionReplayExecution(execution));
+  if (execution.mode != replay_mode ||
+      execution.exact_profile_id != exact_profile_id ||
+      execution.replay_request_hash == Hash256{} ||
+      execution.execution_evidence_hash == Hash256{}) {
+    return absl::DataLossError(
+        "DPM projection execution returned incomplete or cross-mode "
+        "evidence.");
+  }
+  std::optional<Hash256> exact_output_evidence_hash;
+  uint32_t exact_logit_frame_count = 0;
+  switch (execution.mode) {
+    case DPMReplayMode::kCanonicalWinnerReplay:
+      if (execution.exact_profile_admission_record_id.has_value() ||
+          !execution.exact_token_bytes.empty() ||
+          !execution.exact_logit_frames.empty()) {
+        return absl::DataLossError(
+            "WinnerReplay projection returned exact-only evidence.");
+      }
+      break;
+    case DPMReplayMode::kExactRegeneration:
+      if (!execution.exact_profile_admission_record_id.has_value() ||
+          *execution.exact_profile_admission_record_id == Hash256{} ||
+          execution.exact_token_bytes.empty() ||
+          execution.exact_logit_frames.empty() ||
+          execution.exact_logit_frames.size() >
+              std::numeric_limits<uint32_t>::max()) {
+        return absl::DataLossError(
+            "Exact projection returned incomplete token, logits, or profile "
+            "admission evidence.");
+      }
+      exact_output_evidence_hash = ComputeFreshWorkerOutputEvidenceHash(
+          execution.canonical_output, execution.exact_token_bytes,
+          execution.exact_logit_frames);
+      exact_logit_frame_count =
+          static_cast<uint32_t>(execution.exact_logit_frames.size());
+      break;
+  }
   ABSL_ASSIGN_OR_RETURN(
       std::string projected_memory,
-      CanonicalizeDPMProjectionOutput(raw_output,
+      CanonicalizeDPMProjectionOutput(execution.canonical_output,
                                       canonical_request.source_event_count,
                                       config_));
+  if (projected_memory != execution.canonical_output) {
+    return absl::DataLossError(
+        "DPM projection replay runtime returned non-canonical output.");
+  }
   const Hash256 output_hash =
       ComputeCanonicalDPMProjectionOutputHash(projected_memory);
 
@@ -248,6 +320,16 @@ absl::StatusOr<DPMProjectionOutcome> OneShotDPMProjector::Project(
   if (runtime_->GetRuntimeIdentity() != runtime_identity) {
     return absl::FailedPreconditionError(
         "DPM projection runtime identity changed during inference.");
+  }
+  if (runtime_->GetReplayMode() != replay_mode) {
+    return absl::FailedPreconditionError(
+        "DPM projection replay mode changed during execution.");
+  }
+  ABSL_ASSIGN_OR_RETURN(const std::optional<Hash256> final_exact_profile_id,
+                        runtime_->GetExactProfileId());
+  if (final_exact_profile_id != exact_profile_id) {
+    return absl::FailedPreconditionError(
+        "DPM projection exact profile changed during execution.");
   }
   absl::StatusOr<DPMLogSnapshot> unchanged_snapshot =
       ResolveAuthoritativeSnapshot(authoritative_request);
@@ -267,6 +349,15 @@ absl::StatusOr<DPMProjectionOutcome> OneShotDPMProjector::Project(
       .runtime_identity = canonical_request.runtime_identity,
       .request_hash = canonical_request.request_hash,
       .output_hash = output_hash,
+      .replay_mode = execution.mode,
+      .replay_request_hash = execution.replay_request_hash,
+      .execution_evidence_hash = execution.execution_evidence_hash,
+      .exact_profile_id = execution.exact_profile_id,
+      .exact_profile_admission_record_id =
+          execution.exact_profile_admission_record_id,
+      .exact_output_evidence_hash = exact_output_evidence_hash,
+      .exact_logit_frame_count = exact_logit_frame_count,
+      .reused_canonical_winner = execution.reused_canonical_winner,
   };
   ABSL_ASSIGN_OR_RETURN(manifest.manifest_hash,
                         ComputeDPMProjectionManifestHash(manifest));
