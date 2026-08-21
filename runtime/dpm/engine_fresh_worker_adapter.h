@@ -24,14 +24,20 @@ namespace litert::lm {
 // Concrete one-request worker entry point. `fixed_engine_settings` must be
 // assembled by the worker executable before this function reads stdin. The
 // authenticated request cannot replace them and cannot inject an Engine,
-// replay catalog, inference callback, session capsule, or backend selector.
+// replay catalog, inference callback, or backend selector. Session capsules
+// are accepted only through RunFreshWorkerOnce's authenticated transient
+// ByteSource/ByteSink capabilities and only when the request carries a valid
+// own-position execution plan.
 //
 // After authentication and canonical stage decoding, this function creates
 // one kAdvancedLiteRTCompiledModel Engine, derives and checks its
-// ExactLiteRtProfile, creates one fresh session, runs full prefill and one
-// exact decode, and exits through RunFreshWorkerOnce's authenticated result
-// boundary. No replay catalog is constructed or consulted. This adapter is
-// one-shot, but it does not by itself prove that its host is a new OS process;
+// ExactLiteRtProfile, creates one fresh session, performs either full prefill
+// or authenticated own-position restore plus exact delta prefill, runs one
+// exact decode, and optionally exports the producing session only after the
+// canonical output evidence has been finalized. It exits through
+// RunFreshWorkerOnce's authenticated result/capsule boundary. No replay
+// catalog is constructed or consulted. This adapter is one-shot, but it does
+// not by itself prove that its host is a new OS process;
 // FreshWorkerProcessRunner and exact-profile admission own that independently
 // observed process boundary.
 absl::Status RunEngineFreshWorkerOnce(

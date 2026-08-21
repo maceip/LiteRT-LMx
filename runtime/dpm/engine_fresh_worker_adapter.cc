@@ -53,6 +53,7 @@ struct DecodedWorkerInvocation {
   DPMCanonicalReplayRequest replay_request;
   std::optional<DPMProjectionExecutionRequest> projection;
   std::optional<DPMAgentExecutionRequest> agent;
+  std::optional<DPMAgentDeltaExecutionRequest> agent_delta;
   uint32_t max_output_tokens = 0;
 };
 
@@ -233,6 +234,13 @@ absl::StatusOr<DecodedWorkerInvocation> DecodeCanonicalInvocation(
       invocation.max_output_tokens =
           projection.projection_config.max_output_tokens;
       invocation.projection = std::move(projection);
+      if (request.execution_plan.prefill_mode !=
+              FreshWorkerPrefillMode::kFullCanonicalPrefill ||
+          request.execution_plan.capture_producing_capsule) {
+        return absl::UnimplementedError(
+            "Exact projection workers do not restore or capture stateful "
+            "session capsules.");
+      }
       break;
     }
 
@@ -253,6 +261,24 @@ absl::StatusOr<DecodedWorkerInvocation> DecodeCanonicalInvocation(
       }
       invocation.max_output_tokens = agent.max_output_tokens;
       invocation.agent = std::move(agent);
+      if (request.execution_plan.prefill_mode ==
+          FreshWorkerPrefillMode::kOwnPositionCapsuleDelta) {
+        ABSL_ASSIGN_OR_RETURN(
+            DPMAgentDeltaExecutionRequest delta,
+            DecodeDPMAgentDeltaExecutionRequest(
+                request.execution_plan.canonical_execution_payload));
+        ABSL_ASSIGN_OR_RETURN(
+            const std::string canonical_delta,
+            EncodeDPMAgentDeltaExecutionRequest(delta));
+        if (canonical_delta !=
+            request.execution_plan.canonical_execution_payload) {
+          return absl::DataLossError(
+              "Fresh worker agent delta is not canonically encoded.");
+        }
+        ABSL_RETURN_IF_ERROR(ValidateDPMAgentDeltaExecutionBinding(
+            *invocation.agent, request.execution_plan, delta));
+        invocation.agent_delta = std::move(delta);
+      }
       break;
     }
   }
@@ -324,12 +350,13 @@ absl::Status PrefillProjection(
 }
 
 absl::Status PrefillAgent(Engine* engine, Engine::Session* session,
-                          const DPMAgentExecutionRequest& agent) {
-  if (engine == nullptr || session == nullptr ||
-      agent.full_canonical_prefill_chunks.empty()) {
+                          const std::vector<
+                              DPMAgentGenerationRequest::PrefillChunk>&
+                              canonical_chunks) {
+  if (engine == nullptr || session == nullptr || canonical_chunks.empty()) {
     return absl::InvalidArgumentError(
-        "Exact agent execution requires one fresh Engine session and full "
-        "canonical input.");
+        "Exact agent execution requires one Engine session and canonical "
+        "prefill input.");
   }
   const int vocabulary_size = engine->GetTokenizer().GetVocabSize();
   if (vocabulary_size <= 0) {
@@ -337,7 +364,7 @@ absl::Status PrefillAgent(Engine* engine, Engine::Session* session,
         "Exact agent worker tokenizer has no measurable vocabulary.");
   }
   for (const DPMAgentGenerationRequest::PrefillChunk& chunk :
-       agent.full_canonical_prefill_chunks) {
+       canonical_chunks) {
     std::vector<InputData> contents;
     switch (chunk.encoding) {
       case DPMAgentGenerationRequest::PrefillChunk::Encoding::kUtf8Text:
@@ -373,8 +400,35 @@ absl::Status PrefillAgent(Engine* engine, Engine::Session* session,
     }
     // Keeping one prefill call per canonical chunk preserves the exact
     // text/token boundary and prevents historical decision IDs from being
-    // re-tokenized. No checkpoint or delta input exists in this worker.
+    // re-tokenized. The same helper is used for complete logical input and
+    // for the validated post-checkpoint suffix.
     ABSL_RETURN_IF_ERROR(session->RunPrefill(contents));
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateImportedSession(
+    const Engine::Session& session, const SessionConfig& resolved_config,
+    const ExactLiteRtProfile& profile) {
+  ABSL_RETURN_IF_ERROR(ValidateResolvedSessionConfig(
+      session.GetSessionConfig(), DPMReplayStage::kAgentDecision,
+      static_cast<uint32_t>(resolved_config.GetMaxOutputTokens())));
+  ABSL_ASSIGN_OR_RETURN(const SessionHandoffIdentity session_identity,
+                        session.GetSessionHandoffIdentity());
+  if (session_identity != profile.session_identity) {
+    return absl::FailedPreconditionError(
+        "Imported exact session identity differs from the worker-derived "
+        "profile.");
+  }
+  ABSL_ASSIGN_OR_RETURN(const int current_step, session.GetCurrentStep());
+  ABSL_ASSIGN_OR_RETURN(
+      const std::vector<std::vector<int>> token_history,
+      session.GetExactProcessedTokenHistory());
+  if (current_step <= 0 || token_history.size() != 1 ||
+      token_history.front().empty()) {
+    return absl::FailedPreconditionError(
+        "Imported own-position session has no producing continuation "
+        "boundary.");
   }
   return absl::OkStatus();
 }
@@ -513,18 +567,31 @@ absl::StatusOr<FreshWorkerExecutionOutput> BuildStageOutput(
 
 absl::StatusOr<FreshWorkerDerivedExecution> ExecuteEngineFreshWorkerRequest(
     EngineSettings fixed_engine_settings,
-    const FreshWorkerRequest& request) {
+    const FreshWorkerExecutionContext& context) {
+  const FreshWorkerRequest& request = context.request;
   // RunFreshWorkerOnce authenticates the envelope before reaching here. Do
   // all canonical parsing before model load so malformed stage input cannot
   // select artifacts or allocate an inference runtime.
   ABSL_ASSIGN_OR_RETURN(const DecodedWorkerInvocation invocation,
                         DecodeCanonicalInvocation(request));
-  if (request.execution_plan.prefill_mode !=
-          FreshWorkerPrefillMode::kFullCanonicalPrefill ||
-      request.execution_plan.capture_producing_capsule) {
+  const bool restore_requested =
+      request.execution_plan.prefill_mode ==
+      FreshWorkerPrefillMode::kOwnPositionCapsuleDelta;
+  const bool capture_requested =
+      request.execution_plan.capture_producing_capsule;
+  if (restore_requested != invocation.agent_delta.has_value() ||
+      restore_requested != (context.restore_source != nullptr) ||
+      restore_requested != (context.restore_options != nullptr) ||
+      capture_requested != (context.producing_sink != nullptr) ||
+      capture_requested != (context.producing_options != nullptr)) {
+    return absl::FailedPreconditionError(
+        "Exact Engine worker context disagrees with its authenticated "
+        "execution plan.");
+  }
+  if ((restore_requested || capture_requested) &&
+      invocation.replay_request.stage != DPMReplayStage::kAgentDecision) {
     return absl::UnimplementedError(
-        "Exact Engine worker capsule restore/capture requires the separate "
-        "authenticated capsule-stream capability.");
+        "Only exact agent-decision workers admit session capsules.");
   }
   ABSL_RETURN_IF_ERROR(
       ValidateFixedEngineSettings(fixed_engine_settings));
@@ -565,9 +632,9 @@ absl::StatusOr<FreshWorkerDerivedExecution> ExecuteEngineFreshWorkerRequest(
         "request.");
   }
 
-  // Exactly one session is created. Projection reset and agent full-prefill
-  // both start here; no capsule, parent session, checkpoint delta, or replay
-  // artifact is accepted by this boundary.
+  // Exactly one session is created. An own-position capsule is imported only
+  // into this step-zero target; there is no parent Session and no worker-local
+  // fallback to full prefill.
   ABSL_ASSIGN_OR_RETURN(std::unique_ptr<Engine::Session> session,
                         engine->CreateSession(session_config));
   if (session == nullptr) {
@@ -578,14 +645,33 @@ absl::StatusOr<FreshWorkerDerivedExecution> ExecuteEngineFreshWorkerRequest(
       ValidateFreshSession(*engine, *session, session_config,
                            profile_before));
 
+  if (restore_requested) {
+    ABSL_RETURN_IF_ERROR(session->ImportHandoffFrom(
+        *context.restore_source, *context.restore_options));
+    ABSL_RETURN_IF_ERROR(
+        ValidateImportedSession(*session, session_config, profile_before));
+    ABSL_ASSIGN_OR_RETURN(
+        const ExactLiteRtProfile profile_after_import,
+        engine->ResolveExactLiteRtProfile(session->GetSessionConfig(),
+                                          profile_assertion));
+    if (profile_after_import != profile_before) {
+      return absl::FailedPreconditionError(
+          "Worker-derived ExactLiteRtProfile changed during capsule "
+          "import.");
+    }
+  }
+
   switch (invocation.replay_request.stage) {
     case DPMReplayStage::kProjection:
       ABSL_RETURN_IF_ERROR(
           PrefillProjection(session.get(), *invocation.projection));
       break;
     case DPMReplayStage::kAgentDecision:
-      ABSL_RETURN_IF_ERROR(
-          PrefillAgent(engine.get(), session.get(), *invocation.agent));
+      ABSL_RETURN_IF_ERROR(PrefillAgent(
+          engine.get(), session.get(),
+          restore_requested
+              ? invocation.agent_delta->canonical_delta_prefill_chunks
+              : invocation.agent->full_canonical_prefill_chunks));
       break;
   }
 
@@ -623,11 +709,67 @@ absl::StatusOr<FreshWorkerDerivedExecution> ExecuteEngineFreshWorkerRequest(
   ABSL_ASSIGN_OR_RETURN(
       FreshWorkerExecutionOutput output,
       BuildStageOutput(invocation, exact_decode, profile_after));
+  const Hash256 finalized_output_evidence_hash =
+      ComputeFreshWorkerOutputEvidenceHash(
+          output.canonical_output, output.token_bytes, output.logit_frames);
+
+  // Canonical output, exact token bytes, and every ordered logits hash are
+  // finalized before exporting the producing session. A failed export fails
+  // the whole request and cannot turn these bytes into an uncaptured success.
+  if (capture_requested) {
+    ABSL_ASSIGN_OR_RETURN(const int post_decode_step,
+                          session->GetCurrentStep());
+    ABSL_ASSIGN_OR_RETURN(
+        const std::vector<std::vector<int>> post_decode_history,
+        session->GetExactProcessedTokenHistory());
+    ABSL_RETURN_IF_ERROR(session->ExportHandoffTo(
+        *context.producing_options, context.producing_sink));
+    ABSL_ASSIGN_OR_RETURN(const int post_export_step,
+                          session->GetCurrentStep());
+    ABSL_ASSIGN_OR_RETURN(
+        const std::vector<std::vector<int>> post_export_history,
+        session->GetExactProcessedTokenHistory());
+    if (post_export_step != post_decode_step ||
+        post_export_history != post_decode_history ||
+        ComputeFreshWorkerOutputEvidenceHash(
+            output.canonical_output, output.token_bytes,
+            output.logit_frames) != finalized_output_evidence_hash) {
+      return absl::FailedPreconditionError(
+          "Producing-session export changed exact continuation or output "
+          "evidence.");
+    }
+  }
+
+  ABSL_ASSIGN_OR_RETURN(
+      const ExactLiteRtProfile profile_final,
+      engine->ResolveExactLiteRtProfile(session->GetSessionConfig(),
+                                        profile_assertion));
+  if (profile_final != profile_before) {
+    return absl::FailedPreconditionError(
+        "Worker-derived ExactLiteRtProfile changed during producing-session "
+        "capture.");
+  }
+  ABSL_RETURN_IF_ERROR(ValidateResolvedSessionConfig(
+      session->GetSessionConfig(), invocation.replay_request.stage,
+      invocation.max_output_tokens));
+  ABSL_ASSIGN_OR_RETURN(
+      const SessionHandoffIdentity final_session_identity,
+      session->GetSessionHandoffIdentity());
+  if (final_session_identity != profile_final.session_identity ||
+      final_session_identity != producing_session_identity) {
+    return absl::FailedPreconditionError(
+        "Producing session identity changed after exact output or capsule "
+        "capture.");
+  }
 
   return FreshWorkerDerivedExecution{
-      .derived_exact_profile_hash = profile_after.profile_id,
+      .derived_exact_profile_hash = profile_final.profile_id,
       .replay_isolation = FreshWorkerReplayIsolation::kEmptyCatalogs,
       .output = std::move(output),
+      .restored_checkpoint_id =
+          request.execution_plan.restore_checkpoint_id,
+      .exported_producing_capsule = capture_requested,
+      .producing_session_identity = final_session_identity,
   };
 }
 
@@ -641,7 +783,8 @@ absl::Status RunEngineFreshWorkerOnce(
   // changes.
   bool consumed = false;
   return RunFreshWorkerOnce(
-      [&fixed_engine_settings, &consumed](const FreshWorkerRequest& request)
+      [&fixed_engine_settings, &consumed](
+          const FreshWorkerExecutionContext& context)
           -> absl::StatusOr<FreshWorkerDerivedExecution> {
         if (consumed) {
           return absl::FailedPreconditionError(
@@ -649,7 +792,7 @@ absl::Status RunEngineFreshWorkerOnce(
         }
         consumed = true;
         return ExecuteEngineFreshWorkerRequest(
-            std::move(fixed_engine_settings), request);
+            std::move(fixed_engine_settings), context);
       });
 }
 
