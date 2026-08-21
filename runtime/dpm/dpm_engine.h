@@ -26,6 +26,7 @@
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
 #include "runtime/dpm/dpm_event_log.h"
+#include "runtime/dpm/dpm_projection_manifest.h"
 #include "runtime/dpm/session_checkpoint.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/session_handoff.h"
@@ -52,22 +53,27 @@ struct DPMProjectionRequest {
 
 struct DPMProjectionOutcome {
   std::string projected_memory;
-  Hash256 canonical_request_hash;
-  Hash256 manifest_hash;
-
-  // Digest of the active correction set used to construct projected_memory.
-  // A changed digest invalidates a session checkpoint even when its model and
-  // runtime identities still match.
-  Hash256 correction_digest;
+  // Complete identity of projected_memory. A changed embedded correction
+  // digest invalidates a session checkpoint even when model/runtime identity
+  // remains compatible.
+  DPMProjectionManifest manifest;
 };
 
-// Projection remains an explicit dependency while the user-prioritized
-// session handoff path is implemented first. The next subsystem replaces the
-// full-log provider with authenticated baseline-plus-delta projection without
-// changing DPMEngine's turn/receipt contract.
+// Projection is an explicit dependency. Production providers must treat the
+// request snapshot as an assertion, refetch the current authoritative prefix,
+// and derive any baseline from receipts in that prefix. There is no
+// caller-selected projection cache input at this boundary.
 class DPMProjectionProvider {
  public:
   virtual ~DPMProjectionProvider() = default;
+  // Must validate static configuration and the resolved runtime profile
+  // without inference or durable log mutation. Providers that do not expose
+  // a preflight fail closed so RunTurn cannot append an input that can never
+  // be projected.
+  virtual absl::Status ValidateSupport() const {
+    return absl::UnimplementedError(
+        "DPM projection provider does not support preflight admission.");
+  }
   virtual absl::StatusOr<DPMProjectionOutcome> Project(
       const DPMProjectionRequest& request) = 0;
 };
@@ -124,6 +130,8 @@ struct DPMEngineConfig {
   uint32_t checkpoint_interval_turns = 1;
   bool restore_session_checkpoints = true;
   bool require_checkpoint_at_milestone = true;
+  // Product admission is capped by kMaximumDPMGenerationTokens; this is not
+  // an unbounded backend integer knob.
   int max_decision_tokens = 512;
   std::string checkpoint_key_id;
   std::string checkpoint_authentication_key;

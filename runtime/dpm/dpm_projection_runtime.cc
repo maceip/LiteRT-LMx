@@ -27,6 +27,7 @@
 #include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "runtime/dpm/dpm_event_log.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
@@ -76,10 +77,9 @@ absl::Status ValidateRequestedFeatures(const Engine& engine,
                                        const SessionConfig& config,
                                        uint32_t max_output_tokens) {
   if (max_output_tokens == 0 ||
-      max_output_tokens >
-          static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+      max_output_tokens > kMaximumDPMGenerationTokens) {
     return absl::InvalidArgumentError(
-        "DPM projection max output tokens must fit a positive int.");
+        "DPM projection max output tokens must be between 1 and 65,536.");
   }
   const EngineSettings& engine_settings = engine.GetEngineSettings();
   if (engine_settings.IsBenchmarkEnabled()) {

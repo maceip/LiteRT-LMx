@@ -29,7 +29,6 @@ namespace {
 
 constexpr absl::string_view kManifestDomain =
     "LITERT_LMX_DPM_PROJECTION_MANIFEST_SHA256_V1";
-constexpr size_t kMaximumIdentityBytes = 16 * 1024;
 
 bool IsZeroHash(const Hash256& hash) { return hash == Hash256{}; }
 
@@ -38,6 +37,41 @@ bool ContainsControlByte(absl::string_view value) {
     if (byte < 0x20 || byte == 0x7f) return true;
   }
   return false;
+}
+
+bool IsValidUtf8(absl::string_view text) {
+  const auto* bytes = reinterpret_cast<const uint8_t*>(text.data());
+  size_t index = 0;
+  while (index < text.size()) {
+    const uint8_t lead = bytes[index++];
+    if (lead <= 0x7f) continue;
+
+    size_t continuation_count = 0;
+    uint8_t minimum_second = 0x80;
+    uint8_t maximum_second = 0xbf;
+    if (lead >= 0xc2 && lead <= 0xdf) {
+      continuation_count = 1;
+    } else if (lead >= 0xe0 && lead <= 0xef) {
+      continuation_count = 2;
+      if (lead == 0xe0) minimum_second = 0xa0;
+      if (lead == 0xed) maximum_second = 0x9f;
+    } else if (lead >= 0xf0 && lead <= 0xf4) {
+      continuation_count = 3;
+      if (lead == 0xf0) minimum_second = 0x90;
+      if (lead == 0xf4) maximum_second = 0x8f;
+    } else {
+      return false;
+    }
+    if (continuation_count > text.size() - index ||
+        bytes[index] < minimum_second || bytes[index] > maximum_second) {
+      return false;
+    }
+    ++index;
+    for (size_t offset = 1; offset < continuation_count; ++offset, ++index) {
+      if (bytes[index] < 0x80 || bytes[index] > 0xbf) return false;
+    }
+  }
+  return true;
 }
 
 void UpdateU8(uint8_t value, Sha256Hasher* hasher) {
@@ -81,13 +115,14 @@ absl::Status ValidateManifestFields(const DPMProjectionManifest& manifest) {
         "Unsupported DPM projection manifest format version.");
   }
   if (manifest.log_id.empty() || manifest.case_id.empty() ||
-      manifest.log_id.size() > kMaximumIdentityBytes ||
-      manifest.case_id.size() > kMaximumIdentityBytes ||
+      manifest.log_id.size() > kMaximumDPMProjectionIdentityBytes ||
+      manifest.case_id.size() > kMaximumDPMProjectionIdentityBytes ||
+      !IsValidUtf8(manifest.log_id) || !IsValidUtf8(manifest.case_id) ||
       ContainsControlByte(manifest.log_id) ||
       ContainsControlByte(manifest.case_id)) {
     return absl::InvalidArgumentError(
-        "DPM projection manifest requires bounded log and case identities "
-        "without control bytes.");
+        "DPM projection manifest requires bounded UTF-8 log and case "
+        "identities without control bytes.");
   }
   if (manifest.source_event_count == 0 ||
       manifest.input_event_index >= manifest.source_event_count ||

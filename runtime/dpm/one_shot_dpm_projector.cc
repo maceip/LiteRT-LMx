@@ -41,7 +41,7 @@ OneShotDPMProjector::OneShotDPMProjector(
       runtime_(runtime),
       config_(std::move(config)) {}
 
-absl::Status OneShotDPMProjector::ValidateConfiguration() const {
+absl::Status OneShotDPMProjector::ValidateSupport() const {
   if (authoritative_log_ == nullptr || runtime_ == nullptr) {
     return absl::InvalidArgumentError(
         "One-shot DPM projection requires a raw event log and runtime.");
@@ -54,53 +54,36 @@ absl::Status OneShotDPMProjector::ValidateConfiguration() const {
   return runtime_->ValidateSupport();
 }
 
-absl::Status OneShotDPMProjector::ValidateCurrentSnapshot(
+absl::StatusOr<DPMLogSnapshot>
+OneShotDPMProjector::ResolveAuthoritativeSnapshot(
     const DPMProjectionRequest& request) const {
-  if (request.case_id.empty() || request.case_id != request.log.case_id ||
-      request.input_event_index >= request.log.events.size() ||
-      request.input_event_index + 1 != request.log.events.size() ||
-      request.log.generation != request.log.events.size() ||
-      request.log.events[request.input_event_index].index !=
-          request.input_event_index ||
-      request.log.events[request.input_event_index].case_id != request.case_id) {
-    return absl::InvalidArgumentError(
-        "DPM projection request does not name the final input in one "
-        "authoritative case prefix.");
-  }
   ABSL_ASSIGN_OR_RETURN(DPMLogSnapshot current,
                         authoritative_log_->Snapshot());
-  if (current.log_id != request.log.log_id ||
+  if (request.case_id.empty() || current.log_id != request.log.log_id ||
       current.case_id != request.log.case_id ||
+      current.case_id != request.case_id ||
       current.generation != request.log.generation ||
-      current.prefix_hash != request.log.prefix_hash) {
+      current.prefix_hash != request.log.prefix_hash ||
+      current.generation != current.events.size() || current.events.empty() ||
+      request.input_event_index != current.events.size() - 1 ||
+      current.events.back().index != request.input_event_index ||
+      current.events.back().case_id != current.case_id ||
+      (current.events.back().kind != DPMEvent::Kind::kUser &&
+       current.events.back().kind != DPMEvent::Kind::kTool &&
+       current.events.back().kind != DPMEvent::Kind::kInternal) ||
+      current.events.back().turn_receipt.has_value()) {
     return absl::AbortedError(
-        "DPM projection request no longer matches the authoritative log.");
-  }
-  if (current.events.size() != request.log.events.size()) {
-    return absl::AbortedError(
-        "DPM projection request event count changed during admission.");
-  }
-  for (size_t index = 0; index < current.events.size(); ++index) {
-    const DPMEvent& authoritative = current.events[index];
-    const DPMEvent& supplied = request.log.events[index];
-    if (authoritative.index != supplied.index ||
-        authoritative.kind != supplied.kind ||
-        authoritative.timestamp_us != supplied.timestamp_us ||
-        authoritative.operation_id != supplied.operation_id ||
-        authoritative.case_id != supplied.case_id ||
-        authoritative.payload != supplied.payload) {
-      return absl::DataLossError(
-          "DPM projection request event bytes differ from the raw log.");
-    }
+        "DPM projection request does not name the current authoritative "
+        "pending input prefix.");
   }
   ABSL_ASSIGN_OR_RETURN(
       Hash256 authoritative_prefix,
-      authoritative_log_->PrefixHash(request.log.events.size()));
-  if (authoritative_prefix != request.log.prefix_hash) {
+      authoritative_log_->PrefixHash(current.events.size()));
+  if (authoritative_prefix != current.prefix_hash) {
     return absl::DataLossError(
         "DPM projection source prefix hash differs from the raw event log.");
   }
-  return absl::OkStatus();
+  return current;
 }
 
 absl::Status OneShotDPMProjector::ValidateBaseline(
@@ -129,7 +112,7 @@ absl::Status OneShotDPMProjector::ValidateBaseline(
       Hash256 authoritative_baseline_prefix,
       authoritative_log_->PrefixHash(event_range_start));
   if (authoritative_baseline_prefix != baseline.manifest.source_prefix_hash) {
-    return absl::FailedPreconditionError(
+    return absl::DataLossError(
         "DPM projection baseline does not derive from the current raw-log "
         "prefix.");
   }
@@ -146,38 +129,93 @@ absl::Status OneShotDPMProjector::ValidateBaseline(
   return absl::OkStatus();
 }
 
-absl::StatusOr<OneShotDPMProjectionResult> OneShotDPMProjector::Project(
-    const DPMProjectionRequest& request,
-    std::optional<DPMProjectionBaselineArtifact> baseline) {
-  ABSL_RETURN_IF_ERROR(ValidateConfiguration());
-  ABSL_RETURN_IF_ERROR(ValidateCurrentSnapshot(request));
+absl::StatusOr<std::optional<DPMProjectionBaselineArtifact>>
+OneShotDPMProjector::SelectNewestCompatibleBaseline(
+    const DPMProjectionRequest& authoritative_request,
+    const Hash256& correction_digest, const Hash256& config_hash,
+    const SessionHandoffIdentity& runtime_identity) const {
+  // Reverse durable response-event order is the unique selection rule. The
+  // first compatible receipt is therefore the newest compatible ancestor for
+  // every process observing this exact raw-log prefix.
+  for (auto event = authoritative_request.log.events.rbegin();
+       event != authoritative_request.log.events.rend(); ++event) {
+    if (event->kind != DPMEvent::Kind::kModelTurn ||
+        !event->turn_receipt.has_value()) {
+      continue;
+    }
+    const DPMTurnReceipt& receipt = *event->turn_receipt;
+    if (receipt.format_version != DPMTurnReceipt::kFormatVersion ||
+        receipt.operation_id.empty() ||
+        event->index >= authoritative_request.log.events.size() ||
+        receipt.response_event_index != event->index ||
+        receipt.input_event_index >= event->index ||
+        receipt.input_event_index >= authoritative_request.log.events.size() ||
+        receipt.input_event_index + 1 != event->index ||
+        receipt.operation_id != event->operation_id ||
+        receipt.decision_output != event->payload ||
+        receipt.projection_manifest.source_event_count != event->index ||
+        receipt.projection_manifest.input_event_index !=
+            receipt.input_event_index) {
+      continue;
+    }
+    const DPMEvent& input =
+        authoritative_request.log.events[receipt.input_event_index];
+    if ((input.kind != DPMEvent::Kind::kUser &&
+         input.kind != DPMEvent::Kind::kTool &&
+         input.kind != DPMEvent::Kind::kInternal) ||
+        input.turn_receipt.has_value() ||
+        input.index != receipt.input_event_index ||
+        input.operation_id != receipt.operation_id ||
+        input.case_id != event->case_id ||
+        event->case_id != authoritative_request.log.case_id ||
+        event->timestamp_us < input.timestamp_us) {
+      continue;
+    }
+    DPMProjectionBaselineArtifact candidate{
+        .manifest = receipt.projection_manifest,
+        .projected_memory = receipt.projected_memory,
+    };
+    const absl::Status compatibility = ValidateBaseline(
+        authoritative_request, correction_digest, config_hash,
+        runtime_identity, candidate);
+    if (compatibility.ok()) {
+      return std::optional<DPMProjectionBaselineArtifact>(
+          std::move(candidate));
+    }
+    // Projection receipts are disposable derivatives. A malformed manifest,
+    // stale prefix, unavailable prefix lookup, invalid output, or any other
+    // candidate-specific failure is a cache miss and cannot block rebuilding
+    // from the authoritative raw log.
+  }
+  return std::optional<DPMProjectionBaselineArtifact>();
+}
+
+absl::StatusOr<DPMProjectionOutcome> OneShotDPMProjector::Project(
+    const DPMProjectionRequest& request) {
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  ABSL_ASSIGN_OR_RETURN(DPMLogSnapshot authoritative_snapshot,
+                        ResolveAuthoritativeSnapshot(request));
+  DPMProjectionRequest authoritative_request{
+      .log = std::move(authoritative_snapshot),
+      .input_event_index = request.input_event_index,
+      .case_id = request.case_id,
+  };
   ABSL_ASSIGN_OR_RETURN(Hash256 correction_digest,
-                        ComputeDPMCorrectionDigest(request.log));
+                        ComputeDPMCorrectionDigest(authoritative_request.log));
   ABSL_ASSIGN_OR_RETURN(Hash256 config_hash,
                         ComputeDPMProjectionConfigHash(config_));
   const SessionHandoffIdentity runtime_identity =
       runtime_->GetRuntimeIdentity();
-
-  bool used_baseline = false;
-  if (baseline.has_value()) {
-    const absl::Status baseline_status =
-        ValidateBaseline(request, correction_digest, config_hash,
-                         runtime_identity, *baseline);
-    if (baseline_status.ok()) {
-      used_baseline = true;
-    } else {
-      // Projection artifacts are disposable. Any stale, corrupt, or otherwise
-      // incompatible candidate is ignored and the raw log is projected from
-      // event zero. No weaker cached answer is returned.
-      baseline.reset();
-    }
-  }
+  ABSL_ASSIGN_OR_RETURN(
+      std::optional<DPMProjectionBaselineArtifact> baseline,
+      SelectNewestCompatibleBaseline(authoritative_request, correction_digest,
+                                     config_hash, runtime_identity));
 
   ABSL_ASSIGN_OR_RETURN(
       CanonicalDPMProjectionRequest canonical_request,
       BuildCanonicalDPMProjectionRequest(
-          request.log, request.input_event_index, correction_digest, config_,
-          runtime_identity, baseline));
+          authoritative_request.log, authoritative_request.input_event_index,
+          correction_digest, config_, runtime_identity, baseline));
   ABSL_ASSIGN_OR_RETURN(
       Hash256 verified_request_hash,
       ComputeCanonicalDPMProjectionRequestHash(canonical_request));
@@ -205,7 +243,9 @@ absl::StatusOr<OneShotDPMProjectionResult> OneShotDPMProjector::Project(
     return absl::FailedPreconditionError(
         "DPM projection runtime identity changed during inference.");
   }
-  ABSL_RETURN_IF_ERROR(ValidateCurrentSnapshot(request));
+  absl::StatusOr<DPMLogSnapshot> unchanged_snapshot =
+      ResolveAuthoritativeSnapshot(authoritative_request);
+  if (!unchanged_snapshot.ok()) return unchanged_snapshot.status();
 
   DPMProjectionManifest manifest{
       .log_id = canonical_request.log_id,
@@ -226,16 +266,9 @@ absl::StatusOr<OneShotDPMProjectionResult> OneShotDPMProjector::Project(
                         ComputeDPMProjectionManifestHash(manifest));
   ABSL_RETURN_IF_ERROR(ValidateDPMProjectionManifest(manifest));
 
-  DPMProjectionOutcome outcome{
+  return DPMProjectionOutcome{
       .projected_memory = std::move(projected_memory),
-      .canonical_request_hash = manifest.request_hash,
-      .manifest_hash = manifest.manifest_hash,
-      .correction_digest = manifest.correction_digest,
-  };
-  return OneShotDPMProjectionResult{
-      .outcome = std::move(outcome),
       .manifest = std::move(manifest),
-      .used_baseline = used_baseline,
   };
 }
 

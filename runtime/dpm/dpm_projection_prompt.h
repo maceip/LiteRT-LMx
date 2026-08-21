@@ -35,6 +35,17 @@ namespace litert::lm {
 // exactly one fresh GREEDY CPU inference and malformed output fails closed.
 struct DPMProjectionConfig {
   static constexpr uint32_t kFormatVersion = 1;
+  // This is a product admission ceiling, not a backend integer limit. It keeps
+  // a corrupted or caller-controlled configuration from authorizing an
+  // effectively unbounded projection while retaining ample room above the
+  // default deterministic-memory budget.
+  static constexpr uint32_t kMaximumOutputTokens =
+      kMaximumDPMGenerationTokens;
+  static constexpr uint32_t kMaximumItemsPerSection = 65'536;
+  // Citation sets are retained only while one item is admitted. Keep this
+  // fixed ceiling low enough to prevent a many-citation string from
+  // amplifying its bounded input into an unbounded tree allocation.
+  static constexpr uint32_t kMaximumCitationsPerItem = 4'096;
 
   uint32_t format_version = kFormatVersion;
   std::string schema_id;
@@ -43,15 +54,15 @@ struct DPMProjectionConfig {
   std::string schema_json;
   uint32_t max_output_tokens = 4096;
   size_t memory_budget_bytes = 4096;
-  size_t max_event_range_bytes = 16 * 1024 * 1024;
+  size_t max_event_range_bytes = kMaximumDPMEventPayloadBytes;
   uint32_t max_items_per_section = 4096;
   size_t max_item_bytes = 4096;
 };
 
-// A previously produced projection may accelerate a later one only when the
-// caller supplies its complete manifest and exact canonical output. The
-// projector revalidates both and compares the baseline's prefix hash with the
-// authoritative DPMEventLog before using it.
+// Internal prompt-builder input for a previously produced projection selected
+// from an authoritative prior receipt. The production provider does not expose
+// this as caller-selected state: it revalidates the complete manifest, exact
+// canonical output, and raw-log prefix before invoking this helper.
 struct DPMProjectionBaselineArtifact {
   DPMProjectionManifest manifest;
   std::string projected_memory;

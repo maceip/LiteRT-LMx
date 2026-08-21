@@ -27,34 +27,32 @@
 
 namespace litert::lm {
 
-struct OneShotDPMProjectionResult {
-  DPMProjectionOutcome outcome;
-  DPMProjectionManifest manifest;
-  bool used_baseline = false;
-};
-
 // Production projection core. Baseline discovery and persistence deliberately
-// remain outside this class: prior artifacts are carried by authoritative
-// receipts, while this class verifies a selected artifact against the raw log.
-// A missing or incompatible disposable baseline falls back to event zero.
-class OneShotDPMProjector {
+// remain in the raw log: this class scans authoritative prior receipts in
+// descending response-event order, verifies the first compatible artifact,
+// and otherwise falls back to event zero. No caller can select a baseline.
+class OneShotDPMProjector final : public DPMProjectionProvider {
  public:
   OneShotDPMProjector(DPMEventLog* authoritative_log,
                       DPMProjectionRuntime* runtime,
                       DPMProjectionConfig config);
 
-  absl::Status ValidateConfiguration() const;
+  absl::Status ValidateSupport() const override;
 
   // Performs exactly one DPMProjectionRuntime::GenerateFresh call and no
-  // repairs. The optional baseline is used only after every manifest, output,
-  // prefix, correction, config, and runtime identity check succeeds.
-  absl::StatusOr<OneShotDPMProjectionResult> Project(
-      const DPMProjectionRequest& request,
-      std::optional<DPMProjectionBaselineArtifact> baseline = std::nullopt);
+  // repairs. request.log is only an identity assertion; any baseline is
+  // derived solely from a freshly fetched authoritative snapshot.
+  absl::StatusOr<DPMProjectionOutcome> Project(
+      const DPMProjectionRequest& request) override;
 
  private:
-  absl::Status ValidateCurrentSnapshot(
+  absl::StatusOr<DPMLogSnapshot> ResolveAuthoritativeSnapshot(
       const DPMProjectionRequest& request) const;
+  absl::StatusOr<std::optional<DPMProjectionBaselineArtifact>>
+  SelectNewestCompatibleBaseline(
+      const DPMProjectionRequest& authoritative_request,
+      const Hash256& correction_digest, const Hash256& config_hash,
+      const SessionHandoffIdentity& runtime_identity) const;
   absl::Status ValidateBaseline(
       const DPMProjectionRequest& request,
       const Hash256& correction_digest, const Hash256& config_hash,

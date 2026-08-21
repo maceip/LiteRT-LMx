@@ -15,6 +15,7 @@
 #ifndef THIRD_PARTY_ODML_LITERT_LM_RUNTIME_DPM_DPM_PROJECTION_MANIFEST_H_
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_DPM_DPM_PROJECTION_MANIFEST_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -25,6 +26,11 @@
 #include "runtime/platform/hash/hasher.h"
 
 namespace litert::lm {
+
+// Log and case identities are embedded in manifests and projection requests.
+// Keeping one product bound here prevents the two admission paths from
+// accepting different identity domains.
+inline constexpr std::size_t kMaximumDPMProjectionIdentityBytes = 16 * 1024;
 
 // Content-addressed description of one independently executed DPM projection.
 // The raw event log remains authoritative. This object names a disposable

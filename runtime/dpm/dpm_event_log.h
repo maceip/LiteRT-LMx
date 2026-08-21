@@ -15,6 +15,7 @@
 #ifndef THIRD_PARTY_ODML_LITERT_LM_RUNTIME_DPM_DPM_EVENT_LOG_H_
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_DPM_DPM_EVENT_LOG_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -22,25 +23,42 @@
 #include <vector>
 
 #include "absl/status/statusor.h"  // from @com_google_absl
+#include "runtime/dpm/dpm_projection_manifest.h"
 #include "runtime/engine/session_handoff.h"
 #include "runtime/platform/hash/hasher.h"
 
 namespace litert::lm {
 
+// Shared product admission bounds for every event that can enter a DPM
+// projection. Keeping these at the event boundary prevents durable log bytes
+// that the production projector can never consume.
+inline constexpr size_t kMaximumDPMEventOperationIdBytes = 16 * 1024;
+inline constexpr size_t kMaximumDPMEventPayloadBytes = 16 * 1024 * 1024;
+inline constexpr uint32_t kMaximumDPMGenerationTokens = 65'536;
+// The canonical agent input frames one maximum event payload, one maximum
+// projection, and the bounded log/case identities. The fixed allowance covers
+// field labels, decimal lengths/indices, and all hexadecimal digests. Keeping
+// this shared with durable decoding prevents receipt bytes from admitting an
+// input the engine itself could never produce.
+inline constexpr size_t kMaximumDPMCanonicalAgentInputBytes =
+    2 * kMaximumDPMEventPayloadBytes +
+    2 * kMaximumDPMProjectionIdentityBytes + 4 * 1024;
+
 // The raw event log is the authority for a DPM session. Session checkpoints,
 // projections, and manifests are disposable derivatives of these events.
 struct DPMTurnReceipt {
-  static constexpr uint32_t kFormatVersion = 1;
+  static constexpr uint32_t kFormatVersion = 2;
 
   uint32_t format_version = kFormatVersion;
   std::string operation_id;
   uint64_t input_event_index = 0;
   uint64_t response_event_index = 0;
 
-  // The exact projection and agent request consumed by this turn.
-  Hash256 projection_request_hash;
-  Hash256 projection_manifest_hash;
-  Hash256 correction_digest;
+  // The complete projection derivative consumed by this turn. Its embedded
+  // request, output, correction, runtime, and manifest hashes are the sole
+  // authoritative projection identity; parallel receipt hash fields would
+  // create an avoidable split-brain validation surface.
+  DPMProjectionManifest projection_manifest;
   SessionHandoffIdentity agent_session_identity;
   uint32_t max_decision_tokens = 0;
   Hash256 agent_request_hash;

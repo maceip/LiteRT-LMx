@@ -32,6 +32,8 @@
 #include "absl/strings/str_append.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "runtime/dpm/correction_digest.h"
+#include "runtime/dpm/dpm_projection_manifest.h"
+#include "runtime/dpm/dpm_projection_prompt.h"
 #include "runtime/platform/hash/sha256_hasher.h"
 #include "runtime/util/byte_stream.h"
 
@@ -82,6 +84,13 @@ bool IsValidUtf8(absl::string_view text) {
     }
   }
   return true;
+}
+
+bool ContainsControlByte(absl::string_view text) {
+  for (unsigned char byte : text) {
+    if (byte < 0x20 || byte == 0x7f) return true;
+  }
+  return false;
 }
 
 Hash256 Sha256(absl::string_view bytes) {
@@ -191,13 +200,17 @@ Hash256 ComputeLogicalAgentRequestHash(
 }
 
 absl::Status ValidateSnapshotShape(const DPMLogSnapshot& snapshot) {
-  if (snapshot.log_id.empty() || snapshot.case_id.empty()) {
+  if (snapshot.log_id.empty() || snapshot.case_id.empty() ||
+      snapshot.log_id.size() > kMaximumDPMProjectionIdentityBytes ||
+      snapshot.case_id.size() > kMaximumDPMProjectionIdentityBytes) {
     return absl::DataLossError(
-        "DPM log snapshot has no immutable log/case identity.");
+        "DPM log snapshot has missing or over-bound log/case identity.");
   }
-  if (!IsValidUtf8(snapshot.log_id) || !IsValidUtf8(snapshot.case_id)) {
+  if (!IsValidUtf8(snapshot.log_id) || !IsValidUtf8(snapshot.case_id) ||
+      ContainsControlByte(snapshot.log_id) ||
+      ContainsControlByte(snapshot.case_id)) {
     return absl::DataLossError(
-        "DPM log snapshot identities are not valid UTF-8.");
+        "DPM log snapshot identities must be UTF-8 without control bytes.");
   }
   if (snapshot.generation != snapshot.events.size()) {
     return absl::DataLossError(
@@ -213,11 +226,16 @@ absl::Status ValidateSnapshotShape(const DPMLogSnapshot& snapshot) {
       return absl::DataLossError(
           "DPM log snapshot contains non-contiguous or cross-case events.");
     }
-    if (!IsValidUtf8(snapshot.events[i].operation_id) ||
+    if (snapshot.events[i].operation_id.empty() ||
+        snapshot.events[i].operation_id.size() >
+            kMaximumDPMEventOperationIdBytes ||
+        snapshot.events[i].payload.size() > kMaximumDPMEventPayloadBytes ||
+        ContainsControlByte(snapshot.events[i].operation_id) ||
+        !IsValidUtf8(snapshot.events[i].operation_id) ||
         !IsValidUtf8(snapshot.events[i].case_id) ||
         !IsValidUtf8(snapshot.events[i].payload)) {
       return absl::DataLossError(
-          "DPM log snapshot contains non-UTF-8 event fields.");
+          "DPM log snapshot contains invalid or over-bound event fields.");
     }
   }
   return absl::OkStatus();
@@ -286,15 +304,16 @@ absl::Status ValidateReceiptAndAdvance(const DPMLogSnapshot& snapshot,
         "DPM turn receipt is not bound to its authoritative input event.");
   }
   if (receipt.canonical_agent_input.empty() ||
+      receipt.canonical_agent_input.size() >
+          kMaximumDPMCanonicalAgentInputBytes ||
       receipt.projected_memory.empty() ||
+      receipt.projected_memory.size() > kMaximumDPMEventPayloadBytes ||
       receipt.decision_token_ids.empty() ||
-      IsZeroHash(receipt.projection_request_hash) ||
-      IsZeroHash(receipt.projection_manifest_hash) ||
-      IsZeroHash(receipt.correction_digest) ||
       IsZeroHash(receipt.agent_session_identity.model_artifact_hash) ||
       IsZeroHash(receipt.agent_session_identity.runtime_artifact_hash) ||
       IsZeroHash(receipt.agent_session_identity.inference_profile_hash) ||
       receipt.max_decision_tokens == 0 ||
+      receipt.max_decision_tokens > kMaximumDPMGenerationTokens ||
       IsZeroHash(receipt.agent_request_hash) ||
       IsZeroHash(receipt.agent_transcript_hash)) {
     return absl::DataLossError(
@@ -306,6 +325,19 @@ absl::Status ValidateReceiptAndAdvance(const DPMLogSnapshot& snapshot,
       !IsValidUtf8(receipt.decision_output)) {
     return absl::DataLossError(
         "DPM turn receipt contains non-UTF-8 reconstruction fields.");
+  }
+  ABSL_RETURN_IF_ERROR(ValidateDPMProjectionManifest(
+      receipt.projection_manifest));
+  if (receipt.projection_manifest.log_id != snapshot.log_id ||
+      receipt.projection_manifest.case_id != snapshot.case_id ||
+      receipt.projection_manifest.source_event_count != response.index ||
+      receipt.projection_manifest.input_event_index !=
+          receipt.input_event_index ||
+      ComputeCanonicalDPMProjectionOutputHash(receipt.projected_memory) !=
+          receipt.projection_manifest.output_hash) {
+    return absl::DataLossError(
+        "DPM turn receipt projection manifest is not bound to its raw-log "
+        "source and projected-memory bytes.");
   }
   if (receipt.decision_token_ids.size() > receipt.max_decision_tokens) {
     return absl::DataLossError(
@@ -322,15 +354,18 @@ absl::Status ValidateReceiptAndAdvance(const DPMLogSnapshot& snapshot,
 
   if (ComputeLogicalAgentRequestHash(
           *transcript, receipt.canonical_agent_input,
-          receipt.max_decision_tokens, receipt.correction_digest,
+          receipt.max_decision_tokens,
+          receipt.projection_manifest.correction_digest,
           receipt.agent_session_identity) != receipt.agent_request_hash) {
     return absl::DataLossError(
         "DPM turn receipt agent request hash is not canonical.");
   }
 
   if (!transcript->correction_digest.has_value() ||
-      *transcript->correction_digest != receipt.correction_digest) {
-    ResetTranscriptHasher(receipt.correction_digest, transcript);
+      *transcript->correction_digest !=
+          receipt.projection_manifest.correction_digest) {
+    ResetTranscriptHasher(receipt.projection_manifest.correction_digest,
+                          transcript);
   }
   UpdateBytesFrame('I', receipt.canonical_agent_input, &transcript->hasher);
   UpdateTokenFrame(receipt.decision_token_ids, &transcript->hasher);
@@ -405,7 +440,8 @@ absl::StatusOr<AuthoritativeLogIndex> ValidateAndIndexAuthoritativeLog(
     ABSL_RETURN_IF_ERROR(
         ValidateReceiptAndAdvance(snapshot, event, &index.transcript));
     const DPMTurnReceipt& receipt = *event.turn_receipt;
-    if (receipt.correction_digest != index.correction_digest) {
+    if (receipt.projection_manifest.correction_digest !=
+        index.correction_digest) {
       return absl::DataLossError(
           "DPM turn receipt correction digest is not derived from the raw "
           "log.");
@@ -469,25 +505,37 @@ void AppendTextSection(absl::string_view name, absl::string_view bytes,
 }
 
 absl::Status ValidateProjectionOutcome(
-    const DPMProjectionOutcome& projection) {
-  if (projection.projected_memory.empty()) {
+    const DPMProjectionOutcome& projection,
+    const DPMProjectionRequest& request) {
+  if (projection.projected_memory.empty() ||
+      projection.projected_memory.size() > kMaximumDPMEventPayloadBytes ||
+      !IsValidUtf8(projection.projected_memory)) {
     return absl::FailedPreconditionError(
-        "DPM projection provider returned empty projected memory.");
+        "DPM projection provider returned empty, over-bound, or non-UTF-8 "
+        "projected memory.");
   }
-  if (IsZeroHash(projection.canonical_request_hash) ||
-      IsZeroHash(projection.manifest_hash) ||
-      IsZeroHash(projection.correction_digest)) {
+  ABSL_RETURN_IF_ERROR(ValidateDPMProjectionManifest(projection.manifest));
+  if (projection.manifest.log_id != request.log.log_id ||
+      projection.manifest.case_id != request.log.case_id ||
+      projection.manifest.case_id != request.case_id ||
+      projection.manifest.source_event_count != request.log.events.size() ||
+      projection.manifest.source_prefix_hash != request.log.prefix_hash ||
+      projection.manifest.input_event_index != request.input_event_index ||
+      ComputeCanonicalDPMProjectionOutputHash(projection.projected_memory) !=
+          projection.manifest.output_hash) {
     return absl::FailedPreconditionError(
-        "DPM projection provider returned an incomplete identity.");
+        "DPM projection provider returned an identity not bound to the "
+        "requested raw-log prefix and projected-memory bytes.");
   }
   return absl::OkStatus();
 }
 
 absl::Status ValidateAgentOutcome(
     const DPMAgentGenerationOutcome& outcome, uint32_t max_decision_tokens) {
-  if (!IsValidUtf8(outcome.decision_output)) {
+  if (outcome.decision_output.size() > kMaximumDPMEventPayloadBytes ||
+      !IsValidUtf8(outcome.decision_output)) {
     return absl::DataLossError(
-        "DPM agent returned decision bytes that are not valid UTF-8.");
+        "DPM agent returned over-bound or non-UTF-8 decision bytes.");
   }
   if (outcome.decision_token_ids.empty()) {
     return absl::FailedPreconditionError(
@@ -546,10 +594,11 @@ absl::Status DPMEngine::ValidateConfiguration() const {
   }
   if (config_.max_decision_tokens <= 0 ||
       static_cast<uint64_t>(config_.max_decision_tokens) >
-          std::numeric_limits<uint32_t>::max()) {
+          kMaximumDPMGenerationTokens) {
     return absl::InvalidArgumentError(
-        "DPM decision token limit must fit a positive uint32 value.");
+        "DPM decision token limit must be between 1 and 65,536.");
   }
+  ABSL_RETURN_IF_ERROR(projection_provider_->ValidateSupport());
   const SessionHandoffIdentity& identity =
       agent_runtime_->GetSessionHandoffIdentity();
   if (IsZeroHash(identity.model_artifact_hash) ||
@@ -622,7 +671,8 @@ DPMEngine::RecoverCommittedTurn(const DPMLogSnapshot& snapshot,
   result.decision_token_ids = receipt.decision_token_ids;
   result.input_event_index = receipt.input_event_index;
   result.response_event_index = receipt.response_event_index;
-  result.projection_manifest_hash = receipt.projection_manifest_hash;
+  result.projection_manifest_hash =
+      receipt.projection_manifest.manifest_hash;
   result.session_checkpoint_id = receipt.session_checkpoint_id;
   result.recovered_committed_turn = true;
   return std::optional<DPMTurnResult>(std::move(result));
@@ -641,9 +691,14 @@ absl::Status DPMEngine::ValidateRestoreCandidate(
   if (!receipt.session_checkpoint_id ||
       *receipt.session_checkpoint_id != descriptor.descriptor_id ||
       descriptor.log_id != current.log_id ||
+      descriptor.log_id != receipt.projection_manifest.log_id ||
       descriptor.stage != DPMSessionCheckpointStage::kAgentDecision ||
       descriptor.response_event_index != receipt.response_event_index ||
       descriptor.source_event_count != receipt.response_event_index ||
+      descriptor.source_event_count !=
+          receipt.projection_manifest.source_event_count ||
+      descriptor.source_prefix_hash !=
+          receipt.projection_manifest.source_prefix_hash ||
       descriptor.response_event_index >= current.events.size()) {
     return absl::FailedPreconditionError(
         "DPM checkpoint descriptor is not attached to this log receipt.");
@@ -657,14 +712,16 @@ absl::Status DPMEngine::ValidateRestoreCandidate(
         "DPM checkpoint receipt is no longer authoritative.");
   }
   if (descriptor.projection_request_hash !=
-          receipt.projection_request_hash ||
+          receipt.projection_manifest.request_hash ||
       descriptor.projection_manifest_hash !=
-          receipt.projection_manifest_hash ||
-      descriptor.correction_digest != receipt.correction_digest ||
+          receipt.projection_manifest.manifest_hash ||
+      descriptor.correction_digest !=
+          receipt.projection_manifest.correction_digest ||
       descriptor.agent_request_hash != receipt.agent_request_hash ||
       descriptor.agent_transcript_hash != receipt.agent_transcript_hash ||
       descriptor.session_identity != receipt.agent_session_identity ||
-      descriptor.correction_digest != projection.correction_digest ||
+      descriptor.correction_digest !=
+          projection.manifest.correction_digest ||
       !(descriptor.session_identity ==
         agent_runtime_->GetSessionHandoffIdentity()) ||
       descriptor.key_id != config_.checkpoint_key_id) {
@@ -690,8 +747,8 @@ absl::Status DPMEngine::ValidateRestoreCandidate(
       candidate_transcript_hash = SnapshotDigest(transcript.hasher);
       continue;
     }
-    if (found &&
-        event.turn_receipt->correction_digest != projection.correction_digest) {
+    if (found && event.turn_receipt->projection_manifest.correction_digest !=
+                     projection.manifest.correction_digest) {
       return absl::FailedPreconditionError(
           "DPM correction epoch changed after the checkpoint.");
     }
@@ -744,7 +801,8 @@ DPMEngine::BuildFullTranscriptChunks(
     if (event.kind != DPMEvent::Kind::kModelTurn) continue;
     ABSL_RETURN_IF_ERROR(
         ValidateReceiptAndAdvance(snapshot, event, &transcript));
-    if (event.turn_receipt->correction_digest != current_correction_digest) {
+    if (event.turn_receipt->projection_manifest.correction_digest !=
+        current_correction_digest) {
       chunks.clear();
       in_current_epoch = false;
       continue;
@@ -777,14 +835,14 @@ DPMEngine::BuildDeltaTranscriptChunks(
   std::vector<DPMAgentGenerationRequest::PrefillChunk> chunks;
   const Hash256 restored_correction_digest =
       snapshot.events[restored_response_event_index]
-          .turn_receipt->correction_digest;
+          .turn_receipt->projection_manifest.correction_digest;
   TranscriptCursor transcript;
   for (const DPMEvent& event : snapshot.events) {
     if (event.kind != DPMEvent::Kind::kModelTurn) continue;
     ABSL_RETURN_IF_ERROR(
         ValidateReceiptAndAdvance(snapshot, event, &transcript));
     if (event.index <= restored_response_event_index) continue;
-    if (event.turn_receipt->correction_digest !=
+    if (event.turn_receipt->projection_manifest.correction_digest !=
         restored_correction_digest) {
       return absl::FailedPreconditionError(
           "DPM correction epoch changed after the selected restore point.");
@@ -807,6 +865,12 @@ absl::StatusOr<std::string> DPMEngine::BuildCanonicalAgentInput(
     return absl::InvalidArgumentError(
         "DPM agent input names an event outside its source snapshot.");
   }
+  if (request.payload.size() > kMaximumDPMEventPayloadBytes ||
+      projection.projected_memory.size() > kMaximumDPMEventPayloadBytes ||
+      request.case_id.size() > kMaximumDPMProjectionIdentityBytes) {
+    return absl::ResourceExhaustedError(
+        "DPM canonical agent input field exceeds its product bound.");
+  }
   std::string input;
   input.reserve(request.payload.size() + projection.projected_memory.size() +
                 request.case_id.size() + source_snapshot.log_id.size() + 512);
@@ -819,15 +883,19 @@ absl::StatusOr<std::string> DPMEngine::BuildCanonicalAgentInput(
                   "\nINPUT_KIND ", static_cast<int>(request.kind), "\n");
   AppendTextSection("CASE_ID_BYTES", request.case_id, &input);
   absl::StrAppend(&input, "PROJECTION_REQUEST_SHA256 ",
-                  projection.canonical_request_hash.ToHex(),
+                  projection.manifest.request_hash.ToHex(),
                   "\nPROJECTION_MANIFEST_SHA256 ",
-                  projection.manifest_hash.ToHex(),
+                  projection.manifest.manifest_hash.ToHex(),
                   "\nCORRECTION_SET_SHA256 ",
-                  projection.correction_digest.ToHex(), "\n");
+                  projection.manifest.correction_digest.ToHex(), "\n");
   AppendTextSection("PROJECTED_MEMORY_BYTES", projection.projected_memory,
                     &input);
   AppendTextSection("REQUEST_BYTES", request.payload, &input);
   input.append("END_DPM_AGENT_INPUT\n");
+  if (input.size() > kMaximumDPMCanonicalAgentInputBytes) {
+    return absl::ResourceExhaustedError(
+        "DPM canonical agent input exceeds its derived product bound.");
+  }
   if (!IsValidUtf8(input)) {
     return absl::FailedPreconditionError(
         "DPM projection produced an agent input that is not valid UTF-8.");
@@ -888,9 +956,9 @@ DPMEngine::CaptureProducingSession(
   descriptor.source_event_count = source_snapshot.events.size();
   descriptor.source_prefix_hash = source_snapshot.prefix_hash;
   descriptor.response_event_index = response_event_index;
-  descriptor.projection_request_hash = projection.canonical_request_hash;
-  descriptor.projection_manifest_hash = projection.manifest_hash;
-  descriptor.correction_digest = projection.correction_digest;
+  descriptor.projection_request_hash = projection.manifest.request_hash;
+  descriptor.projection_manifest_hash = projection.manifest.manifest_hash;
+  descriptor.correction_digest = projection.manifest.correction_digest;
   descriptor.agent_request_hash = agent_request_hash;
   descriptor.agent_transcript_hash = transcript_hash;
   descriptor.session_identity = session_identity;
@@ -907,7 +975,13 @@ DPMEngine::CaptureProducingSession(
 absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
     const DPMTurnRequest& request) {
   absl::MutexLock turn_lock(turn_mutex_);
-  ABSL_RETURN_IF_ERROR(ValidateConfiguration());
+  // A committed operation is recoverable from the authoritative log without
+  // an inference runtime, projector, clock, or checkpoint repository. Keep
+  // that idempotent recovery path ahead of all inference-support preflight.
+  if (log_ == nullptr) {
+    return absl::InvalidArgumentError(
+        "DPM RunTurn requires an authoritative event log.");
+  }
   if (request.operation_id.empty() || request.case_id.empty() ||
       request.payload.empty()) {
     return absl::InvalidArgumentError(
@@ -917,6 +991,15 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
       !IsValidUtf8(request.payload)) {
     return absl::InvalidArgumentError(
         "DPM operation id, case id, and input payload must be valid UTF-8.");
+  }
+  if (request.operation_id.size() > kMaximumDPMEventOperationIdBytes ||
+      request.case_id.size() > kMaximumDPMProjectionIdentityBytes ||
+      request.payload.size() > kMaximumDPMEventPayloadBytes ||
+      ContainsControlByte(request.operation_id) ||
+      ContainsControlByte(request.case_id)) {
+    return absl::InvalidArgumentError(
+        "DPM operation/case identities or input payload exceed product "
+        "bounds, or an identity contains a control byte.");
   }
   if (!IsDecisionInputKind(request.kind)) {
     return absl::InvalidArgumentError(
@@ -947,13 +1030,6 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
   if (initial_prefix != initial.prefix_hash) {
     return absl::AbortedError(
         "DPM log changed while acquiring its authoritative snapshot.");
-  }
-  const SessionHandoffIdentity& loaded_identity =
-      agent_runtime_->GetSessionHandoffIdentity();
-  if (initial_index.agent_identity.has_value() &&
-      *initial_index.agent_identity != loaded_identity) {
-    return absl::FailedPreconditionError(
-        "DPM log agent identity does not match the loaded engine profile.");
   }
 
   std::optional<uint64_t> existing_input_index;
@@ -987,6 +1063,19 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
     return absl::FailedPreconditionError(
         "Another DPM operation has an incomplete tail turn that must be "
         "retried first.");
+  }
+
+  // From this point the operation either needs a new input append or must
+  // retry an existing recoverable input. Both paths require the complete
+  // projection, agent, and checkpoint capability preflight before any new
+  // mutation or inference work.
+  ABSL_RETURN_IF_ERROR(ValidateConfiguration());
+  const SessionHandoffIdentity& loaded_identity =
+      agent_runtime_->GetSessionHandoffIdentity();
+  if (initial_index.agent_identity.has_value() &&
+      *initial_index.agent_identity != loaded_identity) {
+    return absl::FailedPreconditionError(
+        "DPM log agent identity does not match the loaded engine profile.");
   }
 
   DPMLogSnapshot source_snapshot;
@@ -1045,8 +1134,10 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
   projection_request.case_id = request.case_id;
   ABSL_ASSIGN_OR_RETURN(DPMProjectionOutcome projection,
                         projection_provider_->Project(projection_request));
-  ABSL_RETURN_IF_ERROR(ValidateProjectionOutcome(projection));
-  if (projection.correction_digest != source_index.correction_digest) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateProjectionOutcome(projection, projection_request));
+  if (projection.manifest.correction_digest !=
+      source_index.correction_digest) {
     return absl::FailedPreconditionError(
         "DPM projection correction digest is not derived from the raw log.");
   }
@@ -1058,7 +1149,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
       static_cast<uint32_t>(config_.max_decision_tokens);
   const Hash256 agent_request_hash = ComputeLogicalAgentRequestHash(
       source_index.transcript, canonical_agent_input, max_decision_tokens,
-      projection.correction_digest, loaded_identity);
+      projection.manifest.correction_digest, loaded_identity);
 
   ABSL_ASSIGN_OR_RETURN(std::optional<RestoreCandidate> restore_candidate,
                         FindRestoreCandidate(source_snapshot, projection));
@@ -1120,7 +1211,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
     ABSL_ASSIGN_OR_RETURN(generation_request.canonical_prefill_chunks,
                           BuildFullTranscriptChunks(
                               source_snapshot, canonical_agent_input,
-                              projection.correction_digest));
+                              projection.manifest.correction_digest));
   }
 
   absl::StatusOr<DPMAgentGenerationOutcome> generated =
@@ -1138,7 +1229,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
     ABSL_ASSIGN_OR_RETURN(
         generation_request.canonical_prefill_chunks,
         BuildFullTranscriptChunks(source_snapshot, canonical_agent_input,
-                                  projection.correction_digest));
+                                  projection.manifest.correction_digest));
     generated = agent_runtime_->Generate(session.get(), generation_request);
     restored = false;
   }
@@ -1151,7 +1242,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
       ComputeTranscriptHash(source_snapshot, canonical_agent_input,
                             agent_outcome.decision_output,
                             agent_outcome.decision_token_ids,
-                            projection.correction_digest));
+                            projection.manifest.correction_digest));
 
   if (source_snapshot.events.size() >=
       std::numeric_limits<uint64_t>::max()) {
@@ -1197,9 +1288,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
   receipt.operation_id = request.operation_id;
   receipt.input_event_index = input_event_index;
   receipt.response_event_index = response_event_index;
-  receipt.projection_request_hash = projection.canonical_request_hash;
-  receipt.projection_manifest_hash = projection.manifest_hash;
-  receipt.correction_digest = projection.correction_digest;
+  receipt.projection_manifest = projection.manifest;
   receipt.agent_session_identity = loaded_identity;
   receipt.max_decision_tokens = max_decision_tokens;
   receipt.agent_request_hash = agent_request_hash;
@@ -1250,7 +1339,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
   result.decision_token_ids = std::move(agent_outcome.decision_token_ids);
   result.input_event_index = input_event_index;
   result.response_event_index = committed.event_index;
-  result.projection_manifest_hash = projection.manifest_hash;
+  result.projection_manifest_hash = projection.manifest.manifest_hash;
   result.session_checkpoint_id = checkpoint_id;
   result.restored_session_checkpoint = restored;
   return result;
@@ -1274,6 +1363,15 @@ absl::StatusOr<DPMCorrectionResult> DPMEngine::AppendCorrection(
     return absl::InvalidArgumentError(
         "DPM correction operation id, case id, and payload must be valid "
         "UTF-8.");
+  }
+  if (request.operation_id.size() > kMaximumDPMEventOperationIdBytes ||
+      request.case_id.size() > kMaximumDPMProjectionIdentityBytes ||
+      request.canonical_payload.size() > kMaximumDPMEventPayloadBytes ||
+      ContainsControlByte(request.operation_id) ||
+      ContainsControlByte(request.case_id)) {
+    return absl::InvalidArgumentError(
+        "DPM correction operation/case identities or payload exceed product "
+        "bounds, or an identity contains a control byte.");
   }
   if (request.timestamp_us.has_value() && *request.timestamp_us <= 0) {
     return absl::InvalidArgumentError(

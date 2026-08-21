@@ -38,22 +38,33 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "runtime/dpm/dpm_projection_manifest.h"
+#include "runtime/dpm/dpm_projection_prompt.h"
 #include "runtime/platform/hash/sha256_hasher.h"
 
 namespace litert::lm {
 namespace {
 
 constexpr std::array<char, 8> kLogMagic = {'D', 'P', 'M', 'L', 'O', 'G',
-                                            '0', '1'};
+                                            '0', '2'};
 constexpr std::array<char, 8> kRecordMagic = {'D', 'P', 'M', 'E', 'V', 'T',
-                                               '0', '1'};
-constexpr uint32_t kLogFormatVersion = 1;
-constexpr uint32_t kEventFormatVersion = 1;
-constexpr uint64_t kMaxRecordBytes = uint64_t{512} * 1024 * 1024;
+                                               '0', '2'};
+constexpr uint32_t kLogFormatVersion = 2;
+constexpr uint32_t kEventFormatVersion = 2;
+// A maximum model-turn record contains three payload-sized strings (the event
+// payload, projected memory, and the receipt's decision output), the canonical
+// agent input, all repeated operation/case/manifest identities, the complete
+// token vector, and a conservative allowance for fixed framing and hashes.
+constexpr uint64_t kMaxRecordBytes =
+    uint64_t{3} * kMaximumDPMEventPayloadBytes +
+    kMaximumDPMCanonicalAgentInputBytes +
+    uint64_t{3} * kMaximumDPMProjectionIdentityBytes +
+    uint64_t{2} * kMaximumDPMEventOperationIdBytes +
+    uint64_t{kMaximumDPMGenerationTokens} * sizeof(int32_t) + 4 * 1024;
 constexpr uint64_t kRecordHeaderSize =
     kRecordMagic.size() + sizeof(uint64_t) + 32 + 32;
-constexpr absl::string_view kGenesisDomain = "DPM_EVENT_LOG_GENESIS_SHA256_V1";
-constexpr absl::string_view kRecordDomain = "DPM_EVENT_LOG_PREFIX_SHA256_V1";
+constexpr absl::string_view kGenesisDomain = "DPM_EVENT_LOG_GENESIS_SHA256_V2";
+constexpr absl::string_view kRecordDomain = "DPM_EVENT_LOG_PREFIX_SHA256_V2";
 static_assert(sizeof(size_t) <= sizeof(uint64_t));
 static_assert(sizeof(int) >= sizeof(int32_t));
 
@@ -309,6 +320,48 @@ bool IsZeroHash(const Hash256& hash) {
   return true;
 }
 
+bool ContainsControlByte(absl::string_view text) {
+  for (unsigned char byte : text) {
+    if (byte < 0x20 || byte == 0x7f) return true;
+  }
+  return false;
+}
+
+bool IsValidUtf8(absl::string_view text) {
+  const auto* bytes = reinterpret_cast<const uint8_t*>(text.data());
+  size_t index = 0;
+  while (index < text.size()) {
+    const uint8_t lead = bytes[index++];
+    if (lead <= 0x7f) continue;
+
+    size_t continuation_count = 0;
+    uint8_t minimum_second = 0x80;
+    uint8_t maximum_second = 0xbf;
+    if (lead >= 0xc2 && lead <= 0xdf) {
+      continuation_count = 1;
+    } else if (lead >= 0xe0 && lead <= 0xef) {
+      continuation_count = 2;
+      if (lead == 0xe0) minimum_second = 0xa0;
+      if (lead == 0xed) maximum_second = 0x9f;
+    } else if (lead >= 0xf0 && lead <= 0xf4) {
+      continuation_count = 3;
+      if (lead == 0xf0) minimum_second = 0x90;
+      if (lead == 0xf4) maximum_second = 0x8f;
+    } else {
+      return false;
+    }
+    if (continuation_count > text.size() - index ||
+        bytes[index] < minimum_second || bytes[index] > maximum_second) {
+      return false;
+    }
+    ++index;
+    for (size_t offset = 1; offset < continuation_count; ++offset, ++index) {
+      if (bytes[index] < 0x80 || bytes[index] > 0xbf) return false;
+    }
+  }
+  return true;
+}
+
 absl::StatusOr<std::string> BuildLogHeader(absl::string_view log_id,
                                            absl::string_view case_id) {
   if (log_id.empty()) {
@@ -318,10 +371,13 @@ absl::StatusOr<std::string> BuildLogHeader(absl::string_view log_id,
     return absl::InvalidArgumentError(
         "DPM filesystem log requires a case id.");
   }
-  if (log_id.size() > std::numeric_limits<uint32_t>::max() ||
-      case_id.size() > std::numeric_limits<uint32_t>::max()) {
-    return absl::ResourceExhaustedError(
-        "DPM log or case identity is too large.");
+  if (log_id.size() > kMaximumDPMProjectionIdentityBytes ||
+      case_id.size() > kMaximumDPMProjectionIdentityBytes ||
+      !IsValidUtf8(log_id) || !IsValidUtf8(case_id) ||
+      ContainsControlByte(log_id) || ContainsControlByte(case_id)) {
+    return absl::InvalidArgumentError(
+        "DPM log and case identities must be bounded UTF-8 without control "
+        "bytes.");
   }
   std::string header;
   header.append(kLogMagic.data(), kLogMagic.size());
@@ -396,8 +452,13 @@ class CanonicalReader {
     return static_cast<int32_t>(value);
   }
 
-  absl::StatusOr<std::string> ReadString() {
+  absl::StatusOr<std::string> ReadString(
+      size_t maximum_bytes, absl::string_view field_name) {
     ABSL_ASSIGN_OR_RETURN(uint64_t length, ReadU64());
+    if (length > static_cast<uint64_t>(maximum_bytes)) {
+      return absl::DataLossError(absl::StrCat(
+          "Canonical DPM ", field_name, " exceeds its product limit."));
+    }
     if (length > bytes_.size() - offset_) {
       return absl::DataLossError("Truncated canonical DPM event string.");
     }
@@ -427,9 +488,87 @@ class CanonicalReader {
   size_t offset_ = 0;
 };
 
+absl::Status AppendProjectionManifest(
+    const DPMProjectionManifest& manifest, std::string* output) {
+  ABSL_RETURN_IF_ERROR(ValidateDPMProjectionManifest(manifest));
+  AppendU32(manifest.format_version, output);
+  ABSL_RETURN_IF_ERROR(AppendString(manifest.log_id, output));
+  ABSL_RETURN_IF_ERROR(AppendString(manifest.case_id, output));
+  AppendU64(manifest.source_event_count, output);
+  AppendHash(manifest.source_prefix_hash, output);
+  AppendU64(manifest.input_event_index, output);
+  AppendU64(manifest.event_range_start, output);
+  output->push_back(manifest.baseline_manifest_hash.has_value() ? 1 : 0);
+  if (manifest.baseline_manifest_hash.has_value()) {
+    AppendHash(*manifest.baseline_manifest_hash, output);
+    AppendHash(*manifest.baseline_output_hash, output);
+  }
+  AppendHash(manifest.correction_digest, output);
+  AppendHash(manifest.config_hash, output);
+  AppendHash(manifest.runtime_identity.model_artifact_hash, output);
+  AppendHash(manifest.runtime_identity.runtime_artifact_hash, output);
+  AppendHash(manifest.runtime_identity.inference_profile_hash, output);
+  AppendHash(manifest.request_hash, output);
+  AppendHash(manifest.output_hash, output);
+  AppendHash(manifest.manifest_hash, output);
+  return absl::OkStatus();
+}
+
+absl::StatusOr<DPMProjectionManifest> ReadProjectionManifest(
+    CanonicalReader* reader) {
+  if (reader == nullptr) {
+    return absl::InvalidArgumentError(
+        "Canonical DPM projection manifest reader is null.");
+  }
+  DPMProjectionManifest manifest;
+  ABSL_ASSIGN_OR_RETURN(manifest.format_version, reader->ReadU32());
+  if (manifest.format_version != DPMProjectionManifest::kFormatVersion) {
+    return absl::FailedPreconditionError(
+        "Unsupported canonical DPM projection manifest version.");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      manifest.log_id,
+      reader->ReadString(kMaximumDPMProjectionIdentityBytes,
+                         "projection manifest log id"));
+  ABSL_ASSIGN_OR_RETURN(
+      manifest.case_id,
+      reader->ReadString(kMaximumDPMProjectionIdentityBytes,
+                         "projection manifest case id"));
+  ABSL_ASSIGN_OR_RETURN(manifest.source_event_count, reader->ReadU64());
+  ABSL_ASSIGN_OR_RETURN(manifest.source_prefix_hash, reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(manifest.input_event_index, reader->ReadU64());
+  ABSL_ASSIGN_OR_RETURN(manifest.event_range_start, reader->ReadU64());
+  ABSL_ASSIGN_OR_RETURN(uint8_t has_baseline, reader->ReadU8());
+  if (has_baseline > 1) {
+    return absl::DataLossError(
+        "Non-canonical DPM projection baseline-presence flag.");
+  }
+  if (has_baseline == 1) {
+    ABSL_ASSIGN_OR_RETURN(Hash256 baseline_manifest, reader->ReadHash());
+    ABSL_ASSIGN_OR_RETURN(Hash256 baseline_output, reader->ReadHash());
+    manifest.baseline_manifest_hash = baseline_manifest;
+    manifest.baseline_output_hash = baseline_output;
+  }
+  ABSL_ASSIGN_OR_RETURN(manifest.correction_digest, reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(manifest.config_hash, reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(manifest.runtime_identity.model_artifact_hash,
+                        reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(manifest.runtime_identity.runtime_artifact_hash,
+                        reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(manifest.runtime_identity.inference_profile_hash,
+                        reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(manifest.request_hash, reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(manifest.output_hash, reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(manifest.manifest_hash, reader->ReadHash());
+  ABSL_RETURN_IF_ERROR(ValidateDPMProjectionManifest(manifest));
+  return manifest;
+}
+
 absl::Status ValidateEvent(const DPMEvent& event,
                            const std::vector<DPMEvent>& prior_events,
-                           absl::string_view case_id) {
+                           absl::string_view log_id,
+                           absl::string_view case_id,
+                           const Hash256& prior_prefix_hash) {
   switch (event.kind) {
     case DPMEvent::Kind::kUser:
     case DPMEvent::Kind::kTool:
@@ -451,6 +590,16 @@ absl::Status ValidateEvent(const DPMEvent& event,
   if (event.case_id != case_id) {
     return absl::FailedPreconditionError(
         "DPM event case id does not match the immutable log case.");
+  }
+  if (event.operation_id.size() > kMaximumDPMEventOperationIdBytes ||
+      event.payload.size() > kMaximumDPMEventPayloadBytes ||
+      !IsValidUtf8(event.operation_id) || !IsValidUtf8(event.case_id) ||
+      !IsValidUtf8(event.payload) ||
+      ContainsControlByte(event.operation_id) ||
+      ContainsControlByte(event.case_id)) {
+    return absl::InvalidArgumentError(
+        "DPM event identities or payload are invalid or exceed product "
+        "bounds.");
   }
   if (event.kind != DPMEvent::Kind::kModelTurn) {
     if (event.turn_receipt.has_value()) {
@@ -518,16 +667,58 @@ absl::Status ValidateEvent(const DPMEvent& event,
           "DPM operation already has a committed model turn.");
     }
   }
+  const DPMProjectionManifest& projection = receipt.projection_manifest;
+  ABSL_RETURN_IF_ERROR(ValidateDPMProjectionManifest(projection));
+  if (projection.log_id != log_id || projection.case_id != case_id ||
+      projection.source_event_count != event.index ||
+      projection.source_event_count != prior_events.size() ||
+      projection.source_prefix_hash != prior_prefix_hash ||
+      projection.input_event_index != receipt.input_event_index ||
+      ComputeCanonicalDPMProjectionOutputHash(receipt.projected_memory) !=
+          projection.output_hash) {
+    return absl::InvalidArgumentError(
+        "DPM turn receipt projection manifest is not bound to its raw-log "
+        "source and projected-memory bytes.");
+  }
+  if (projection.baseline_manifest_hash.has_value()) {
+    if (projection.event_range_start >= prior_events.size()) {
+      return absl::InvalidArgumentError(
+          "DPM projection baseline range does not name a prior response.");
+    }
+    const DPMEvent& baseline_response =
+        prior_events[static_cast<size_t>(projection.event_range_start)];
+    if (baseline_response.kind != DPMEvent::Kind::kModelTurn ||
+        !baseline_response.turn_receipt.has_value()) {
+      return absl::InvalidArgumentError(
+          "DPM projection baseline does not name an authoritative receipt.");
+    }
+    const DPMProjectionManifest& baseline =
+        baseline_response.turn_receipt->projection_manifest;
+    if (baseline.source_event_count != projection.event_range_start ||
+        baseline.manifest_hash != *projection.baseline_manifest_hash ||
+        baseline.output_hash != *projection.baseline_output_hash ||
+        baseline.correction_digest != projection.correction_digest ||
+        baseline.config_hash != projection.config_hash ||
+        baseline.runtime_identity != projection.runtime_identity) {
+      return absl::InvalidArgumentError(
+          "DPM projection baseline lineage is not the compatible prior "
+          "authoritative receipt named by its event range.");
+    }
+  }
   if (receipt.projected_memory.empty() ||
+      receipt.projected_memory.size() > kMaximumDPMEventPayloadBytes ||
       receipt.canonical_agent_input.empty() ||
+      receipt.canonical_agent_input.size() >
+          kMaximumDPMCanonicalAgentInputBytes ||
       receipt.decision_token_ids.empty() ||
-      IsZeroHash(receipt.projection_request_hash) ||
-      IsZeroHash(receipt.projection_manifest_hash) ||
-      IsZeroHash(receipt.correction_digest) ||
+      !IsValidUtf8(receipt.projected_memory) ||
+      !IsValidUtf8(receipt.canonical_agent_input) ||
+      !IsValidUtf8(receipt.decision_output) ||
       IsZeroHash(receipt.agent_session_identity.model_artifact_hash) ||
       IsZeroHash(receipt.agent_session_identity.runtime_artifact_hash) ||
       IsZeroHash(receipt.agent_session_identity.inference_profile_hash) ||
       receipt.max_decision_tokens == 0 ||
+      receipt.max_decision_tokens > kMaximumDPMGenerationTokens ||
       IsZeroHash(receipt.agent_request_hash) ||
       IsZeroHash(receipt.agent_transcript_hash)) {
     return absl::InvalidArgumentError(
@@ -574,9 +765,8 @@ absl::StatusOr<std::string> EncodeEventCanonical(const DPMEvent& event) {
   ABSL_RETURN_IF_ERROR(AppendString(receipt.operation_id, &bytes));
   AppendU64(receipt.input_event_index, &bytes);
   AppendU64(receipt.response_event_index, &bytes);
-  AppendHash(receipt.projection_request_hash, &bytes);
-  AppendHash(receipt.projection_manifest_hash, &bytes);
-  AppendHash(receipt.correction_digest, &bytes);
+  ABSL_RETURN_IF_ERROR(
+      AppendProjectionManifest(receipt.projection_manifest, &bytes));
   AppendHash(receipt.agent_session_identity.model_artifact_hash, &bytes);
   AppendHash(receipt.agent_session_identity.runtime_artifact_hash, &bytes);
   AppendHash(receipt.agent_session_identity.inference_profile_hash, &bytes);
@@ -609,9 +799,16 @@ absl::StatusOr<DPMEvent> DecodeEventCanonical(absl::string_view bytes) {
   ABSL_ASSIGN_OR_RETURN(uint8_t kind, reader.ReadU8());
   event.kind = static_cast<DPMEvent::Kind>(kind);
   ABSL_ASSIGN_OR_RETURN(event.timestamp_us, reader.ReadI64());
-  ABSL_ASSIGN_OR_RETURN(event.operation_id, reader.ReadString());
-  ABSL_ASSIGN_OR_RETURN(event.case_id, reader.ReadString());
-  ABSL_ASSIGN_OR_RETURN(event.payload, reader.ReadString());
+  ABSL_ASSIGN_OR_RETURN(
+      event.operation_id,
+      reader.ReadString(kMaximumDPMEventOperationIdBytes,
+                        "event operation id"));
+  ABSL_ASSIGN_OR_RETURN(
+      event.case_id,
+      reader.ReadString(kMaximumDPMProjectionIdentityBytes, "event case id"));
+  ABSL_ASSIGN_OR_RETURN(
+      event.payload,
+      reader.ReadString(kMaximumDPMEventPayloadBytes, "event payload"));
   ABSL_ASSIGN_OR_RETURN(uint8_t has_receipt, reader.ReadU8());
   if (has_receipt > 1) {
     return absl::DataLossError(
@@ -620,12 +817,18 @@ absl::StatusOr<DPMEvent> DecodeEventCanonical(absl::string_view bytes) {
   if (has_receipt == 1) {
     DPMTurnReceipt receipt;
     ABSL_ASSIGN_OR_RETURN(receipt.format_version, reader.ReadU32());
-    ABSL_ASSIGN_OR_RETURN(receipt.operation_id, reader.ReadString());
+    if (receipt.format_version != DPMTurnReceipt::kFormatVersion) {
+      return absl::FailedPreconditionError(
+          "Unsupported canonical DPM turn receipt version.");
+    }
+    ABSL_ASSIGN_OR_RETURN(
+        receipt.operation_id,
+        reader.ReadString(kMaximumDPMEventOperationIdBytes,
+                          "turn receipt operation id"));
     ABSL_ASSIGN_OR_RETURN(receipt.input_event_index, reader.ReadU64());
     ABSL_ASSIGN_OR_RETURN(receipt.response_event_index, reader.ReadU64());
-    ABSL_ASSIGN_OR_RETURN(receipt.projection_request_hash, reader.ReadHash());
-    ABSL_ASSIGN_OR_RETURN(receipt.projection_manifest_hash, reader.ReadHash());
-    ABSL_ASSIGN_OR_RETURN(receipt.correction_digest, reader.ReadHash());
+    ABSL_ASSIGN_OR_RETURN(receipt.projection_manifest,
+                          ReadProjectionManifest(&reader));
     ABSL_ASSIGN_OR_RETURN(receipt.agent_session_identity.model_artifact_hash,
                           reader.ReadHash());
     ABSL_ASSIGN_OR_RETURN(receipt.agent_session_identity.runtime_artifact_hash,
@@ -635,13 +838,23 @@ absl::StatusOr<DPMEvent> DecodeEventCanonical(absl::string_view bytes) {
         reader.ReadHash());
     ABSL_ASSIGN_OR_RETURN(receipt.max_decision_tokens, reader.ReadU32());
     ABSL_ASSIGN_OR_RETURN(receipt.agent_request_hash, reader.ReadHash());
-    ABSL_ASSIGN_OR_RETURN(receipt.projected_memory, reader.ReadString());
-    ABSL_ASSIGN_OR_RETURN(receipt.canonical_agent_input, reader.ReadString());
-    ABSL_ASSIGN_OR_RETURN(receipt.decision_output, reader.ReadString());
+    ABSL_ASSIGN_OR_RETURN(
+        receipt.projected_memory,
+        reader.ReadString(kMaximumDPMEventPayloadBytes,
+                          "turn receipt projected memory"));
+    ABSL_ASSIGN_OR_RETURN(
+        receipt.canonical_agent_input,
+        reader.ReadString(kMaximumDPMCanonicalAgentInputBytes,
+                          "turn receipt canonical agent input"));
+    ABSL_ASSIGN_OR_RETURN(
+        receipt.decision_output,
+        reader.ReadString(kMaximumDPMEventPayloadBytes,
+                          "turn receipt decision output"));
     ABSL_ASSIGN_OR_RETURN(uint64_t token_count, reader.ReadU64());
-    if (token_count > bytes.size() / sizeof(int32_t)) {
+    if (token_count > kMaximumDPMGenerationTokens ||
+        token_count > bytes.size() / sizeof(int32_t)) {
       return absl::DataLossError(
-          "Canonical DPM token vector is unreasonably large.");
+          "Canonical DPM token vector exceeds the product limit.");
     }
     receipt.decision_token_ids.reserve(static_cast<size_t>(token_count));
     for (uint64_t i = 0; i < token_count; ++i) {
@@ -762,8 +975,8 @@ absl::StatusOr<ScanResult> ScanLog(int fd, absl::string_view log_id,
       return absl::DataLossError(
           "DPM event log contains non-contiguous indices.");
     }
-    absl::Status validation =
-        ValidateEvent(event, result.snapshot.events, case_id);
+    absl::Status validation = ValidateEvent(
+        event, result.snapshot.events, log_id, case_id, prefix);
     if (!validation.ok()) {
       return absl::DataLossError(absl::StrCat(
           "Invalid authoritative DPM event: ", validation.message()));
@@ -986,8 +1199,9 @@ FilesystemDPMEventLog::AppendIfGeneration(DPMEvent event,
         "DPM event log cannot address another event.");
   }
   event.index = scanned.snapshot.generation;
-  ABSL_RETURN_IF_ERROR(
-      ValidateEvent(event, scanned.snapshot.events, case_id_));
+  ABSL_RETURN_IF_ERROR(ValidateEvent(
+      event, scanned.snapshot.events, log_id_, case_id_,
+      scanned.prefixes.back()));
   ABSL_ASSIGN_OR_RETURN(std::string canonical_event,
                         EncodeEventCanonical(event));
   const Hash256 previous = scanned.prefixes.back();

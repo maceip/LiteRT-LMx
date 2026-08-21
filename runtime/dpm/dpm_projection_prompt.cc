@@ -23,12 +23,12 @@
 #include <set>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_append.h"  // from @com_google_absl
-#include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "nlohmann/json.hpp"  // from @nlohmann_json
 #include "runtime/platform/hash/sha256_hasher.h"
@@ -44,7 +44,11 @@ constexpr absl::string_view kOutputDomain =
     "LITERT_LMX_DPM_PROJECTION_OUTPUT_SHA256_V1";
 constexpr size_t kMaximumSchemaIdBytes = 16 * 1024;
 constexpr size_t kMaximumSchemaBytes = 16 * 1024 * 1024;
-constexpr size_t kMaximumEventPayloadBytes = 16 * 1024 * 1024;
+constexpr size_t kMaximumSchemaNestingDepth = 64;
+constexpr size_t kMaximumSchemaSyntaxElements = 65'536;
+// Schema, event range, and optional baseline are independently limited to
+// 16 MiB. This leaves deterministic headroom for the fixed protocol framing.
+constexpr size_t kMaximumCanonicalPromptBytes = 64 * 1024 * 1024;
 
 constexpr absl::string_view kProjectionPreamble =
     "System. Produce a decision-ready deterministic memory projection from "
@@ -183,6 +187,8 @@ absl::Status ValidateIdentity(const SessionHandoffIdentity& identity) {
 
 absl::Status ValidateSnapshot(const DPMLogSnapshot& snapshot) {
   if (snapshot.log_id.empty() || snapshot.case_id.empty() ||
+      snapshot.log_id.size() > kMaximumDPMProjectionIdentityBytes ||
+      snapshot.case_id.size() > kMaximumDPMProjectionIdentityBytes ||
       !IsValidUtf8(snapshot.log_id) || !IsValidUtf8(snapshot.case_id) ||
       ContainsControlByte(snapshot.log_id) ||
       ContainsControlByte(snapshot.case_id)) {
@@ -198,9 +204,14 @@ absl::Status ValidateSnapshot(const DPMLogSnapshot& snapshot) {
     const DPMEvent& event = snapshot.events[index];
     if (event.index != index || event.case_id != snapshot.case_id ||
         !IsKnownEventKind(event.kind) || event.timestamp_us <= 0 ||
-        event.payload.size() > kMaximumEventPayloadBytes ||
+        event.operation_id.empty() ||
+        event.operation_id.size() > kMaximumDPMEventOperationIdBytes ||
+        event.case_id.size() > kMaximumDPMProjectionIdentityBytes ||
+        event.payload.size() > kMaximumDPMEventPayloadBytes ||
         !IsValidUtf8(event.operation_id) || !IsValidUtf8(event.case_id) ||
-        !IsValidUtf8(event.payload)) {
+        !IsValidUtf8(event.payload) ||
+        ContainsControlByte(event.operation_id) ||
+        ContainsControlByte(event.case_id)) {
       return absl::DataLossError(
           "DPM projection received a malformed or contaminated event.");
     }
@@ -216,6 +227,7 @@ absl::Status ValidateCitationItem(absl::string_view item,
   }
   bool found_citation = false;
   bool ends_in_citation = false;
+  std::set<uint64_t> citations;
   for (size_t open = 0; open < item.size(); ++open) {
     if (item[open] != '[' || open + 1 >= item.size() ||
         item[open + 1] < '0' || item[open + 1] > '9') {
@@ -237,10 +249,25 @@ absl::Status ValidateCitationItem(absl::string_view item,
       citation = citation * 10 + digit;
       ++cursor;
     }
-    if (cursor >= item.size() || item[cursor] != ']') continue;
+    // Once '[' is followed by a digit it is citation syntax, not prose. A
+    // missing bracket or any suffix inside the brackets is therefore a hard
+    // parse failure rather than something a later valid citation can mask.
+    if (cursor >= item.size() || item[cursor] != ']') {
+      return absl::InvalidArgumentError(
+          "DPM projection contains malformed numeric citation syntax.");
+    }
     if (citation == 0 || citation > source_event_count) {
       return absl::InvalidArgumentError(
           "DPM projection citation falls outside its source event prefix.");
+    }
+    if (citations.size() >=
+        DPMProjectionConfig::kMaximumCitationsPerItem) {
+      return absl::ResourceExhaustedError(
+          "DPM projection item exceeds the product citation limit.");
+    }
+    if (!citations.insert(citation).second) {
+      return absl::InvalidArgumentError(
+          "DPM projection item repeats an event citation.");
     }
     found_citation = true;
     if (cursor + 1 == item.size()) ends_in_citation = true;
@@ -254,10 +281,449 @@ absl::Status ValidateCitationItem(absl::string_view item,
   return absl::OkStatus();
 }
 
+// Tracks an exact encoded size without permitting size_t wrap or allowing an
+// intermediate representation to exceed the caller's product bound.
+class BoundedSizeAccumulator {
+ public:
+  explicit BoundedSizeAccumulator(size_t maximum) : maximum_(maximum) {}
+
+  bool Add(size_t amount) {
+    if (total_ > maximum_ || amount > maximum_ - total_) return false;
+    total_ += amount;
+    return true;
+  }
+
+  size_t total() const { return total_; }
+
+ private:
+  size_t maximum_;
+  size_t total_ = 0;
+};
+
+size_t DecimalDigits(uint64_t value) {
+  size_t digits = 1;
+  while (value >= 10) {
+    value /= 10;
+    ++digits;
+  }
+  return digits;
+}
+
+// nlohmann::ordered_json::dump() with ensure_ascii=false uses these exact
+// escapes for JSON strings: the five short control escapes, quote/backslash,
+// lowercase \u00xx for other C0 controls, and verbatim valid UTF-8 otherwise.
+// Keeping that encoding here avoids constructing a per-event DOM and a second
+// line-sized string merely to discover that the configured range is too big.
+bool AddCanonicalJsonStringSize(absl::string_view value,
+                                BoundedSizeAccumulator* size) {
+  if (!size->Add(2)) return false;  // Opening and closing quotes.
+  for (const unsigned char byte : value) {
+    switch (byte) {
+      case '"':
+      case '\\':
+      case '\b':
+      case '\t':
+      case '\n':
+      case '\f':
+      case '\r':
+        if (!size->Add(2)) return false;
+        break;
+      default:
+        if (!size->Add(byte < 0x20 ? 6 : 1)) return false;
+        break;
+    }
+  }
+  return true;
+}
+
+void AppendCanonicalJsonString(absl::string_view value, std::string* output) {
+  constexpr char kHex[] = "0123456789abcdef";
+  output->push_back('"');
+  for (const unsigned char byte : value) {
+    switch (byte) {
+      case '"':
+        output->append("\\\"");
+        break;
+      case '\\':
+        output->append("\\\\");
+        break;
+      case '\b':
+        output->append("\\b");
+        break;
+      case '\t':
+        output->append("\\t");
+        break;
+      case '\n':
+        output->append("\\n");
+        break;
+      case '\f':
+        output->append("\\f");
+        break;
+      case '\r':
+        output->append("\\r");
+        break;
+      default:
+        if (byte < 0x20) {
+          output->append("\\u00");
+          output->push_back(kHex[(byte >> 4) & 0x0f]);
+          output->push_back(kHex[byte & 0x0f]);
+        } else {
+          output->push_back(static_cast<char>(byte));
+        }
+        break;
+    }
+  }
+  output->push_back('"');
+}
+
+constexpr absl::string_view kEventIndexField = "{\"event_index\":";
+constexpr absl::string_view kCitationField = ",\"citation\":\"[";
+constexpr absl::string_view kKindField = ",\"kind\":";
+constexpr absl::string_view kTimestampField = ",\"timestamp_us\":";
+constexpr absl::string_view kOperationIdField = ",\"operation_id\":";
+constexpr absl::string_view kCaseIdField = ",\"case_id\":";
+constexpr absl::string_view kPayloadField = ",\"payload\":";
+
+bool AddCanonicalEventLineSize(const DPMEvent& event,
+                               BoundedSizeAccumulator* size) {
+  return size->Add(kEventIndexField.size()) &&
+         size->Add(DecimalDigits(event.index)) &&
+         size->Add(kCitationField.size()) &&
+         size->Add(DecimalDigits(event.index + 1)) &&
+         size->Add(2) &&  // citation closing bracket and quote
+         size->Add(kKindField.size()) &&
+         AddCanonicalJsonStringSize(EventKindName(event.kind), size) &&
+         size->Add(kTimestampField.size()) &&
+         size->Add(DecimalDigits(static_cast<uint64_t>(event.timestamp_us))) &&
+         size->Add(kOperationIdField.size()) &&
+         AddCanonicalJsonStringSize(event.operation_id, size) &&
+         size->Add(kCaseIdField.size()) &&
+         AddCanonicalJsonStringSize(event.case_id, size) &&
+         size->Add(kPayloadField.size()) &&
+         AddCanonicalJsonStringSize(event.payload, size) &&
+         size->Add(2);  // object closing brace and newline
+}
+
+void AppendCanonicalEventLine(const DPMEvent& event, std::string* output) {
+  output->append(kEventIndexField.data(), kEventIndexField.size());
+  absl::StrAppend(output, event.index);
+  output->append(kCitationField.data(), kCitationField.size());
+  absl::StrAppend(output, event.index + 1);
+  output->append("]\"");
+  output->append(kKindField.data(), kKindField.size());
+  AppendCanonicalJsonString(EventKindName(event.kind), output);
+  output->append(kTimestampField.data(), kTimestampField.size());
+  absl::StrAppend(output, event.timestamp_us);
+  output->append(kOperationIdField.data(), kOperationIdField.size());
+  AppendCanonicalJsonString(event.operation_id, output);
+  output->append(kCaseIdField.data(), kCaseIdField.size());
+  AppendCanonicalJsonString(event.case_id, output);
+  output->append(kPayloadField.data(), kPayloadField.size());
+  AppendCanonicalJsonString(event.payload, output);
+  output->append("}\n");
+}
+
+using ProjectionJson = nlohmann::ordered_json;
+
+// The model output grammar is intentionally much smaller than JSON. Parsing
+// through SAX prevents a syntactically valid but deeply nested or oversized
+// output from first materializing an unrestricted DOM. Only the root object,
+// its three arrays, and bounded strings are ever retained.
+class ProjectionOutputSax final : public nlohmann::json_sax<ProjectionJson> {
+ public:
+  using number_integer_t = typename ProjectionJson::number_integer_t;
+  using number_unsigned_t = typename ProjectionJson::number_unsigned_t;
+  using number_float_t = typename ProjectionJson::number_float_t;
+  using string_t = typename ProjectionJson::string_t;
+  using binary_t = typename ProjectionJson::binary_t;
+
+  ProjectionOutputSax(uint64_t source_event_count,
+                      const DPMProjectionConfig& config)
+      : source_event_count_(source_event_count), config_(config) {}
+
+  bool null() override { return RejectScalar(); }
+  bool boolean(bool) override { return RejectScalar(); }
+  bool number_integer(number_integer_t) override { return RejectScalar(); }
+  bool number_unsigned(number_unsigned_t) override { return RejectScalar(); }
+  bool number_float(number_float_t, const string_t&) override {
+    return RejectScalar();
+  }
+  bool binary(binary_t&) override { return RejectScalar(); }
+
+  bool string(string_t& value) override {
+    if (state_ != State::kArray || active_section_ >= sections_.size()) {
+      return RejectShape();
+    }
+    if (sections_[active_section_].size() >=
+        config_.max_items_per_section) {
+      return Fail(absl::ResourceExhaustedError(
+          "DPM projection section exceeds its configured item limit."));
+    }
+    if (value.size() > config_.max_item_bytes) {
+      return Fail(absl::ResourceExhaustedError(
+          "DPM projection item exceeds its configured byte limit."));
+    }
+    const absl::Status citation_status =
+        ValidateCitationItem(value, source_event_count_);
+    if (!citation_status.ok()) return Fail(citation_status);
+    sections_[active_section_].push_back(std::move(value));
+    return true;
+  }
+
+  bool start_object(std::size_t elements) override {
+    if (state_ != State::kInitial || depth_ != 0) return RejectShape();
+    if (elements != kUnknownSize && elements != sections_.size()) {
+      return RejectShape();
+    }
+    depth_ = 1;
+    state_ = State::kObject;
+    return true;
+  }
+
+  bool key(string_t& key_name) override {
+    if (state_ != State::kObject || awaiting_value_) return RejectShape();
+    size_t section = sections_.size();
+    if (key_name == "Facts") {
+      section = 0;
+    } else if (key_name == "Reasoning") {
+      section = 1;
+    } else if (key_name == "Compliance") {
+      section = 2;
+    } else {
+      return RejectShape();
+    }
+    if (seen_[section]) {
+      return Fail(absl::InvalidArgumentError(
+          "DPM projection output contains a duplicate field."));
+    }
+    seen_[section] = true;
+    active_section_ = section;
+    awaiting_value_ = true;
+    return true;
+  }
+
+  bool end_object() override {
+    if (state_ != State::kObject || depth_ != 1 || awaiting_value_ ||
+        !seen_[0] || !seen_[1] || !seen_[2]) {
+      return RejectShape();
+    }
+    depth_ = 0;
+    state_ = State::kComplete;
+    return true;
+  }
+
+  bool start_array(std::size_t elements) override {
+    if (state_ != State::kObject || depth_ != 1 || !awaiting_value_ ||
+        active_section_ >= sections_.size()) {
+      return RejectShape();
+    }
+    if (elements != kUnknownSize &&
+        elements > config_.max_items_per_section) {
+      return Fail(absl::ResourceExhaustedError(
+          "DPM projection section exceeds its configured item limit."));
+    }
+    depth_ = 2;
+    state_ = State::kArray;
+    return true;
+  }
+
+  bool end_array() override {
+    if (state_ != State::kArray || depth_ != 2) return RejectShape();
+    depth_ = 1;
+    state_ = State::kObject;
+    active_section_ = sections_.size();
+    awaiting_value_ = false;
+    return true;
+  }
+
+  bool parse_error(std::size_t, const std::string&,
+                   const nlohmann::detail::exception&) override {
+    return Fail(absl::InvalidArgumentError(
+        "DPM projection output is not valid strict JSON."));
+  }
+
+  bool complete() const {
+    return status_.ok() && state_ == State::kComplete && depth_ == 0;
+  }
+  const absl::Status& status() const { return status_; }
+  const std::array<std::vector<std::string>, 3>& sections() const {
+    return sections_;
+  }
+
+ private:
+  static constexpr size_t kUnknownSize =
+      (std::numeric_limits<size_t>::max)();
+
+  enum class State { kInitial, kObject, kArray, kComplete, kFailed };
+
+  bool Fail(absl::Status status) {
+    if (status_.ok()) status_ = std::move(status);
+    state_ = State::kFailed;
+    return false;
+  }
+
+  bool RejectShape() {
+    return Fail(absl::InvalidArgumentError(
+        "DPM projection output must be exactly one object containing only "
+        "the unique Facts, Reasoning, and Compliance string arrays."));
+  }
+
+  bool RejectScalar() {
+    return Fail(absl::InvalidArgumentError(
+        "Every DPM projection field must be an array of strings."));
+  }
+
+  uint64_t source_event_count_;
+  const DPMProjectionConfig& config_;
+  State state_ = State::kInitial;
+  size_t depth_ = 0;
+  size_t active_section_ = 3;
+  bool awaiting_value_ = false;
+  std::array<bool, 3> seen_{};
+  std::array<std::vector<std::string>, 3> sections_;
+  absl::Status status_;
+};
+
+// schema_json is caller-provided product configuration rather than model
+// output, so its vocabulary is intentionally generic JSON. It still must pass
+// structural admission before nlohmann materializes the DOM used for the
+// byte-for-byte canonical dump comparison below. One shared counter covers
+// every container, scalar value, and object key; containers count as values
+// exactly once when opened.
+class SchemaPreflightSax final : public nlohmann::json_sax<ProjectionJson> {
+ public:
+  using number_integer_t = typename ProjectionJson::number_integer_t;
+  using number_unsigned_t = typename ProjectionJson::number_unsigned_t;
+  using number_float_t = typename ProjectionJson::number_float_t;
+  using string_t = typename ProjectionJson::string_t;
+  using binary_t = typename ProjectionJson::binary_t;
+
+  bool null() override { return Scalar(); }
+  bool boolean(bool) override { return Scalar(); }
+  bool number_integer(number_integer_t) override { return Scalar(); }
+  bool number_unsigned(number_unsigned_t) override { return Scalar(); }
+  bool number_float(number_float_t, const string_t&) override {
+    return Scalar();
+  }
+  bool string(string_t&) override { return Scalar(); }
+  bool binary(binary_t&) override { return Scalar(); }
+
+  bool start_object(std::size_t elements) override {
+    if (depth_ == 0) {
+      if (root_started_ || root_complete_) return RejectTopLevel();
+      root_started_ = true;
+    }
+    return StartContainer(Container::kObject, elements);
+  }
+
+  bool key(string_t&) override {
+    if (depth_ == 0 || stack_[depth_ - 1] != Container::kObject) {
+      return RejectStructure();
+    }
+    return CountElement();
+  }
+
+  bool end_object() override { return EndContainer(Container::kObject); }
+
+  bool start_array(std::size_t elements) override {
+    if (depth_ == 0) return RejectTopLevel();
+    return StartContainer(Container::kArray, elements);
+  }
+
+  bool end_array() override { return EndContainer(Container::kArray); }
+
+  bool parse_error(std::size_t, const std::string&,
+                   const nlohmann::detail::exception&) override {
+    return Fail(absl::InvalidArgumentError(
+        "DPM projection schema_json is not valid strict JSON."));
+  }
+
+  bool complete() const {
+    return status_.ok() && root_started_ && root_complete_ && depth_ == 0;
+  }
+  const absl::Status& status() const { return status_; }
+
+ private:
+  static constexpr size_t kUnknownSize =
+      (std::numeric_limits<size_t>::max)();
+  enum class Container : uint8_t { kObject, kArray };
+
+  bool Scalar() {
+    if (depth_ == 0) return RejectTopLevel();
+    return CountElement();
+  }
+
+  bool StartContainer(Container container, size_t elements) {
+    if (depth_ >= kMaximumSchemaNestingDepth) {
+      return Fail(absl::ResourceExhaustedError(
+          "DPM projection schema_json exceeds the nesting-depth limit."));
+    }
+    // Text JSON reports unknown container sizes. Other nlohmann adapters may
+    // report them, so reject an impossible count before accepting callbacks.
+    if (elements != kUnknownSize &&
+        elements > kMaximumSchemaSyntaxElements) {
+      return Fail(absl::ResourceExhaustedError(
+          "DPM projection schema_json exceeds the syntax-element limit."));
+    }
+    if (!CountElement()) return false;
+    stack_[depth_++] = container;
+    return true;
+  }
+
+  bool EndContainer(Container expected) {
+    if (depth_ == 0 || stack_[depth_ - 1] != expected) {
+      return RejectStructure();
+    }
+    --depth_;
+    if (depth_ == 0) root_complete_ = true;
+    return true;
+  }
+
+  bool CountElement() {
+    if (syntax_elements_ >= kMaximumSchemaSyntaxElements) {
+      return Fail(absl::ResourceExhaustedError(
+          "DPM projection schema_json exceeds the syntax-element limit."));
+    }
+    ++syntax_elements_;
+    return true;
+  }
+
+  bool RejectTopLevel() {
+    return Fail(absl::InvalidArgumentError(
+        "DPM projection schema_json must have exactly one object at its "
+        "top level."));
+  }
+
+  bool RejectStructure() {
+    return Fail(absl::InvalidArgumentError(
+        "DPM projection schema_json has invalid container structure."));
+  }
+
+  bool Fail(absl::Status status) {
+    if (status_.ok()) status_ = std::move(status);
+    return false;
+  }
+
+  std::array<Container, kMaximumSchemaNestingDepth> stack_{};
+  size_t depth_ = 0;
+  size_t syntax_elements_ = 0;
+  bool root_started_ = false;
+  bool root_complete_ = false;
+  absl::Status status_;
+};
+
 absl::Status ValidateCanonicalRequestFields(
     const CanonicalDPMProjectionRequest& request) {
   if (request.prompt_bytes.empty() || request.log_id.empty() ||
-      request.case_id.empty() || request.source_event_count == 0 ||
+      request.case_id.empty() ||
+      request.prompt_bytes.size() > kMaximumCanonicalPromptBytes ||
+      request.log_id.size() > kMaximumDPMProjectionIdentityBytes ||
+      request.case_id.size() > kMaximumDPMProjectionIdentityBytes ||
+      !IsValidUtf8(request.prompt_bytes) ||
+      !IsValidUtf8(request.log_id) || !IsValidUtf8(request.case_id) ||
+      ContainsControlByte(request.log_id) ||
+      ContainsControlByte(request.case_id) ||
+      request.source_event_count == 0 ||
       request.input_event_index != request.source_event_count - 1 ||
       request.event_range_start > request.input_event_index ||
       IsZeroHash(request.source_prefix_hash) ||
@@ -299,19 +765,41 @@ absl::Status ValidateDPMProjectionConfig(const DPMProjectionConfig& config) {
         "DPM projection requires bounded UTF-8 schema identity and JSON.");
   }
   if (config.max_output_tokens == 0 ||
-      config.max_output_tokens >
-          static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+      config.max_output_tokens > DPMProjectionConfig::kMaximumOutputTokens ||
       config.memory_budget_bytes == 0 ||
-      config.memory_budget_bytes > kMaximumEventPayloadBytes ||
+      config.memory_budget_bytes > kMaximumDPMEventPayloadBytes ||
       config.max_event_range_bytes == 0 ||
-      config.max_event_range_bytes > kMaximumEventPayloadBytes ||
+      config.max_event_range_bytes > kMaximumDPMEventPayloadBytes ||
       config.max_items_per_section == 0 ||
+      config.max_items_per_section >
+          DPMProjectionConfig::kMaximumItemsPerSection ||
       config.max_item_bytes == 0 ||
       config.max_item_bytes > config.memory_budget_bytes) {
     return absl::InvalidArgumentError(
         "DPM projection requires positive bounded inference, event, and "
         "output limits.");
   }
+
+  SchemaPreflightSax schema_preflight;
+  bool schema_preflight_parsed = false;
+  try {
+    schema_preflight_parsed = ProjectionJson::sax_parse(
+        config.schema_json.begin(), config.schema_json.end(),
+        &schema_preflight, ProjectionJson::input_format_t::json,
+        /*strict=*/true, /*ignore_comments=*/false);
+  } catch (const std::exception&) {
+    return absl::InvalidArgumentError(
+        "DPM projection schema_json failed bounded JSON preflight.");
+  }
+  if (!schema_preflight_parsed || !schema_preflight.complete()) {
+    if (!schema_preflight.status().ok()) return schema_preflight.status();
+    return absl::InvalidArgumentError(
+        "DPM projection schema_json failed bounded JSON preflight.");
+  }
+
+  // Only a schema admitted by the allocation-bounded structural pass above
+  // reaches the DOM. The DOM remains necessary here solely to preserve the
+  // existing canonical dump equality contract and its exact config hash.
   try {
     const nlohmann::ordered_json schema =
         nlohmann::ordered_json::parse(config.schema_json);
@@ -348,40 +836,38 @@ absl::StatusOr<std::string> RenderCanonicalDPMEventRange(
     uint64_t event_range_end, size_t maximum_bytes) {
   ABSL_RETURN_IF_ERROR(ValidateSnapshot(snapshot));
   if (event_range_start >= event_range_end ||
-      event_range_end > snapshot.events.size() || maximum_bytes == 0) {
+      event_range_end > snapshot.events.size() || maximum_bytes == 0 ||
+      maximum_bytes > kMaximumDPMEventPayloadBytes) {
     return absl::InvalidArgumentError(
-        "DPM projection event range must be nonempty and within the "
-        "authoritative snapshot.");
+        "DPM projection event range must be nonempty, product-bounded, and "
+        "within the authoritative snapshot.");
   }
 
-  std::string rendered;
+  // Size the final representation before reserving or rendering. This makes
+  // escape expansion part of admission and ensures the renderer's sole
+  // potentially range-sized allocation is exactly the accepted output size.
+  BoundedSizeAccumulator encoded_size(maximum_bytes);
   for (uint64_t index = event_range_start; index < event_range_end; ++index) {
     const DPMEvent& event = snapshot.events[index];
     if (event.index == std::numeric_limits<uint64_t>::max()) {
       return absl::ResourceExhaustedError(
           "DPM event index cannot be represented as a one-based citation.");
     }
-    nlohmann::ordered_json line = nlohmann::ordered_json::object();
-    line["event_index"] = event.index;
-    line["citation"] = absl::StrCat("[", event.index + 1, "]");
-    line["kind"] = std::string(EventKindName(event.kind));
-    line["timestamp_us"] = event.timestamp_us;
-    line["operation_id"] = event.operation_id;
-    line["case_id"] = event.case_id;
-    line["payload"] = event.payload;
-    std::string encoded;
-    try {
-      encoded = line.dump();
-    } catch (const std::exception&) {
-      return absl::InvalidArgumentError(
-          "DPM event cannot be represented as canonical UTF-8 JSON.");
-    }
-    if (encoded.size() + 1 > maximum_bytes - rendered.size()) {
+    if (!AddCanonicalEventLineSize(event, &encoded_size)) {
       return absl::ResourceExhaustedError(
           "DPM projection event range exceeds its configured byte limit.");
     }
-    rendered.append(encoded);
-    rendered.push_back('\n');
+  }
+
+  std::string rendered;
+  rendered.reserve(encoded_size.total());
+  for (uint64_t index = event_range_start; index < event_range_end; ++index) {
+    const DPMEvent& event = snapshot.events[index];
+    AppendCanonicalEventLine(event, &rendered);
+  }
+  if (rendered.size() != encoded_size.total()) {
+    return absl::InternalError(
+        "Canonical DPM event sizing and rendering disagree.");
   }
   return rendered;
 }
@@ -478,6 +964,10 @@ BuildCanonicalDPMProjectionRequest(
       "\"Compliance\":[...]}. The first byte must be '{' and the final "
       "byte must be '}'. Every nonempty item must end in a numeric citation "
       "within citation_bounds.\n");
+  if (prompt.size() > kMaximumCanonicalPromptBytes) {
+    return absl::ResourceExhaustedError(
+        "Canonical DPM projection prompt exceeds the product byte limit.");
+  }
 
   CanonicalDPMProjectionRequest request{
       .prompt_bytes = std::move(prompt),
@@ -535,65 +1025,54 @@ absl::StatusOr<std::string> CanonicalizeDPMProjectionOutput(
         "DPM projection output is not a bounded bare UTF-8 JSON object.");
   }
 
-  bool duplicate_key = false;
-  std::set<std::string> keys;
-  nlohmann::ordered_json projection;
-  try {
-    projection = nlohmann::ordered_json::parse(
-        raw_output.begin(), raw_output.end(),
-        [&duplicate_key, &keys](int, nlohmann::ordered_json::parse_event_t event,
-                                nlohmann::ordered_json& parsed) {
-          if (event == nlohmann::ordered_json::parse_event_t::key) {
-            const std::string key = parsed.get<std::string>();
-            if (!keys.insert(key).second) duplicate_key = true;
-          }
-          return true;
-        },
-        /*allow_exceptions=*/true, /*ignore_comments=*/false);
-  } catch (const std::exception&) {
+  ProjectionOutputSax parser(source_event_count, config);
+  const bool parsed = ProjectionJson::sax_parse(
+      raw_output.begin(), raw_output.end(), &parser,
+      ProjectionJson::input_format_t::json,
+      /*strict=*/true, /*ignore_comments=*/false);
+  if (!parsed || !parser.complete()) {
+    if (!parser.status().ok()) return parser.status();
     return absl::InvalidArgumentError(
         "DPM projection output is not valid strict JSON.");
   }
-  if (duplicate_key || !projection.is_object() || projection.size() != 3 ||
-      !projection.contains("Facts") || !projection.contains("Reasoning") ||
-      !projection.contains("Compliance")) {
-    return absl::InvalidArgumentError(
-        "DPM projection output must contain exactly the unique fields Facts, "
-        "Reasoning, and Compliance.");
-  }
 
-  nlohmann::ordered_json canonical = nlohmann::ordered_json::object();
-  for (absl::string_view field : {absl::string_view("Facts"),
-                                  absl::string_view("Reasoning"),
-                                  absl::string_view("Compliance")}) {
-    const std::string field_name(field);
-    const nlohmann::ordered_json& section = projection[field_name];
-    if (!section.is_array() ||
-        section.size() > config.max_items_per_section) {
-      return absl::InvalidArgumentError(
-          "Every DPM projection field must be a bounded JSON array.");
+  constexpr std::array<absl::string_view, 3> kSectionPrefixes = {
+      "{\"Facts\":[", "],\"Reasoning\":[", "],\"Compliance\":["};
+  BoundedSizeAccumulator canonical_size(config.memory_budget_bytes);
+  for (size_t section = 0; section < parser.sections().size(); ++section) {
+    if (!canonical_size.Add(kSectionPrefixes[section].size())) {
+      return absl::ResourceExhaustedError(
+          "Canonical DPM projection exceeds its configured memory budget.");
     }
-    nlohmann::ordered_json canonical_section =
-        nlohmann::ordered_json::array();
-    for (const nlohmann::ordered_json& item : section) {
-      if (!item.is_string()) {
-        return absl::InvalidArgumentError(
-            "Every DPM projection array item must be a string.");
-      }
-      const std::string text = item.get<std::string>();
-      if (text.size() > config.max_item_bytes) {
+    const std::vector<std::string>& items = parser.sections()[section];
+    for (size_t item = 0; item < items.size(); ++item) {
+      if ((item != 0 && !canonical_size.Add(1)) ||
+          !AddCanonicalJsonStringSize(items[item], &canonical_size)) {
         return absl::ResourceExhaustedError(
-            "DPM projection item exceeds its configured byte limit.");
+            "Canonical DPM projection exceeds its configured memory budget.");
       }
-      ABSL_RETURN_IF_ERROR(ValidateCitationItem(text, source_event_count));
-      canonical_section.push_back(text);
     }
-    canonical[field_name] = std::move(canonical_section);
   }
-  const std::string canonical_bytes = canonical.dump();
-  if (canonical_bytes.size() > config.memory_budget_bytes) {
+  if (!canonical_size.Add(2)) {  // Final array and object closing bytes.
     return absl::ResourceExhaustedError(
         "Canonical DPM projection exceeds its configured memory budget.");
+  }
+
+  std::string canonical_bytes;
+  canonical_bytes.reserve(canonical_size.total());
+  for (size_t section = 0; section < parser.sections().size(); ++section) {
+    canonical_bytes.append(kSectionPrefixes[section].data(),
+                           kSectionPrefixes[section].size());
+    const std::vector<std::string>& items = parser.sections()[section];
+    for (size_t item = 0; item < items.size(); ++item) {
+      if (item != 0) canonical_bytes.push_back(',');
+      AppendCanonicalJsonString(items[item], &canonical_bytes);
+    }
+  }
+  canonical_bytes.append("]}");
+  if (canonical_bytes.size() != canonical_size.total()) {
+    return absl::InternalError(
+        "Canonical DPM output sizing and rendering disagree.");
   }
   return canonical_bytes;
 }
