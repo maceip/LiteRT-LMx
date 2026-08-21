@@ -45,7 +45,6 @@ constexpr uint32_t kRequestKind = 1;
 constexpr uint32_t kResultKind = 2;
 constexpr uint64_t kMaximumResultStatusMessageBytes = 4096;
 constexpr uint64_t kMaximumKeyIdBytes = 256;
-constexpr uint64_t kMaximumAuthenticationKeyBytes = 4096;
 constexpr uint32_t kMaximumContinuationWitnessKeyIdBytes = 1024;
 constexpr uint64_t kEnvelopeFixedBytes = 8 + 4 + 4 + 4 + 8 + 32;
 constexpr absl::string_view kRequestMacDomain =
@@ -860,7 +859,7 @@ absl::Status ValidateFreshWorkerAuthentication(
   }
   if (authentication.authentication_key.size() < 32 ||
       authentication.authentication_key.size() >
-          kMaximumAuthenticationKeyBytes) {
+          kMaximumFreshWorkerAuthenticationKeyBytes) {
     return absl::InvalidArgumentError(
         "Fresh-worker authentication key must contain 32 to 4096 bytes.");
   }

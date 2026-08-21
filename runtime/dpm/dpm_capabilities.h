@@ -108,6 +108,7 @@ absl::Status ValidateDPMStageCapabilities(
 
 struct DPMAgentCheckpointCapabilities {
   bool checkpoint_transport_configured = false;
+  bool operation_evidence_transport_configured = false;
   bool restore_enabled = false;
   uint32_t capture_interval_turns = 0;
   bool capture_required_at_milestone = false;
@@ -122,6 +123,12 @@ struct DPMAgentCheckpointCapabilities {
   // are already covered. Consumers must compare the concrete operation before
   // claiming or using CapsuleRestore.
   std::optional<CapsuleRestoreOperationalCoverage> operational_coverage;
+  // Coverage V2 is one atomic, runtime-derived operational domain. Its
+  // presence never replaces per-operation capture/restore evidence, but it
+  // does prove that the loaded runtime can attempt the witnessed own-position
+  // mechanism within these exact bounds.
+  std::optional<CapsuleRestoreStateWitnessOperationalCoverage>
+      state_witness_operational_coverage;
 };
 
 struct DPMGuaranteeAvailability {
@@ -132,7 +139,7 @@ struct DPMGuaranteeAvailability {
 };
 
 struct DPMCapabilities {
-  static constexpr uint32_t kFormatVersion = 1;
+  static constexpr uint32_t kFormatVersion = 2;
   uint32_t format_version = kFormatVersion;
   DPMStageCapabilities projection;
   DPMStageCapabilities agent;

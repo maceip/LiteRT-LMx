@@ -336,6 +336,7 @@ bool IsSupportedTurnReceiptVersion(uint32_t format_version) {
     case DPMTurnReceipt::kLegacyFormatVersion:
     case DPMTurnReceipt::kPreviousFormatVersion:
     case DPMTurnReceipt::kCoverageV1FormatVersion:
+    case DPMTurnReceipt::kCoverageV2FormatVersion:
     case DPMTurnReceipt::kFormatVersion:
       return true;
     default:
@@ -347,6 +348,7 @@ bool HasVersionFourReceiptFields(uint32_t format_version) {
   switch (format_version) {
     case DPMTurnReceipt::kPreviousFormatVersion:
     case DPMTurnReceipt::kCoverageV1FormatVersion:
+    case DPMTurnReceipt::kCoverageV2FormatVersion:
     case DPMTurnReceipt::kFormatVersion:
       return true;
     case DPMTurnReceipt::kLegacyFormatVersion:
@@ -358,6 +360,7 @@ bool HasVersionFourReceiptFields(uint32_t format_version) {
 bool HasVersionFiveReceiptFields(uint32_t format_version) {
   switch (format_version) {
     case DPMTurnReceipt::kCoverageV1FormatVersion:
+    case DPMTurnReceipt::kCoverageV2FormatVersion:
     case DPMTurnReceipt::kFormatVersion:
       return true;
     case DPMTurnReceipt::kLegacyFormatVersion:
@@ -365,6 +368,11 @@ bool HasVersionFiveReceiptFields(uint32_t format_version) {
     default:
       return false;
   }
+}
+
+bool HasVersionSixReceiptFields(uint32_t format_version) {
+  return format_version == DPMTurnReceipt::kCoverageV2FormatVersion ||
+         format_version == DPMTurnReceipt::kFormatVersion;
 }
 
 bool ContainsControlByte(absl::string_view text) {
@@ -965,7 +973,7 @@ absl::StatusOr<std::string> EncodeEventCanonical(const DPMEvent& event) {
         AppendHash(*receipt.agent_capsule_restore_coverage_id, &bytes);
       }
     }
-    if (receipt.format_version == DPMTurnReceipt::kFormatVersion) {
+    if (HasVersionSixReceiptFields(receipt.format_version)) {
       bytes.push_back(receipt.agent_prepared_prefill_work.has_value() ? 1 : 0);
       if (receipt.agent_prepared_prefill_work.has_value()) {
         AppendPreparedPrefillWorkBinding(
@@ -989,6 +997,10 @@ absl::StatusOr<std::string> EncodeEventCanonical(const DPMEvent& event) {
       if (receipt.agent_capsule_restore_evidence_id.has_value()) {
         AppendHash(*receipt.agent_capsule_restore_evidence_id, &bytes);
       }
+    }
+    if (receipt.format_version == DPMTurnReceipt::kFormatVersion) {
+      bytes.push_back(
+          receipt.agent_rematerialized_canonical_winner ? 1 : 0);
     }
   }
   return bytes;
@@ -1204,7 +1216,7 @@ absl::StatusOr<DPMEvent> DecodeEventCanonical(absl::string_view bytes) {
               capsule_restore_coverage;
         }
       }
-      if (receipt.format_version == DPMTurnReceipt::kFormatVersion) {
+      if (HasVersionSixReceiptFields(receipt.format_version)) {
         ABSL_ASSIGN_OR_RETURN(uint8_t has_prepared_prefill_work,
                               reader.ReadU8());
         if (has_prepared_prefill_work > 1) {
@@ -1266,6 +1278,16 @@ absl::StatusOr<DPMEvent> DecodeEventCanonical(absl::string_view bytes) {
                                 reader.ReadHash());
           receipt.agent_capsule_restore_evidence_id = restore_evidence_id;
         }
+      }
+      if (receipt.format_version == DPMTurnReceipt::kFormatVersion) {
+        ABSL_ASSIGN_OR_RETURN(uint8_t rematerialized_canonical_winner,
+                              reader.ReadU8());
+        if (rematerialized_canonical_winner > 1) {
+          return absl::DataLossError(
+              "Non-canonical DPM WinnerReplay rematerialization flag.");
+        }
+        receipt.agent_rematerialized_canonical_winner =
+            rematerialized_canonical_winner == 1;
       }
     }
     ABSL_RETURN_IF_ERROR(ValidateDPMTurnReceiptReplayEvidence(receipt));

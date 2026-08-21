@@ -52,7 +52,8 @@ struct DPMTurnReceipt {
   static constexpr uint32_t kLegacyFormatVersion = 3;
   static constexpr uint32_t kPreviousFormatVersion = 4;
   static constexpr uint32_t kCoverageV1FormatVersion = 5;
-  static constexpr uint32_t kFormatVersion = 6;
+  static constexpr uint32_t kCoverageV2FormatVersion = 6;
+  static constexpr uint32_t kFormatVersion = 7;
 
   uint32_t format_version = kFormatVersion;
   std::string operation_id;
@@ -82,6 +83,12 @@ struct DPMTurnReceipt {
   std::optional<Hash256> agent_exact_output_evidence_hash;
   uint32_t agent_exact_logit_frame_count = 0;
   bool agent_reused_canonical_winner = false;
+  // A catalog-selected winner may be regenerated in a live parent solely to
+  // make that exact selected output checkpointable. Keep that fact distinct
+  // from both a newly published live winner and a catalog-only replay: the
+  // catalog remains the output oracle even though this operation now has a
+  // byte-equal producing session.
+  bool agent_rematerialized_canonical_winner = false;
   bool agent_producing_session_matched_output = false;
 
   // Stored in the immutable log so a missing KV artifact can be reconstructed
@@ -119,9 +126,12 @@ struct DPMTurnReceipt {
   DPMCheckpointCaptureOrigin checkpoint_capture_origin =
       DPMCheckpointCaptureOrigin::kNone;
 
-  // ExactRegeneration records the complete physical plan selected for every
-  // independent worker. WinnerReplay and legacy receipts use kNone plus the
-  // all-zero hash. A delta plan requires restored_from_session_checkpoint_id.
+  // ExactRegeneration records the complete model-affecting physical plan
+  // selected for every independent worker. Post-output capsule capture policy
+  // is intentionally outside this hash and is proven separately by
+  // checkpoint_capture_origin plus authenticated run-zero provenance.
+  // WinnerReplay and legacy receipts use kNone plus the all-zero hash. A delta
+  // plan requires restored_from_session_checkpoint_id.
   DPMCheckpointWorkerPrefillMode agent_worker_prefill_mode =
       DPMCheckpointWorkerPrefillMode::kNone;
   Hash256 agent_physical_execution_plan_hash;
@@ -164,6 +174,10 @@ struct DPMTurnReceipt {
   // restore by itself.
   std::optional<Hash256> restored_checkpoint_capture_evidence_id;
   std::optional<Hash256> agent_capsule_restore_evidence_id;
+
+  // Version 7 appends the explicit WinnerReplay rematerialization bit after
+  // all version 6 Coverage V2 evidence. Older receipts cannot claim this
+  // provenance and current checkpoint selection never silently upgrades them.
 };
 
 struct DPMEvent {

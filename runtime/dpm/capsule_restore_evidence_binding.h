@@ -52,7 +52,7 @@ absl::Status ValidateDPMPreparedPrefillWorkBindingForPlan(
     const DPMPreparedPrefillPlan& prepared_plan);
 
 // Joins a publishable version-4 checkpoint artifact to the authoritative
-// version-6 receipt that published it, the complete V3 capture evidence, and
+// version-7 receipt that published it, the complete V3 capture evidence, and
 // a freshly reauthenticated current authority. This validates replicated
 // fields only; raw-log prefix correctness and checkpoint candidate recency
 // remain DPMEngine responsibilities.
@@ -78,7 +78,7 @@ absl::Status ValidateCapsuleRestoreEvidenceV3SourceCheckpointBinding(
         current_admission);
 
 // Post-generation/commit gate. In addition to the source-only join, requires
-// a fully assembled version-6 restoring receipt to carry the exact source
+// a fully assembled version-7 restoring receipt to carry the exact source
 // checkpoint, source-capture evidence, operation restore evidence, target DPM
 // state, prepared work, current authority, and mode-specific exact evidence.
 absl::Status ValidateCapsuleRestoreEvidenceV3TurnBinding(

@@ -137,6 +137,11 @@ struct DPMAgentReplayExecution {
   // it is distinct from both profile admission and the request-evidence ID.
   std::optional<Hash256> exact_output_evidence_hash;
   bool reused_canonical_winner = false;
+  // True only when a previously catalog-selected winner was regenerated
+  // byte-for-byte in this live parent session. `reused_canonical_winner`
+  // remains true because the catalog, rather than this second model call,
+  // selected the authoritative output.
+  bool rematerialized_canonical_winner = false;
 
   // True only when `producing_session` is the live session that generated the
   // selected bytes. Catalog hits, lost publication races, and current exact

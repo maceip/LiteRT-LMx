@@ -1574,14 +1574,26 @@ absl::Status ValidateDPMAgentReplayExecution(
         *execution.capsule_restore_evidence_v3));
   }
   switch (execution.mode) {
-    case DPMReplayMode::kCanonicalWinnerReplay:
+    case DPMReplayMode::kCanonicalWinnerReplay: {
+      const bool is_published_live_winner =
+          !execution.reused_canonical_winner &&
+          !execution.rematerialized_canonical_winner &&
+          execution.producing_session_matches_output;
+      const bool is_catalog_only_winner =
+          execution.reused_canonical_winner &&
+          !execution.rematerialized_canonical_winner &&
+          !execution.producing_session_matches_output;
+      const bool is_rematerialized_catalog_winner =
+          execution.reused_canonical_winner &&
+          execution.rematerialized_canonical_winner &&
+          execution.producing_session_matches_output;
       if (execution.exact_profile_id.has_value() ||
           execution.exact_profile_admission_record_id.has_value() ||
           execution.exact_output_evidence_hash.has_value() ||
           !execution.exact_token_bytes.empty() ||
           !execution.exact_logit_frames.empty() ||
-          execution.producing_session_matches_output ==
-              execution.reused_canonical_winner ||
+          (!is_published_live_winner && !is_catalog_only_winner &&
+           !is_rematerialized_catalog_winner) ||
           execution.prepared_prefill_plan.has_value() !=
               execution.producing_session_matches_output ||
           (execution.capsule_restore_evidence_v3.has_value() &&
@@ -1594,6 +1606,7 @@ absl::Status ValidateDPMAgentReplayExecution(
             "producing-session provenance.");
       }
       break;
+    }
     case DPMReplayMode::kExactRegeneration: {
       if (!execution.exact_profile_id.has_value() ||
           IsZeroHash(*execution.exact_profile_id) ||
@@ -1606,6 +1619,7 @@ absl::Status ValidateDPMAgentReplayExecution(
           !execution.prepared_prefill_plan.has_value() ||
           execution.capsule_restore_evidence_v3.has_value() ||
           execution.reused_canonical_winner ||
+          execution.rematerialized_canonical_winner ||
           execution.producing_session_matches_output) {
         return absl::DataLossError(
             "Exact agent execution is missing non-catalog evidence or "
@@ -2175,6 +2189,7 @@ CanonicalWinnerDPMAgentRuntime::RematerializeCanonicalWinner(
   }
   if (selected_winner.mode != DPMReplayMode::kCanonicalWinnerReplay ||
       !selected_winner.reused_canonical_winner ||
+      selected_winner.rematerialized_canonical_winner ||
       selected_winner.producing_session_matches_output) {
     return absl::FailedPreconditionError(
         "WinnerReplay rematerialization requires an already selected catalog "
@@ -2287,7 +2302,8 @@ CanonicalWinnerDPMAgentRuntime::RematerializeCanonicalWinner(
   }
 
   DPMAgentReplayExecution live_execution = selected_winner;
-  live_execution.reused_canonical_winner = false;
+  live_execution.reused_canonical_winner = true;
+  live_execution.rematerialized_canonical_winner = true;
   live_execution.producing_session_matches_output = true;
   live_execution.prepared_prefill_plan = invocation.prepared_prefill_plan();
   live_execution.capsule_restore_evidence_v3 =

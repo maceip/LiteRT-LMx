@@ -26,9 +26,11 @@
 #include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "runtime/dpm/dpm_capabilities.h"
+#include "runtime/dpm/dpm_agent_replay_runtime.h"
 #include "runtime/dpm/dpm_prepared_prefill_plan.h"
 #include "runtime/dpm/dpm_projection_manifest.h"
 #include "runtime/dpm/dpm_receipt_validation.h"
+#include "runtime/dpm/fresh_worker_protocol.h"
 #include "runtime/engine/exact_litert_profile.h"
 #include "runtime/engine/session_handoff_capability.h"
 
@@ -137,11 +139,11 @@ absl::Status ValidateCurrentV3Admission(
        {"qualification evidence", coverage.qualification_evidence_hash}});
 }
 
-absl::Status ValidateAuthoritativeV6Receipt(
+absl::Status ValidateAuthoritativeCurrentReceipt(
     const DPMTurnReceipt& receipt) {
   if (receipt.format_version != DPMTurnReceipt::kFormatVersion) {
     return absl::FailedPreconditionError(
-        "CapsuleRestore evidence binding requires an authoritative version-6 "
+        "CapsuleRestore evidence binding requires an authoritative version-7 "
         "turn receipt.");
   }
   ABSL_RETURN_IF_ERROR(
@@ -155,8 +157,125 @@ absl::Status ValidateAuthoritativeV6Receipt(
       IsZeroHash(receipt.agent_request_hash) ||
       IsZeroHash(receipt.agent_transcript_hash)) {
     return absl::InvalidArgumentError(
-        "Version-6 turn receipt is internally inconsistent at its projection, "
+        "Version-7 turn receipt is internally inconsistent at its projection, "
         "response, agent-request, or transcript boundary.");
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<std::vector<DPMAgentGenerationRequest::PrefillChunk>>
+ToAgentPrefillChunks(
+    const std::vector<CapsuleCanonicalPrefillChunkV2>& chunks) {
+  std::vector<DPMAgentGenerationRequest::PrefillChunk> converted;
+  converted.reserve(chunks.size());
+  for (const CapsuleCanonicalPrefillChunkV2& chunk : chunks) {
+    DPMAgentGenerationRequest::PrefillChunk converted_chunk;
+    switch (chunk.encoding) {
+      case CapsuleCanonicalPrefillChunkV2::Encoding::kUtf8Text:
+        converted_chunk.encoding =
+            DPMAgentGenerationRequest::PrefillChunk::Encoding::kUtf8Text;
+        converted_chunk.text = chunk.utf8_text;
+        break;
+      case CapsuleCanonicalPrefillChunkV2::Encoding::kExactTokenIds:
+        converted_chunk.encoding =
+            DPMAgentGenerationRequest::PrefillChunk::Encoding::kTokenIds;
+        converted_chunk.token_ids.reserve(chunk.token_ids.size());
+        for (int32_t token_id : chunk.token_ids) {
+          if (token_id < 0) {
+            return absl::DataLossError(
+                "CapsuleRestore exact physical plan contains a negative "
+                "canonical token ID.");
+          }
+          converted_chunk.token_ids.push_back(static_cast<int>(token_id));
+        }
+        break;
+      default:
+        return absl::DataLossError(
+            "CapsuleRestore exact physical plan contains an unknown chunk "
+            "encoding.");
+    }
+    converted.push_back(std::move(converted_chunk));
+  }
+  return converted;
+}
+
+absl::Status ValidateExactRestoreModelAffectingExecutionPlan(
+    const CapsuleRestoreEvidenceV3& restore_evidence,
+    const DPMSessionCheckpointArtifact& source_artifact,
+    const DPMTurnReceipt& restoring_receipt) {
+  const CapsuleRestorePlanV2& restore_plan = restore_evidence.plan;
+  const DPMSessionCheckpointDescriptor& source_descriptor =
+      source_artifact.descriptor;
+  if (restore_plan.prefill.mode !=
+          CapsulePrefillModeV2::kOwnPositionCapsuleDelta ||
+      restoring_receipt.agent_worker_prefill_mode !=
+          DPMCheckpointWorkerPrefillMode::kOwnPositionCapsuleDelta) {
+    return absl::FailedPreconditionError(
+        "Exact CapsuleRestore turn does not carry an own-position physical "
+        "delta plan.");
+  }
+
+  ABSL_ASSIGN_OR_RETURN(
+      std::vector<DPMAgentGenerationRequest::PrefillChunk> delta_chunks,
+      ToAgentPrefillChunks(restore_plan.prefill.canonical_chunks));
+  DPMAgentDeltaExecutionRequest delta_request{
+      .logical_agent_request_hash =
+          restore_plan.target_state.logical_agent_request_hash,
+      .correction_digest = restore_plan.target_state.correction_digest,
+      .restore_checkpoint_id = source_descriptor.descriptor_id,
+      .restored_response_event_index =
+          source_descriptor.response_event_index,
+      .restored_agent_transcript_hash =
+          source_descriptor.agent_transcript_hash,
+      .max_output_tokens = restore_plan.maximum_output_tokens,
+      .canonical_delta_prefill_chunks = std::move(delta_chunks),
+  };
+  ABSL_ASSIGN_OR_RETURN(
+      std::string canonical_delta_payload,
+      EncodeDPMAgentDeltaExecutionRequest(delta_request));
+
+  FreshWorkerExecutionPlan physical_plan;
+  physical_plan.prefill_mode =
+      FreshWorkerPrefillMode::kOwnPositionCapsuleDelta;
+  physical_plan.logical_replay_request_hash =
+      restoring_receipt.agent_replay_request_hash;
+  physical_plan.restore_checkpoint_id = source_descriptor.descriptor_id;
+  physical_plan.session_identity = source_descriptor.session_identity;
+  physical_plan.restore_durable_envelope_hash =
+      source_descriptor.envelope_hash;
+  physical_plan.restore_durable_envelope_size =
+      source_descriptor.envelope_size;
+  physical_plan.canonical_execution_payload =
+      std::move(canonical_delta_payload);
+  // Capture is a post-output transport policy and is deliberately excluded
+  // from FreshWorkerExecutionPlan::plan_hash. Reconstruct it anyway from the
+  // authoritative receipt, then require the separate authenticated run-zero
+  // provenance that proves a requested capture actually produced the
+  // checkpoint. The hash comparison below is intentionally and precisely the
+  // complete model-affecting plan contract, not a claim that the capture bit
+  // participates in that digest.
+  physical_plan.capture_producing_capsule =
+      restoring_receipt.session_checkpoint_id.has_value();
+  if (physical_plan.capture_producing_capsule !=
+          restoring_receipt.agent_exact_worker_checkpoint_provenance
+              .has_value() ||
+      (physical_plan.capture_producing_capsule &&
+       restoring_receipt.checkpoint_capture_origin !=
+           DPMCheckpointCaptureOrigin::kAuthenticatedFreshWorker)) {
+    return absl::FailedPreconditionError(
+        "Exact restoring receipt capture policy lacks its separate "
+        "authenticated run-zero checkpoint provenance.");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      physical_plan.plan_hash,
+      ComputeFreshWorkerExecutionPlanHash(physical_plan));
+  ABSL_RETURN_IF_ERROR(ValidateFreshWorkerExecutionPlan(physical_plan));
+  if (restoring_receipt.agent_physical_execution_plan_hash !=
+      physical_plan.plan_hash) {
+    return absl::FailedPreconditionError(
+        "Exact restoring receipt model-affecting physical plan is not "
+        "canonically derived from its logical replay request, source "
+        "checkpoint/envelope, and V3 delta payload.");
   }
   return absl::OkStatus();
 }
@@ -648,7 +767,8 @@ absl::Status ValidateCapsuleCaptureEvidenceV3CheckpointBinding(
   ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreAuthorityV2ForAdmission(
       current_authority, current_admission));
   ABSL_RETURN_IF_ERROR(ValidateDPMSessionCheckpointArtifact(artifact));
-  ABSL_RETURN_IF_ERROR(ValidateAuthoritativeV6Receipt(source_receipt));
+  ABSL_RETURN_IF_ERROR(
+      ValidateAuthoritativeCurrentReceipt(source_receipt));
   ABSL_RETURN_IF_ERROR(
       ValidateCapsuleCaptureEvidenceV3(capture_evidence));
   ABSL_RETURN_IF_ERROR(ValidateCaptureWithinCoverage(
@@ -793,7 +913,8 @@ absl::Status ValidateCapsuleRestoreEvidenceV3TurnBinding(
       ValidateCapsuleRestoreEvidenceV3SourceCheckpointBinding(
           restore_evidence, source_capture_evidence, source_artifact,
           source_receipt, current_authority, current_admission));
-  ABSL_RETURN_IF_ERROR(ValidateAuthoritativeV6Receipt(restoring_receipt));
+  ABSL_RETURN_IF_ERROR(
+      ValidateAuthoritativeCurrentReceipt(restoring_receipt));
   ABSL_RETURN_IF_ERROR(
       ValidateReceiptAuthority(restoring_receipt, current_authority));
   ABSL_RETURN_IF_ERROR(
@@ -808,6 +929,14 @@ absl::Status ValidateCapsuleRestoreEvidenceV3TurnBinding(
     return absl::FailedPreconditionError(
         "Restoring receipt does not carry the exact source checkpoint, "
         "source-capture evidence, and operation restore evidence IDs.");
+  }
+  if (source_artifact.descriptor.replay_mode !=
+          restoring_receipt.agent_replay_mode ||
+      source_receipt.agent_replay_mode !=
+          restoring_receipt.agent_replay_mode) {
+    return absl::FailedPreconditionError(
+        "CapsuleRestore cannot cross the CanonicalWinnerReplay and "
+        "ExactRegeneration authority lineages.");
   }
 
   ABSL_ASSIGN_OR_RETURN(
@@ -839,6 +968,9 @@ absl::Status ValidateCapsuleRestoreEvidenceV3TurnBinding(
             "Exact restoring receipt differs from the current profile or "
             "own-position worker prefill mode.");
       }
+      ABSL_RETURN_IF_ERROR(
+          ValidateExactRestoreModelAffectingExecutionPlan(
+              restore_evidence, source_artifact, restoring_receipt));
       break;
   }
 

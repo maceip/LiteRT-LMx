@@ -58,7 +58,8 @@ bool HasPostVersionThreeFields(const DPMTurnReceipt& receipt) {
          receipt.agent_prepared_prefill_work.has_value() ||
          receipt.published_checkpoint_capture.has_value() ||
          receipt.restored_checkpoint_capture_evidence_id.has_value() ||
-         receipt.agent_capsule_restore_evidence_id.has_value();
+         receipt.agent_capsule_restore_evidence_id.has_value() ||
+         receipt.agent_rematerialized_canonical_winner;
 }
 
 bool HasPostVersionFiveFields(const DPMTurnReceipt& receipt) {
@@ -66,6 +67,11 @@ bool HasPostVersionFiveFields(const DPMTurnReceipt& receipt) {
          receipt.published_checkpoint_capture.has_value() ||
          receipt.restored_checkpoint_capture_evidence_id.has_value() ||
          receipt.agent_capsule_restore_evidence_id.has_value();
+}
+
+bool HasCoverageV2ReceiptFields(uint32_t format_version) {
+  return format_version == DPMTurnReceipt::kCoverageV2FormatVersion ||
+         format_version == DPMTurnReceipt::kFormatVersion;
 }
 
 bool MatchesPreparedPrefillWorkHash(
@@ -100,6 +106,7 @@ absl::Status ValidateVersionedCapsuleRestoreProvenance(
       }
       return absl::OkStatus();
     case DPMTurnReceipt::kCoverageV1FormatVersion:
+    case DPMTurnReceipt::kCoverageV2FormatVersion:
     case DPMTurnReceipt::kFormatVersion: {
       const bool uses_capsule =
           receipt.restored_from_session_checkpoint_id.has_value() ||
@@ -128,6 +135,7 @@ absl::Status ValidateCoverageV2Evidence(const DPMTurnReceipt& receipt) {
             "evidence.");
       }
       return absl::OkStatus();
+    case DPMTurnReceipt::kCoverageV2FormatVersion:
     case DPMTurnReceipt::kFormatVersion:
       break;
     default:
@@ -293,15 +301,34 @@ absl::Status ValidateExactWorkerCheckpointProvenance(
 }
 
 absl::Status ValidateWinnerReplayReceipt(const DPMTurnReceipt& receipt) {
+  const bool is_published_live_winner =
+      !receipt.agent_reused_canonical_winner &&
+      !receipt.agent_rematerialized_canonical_winner &&
+      receipt.agent_producing_session_matched_output;
+  const bool is_catalog_only_winner =
+      receipt.agent_reused_canonical_winner &&
+      !receipt.agent_rematerialized_canonical_winner &&
+      !receipt.agent_producing_session_matched_output;
+  const bool is_rematerialized_catalog_winner =
+      receipt.agent_reused_canonical_winner &&
+      receipt.agent_rematerialized_canonical_winner &&
+      receipt.agent_producing_session_matched_output;
   if (receipt.agent_exact_profile_id.has_value() ||
       receipt.agent_exact_profile_admission_record_id.has_value() ||
       receipt.agent_exact_output_evidence_hash.has_value() ||
       receipt.agent_exact_logit_frame_count != 0 ||
-      receipt.agent_producing_session_matched_output ==
-          receipt.agent_reused_canonical_winner) {
+      (!is_published_live_winner && !is_catalog_only_winner &&
+       !is_rematerialized_catalog_winner)) {
     return absl::InvalidArgumentError(
         "WinnerReplay agent receipt contains exact evidence or invalid "
         "live-parent producing-session provenance.");
+  }
+
+  if (receipt.format_version != DPMTurnReceipt::kFormatVersion &&
+      receipt.agent_rematerialized_canonical_winner) {
+    return absl::InvalidArgumentError(
+        "DPM receipt versions before 7 cannot claim explicit catalog "
+        "rematerialization provenance.");
   }
 
   if (receipt.format_version == DPMTurnReceipt::kLegacyFormatVersion) {
@@ -328,7 +355,7 @@ absl::Status ValidateWinnerReplayReceipt(const DPMTurnReceipt& receipt) {
         "Version 4 WinnerReplay receipts cannot claim CapsuleRestore "
         "admission.");
   }
-  if (receipt.format_version == DPMTurnReceipt::kFormatVersion &&
+  if (HasCoverageV2ReceiptFields(receipt.format_version) &&
       receipt.agent_prepared_prefill_work.has_value() !=
           receipt.agent_producing_session_matched_output) {
     return absl::InvalidArgumentError(
@@ -370,6 +397,7 @@ absl::Status ValidateExactRegenerationReceipt(
       receipt.agent_exact_logit_frame_count !=
           receipt.decision_token_ids.size() ||
       receipt.agent_reused_canonical_winner ||
+      receipt.agent_rematerialized_canonical_winner ||
       receipt.agent_producing_session_matched_output) {
     return absl::InvalidArgumentError(
         "ExactRegeneration agent receipt is missing ordered output, profile, "
@@ -391,7 +419,7 @@ absl::Status ValidateExactRegenerationReceipt(
     return absl::InvalidArgumentError(
         "ExactRegeneration receipt is missing its physical execution plan.");
   }
-  if (receipt.format_version == DPMTurnReceipt::kFormatVersion &&
+  if (HasCoverageV2ReceiptFields(receipt.format_version) &&
       !receipt.agent_prepared_prefill_work.has_value()) {
     return absl::InvalidArgumentError(
         "Version 6 ExactRegeneration receipt is missing its runtime-derived "
@@ -416,7 +444,7 @@ absl::Status ValidateExactRegenerationReceipt(
             "Full-prefill ExactRegeneration receipt cannot claim a restored "
             "checkpoint.");
       }
-      if (receipt.format_version == DPMTurnReceipt::kFormatVersion &&
+      if (HasCoverageV2ReceiptFields(receipt.format_version) &&
           receipt.agent_prepared_prefill_work->start_kind !=
               DPMPreparedPrefillStartKind::kFreshSession) {
         return absl::InvalidArgumentError(
@@ -429,7 +457,7 @@ absl::Status ValidateExactRegenerationReceipt(
             "Delta ExactRegeneration receipt must name its own-position "
             "restored checkpoint.");
       }
-      if (receipt.format_version == DPMTurnReceipt::kFormatVersion &&
+      if (HasCoverageV2ReceiptFields(receipt.format_version) &&
           receipt.agent_prepared_prefill_work->start_kind !=
               DPMPreparedPrefillStartKind::kOwnPositionRestore) {
         return absl::InvalidArgumentError(
@@ -487,6 +515,7 @@ absl::Status ValidateDPMTurnReceiptReplayEvidence(
     case DPMTurnReceipt::kLegacyFormatVersion:
     case DPMTurnReceipt::kPreviousFormatVersion:
     case DPMTurnReceipt::kCoverageV1FormatVersion:
+    case DPMTurnReceipt::kCoverageV2FormatVersion:
     case DPMTurnReceipt::kFormatVersion:
       break;
     default:
@@ -536,6 +565,7 @@ absl::Status ValidateDPMTurnReceiptReplayEvidence(
   }
   if (receipt.format_version == DPMTurnReceipt::kPreviousFormatVersion ||
       receipt.format_version == DPMTurnReceipt::kCoverageV1FormatVersion ||
+      receipt.format_version == DPMTurnReceipt::kCoverageV2FormatVersion ||
       receipt.format_version == DPMTurnReceipt::kFormatVersion) {
     ABSL_RETURN_IF_ERROR(
         ValidateCaptureOrigin(receipt.checkpoint_capture_origin));

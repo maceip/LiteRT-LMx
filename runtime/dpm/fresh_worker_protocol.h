@@ -15,6 +15,7 @@
 #ifndef THIRD_PARTY_ODML_LITERT_LM_RUNTIME_DPM_FRESH_WORKER_PROTOCOL_H_
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_DPM_FRESH_WORKER_PROTOCOL_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -45,6 +46,7 @@ inline constexpr uint32_t kMaximumFreshWorkerLogitFrames = 1'000'000;
 inline constexpr uint32_t kMaximumFreshWorkerTokenIds = 1'000'000;
 inline constexpr uint64_t kMaximumFreshWorkerEnvelopeBytes =
     uint64_t{128} * 1024 * 1024;
+inline constexpr size_t kMaximumFreshWorkerAuthenticationKeyBytes = 4096;
 
 // Caller-owned authentication material. The public key ID is serialized for
 // rotation and lookup. The secret authentication key is never serialized in a
