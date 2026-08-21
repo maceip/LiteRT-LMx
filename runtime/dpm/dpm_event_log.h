@@ -25,6 +25,7 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "runtime/dpm/dpm_projection_manifest.h"
 #include "runtime/dpm/dpm_replay_mode.h"
+#include "runtime/dpm/session_checkpoint.h"
 #include "runtime/engine/session_handoff.h"
 #include "runtime/platform/hash/hasher.h"
 
@@ -48,7 +49,8 @@ inline constexpr size_t kMaximumDPMCanonicalAgentInputBytes =
 // The raw event log is the authority for a DPM session. Session checkpoints,
 // projections, and manifests are disposable derivatives of these events.
 struct DPMTurnReceipt {
-  static constexpr uint32_t kFormatVersion = 3;
+  static constexpr uint32_t kLegacyFormatVersion = 3;
+  static constexpr uint32_t kFormatVersion = 4;
 
   uint32_t format_version = kFormatVersion;
   std::string operation_id;
@@ -69,6 +71,9 @@ struct DPMTurnReceipt {
   DPMReplayMode agent_replay_mode =
       DPMReplayMode::kCanonicalWinnerReplay;
   Hash256 agent_replay_request_hash;
+  // WinnerReplay stores the authenticated catalog execution evidence. For
+  // ExactRegeneration this is exclusively the request-scoped N-process
+  // evidence ID, never the reusable profile-admission record ID.
   Hash256 agent_execution_evidence_hash;
   std::optional<Hash256> agent_exact_profile_id;
   std::optional<Hash256> agent_exact_profile_admission_record_id;
@@ -95,6 +100,41 @@ struct DPMTurnReceipt {
   // Content address of the automatically captured producing session. Empty
   // means the checkpoint policy did not select this turn.
   std::optional<Hash256> session_checkpoint_id;
+
+  // Version 4 physical-execution and checkpoint provenance. These fields are
+  // deliberately appended to the version 3 durable encoding so an existing
+  // version 3 receipt retains byte-for-byte canonical serialization.
+  //
+  // restored_from_session_checkpoint_id names an older, already-published
+  // own-position capsule consumed before this turn. It is independent of
+  // session_checkpoint_id: a turn can restore without capturing a new
+  // checkpoint, capture after a full prefill, or restore and capture.
+  std::optional<Hash256> restored_from_session_checkpoint_id;
+
+  // A checkpoint captured by WinnerReplay is produced by the live parent
+  // session. ExactRegeneration may capture only the authenticated run-zero
+  // fresh worker. kNone is canonical when no new checkpoint was published.
+  DPMCheckpointCaptureOrigin checkpoint_capture_origin =
+      DPMCheckpointCaptureOrigin::kNone;
+
+  // ExactRegeneration records the complete physical plan selected for every
+  // independent worker. WinnerReplay and legacy receipts use kNone plus the
+  // all-zero hash. A delta plan requires restored_from_session_checkpoint_id.
+  DPMCheckpointWorkerPrefillMode agent_worker_prefill_mode =
+      DPMCheckpointWorkerPrefillMode::kNone;
+  Hash256 agent_physical_execution_plan_hash;
+
+  // CapsuleRestore admission is separate from exact-profile admission. It is
+  // required whenever ExactRegeneration consumes or publishes a capsule and
+  // absent from WinnerReplay and legacy receipts.
+  std::optional<Hash256> agent_capsule_restore_admission_record_id;
+
+  // Authenticated transient-capsule provenance for an exact checkpoint. The
+  // durable checkpoint descriptor binds the later rewrap, keeping the
+  // direction acyclic: request -> worker result -> transient capsule ->
+  // durable descriptor -> receipt.
+  std::optional<DPMExactWorkerCheckpointProvenance>
+      agent_exact_worker_checkpoint_provenance;
 };
 
 struct DPMEvent {
