@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -26,8 +27,10 @@
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
+#include "runtime/dpm/capsule_restore_evidence.h"
 #include "runtime/dpm/dpm_engine.h"
 #include "runtime/dpm/dpm_prepared_prefill_runtime.h"
+#include "runtime/dpm/fresh_worker_process.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
@@ -189,6 +192,308 @@ bool HasSameStateWitnessAdmissionAuthority(
          lhs.operational_coverage == rhs.operational_coverage &&
          lhs.record.operational_coverage == lhs.operational_coverage &&
          rhs.record.operational_coverage == rhs.operational_coverage;
+}
+
+CapsuleRestoreAuthorityV2 MakeCapsuleRestoreAuthorityV2(
+    const AuthenticatedCapsuleRestoreStateWitnessAdmission& admission) {
+  // `qualification_spec_hash` is the legacy V2 evidence-schema field name.
+  // Coverage V2 has no caller-supplied qualification specification, so this
+  // position binds the authenticated aggregate qualification-evidence hash.
+  return CapsuleRestoreAuthorityV2{
+      .capability = admission.capability,
+      .admission_record_id = admission.record.record_id,
+      .coverage_id = admission.operational_coverage.coverage_id,
+      .qualification_spec_hash =
+          admission.operational_coverage.qualification_evidence_hash,
+  };
+}
+
+absl::StatusOr<std::vector<CapsuleCanonicalPrefillChunkV2>>
+ConvertCapsuleCanonicalPrefillChunksV2(
+    const std::vector<DPMAgentGenerationRequest::PrefillChunk>& chunks) {
+  std::vector<CapsuleCanonicalPrefillChunkV2> converted;
+  converted.reserve(chunks.size());
+  for (const DPMAgentGenerationRequest::PrefillChunk& chunk : chunks) {
+    CapsuleCanonicalPrefillChunkV2 canonical;
+    switch (chunk.encoding) {
+      case DPMAgentGenerationRequest::PrefillChunk::Encoding::kUtf8Text:
+        if (!chunk.token_ids.empty()) {
+          return absl::InvalidArgumentError(
+              "CapsuleRestore text chunk also contains exact token IDs.");
+        }
+        canonical.encoding =
+            CapsuleCanonicalPrefillChunkV2::Encoding::kUtf8Text;
+        canonical.utf8_text = chunk.text;
+        break;
+      case DPMAgentGenerationRequest::PrefillChunk::Encoding::kTokenIds:
+        if (!chunk.text.empty()) {
+          return absl::InvalidArgumentError(
+              "CapsuleRestore token chunk also contains UTF-8 text.");
+        }
+        canonical.encoding =
+            CapsuleCanonicalPrefillChunkV2::Encoding::kExactTokenIds;
+        canonical.token_ids.reserve(chunk.token_ids.size());
+        for (int token_id : chunk.token_ids) {
+          if (token_id < 0 ||
+              static_cast<int64_t>(token_id) >
+                  (std::numeric_limits<int32_t>::max)()) {
+            return absl::InvalidArgumentError(
+                "CapsuleRestore chunk contains a non-int32 token ID.");
+          }
+          canonical.token_ids.push_back(static_cast<int32_t>(token_id));
+        }
+        break;
+      default:
+        return absl::InvalidArgumentError(
+            "CapsuleRestore chunk has an unknown encoding.");
+    }
+    converted.push_back(std::move(canonical));
+  }
+  ABSL_RETURN_IF_ERROR(
+      ValidateCapsuleCanonicalPrefillChunksV2(converted));
+  return converted;
+}
+
+absl::Status ValidateCapsuleRestoreOperationInputsV3(
+    const DPMAgentCapsuleRestoreOperationV3& operation,
+    const Hash256& restore_checkpoint_id,
+    const SessionContinuationStateWitness& restored_state_witness,
+    const Hash256& logical_agent_request_hash, int max_output_tokens,
+    const AuthenticatedCapsuleRestoreStateWitnessAdmission& admission) {
+  if (operation.format_version !=
+      DPMAgentCapsuleRestoreOperationV3::kFormatVersion) {
+    return absl::FailedPreconditionError(
+        "CapsuleRestore operation version is unsupported.");
+  }
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleCaptureEvidenceV3(
+      operation.source_capture_evidence));
+  ABSL_RETURN_IF_ERROR(ValidateSessionContinuationStateWitness(
+      restored_state_witness));
+  ABSL_RETURN_IF_ERROR(ValidateSessionHandoffReauthenticationEvidence(
+      operation.durable_to_transient_reauthentication));
+
+  const CapsuleRestoreAuthorityV2 expected_authority =
+      MakeCapsuleRestoreAuthorityV2(admission);
+  const CapsuleCaptureEvidenceV3& source =
+      operation.source_capture_evidence;
+  const CapsuleRestoreStateWitnessOperationalDomain& domain =
+      admission.operational_coverage.operational_domain;
+  if (operation.current_authority != expected_authority ||
+      source.plan.authority != expected_authority) {
+    return absl::FailedPreconditionError(
+        "CapsuleRestore operation or source capture differs from the freshly "
+        "reauthenticated loaded-Engine authority.");
+  }
+  if (restore_checkpoint_id == Hash256{} ||
+      source.checkpoint_id != restore_checkpoint_id ||
+      source.plan.checkpoint_authentication_key_id !=
+          domain.checkpoint_authentication_key_id ||
+      source.checkpoint_authentication_key_id !=
+          domain.checkpoint_authentication_key_id) {
+    return absl::FailedPreconditionError(
+        "CapsuleRestore operation names another checkpoint or durable "
+        "authentication domain.");
+  }
+
+  const SessionHandoffReauthenticationEvidence& reauthentication =
+      operation.durable_to_transient_reauthentication;
+  if (reauthentication.session_identity !=
+          expected_authority.capability.session_identity ||
+      reauthentication.source_envelope_hash !=
+          source.checkpoint_envelope_hash ||
+      reauthentication.source_envelope_size !=
+          source.checkpoint_envelope_size ||
+      reauthentication.source_key_id !=
+          source.checkpoint_authentication_key_id ||
+      reauthentication.destination_envelope_hash !=
+          restored_state_witness.envelope_hash ||
+      reauthentication.destination_envelope_size !=
+          restored_state_witness.envelope_size ||
+      reauthentication.destination_key_id != restored_state_witness.key_id ||
+      reauthentication.destination_key_id !=
+          kFreshWorkerTransientRestoreKeyId ||
+      reauthentication.purpose !=
+          kFreshWorkerDurableRestoreToTransientReauthenticationPurpose ||
+      reauthentication.capsule_codec_contract_hash !=
+          expected_authority.capability.capsule_codec_contract_hash ||
+      reauthentication.canonical_continuation_state_hash !=
+          source.transient_to_durable_reauthentication
+              .canonical_continuation_state_hash) {
+    return absl::FailedPreconditionError(
+        "CapsuleRestore operation does not bind the durable source endpoint "
+        "to the transient envelope imported by the live target.");
+  }
+  if (restored_state_witness.session_identity !=
+          expected_authority.capability.session_identity ||
+      restored_state_witness.phase != SessionHandoffPhase::kDecoded ||
+      !restored_state_witness.ran_decode ||
+      restored_state_witness.current_step <= 0 ||
+      static_cast<uint64_t>(restored_state_witness.current_step) !=
+          source.plan.capture_end_step ||
+      restored_state_witness.processed_history_token_bytes_hash !=
+          source.checkpoint_history_token_bytes_hash) {
+    return absl::FailedPreconditionError(
+        "CapsuleRestore transient target witness differs from the source "
+        "capture's decoded own-position state.");
+  }
+
+  const CapsuleDPMRestoreTargetV2& target = operation.target_state;
+  const CapsuleDPMCheckpointStateV2& checkpoint =
+      source.plan.checkpoint_state;
+  if (target.log_id.empty() || target.source_event_count == 0 ||
+      target.prospective_response_event_index != target.source_event_count ||
+      target.source_prefix_hash == Hash256{} ||
+      target.projection_request_hash == Hash256{} ||
+      target.projection_manifest_hash == Hash256{} ||
+      target.correction_digest == Hash256{} ||
+      target.agent_transcript_prefix_hash == Hash256{} ||
+      target.logical_agent_request_hash != logical_agent_request_hash ||
+      target.log_id != checkpoint.log_id ||
+      target.correction_digest != checkpoint.correction_digest ||
+      target.source_event_count <= checkpoint.response_event_index ||
+      target.source_prefix_hash == checkpoint.source_prefix_hash ||
+      checkpoint.response_event_index ==
+          (std::numeric_limits<uint64_t>::max)()) {
+    return absl::FailedPreconditionError(
+        "CapsuleRestore target does not describe the authoritative current "
+        "same-epoch logical request after the source checkpoint.");
+  }
+  if (max_output_tokens <= 0 ||
+      static_cast<uint64_t>(max_output_tokens) >
+          domain.maximum_output_tokens) {
+    return absl::FailedPreconditionError(
+        "CapsuleRestore output limit is outside the current authenticated "
+        "Coverage V2 domain.");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateCapsuleRestorePreparedShapeV3(
+    const std::vector<CapsuleCanonicalPrefillChunkV2>& chunks,
+    const DPMPreparedPrefillPlan& prepared,
+    const AuthenticatedCapsuleRestoreStateWitnessAdmission& admission,
+    int max_output_tokens) {
+  const CapsuleRestoreStateWitnessOperationalDomain& domain =
+      admission.operational_coverage.operational_domain;
+  uint64_t text_bytes = 0;
+  uint64_t token_ids = 0;
+  uint32_t encoding_mask = 0;
+  for (const CapsuleCanonicalPrefillChunkV2& chunk : chunks) {
+    switch (chunk.encoding) {
+      case CapsuleCanonicalPrefillChunkV2::Encoding::kUtf8Text:
+        if (chunk.utf8_text.size() >
+            domain.maximum_prefill_text_bytes - text_bytes) {
+          return absl::FailedPreconditionError(
+              "CapsuleRestore delta text exceeds its admitted domain.");
+        }
+        text_bytes += chunk.utf8_text.size();
+        encoding_mask |= CapsuleRestoreStateWitnessEncodingBit(
+            CapsuleRestoreStateWitnessEncoding::kUtf8Text);
+        break;
+      case CapsuleCanonicalPrefillChunkV2::Encoding::kExactTokenIds:
+        if (chunk.token_ids.size() >
+            domain.maximum_prefill_token_ids - token_ids) {
+          return absl::FailedPreconditionError(
+              "CapsuleRestore delta token input exceeds its admitted "
+              "domain.");
+        }
+        token_ids += chunk.token_ids.size();
+        encoding_mask |= CapsuleRestoreStateWitnessEncodingBit(
+            CapsuleRestoreStateWitnessEncoding::kExactTokenIds);
+        break;
+    }
+  }
+  if (chunks.size() < domain.minimum_prefill_chunks ||
+      chunks.size() > domain.maximum_prefill_chunks ||
+      encoding_mask == 0 ||
+      (encoding_mask & ~domain.admitted_encoding_mask) != 0 ||
+      prepared.start_step < domain.minimum_checkpoint_step ||
+      prepared.start_step > domain.maximum_checkpoint_step ||
+      prepared.end_step <= prepared.start_step) {
+    return absl::FailedPreconditionError(
+        "CapsuleRestore prepared delta is outside its authenticated chunk, "
+        "encoding, checkpoint, or position domain.");
+  }
+  const uint64_t delta_positions = prepared.end_step - prepared.start_step;
+  const uint64_t output_tokens =
+      static_cast<uint64_t>(max_output_tokens);
+  if (delta_positions < domain.minimum_delta_positions ||
+      delta_positions > domain.maximum_delta_positions ||
+      prepared.end_step > domain.maximum_context_positions ||
+      output_tokens > domain.maximum_context_positions ||
+      prepared.end_step >
+          domain.maximum_context_positions - output_tokens ||
+      prepared.start_step >
+          (std::numeric_limits<uint32_t>::max)() ||
+      prepared.end_step > (std::numeric_limits<uint32_t>::max)()) {
+    return absl::FailedPreconditionError(
+        "CapsuleRestore prepared delta or requested decode exceeds its "
+        "authenticated shape or context bound.");
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<CapsuleRestoreEvidenceV3>
+BuildAndValidateCapsuleRestoreEvidenceV3(
+    const DPMAgentCapsuleRestoreOperationV3& operation,
+    const Hash256& restore_checkpoint_id,
+    const SessionContinuationStateWitness& restored_state_witness,
+    const std::vector<CapsuleCanonicalPrefillChunkV2>& canonical_chunks,
+    DPMPreparedPrefillPlan prepared_prefill_plan, int max_output_tokens) {
+  const CapsuleCaptureEvidenceV3& source =
+      operation.source_capture_evidence;
+
+  CapsulePrefillPlanV2 capsule_prefill;
+  capsule_prefill.mode =
+      CapsulePrefillModeV2::kOwnPositionCapsuleDelta;
+  capsule_prefill.event_range_start =
+      source.plan.checkpoint_state.response_event_index + 1;
+  capsule_prefill.event_range_end = operation.target_state.source_event_count;
+  capsule_prefill.start_step =
+      static_cast<uint32_t>(prepared_prefill_plan.start_step);
+  capsule_prefill.end_step =
+      static_cast<uint32_t>(prepared_prefill_plan.end_step);
+  capsule_prefill.canonical_chunks = canonical_chunks;
+  ABSL_ASSIGN_OR_RETURN(
+      capsule_prefill.canonical_delta_chunks_hash,
+      ComputeCapsuleCanonicalDeltaChunksHashV2(canonical_chunks));
+  capsule_prefill.prepared_plan = std::move(prepared_prefill_plan);
+  ABSL_RETURN_IF_ERROR(ValidateCapsulePrefillPlanV2(capsule_prefill));
+
+  CapsuleRestorePlanV2 restore_plan;
+  restore_plan.authority = operation.current_authority;
+  restore_plan.source_capture_plan_hash = source.plan.plan_hash;
+  restore_plan.source_capture_evidence_id = source.evidence_id;
+  restore_plan.checkpoint_id = restore_checkpoint_id;
+  restore_plan.checkpoint_state = source.plan.checkpoint_state;
+  restore_plan.checkpoint_envelope_hash = source.checkpoint_envelope_hash;
+  restore_plan.checkpoint_envelope_size = source.checkpoint_envelope_size;
+  restore_plan.checkpoint_authentication_key_id =
+      source.checkpoint_authentication_key_id;
+  restore_plan.checkpoint_step = source.plan.capture_end_step;
+  restore_plan.checkpoint_history_token_bytes_hash =
+      source.checkpoint_history_token_bytes_hash;
+  restore_plan.target_state = operation.target_state;
+  restore_plan.prefill = std::move(capsule_prefill);
+  restore_plan.maximum_output_tokens =
+      static_cast<uint32_t>(max_output_tokens);
+  ABSL_ASSIGN_OR_RETURN(restore_plan.plan_hash,
+                        ComputeCapsuleRestorePlanV2Hash(restore_plan));
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestorePlanV2(restore_plan));
+
+  CapsuleRestoreEvidenceV3 restore_evidence;
+  restore_evidence.plan = std::move(restore_plan);
+  restore_evidence.durable_to_transient_reauthentication =
+      operation.durable_to_transient_reauthentication;
+  restore_evidence.target_post_import = restored_state_witness;
+  ABSL_ASSIGN_OR_RETURN(
+      restore_evidence.evidence_id,
+      ComputeCapsuleRestoreEvidenceV3Id(restore_evidence));
+  ABSL_RETURN_IF_ERROR(
+      ValidateCapsuleRestoreEvidenceV3(restore_evidence));
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreEvidenceV3ForSourceCapture(
+      restore_evidence, source));
+  return restore_evidence;
 }
 
 }  // namespace
@@ -754,6 +1059,24 @@ absl::StatusOr<DPMAgentGenerationOutcome> EngineDPMAgentRuntime::Generate(
         "witness.");
   }
 
+  const bool is_restore = request.restore_checkpoint_id.has_value();
+  const bool has_v1_authority = capsule_restore_admission_.has_value();
+  const bool has_v2_authority =
+      capsule_restore_state_witness_admission_.has_value();
+  const bool has_v3_operation =
+      request.capsule_restore_operation_v3.has_value();
+  if (has_v3_operation != (has_v2_authority && is_restore)) {
+    return absl::InvalidArgumentError(
+        "Coverage V2 restore operation evidence is required exactly for a "
+        "restore-shaped request on a Coverage V2-bound runtime and is "
+        "forbidden for fresh, Coverage V1, or generation-only requests.");
+  }
+  if (has_v1_authority && has_v2_authority) {
+    return absl::InternalError(
+        "DPM agent runtime contains mutually exclusive Coverage V1 and V2 "
+        "authorities.");
+  }
+
   std::optional<AuthenticatedCapsuleRestoreStateWitnessAdmission>
       state_witness_operation_authority;
   if (capsule_restore_state_witness_admission_.has_value()) {
@@ -763,37 +1086,44 @@ absl::StatusOr<DPMAgentGenerationOutcome> EngineDPMAgentRuntime::Generate(
   }
 
   std::optional<AuthenticatedCapsuleRestoreAdmission> restore_admission;
-  if (request.restore_checkpoint_id.has_value()) {
+  std::optional<std::vector<CapsuleCanonicalPrefillChunkV2>>
+      capsule_canonical_chunks;
+  if (is_restore) {
     if (state_witness_operation_authority.has_value()) {
-      return absl::FailedPreconditionError(
-          "CapsuleRestore Coverage V2 cannot authorize restore-shaped "
-          "generation without the operation's authenticated source-capture "
-          "and restore evidence.");
-    }
-    if (!capsule_restore_admission_.has_value()) {
+      ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreOperationInputsV3(
+          *request.capsule_restore_operation_v3,
+          *request.restore_checkpoint_id, *request.restored_state_witness,
+          request.logical_agent_request_hash, request.max_output_tokens,
+          *state_witness_operation_authority));
+      ABSL_ASSIGN_OR_RETURN(
+          capsule_canonical_chunks,
+          ConvertCapsuleCanonicalPrefillChunksV2(
+              request.canonical_prefill_chunks));
+    } else if (!has_v1_authority) {
       return absl::FailedPreconditionError(
           "DPM agent restore-shaped generation requires an authenticated "
           "CapsuleRestore admission binding.");
-    }
-    ABSL_ASSIGN_OR_RETURN(restore_admission,
-                          ResolveCurrentCapsuleRestoreAdmission());
-    const SessionContinuationStateWitness& witness =
-        *request.restored_state_witness;
-    const CapsuleRestoreOperationalCoverage& coverage =
-        restore_admission->operational_coverage;
-    if (restore_admission->capability.session_identity !=
-            session_handoff_identity_ ||
-        witness.session_identity != session_handoff_identity_ ||
-        witness.current_step <= 0 ||
-        static_cast<uint64_t>(witness.current_step) !=
-            coverage.checkpoint_step ||
-        witness.processed_history_token_bytes_hash !=
-            coverage.checkpoint_history_token_bytes_hash ||
-        witness.envelope_size != coverage.checkpoint_envelope_size ||
-        witness.key_id != coverage.checkpoint_authentication_key_id) {
-      return absl::FailedPreconditionError(
-          "DPM agent restore witness is outside the reauthenticated "
-          "CapsuleRestore coverage.");
+    } else {
+      ABSL_ASSIGN_OR_RETURN(restore_admission,
+                            ResolveCurrentCapsuleRestoreAdmission());
+      const SessionContinuationStateWitness& witness =
+          *request.restored_state_witness;
+      const CapsuleRestoreOperationalCoverage& coverage =
+          restore_admission->operational_coverage;
+      if (restore_admission->capability.session_identity !=
+              session_handoff_identity_ ||
+          witness.session_identity != session_handoff_identity_ ||
+          witness.current_step <= 0 ||
+          static_cast<uint64_t>(witness.current_step) !=
+              coverage.checkpoint_step ||
+          witness.processed_history_token_bytes_hash !=
+              coverage.checkpoint_history_token_bytes_hash ||
+          witness.envelope_size != coverage.checkpoint_envelope_size ||
+          witness.key_id != coverage.checkpoint_authentication_key_id) {
+        return absl::FailedPreconditionError(
+            "DPM agent restore witness is outside the reauthenticated "
+            "CapsuleRestore coverage.");
+      }
     }
   }
 
@@ -808,6 +1138,36 @@ absl::StatusOr<DPMAgentGenerationOutcome> EngineDPMAgentRuntime::Generate(
       PrepareDPMEnginePrefillPlan(
           engine_, session, request.canonical_prefill_chunks,
           request.logical_agent_request_hash, start));
+
+  std::optional<CapsuleRestoreEvidenceV3> capsule_restore_evidence_v3;
+  if (state_witness_operation_authority.has_value() && is_restore) {
+    ABSL_RETURN_IF_ERROR(ValidateCapsuleRestorePreparedShapeV3(
+        *capsule_canonical_chunks, prepared_prefill_plan,
+        *state_witness_operation_authority, request.max_output_tokens));
+    ABSL_ASSIGN_OR_RETURN(
+        capsule_restore_evidence_v3,
+        BuildAndValidateCapsuleRestoreEvidenceV3(
+            *request.capsule_restore_operation_v3,
+            *request.restore_checkpoint_id,
+            *request.restored_state_witness, *capsule_canonical_chunks,
+            prepared_prefill_plan, request.max_output_tokens));
+    ABSL_ASSIGN_OR_RETURN(
+        const AuthenticatedCapsuleRestoreStateWitnessAdmission
+            before_execute_authority,
+        ResolveCurrentCapsuleRestoreStateWitnessAdmission());
+    if (!HasSameStateWitnessAdmissionAuthority(
+            before_execute_authority,
+            *state_witness_operation_authority) ||
+        MakeCapsuleRestoreAuthorityV2(before_execute_authority) !=
+            request.capsule_restore_operation_v3->current_authority) {
+      return absl::AbortedError(
+          "CapsuleRestore Coverage V2 authority changed while preparing the "
+          "operation gate.");
+    }
+  }
+
+  // Every Coverage V2 capture/authority/endpoint/target/shape join above is
+  // complete before the first model-visible prefill call executes.
   ABSL_RETURN_IF_ERROR(ExecuteDPMEnginePrefillPlan(
       session, prepared_prefill_plan, request.restored_state_witness));
 
@@ -897,7 +1257,10 @@ absl::StatusOr<DPMAgentGenerationOutcome> EngineDPMAgentRuntime::Generate(
         const AuthenticatedCapsuleRestoreStateWitnessAdmission current,
         ResolveCurrentCapsuleRestoreStateWitnessAdmission());
     if (!HasSameStateWitnessAdmissionAuthority(
-            current, *state_witness_operation_authority)) {
+            current, *state_witness_operation_authority) ||
+        (capsule_restore_evidence_v3.has_value() &&
+         MakeCapsuleRestoreAuthorityV2(current) !=
+             request.capsule_restore_operation_v3->current_authority)) {
       return absl::AbortedError(
           "CapsuleRestore Coverage V2 authority changed during DPM "
           "generation.");
@@ -910,6 +1273,8 @@ absl::StatusOr<DPMAgentGenerationOutcome> EngineDPMAgentRuntime::Generate(
       .decision_output = responses.GetTexts()[0],
       .decision_token_ids = std::move(decision_token_ids),
       .prepared_prefill_plan = std::move(prepared_prefill_plan),
+      .capsule_restore_evidence_v3 =
+          std::move(capsule_restore_evidence_v3),
   };
 }
 

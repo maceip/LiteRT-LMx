@@ -26,6 +26,7 @@
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
 #include "runtime/dpm/capsule_restore_admission.h"
+#include "runtime/dpm/capsule_restore_evidence.h"
 #include "runtime/dpm/dpm_event_log.h"
 #include "runtime/dpm/dpm_capabilities.h"
 #include "runtime/dpm/dpm_prepared_prefill_plan.h"
@@ -65,6 +66,25 @@ struct DPMProjectionOutcome {
   // digest invalidates a session checkpoint even when model/runtime identity
   // remains compatible.
   DPMProjectionManifest manifest;
+};
+
+// Complete per-operation authorization for one Coverage V2 own-position
+// restore. The authenticated source capture proves the durable checkpoint's
+// provenance; current_authority must equal the authority freshly resolved from
+// the loaded Engine; target_state is derived by DPMEngine from the current
+// authoritative raw-log request; and the reauthentication evidence proves the
+// exact durable envelope was rewrapped into the transient envelope imported by
+// the live target. No individual hash in this object authorizes restoration.
+struct DPMAgentCapsuleRestoreOperationV3 {
+  static constexpr uint32_t kFormatVersion =
+      kCapsuleRestoreEvidenceV3FormatVersion;
+
+  uint32_t format_version = kFormatVersion;
+  CapsuleCaptureEvidenceV3 source_capture_evidence;
+  CapsuleRestoreAuthorityV2 current_authority;
+  CapsuleDPMRestoreTargetV2 target_state;
+  SessionHandoffReauthenticationEvidence
+      durable_to_transient_reauthentication;
 };
 
 // Projection is an explicit dependency. Production providers must treat the
@@ -128,6 +148,11 @@ struct DPMAgentGenerationRequest {
   // cannot authorize delta prefill.
   std::optional<Hash256> restore_checkpoint_id;
   std::optional<SessionContinuationStateWitness> restored_state_witness;
+  // Required exactly when a Coverage V2-bound runtime receives the restore
+  // fields above. It is forbidden for fresh generation and for Coverage V1 or
+  // generation-only runtimes.
+  std::optional<DPMAgentCapsuleRestoreOperationV3>
+      capsule_restore_operation_v3;
   int max_output_tokens = 512;
 };
 
@@ -137,6 +162,10 @@ struct DPMAgentGenerationOutcome {
   // Present for a direct live-runtime generation. Catalog-only materialization
   // has no physical session and therefore no prepared plan.
   std::optional<DPMPreparedPrefillPlan> prepared_prefill_plan;
+  // Present exactly when this live invocation passed and executed a Coverage
+  // V2 own-position restore operation. This is the same complete canonical
+  // evidence validated before prefill, not a reconstructed post-hoc label.
+  std::optional<CapsuleRestoreEvidenceV3> capsule_restore_evidence_v3;
 };
 
 class DPMAgentRuntime {
