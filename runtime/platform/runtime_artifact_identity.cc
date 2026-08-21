@@ -41,6 +41,7 @@
 #include <mach-o/loader.h>
 #include <mach/vm_prot.h>
 #include <sys/sysctl.h>
+#include "runtime/platform/apple_metal_identity.h"
 #endif
 
 namespace litert::lm {
@@ -963,6 +964,60 @@ absl::StatusOr<std::vector<Hash256>> MeasureRelevantImages(
       "Loaded runtime image set changed during identity measurement.");
 }
 
+absl::StatusOr<Hash256> MeasureImageContainingAnchor(uintptr_t code_anchor) {
+  if (code_anchor == 0) {
+    return absl::FailedPreconditionError(
+        "Cannot measure a zero loaded-image code anchor.");
+  }
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    const uint32_t image_count = ::_dyld_image_count();
+    std::vector<const mach_header*> image_headers;
+    std::vector<std::string> image_names;
+    image_headers.reserve(image_count);
+    image_names.reserve(image_count);
+    std::optional<Hash256> anchored_digest;
+    for (uint32_t index = 0; index < image_count; ++index) {
+      const mach_header* image_header = ::_dyld_get_image_header(index);
+      const char* image_name = ::_dyld_get_image_name(index);
+      if (image_header == nullptr || image_name == nullptr ||
+          image_name[0] == '\0') {
+        return absl::FailedPreconditionError(
+            "dyld reported incomplete anchored-image evidence.");
+      }
+      image_headers.push_back(image_header);
+      image_names.emplace_back(image_name);
+      ABSL_ASSIGN_OR_RETURN(
+          MeasuredImage measured,
+          MeasureImage(image_header, code_anchor,
+                       /*include_without_anchor=*/false));
+      if (!measured.contains_runtime_anchor) continue;
+      if (!measured.has_digest || anchored_digest.has_value()) {
+        return absl::FailedPreconditionError(
+            "Loaded code anchor has missing or ambiguous image identity.");
+      }
+      anchored_digest = measured.digest;
+    }
+    if (::_dyld_image_count() != image_count) continue;
+    bool stable = true;
+    for (uint32_t index = 0; index < image_count; ++index) {
+      const char* image_name = ::_dyld_get_image_name(index);
+      if (::_dyld_get_image_header(index) != image_headers[index] ||
+          image_name == nullptr || image_names[index] != image_name) {
+        stable = false;
+        break;
+      }
+    }
+    if (!stable) continue;
+    if (!anchored_digest.has_value()) {
+      return absl::FailedPreconditionError(
+          "No loaded Mach-O image contains the requested code anchor.");
+    }
+    return *anchored_digest;
+  }
+  return absl::UnavailableError(
+      "Loaded image set changed during anchored identity measurement.");
+}
+
 absl::StatusOr<Hash256> MeasureAppleCpuRuntimeArtifact(
     const SessionHandoffRuntimeProfile& profile) {
   if (profile.runtime_code_anchor == 0 || profile.canonical_profile.empty()) {
@@ -994,19 +1049,96 @@ absl::StatusOr<Hash256> MeasureAppleCpuRuntimeArtifact(
   return hasher.Finalize();
 }
 
+absl::StatusOr<Hash256> MeasureAppleMetalRuntimeArtifact(
+    const SessionHandoffRuntimeProfile& profile) {
+  if (profile.runtime_code_anchor == 0 || profile.canonical_profile.empty() ||
+      !profile.metal_corun.has_value()) {
+    return absl::FailedPreconditionError(
+        "Loaded Metal runtime profile lacks measurable evidence.");
+  }
+  const MetalCoRunRuntimeEvidence& metal = *profile.metal_corun;
+  if (metal.metal_device == nullptr || metal.metal_command_queue == nullptr ||
+      metal.selected_accelerator_code_anchor == 0 ||
+      metal.canonical_policy.empty() ||
+      (metal.derived_evidence &
+       MetalCoRunEvidenceBit(MetalCoRunEvidence::kSelectedMetalDelegate)) ==
+          0) {
+    return absl::FailedPreconditionError(
+        "Loaded Metal runtime lacks selected accelerator, device, queue, or "
+        "policy evidence.");
+  }
+
+  // The runtime API table and the selected accelerator callback are separate
+  // live code anchors. Measuring both prevents a generic LiteRT runtime image
+  // plus a GPU label from impersonating the actually selected Metal plugin.
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 runtime_image_digest,
+      MeasureImageContainingAnchor(profile.runtime_code_anchor));
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 accelerator_image_digest,
+      MeasureImageContainingAnchor(metal.selected_accelerator_code_anchor));
+  // Also bind non-system libraries already loaded at compilation time. This
+  // covers ML Drift support images while the two anchored digests above prove
+  // which runtime and selected accelerator images are actually in use.
+  ABSL_ASSIGN_OR_RETURN(
+      std::vector<Hash256> dependency_image_digests,
+      MeasureRelevantImages(profile.runtime_code_anchor));
+  ABSL_ASSIGN_OR_RETURN(
+      std::string metal_device_identity,
+      DeriveMacOsMetalDeviceIdentity(metal.metal_device,
+                                     metal.metal_command_queue));
+
+  constexpr std::array<absl::string_view, 7> kPlatformEvidence = {
+      "kern.osversion", "kern.osrelease", "hw.model",     "hw.machine",
+      "hw.cputype",     "hw.cpusubtype",  "hw.cpufamily",
+  };
+  Sha256Hasher hasher;
+  HashFrame("LITERT_LM_LOADED_METAL_RUNTIME_ARTIFACT_V1", &hasher);
+  HashU32(static_cast<uint32_t>(profile.runtime_class), &hasher);
+  HashFrame(profile.canonical_profile, &hasher);
+  HashFrame(metal.canonical_policy, &hasher);
+  HashFrame(metal_device_identity, &hasher);
+  hasher.Update(absl::string_view(
+      reinterpret_cast<const char*>(runtime_image_digest.bytes.data()),
+      runtime_image_digest.bytes.size()));
+  hasher.Update(absl::string_view(
+      reinterpret_cast<const char*>(accelerator_image_digest.bytes.data()),
+      accelerator_image_digest.bytes.size()));
+  HashU32(static_cast<uint32_t>(dependency_image_digests.size()), &hasher);
+  for (const Hash256& image_digest : dependency_image_digests) {
+    hasher.Update(absl::string_view(
+        reinterpret_cast<const char*>(image_digest.bytes.data()),
+        image_digest.bytes.size()));
+  }
+  for (absl::string_view name : kPlatformEvidence) {
+    ABSL_ASSIGN_OR_RETURN(std::string value, ReadSysctl(name));
+    HashFrame(name, &hasher);
+    HashFrame(value, &hasher);
+  }
+  return hasher.Finalize();
+}
+
 #endif  // defined(__APPLE__)
 
 }  // namespace
 
 absl::StatusOr<Hash256> MeasureLoadedRuntimeArtifact(
     const SessionHandoffRuntimeProfile& profile) {
+#if defined(__APPLE__)
+  switch (profile.runtime_class) {
+    case SessionHandoffRuntimeClass::kLiteRtCpu:
+      return MeasureAppleCpuRuntimeArtifact(profile);
+    case SessionHandoffRuntimeClass::kLiteRtMetal:
+      return MeasureAppleMetalRuntimeArtifact(profile);
+    default:
+      return absl::UnimplementedError(
+          "Loaded runtime/delegate identity class is unsupported.");
+  }
+#else
   if (profile.runtime_class != SessionHandoffRuntimeClass::kLiteRtCpu) {
     return absl::UnimplementedError(
         "Loaded runtime/delegate identity class is unsupported.");
   }
-#if defined(__APPLE__)
-  return MeasureAppleCpuRuntimeArtifact(profile);
-#else
   return absl::UnimplementedError(
       "Exact loaded LiteRT runtime artifact measurement is currently "
       "implemented only for Apple CPU processes.");

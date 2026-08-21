@@ -242,6 +242,7 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
              (executor_settings.IsWeightCacheDisabled() &&
               executor_settings.IsProgramCacheDisabled()))),
         compiled_backend_(executor_settings.GetBackend()),
+        compiled_executor_settings_(executor_settings),
         executor_settings_(std::move(executor_settings)),
         env_(env),
         model_(*model),
@@ -418,6 +419,11 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
   // therefore cannot be authoritative continuation-state evidence.
   const Backend compiled_backend_;
 
+  // Immutable copy of the exact settings supplied to CreateCompilationOptions
+  // for `compiled_model_`. Mutable runtime settings are checked for drift but
+  // are never used as evidence of what was compiled.
+  const LlmExecutorSettings compiled_executor_settings_;
+
   mutable absl::Mutex executor_settings_mutex_;
   LlmExecutorSettings executor_settings_
       ABSL_GUARDED_BY(executor_settings_mutex_);
@@ -513,6 +519,11 @@ class LlmLiteRtCompiledModelExecutorStatic
   absl::Status Prefill(const ExecutorInputs& inputs,
                        const ExecutorPrefillParams& params) override;
 
+  const SortedPrefillSignatureMap&
+  prefill_signature_map_for_exact_profile() const {
+    return prefill_signature_map_;
+  }
+
  private:
   LlmLiteRtCompiledModelExecutorStatic(
       LlmExecutorSettings executor_settings, Environment& env,
@@ -570,6 +581,13 @@ class LlmLiteRtCompiledModelExecutorDynamic
          ModelResources& resources);
 
   using LlmLiteRtCompiledModelExecutorBase::Prefill;
+
+  int prefill_chunk_size_for_exact_profile() const {
+    return prefill_chunk_size_;
+  }
+  uint32_t kv_increment_size_for_exact_profile() const {
+    return kv_increament_size_;
+  }
 
   absl::Status Prefill(const ExecutorInputs& inputs,
                        const ExecutorPrefillParams& params) override;

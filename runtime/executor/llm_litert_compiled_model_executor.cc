@@ -26,6 +26,7 @@
 #include <random>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "absl/cleanup/cleanup.h"  // from @com_google_absl
@@ -45,9 +46,11 @@
 #include "litert/c/litert_model.h"  // from @litert
 #include "litert/c/litert_op_code.h"  // from @litert
 #include "litert/cc/internal/litert_handle.h"  // from @litert
+#include "litert/cc/litert_any.h"  // from @litert
 #include "litert/cc/litert_compiled_model.h"  // from @litert
 #include "litert/cc/litert_element_type.h"  // from @litert
 #include "litert/cc/litert_environment.h"  // from @litert
+#include "litert/cc/litert_environment_options.h"  // from @litert
 #include "litert/cc/litert_expected.h"  // from @litert
 #include "litert/cc/litert_layout.h"  // from @litert
 #include "litert/cc/litert_macros.h"  // from @litert
@@ -321,6 +324,12 @@ void AppendRuntimeU32(uint32_t value, std::string* output) {
   }
 }
 
+void AppendRuntimeU64(uint64_t value, std::string* output) {
+  for (int shift = 56; shift >= 0; shift -= 8) {
+    output->push_back(static_cast<char>((value >> shift) & 0xff));
+  }
+}
+
 void AppendRuntimeI32(int32_t value, std::string* output) {
   AppendRuntimeU32(std::bit_cast<uint32_t>(value), output);
 }
@@ -344,6 +353,152 @@ void AppendRuntimeOptionalInt(const std::optional<int>& value,
                               std::string* output) {
   AppendRuntimeBool(value.has_value(), output);
   if (value.has_value()) AppendRuntimeI32(*value, output);
+}
+
+absl::StatusOr<const void*> GetUniqueEnvironmentPointer(
+    const EnvironmentOptions& options, EnvironmentOptions::Tag tag,
+    absl::string_view label) {
+  const void* result = nullptr;
+  bool found = false;
+  for (const EnvironmentOptions::Option& option : options.GetOptions()) {
+    if (option.tag != tag) continue;
+    if (found) {
+      return absl::FailedPreconditionError(
+          absl::StrCat("Loaded Environment contains duplicate ", label,
+                       " options."));
+    }
+    found = true;
+    if (const auto* value = std::get_if<const void*>(&option.value)) {
+      result = *value;
+    } else if (const auto* value = std::get_if<void*>(&option.value)) {
+      result = *value;
+    } else {
+      return absl::FailedPreconditionError(
+          absl::StrCat("Loaded Environment ", label,
+                       " option has the wrong value type."));
+    }
+  }
+  if (!found || result == nullptr) {
+    return absl::FailedPreconditionError(
+        absl::StrCat("Loaded Environment has no non-null ", label,
+                     " option."));
+  }
+  return result;
+}
+
+bool HasEnvironmentTag(const EnvironmentOptions& options,
+                       EnvironmentOptions::Tag tag) {
+  for (const EnvironmentOptions::Option& option : options.GetOptions()) {
+    if (option.tag == tag) return true;
+  }
+  return false;
+}
+
+template <typename BufferMap>
+absl::Status AppendFixedTensorMapContract(absl::string_view label,
+                                          const BufferMap& buffers,
+                                          std::string* output) {
+  std::vector<absl::string_view> names;
+  names.reserve(buffers.size());
+  for (const auto& [name, _] : buffers) names.push_back(name);
+  std::sort(names.begin(), names.end());
+  AppendRuntimeBytes(label, output);
+  AppendRuntimeU32(static_cast<uint32_t>(names.size()), output);
+  for (absl::string_view name : names) {
+    if (name.empty()) {
+      return absl::FailedPreconditionError(
+          "Loaded decode tensor contract contains an empty name.");
+    }
+    const auto found = buffers.find(name);
+    if (found == buffers.end()) {
+      return absl::InternalError(
+          "Loaded decode tensor contract changed while being measured.");
+    }
+    const TensorBuffer& buffer = found->second;
+    LITERT_ASSIGN_OR_RETURN(const RankedTensorType tensor_type,
+                            buffer.TensorType());
+    LITERT_ASSIGN_OR_RETURN(const TensorBufferType buffer_type,
+                            buffer.BufferType());
+    LITERT_ASSIGN_OR_RETURN(const size_t packed_size, buffer.PackedSize());
+    LITERT_ASSIGN_OR_RETURN(const size_t size, buffer.Size());
+    LITERT_ASSIGN_OR_RETURN(const size_t offset, buffer.Offset());
+    const Layout& layout = tensor_type.Layout();
+    for (int dimension : layout.Dimensions()) {
+      if (dimension <= 0) {
+        return absl::UnimplementedError(absl::StrCat(
+            "Exact Metal decode requires a fixed positive shape for ", name,
+            "."));
+      }
+    }
+    AppendRuntimeBytes(name, output);
+    AppendRuntimeI32(static_cast<int32_t>(tensor_type.ElementType()), output);
+    AppendRuntimeI32(static_cast<int32_t>(buffer_type), output);
+    AppendRuntimeU32(layout.Rank(), output);
+    for (int dimension : layout.Dimensions()) {
+      AppendRuntimeI32(dimension, output);
+    }
+    AppendRuntimeBool(layout.HasStrides(), output);
+    if (layout.HasStrides()) {
+      for (uint32_t stride : layout.Strides()) {
+        AppendRuntimeU32(stride, output);
+      }
+    }
+    AppendRuntimeU64(packed_size, output);
+    AppendRuntimeU64(size, output);
+    AppendRuntimeU64(offset, output);
+    AppendRuntimeBool(buffer.IsMetalMemory(), output);
+  }
+  return absl::OkStatus();
+}
+
+absl::Status AppendStaticPrefillScheduleContract(
+    absl::string_view label, absl::string_view scheduling_rule,
+    const CompiledModel& compiled_model, const ModelSignatures& signatures,
+    const SortedPrefillSignatureMap& prefill_schedule, std::string* output) {
+  if (prefill_schedule.empty()) {
+    return absl::FailedPreconditionError(
+        "Loaded executor has no fixed prefill signature schedule.");
+  }
+  AppendRuntimeBytes(label, output);
+  AppendRuntimeBytes(scheduling_rule, output);
+  AppendRuntimeU32(static_cast<uint32_t>(prefill_schedule.size()), output);
+  for (const auto& [sequence_length, signature_name] : prefill_schedule) {
+    if (sequence_length <= 0 || signature_name.empty()) {
+      return absl::FailedPreconditionError(
+          "Loaded prefill schedule contains an invalid shape or signature.");
+    }
+    LITERT_ASSIGN_OR_RETURN(
+        const RankedTensorType positions_type,
+        compiled_model.GetInputTensorType(signature_name,
+                                          signatures.input_positions));
+    const Layout& positions_layout = positions_type.Layout();
+    const auto position_dimensions = positions_layout.Dimensions();
+    const bool implicit_batch_one =
+        position_dimensions.size() == 1 &&
+        position_dimensions[0] == sequence_length;
+    const bool explicit_batch_one =
+        position_dimensions.size() == 2 && position_dimensions[0] == 1 &&
+        position_dimensions[1] == sequence_length;
+    if (!implicit_batch_one && !explicit_batch_one) {
+      return absl::UnimplementedError(
+          "Exact prefill requires every compiled input-position signature to "
+          "have fixed batch one and the advertised sequence length.");
+    }
+    AppendRuntimeI32(sequence_length, output);
+    AppendRuntimeBytes(signature_name, output);
+    AppendRuntimeI32(static_cast<int32_t>(positions_type.ElementType()), output);
+    AppendRuntimeU32(positions_layout.Rank(), output);
+    for (int dimension : position_dimensions) {
+      AppendRuntimeI32(dimension, output);
+    }
+    AppendRuntimeBool(positions_layout.HasStrides(), output);
+    if (positions_layout.HasStrides()) {
+      for (uint32_t stride : positions_layout.Strides()) {
+        AppendRuntimeU32(stride, output);
+      }
+    }
+  }
+  return absl::OkStatus();
 }
 
 bool RuntimeConfigsEqual(const RuntimeConfig& lhs, const RuntimeConfig& rhs) {
@@ -2523,23 +2678,28 @@ LlmLiteRtCompiledModelExecutorBase::GetSessionHandoffRuntimeProfile() const {
     return absl::UnimplementedError(
         "Loaded runtime identity currently requires the CPU sampler.");
   }
-  if (compiled_backend_ != Backend::CPU) {
+  if (compiled_backend_ != Backend::CPU && compiled_backend_ != Backend::GPU) {
     return absl::UnimplementedError(
-        "Exact loaded delegate/device evidence is currently available only "
-        "for the LiteRT CPU executor.");
+        "Exact loaded runtime identity supports only concrete LiteRT CPU or "
+        "Metal executors.");
   }
-  if (!settings.GetAdvancedSettings().has_value()) {
+  const LlmExecutorSettings& compiled_settings = compiled_executor_settings_;
+  if (compiled_settings.GetBackend() != compiled_backend_) {
+    return absl::FailedPreconditionError(
+        "Immutable compilation settings disagree with the compiled backend.");
+  }
+  if (!compiled_settings.GetAdvancedSettings().has_value()) {
     return absl::FailedPreconditionError(
         "Loaded LiteRT executor has no resolved advanced settings.");
   }
   const bool caches_disabled_by_sentinel =
-      settings.GetCacheDir() == ":nocache";
+      compiled_settings.GetCacheDir() == ":nocache";
   if (!session_handoff_compile_caches_disabled_ ||
-      settings.GetScopedCacheFile() != nullptr ||
-      settings.GetScopedProgramCacheFile() != nullptr ||
+      compiled_settings.GetScopedCacheFile() != nullptr ||
+      compiled_settings.GetScopedProgramCacheFile() != nullptr ||
       (!caches_disabled_by_sentinel &&
-       (!settings.IsWeightCacheDisabled() ||
-        !settings.IsProgramCacheDisabled()))) {
+       (!compiled_settings.IsWeightCacheDisabled() ||
+        !compiled_settings.IsProgramCacheDisabled()))) {
     return absl::UnimplementedError(
         "Loaded runtime identity requires weight and program caches to be "
         "disabled before model compilation; exact cache artifact evidence is "
@@ -2563,11 +2723,24 @@ LlmLiteRtCompiledModelExecutorBase::GetSessionHandoffRuntimeProfile() const {
   LITERT_ASSIGN_OR_RETURN(const RankedTensorType logits_tensor_type,
                           logits_buffer_it->second.TensorType());
   const ElementType logits_element_type = logits_tensor_type.ElementType();
-  if (logits_element_type != ElementType::Float16 &&
-      logits_element_type != ElementType::Float32) {
-    return absl::UnimplementedError(
-        "Session handoff GREEDY sampling requires FP16 or FP32 decode "
-        "logits.");
+  SessionHandoffLogitsElementType runtime_logits_element_type =
+      SessionHandoffLogitsElementType::kUnsupported;
+  uint64_t logits_element_byte_count = 0;
+  switch (logits_element_type) {
+    case ElementType::Float16:
+      runtime_logits_element_type =
+          SessionHandoffLogitsElementType::kFloat16;
+      logits_element_byte_count = 2;
+      break;
+    case ElementType::Float32:
+      runtime_logits_element_type =
+          SessionHandoffLogitsElementType::kFloat32;
+      logits_element_byte_count = 4;
+      break;
+    default:
+      return absl::UnimplementedError(
+          "Session handoff GREEDY sampling requires FP16 or FP32 decode "
+          "logits.");
   }
   const auto& logits_layout = logits_tensor_type.Layout();
   if (logits_layout.HasStrides()) {
@@ -2603,6 +2776,22 @@ LlmLiteRtCompiledModelExecutorBase::GetSessionHandoffRuntimeProfile() const {
         "Loaded decode logits element count is inconsistent with its "
         "single-row vocabulary shape.");
   }
+  const uint64_t logits_vocabulary_size_u64 =
+      static_cast<uint64_t>(logits_vocabulary_size);
+  if (logits_vocabulary_size_u64 >
+      std::numeric_limits<uint64_t>::max() / logits_element_byte_count) {
+    return absl::ResourceExhaustedError(
+        "Loaded decode logits frame byte count overflows uint64.");
+  }
+  const uint64_t logits_frame_byte_count =
+      logits_vocabulary_size_u64 * logits_element_byte_count;
+  LITERT_ASSIGN_OR_RETURN(const size_t packed_logits_byte_count,
+                          logits_buffer_it->second.PackedSize());
+  if (packed_logits_byte_count != logits_frame_byte_count) {
+    return absl::FailedPreconditionError(
+        "Loaded decode logits packed bytes do not exactly match the complete "
+        "runtime-derived tensor frame.");
+  }
   if (llm_context_ == nullptr ||
       !llm_context_->runtime_config().output_heads.has_value()) {
     return absl::FailedPreconditionError(
@@ -2625,11 +2814,24 @@ LlmLiteRtCompiledModelExecutorBase::GetSessionHandoffRuntimeProfile() const {
         "Loaded runtime identity cannot measure the decode state "
         "allocation.");
   }
-  ABSL_RETURN_IF_ERROR(state->ValidateSessionHandoffSupport());
+  if (compiled_backend_ == Backend::CPU) {
+    ABSL_RETURN_IF_ERROR(state->ValidateSessionHandoffSupport());
+  } else {
+    ABSL_RETURN_IF_ERROR(
+        state->ValidateDeterministicProjectionResetSupport());
+    ABSL_RETURN_IF_ERROR(state->ValidateMetalStateStorageForExactProfile());
+  }
   ABSL_RETURN_IF_ERROR(ValidateAuthoritativeStateMetadata(
       executor_metadata_, *state, "primary LiteRT state"));
   if (decode_state != nullptr) {
-    ABSL_RETURN_IF_ERROR(decode_state->ValidateSessionHandoffSupport());
+    if (compiled_backend_ == Backend::CPU) {
+      ABSL_RETURN_IF_ERROR(decode_state->ValidateSessionHandoffSupport());
+    } else {
+      ABSL_RETURN_IF_ERROR(
+          decode_state->ValidateDeterministicProjectionResetSupport());
+      ABSL_RETURN_IF_ERROR(
+          decode_state->ValidateMetalStateStorageForExactProfile());
+    }
     ABSL_RETURN_IF_ERROR(ValidateAuthoritativeStateMetadata(
         executor_metadata_, *decode_state, "LiteRT decode state"));
   }
@@ -2646,12 +2848,11 @@ LlmLiteRtCompiledModelExecutorBase::GetSessionHandoffRuntimeProfile() const {
         "Loaded runtime identity cannot classify the concrete executor.");
   }
 
-  const AdvancedSettings& advanced = *settings.GetAdvancedSettings();
-  ABSL_ASSIGN_OR_RETURN(const CpuConfig cpu,
-                        settings.GetBackendConfig<CpuConfig>());
+  const AdvancedSettings& advanced =
+      *compiled_settings.GetAdvancedSettings();
 
   std::string profile;
-  AppendRuntimeBytes("LITERT_LM_SESSION_RUNTIME_PROFILE_V1", &profile);
+  AppendRuntimeBytes("LITERT_LM_SESSION_RUNTIME_PROFILE_V3", &profile);
   // This subsection is derived from the compiled TensorBuffer, not from
   // caller-provided sampler or session labels. Keep it in the identity so a
   // different loaded logits contract cannot share an exact-handoff profile.
@@ -2663,26 +2864,104 @@ LlmLiteRtCompiledModelExecutorBase::GetSessionHandoffRuntimeProfile() const {
     AppendRuntimeI32(dimension, &profile);
   }
   AppendRuntimeU32(static_cast<uint32_t>(logits_element_count), &profile);
+  AppendRuntimeU64(logits_frame_byte_count, &profile);
   AppendRuntimeU8(executor_shape, &profile);
   AppendRuntimeI32(static_cast<int32_t>(compiled_backend_), &profile);
   AppendRuntimeI32(static_cast<int32_t>(sampler_backend), &profile);
-  AppendRuntimeBool(settings.GetActivationDataType().has_value(), &profile);
-  if (settings.GetActivationDataType().has_value()) {
+  AppendRuntimeBool(compiled_settings.GetActivationDataType().has_value(),
+                    &profile);
+  if (compiled_settings.GetActivationDataType().has_value()) {
     AppendRuntimeI32(
-        static_cast<int32_t>(*settings.GetActivationDataType()), &profile);
+        static_cast<int32_t>(*compiled_settings.GetActivationDataType()),
+        &profile);
   }
-  AppendRuntimeBool(settings.IsMixedPrecisionEnabled(), &profile);
-  AppendRuntimeU32(settings.GetMaxNumTokens(), &profile);
-  AppendRuntimeU32(settings.GetMaxNumImages(), &profile);
-  AppendRuntimeU32(settings.GetLoraRank(), &profile);
+  AppendRuntimeBool(compiled_settings.IsMixedPrecisionEnabled(), &profile);
+  AppendRuntimeU32(compiled_settings.GetMaxNumTokens(), &profile);
+  AppendRuntimeU32(compiled_settings.GetMaxNumImages(), &profile);
+  AppendRuntimeU32(compiled_settings.GetLoraRank(), &profile);
   AppendRuntimeI32(
-      static_cast<int32_t>(settings.GetModelAssets().fake_weights_mode()),
+      static_cast<int32_t>(
+          compiled_settings.GetModelAssets().fake_weights_mode()),
       &profile);
 
-  AppendRuntimeU32(cpu.kv_increment_size, &profile);
-  AppendRuntimeI32(cpu.prefill_chunk_size, &profile);
-  AppendRuntimeU32(cpu.number_of_threads, &profile);
-  AppendRuntimeBool(cpu.enable_ynnpack, &profile);
+  uint32_t runtime_cpu_thread_count = 0;
+  int32_t runtime_prefill_chunk_size = 0;
+  if (compiled_backend_ == Backend::CPU) {
+    ABSL_ASSIGN_OR_RETURN(
+        const CpuConfig cpu,
+        compiled_settings.GetBackendConfig<CpuConfig>());
+    if (cpu.number_of_threads == 0) {
+      return absl::FailedPreconditionError(
+          "Loaded CPU executor has no positive compiled thread count.");
+    }
+    runtime_cpu_thread_count = cpu.number_of_threads;
+    AppendRuntimeBytes("CPU_COMPILATION_INPUTS_V2", &profile);
+    AppendRuntimeU32(cpu.kv_increment_size, &profile);
+    AppendRuntimeI32(cpu.prefill_chunk_size, &profile);
+    AppendRuntimeU32(cpu.number_of_threads, &profile);
+    AppendRuntimeBool(cpu.enable_ynnpack, &profile);
+    // These are the exact fixed options applied by CreateCompilationOptions.
+    // Their implementation and numeric XNNPACK defaults are also sealed by the
+    // loaded executable/delegate image digest.
+    AppendRuntimeBytes(
+        "XNNPACK_DEFAULT_PLUS_DYNAMIC_FULLY_CONNECTED_PLUS_LATEST_OPERATORS_V1",
+        &profile);
+    AppendRuntimeBool(/*compress_quantization_zero_points=*/true, &profile);
+    AppendRuntimeBool(/*hardware_accelerator_cpu_only=*/true, &profile);
+
+    if (const auto* static_executor =
+            dynamic_cast<const LlmLiteRtCompiledModelExecutorStatic*>(this)) {
+      runtime_prefill_chunk_size = -1;
+      ABSL_RETURN_IF_ERROR(AppendStaticPrefillScheduleContract(
+          "CPU_STATIC_PREFILL_SIGNATURES_V1",
+          "STATIC_PREFILL_LONGEST_FIT_GREEDY_V1", *compiled_model_,
+          signatures_,
+          static_executor->prefill_signature_map_for_exact_profile(),
+          &profile));
+    } else if (const auto* dynamic_executor =
+                   dynamic_cast<const LlmLiteRtCompiledModelExecutorDynamic*>(
+                       this)) {
+      runtime_prefill_chunk_size =
+          dynamic_executor->prefill_chunk_size_for_exact_profile();
+      if (runtime_prefill_chunk_size != cpu.prefill_chunk_size ||
+          dynamic_executor->kv_increment_size_for_exact_profile() !=
+              cpu.kv_increment_size) {
+        return absl::FailedPreconditionError(
+            "Loaded dynamic CPU executor does not match its retained "
+            "compilation-time chunking contract.");
+      }
+      AppendRuntimeBytes("CPU_DYNAMIC_PREFILL_CHUNKING_V1", &profile);
+      AppendRuntimeI32(runtime_prefill_chunk_size, &profile);
+      AppendRuntimeU32(
+          dynamic_executor->kv_increment_size_for_exact_profile(), &profile);
+    } else {
+      return absl::UnimplementedError(
+          "Loaded CPU prefill executor has no exact chunking contract.");
+    }
+    ABSL_RETURN_IF_ERROR(AppendFixedTensorMapContract(
+        "CPU_DECODE_INPUTS_V1", decode_input_buffers_, &profile));
+    ABSL_RETURN_IF_ERROR(AppendFixedTensorMapContract(
+        "CPU_DECODE_OUTPUTS_V1", decode_output_buffers_, &profile));
+  } else {
+    ABSL_ASSIGN_OR_RETURN(
+        const GpuConfig gpu,
+        compiled_settings.GetBackendConfig<GpuConfig>());
+    AppendRuntimeBytes("GPU_COMPILATION_INPUTS_V1", &profile);
+    AppendRuntimeU32(gpu.max_top_k, &profile);
+    AppendRuntimeBool(gpu.external_tensor_mode, &profile);
+    // These values are the immutable inputs from which
+    // CreateCompilationOptions constructed the actual GpuOptions passed to
+    // CompiledModel::Create. The measured delegate code image binds the
+    // option-default implementation that interpreted them.
+    AppendRuntimeI32(static_cast<int32_t>(
+                         compiled_settings.GetActivationDataType().value_or(
+                             ActivationDataType::FLOAT16)),
+                     &profile);
+    // The exact sampler is a serial CPU scan. Metal prefill is governed by the
+    // ordered static signature schedule rather than CpuConfig chunking.
+    runtime_cpu_thread_count = 1;
+    runtime_prefill_chunk_size = -1;
+  }
 
   AppendRuntimeU32(
       static_cast<uint32_t>(advanced.prefill_batch_sizes.size()), &profile);
@@ -2718,17 +2997,21 @@ LlmLiteRtCompiledModelExecutorBase::GetSessionHandoffRuntimeProfile() const {
   AppendRuntimeBool(advanced.error_on_invalid_sampled_token_id, &profile);
 
   AppendRuntimeU32(
-      static_cast<uint32_t>(settings.GetSelectedSignatures().size()),
+      static_cast<uint32_t>(compiled_settings.GetSelectedSignatures().size()),
       &profile);
-  for (const std::string& signature : settings.GetSelectedSignatures()) {
+  for (const std::string& signature :
+       compiled_settings.GetSelectedSignatures()) {
     AppendRuntimeBytes(signature, &profile);
   }
-  AppendRuntimeBool(settings.IsWeightCacheDisabled(), &profile);
-  AppendRuntimeBool(settings.IsProgramCacheDisabled(), &profile);
-  AppendRuntimeBool(!settings.GetCacheDir().empty(), &profile);
-  AppendRuntimeBool(settings.GetScopedCacheFile() != nullptr, &profile);
-  AppendRuntimeBool(settings.GetScopedProgramCacheFile() != nullptr, &profile);
-  AppendRuntimeBool(!settings.GetLitertDispatchLibDir().empty(), &profile);
+  AppendRuntimeBool(compiled_settings.IsWeightCacheDisabled(), &profile);
+  AppendRuntimeBool(compiled_settings.IsProgramCacheDisabled(), &profile);
+  AppendRuntimeBool(!compiled_settings.GetCacheDir().empty(), &profile);
+  AppendRuntimeBool(compiled_settings.GetScopedCacheFile() != nullptr,
+                    &profile);
+  AppendRuntimeBool(compiled_settings.GetScopedProgramCacheFile() != nullptr,
+                    &profile);
+  AppendRuntimeBool(!compiled_settings.GetLitertDispatchLibDir().empty(),
+                    &profile);
   AppendRuntimeBool(!weight_cache_path_.empty(), &profile);
 
   AppendRuntimeI32(static_cast<int32_t>(state->allocation_policy()), &profile);
@@ -2764,10 +3047,191 @@ LlmLiteRtCompiledModelExecutorBase::GetSessionHandoffRuntimeProfile() const {
         "Loaded LiteRT runtime code anchor is zero.");
   }
 
+  if (compiled_backend_ == Backend::GPU) {
+#if !defined(__APPLE__)
+    return absl::UnimplementedError(
+        "Concrete Metal runtime identity is available only on Apple "
+        "platforms.");
+#else
+    if (executor_shape != 1) {
+      return absl::UnimplementedError(
+          "Exact Metal runtime identity requires the statically shaped "
+          "LiteRT executor.");
+    }
+    if (!logits_buffer_it->second.IsMetalMemory()) {
+      return absl::UnimplementedError(
+          "Backend::GPU did not produce a Metal-backed live decode logits "
+          "allocation.");
+    }
+    LITERT_ASSIGN_OR_RETURN(const bool fully_accelerated,
+                            compiled_model_->IsFullyAccelerated());
+    if (!fully_accelerated) {
+      return absl::UnimplementedError(
+          "Loaded Metal model is not fully accelerated; a CPU/delegate "
+          "partition cannot satisfy the exact Metal profile.");
+    }
+    LITERT_ASSIGN_OR_RETURN(auto environment_options, env_.GetOptions());
+    if (HasEnvironmentTag(environment_options,
+                          EnvironmentOptions::Tag::kWebGpuDevice) ||
+        HasEnvironmentTag(environment_options,
+                          EnvironmentOptions::Tag::kWebGpuQueue) ||
+        HasEnvironmentTag(environment_options,
+                          EnvironmentOptions::Tag::kWebGpuInstance) ||
+        HasEnvironmentTag(environment_options,
+                          EnvironmentOptions::Tag::kOpenClDeviceId) ||
+        HasEnvironmentTag(environment_options,
+                          EnvironmentOptions::Tag::kOpenClCommandQueue) ||
+        HasEnvironmentTag(environment_options,
+                          EnvironmentOptions::Tag::kVulkanEnvironment)) {
+      return absl::UnimplementedError(
+          "Loaded GPU Environment exposes a non-Metal accelerator alongside "
+          "Metal; the concrete selected delegate is ambiguous.");
+    }
+    ABSL_ASSIGN_OR_RETURN(
+        const void* metal_device,
+        GetUniqueEnvironmentPointer(environment_options,
+                                    EnvironmentOptions::Tag::kMetalDevice,
+                                    "MTLDevice"));
+    ABSL_ASSIGN_OR_RETURN(
+        const void* metal_command_queue,
+        GetUniqueEnvironmentPointer(
+            environment_options,
+            EnvironmentOptions::Tag::kMetalCommandQueue,
+            "MTLCommandQueue"));
+    ABSL_ASSIGN_OR_RETURN(
+        const void* accelerator_callback,
+        GetUniqueEnvironmentPointer(
+            environment_options,
+            EnvironmentOptions::Tag::kCallbackOnGpuEnvDestroy,
+            "selected accelerator destruction callback"));
+    // The callback user data is owned by the selected accelerator. Requiring
+    // it distinguishes the ML Drift Metal-owned Environment contract from a
+    // caller that merely inserted device-shaped labels.
+    ABSL_ASSIGN_OR_RETURN(
+        const void* accelerator_user_data,
+        GetUniqueEnvironmentPointer(
+            environment_options,
+            EnvironmentOptions::Tag::kCallbackUserDataOnGpuEnvDestroy,
+            "selected accelerator callback state"));
+    (void)accelerator_user_data;
+
+    const auto* static_executor =
+        dynamic_cast<const LlmLiteRtCompiledModelExecutorStatic*>(this);
+    if (static_executor == nullptr) {
+      return absl::UnimplementedError(
+          "Exact Metal prefill scheduling requires the static executor.");
+    }
+    const SortedPrefillSignatureMap& prefill_schedule =
+        static_executor->prefill_signature_map_for_exact_profile();
+    std::string metal_policy;
+    AppendRuntimeBytes("LITERT_LM_METAL_CORUN_POLICY_V1", &metal_policy);
+    // This is queried from the compiled model after delegate application. It
+    // is stronger than the fully-delegated compilation hint, although it still
+    // does not identify the selected kernels or their reduction policy.
+    AppendRuntimeBool(fully_accelerated, &metal_policy);
+    uint32_t derived_corun_evidence = MetalCoRunEvidenceBit(
+        MetalCoRunEvidence::kSelectedMetalDelegate);
+    ABSL_RETURN_IF_ERROR(AppendStaticPrefillScheduleContract(
+        "METAL_STATIC_PREFILL_SIGNATURES_V1",
+        "STATIC_PREFILL_CAUTIOUS_GREEDY_V1", *compiled_model_,
+        signatures_, prefill_schedule, &metal_policy));
+    derived_corun_evidence |= MetalCoRunEvidenceBit(
+        MetalCoRunEvidence::kFixedPrefillSchedule);
+
+    ABSL_RETURN_IF_ERROR(AppendFixedTensorMapContract(
+        "METAL_DECODE_INPUTS_V1", decode_input_buffers_, &metal_policy));
+    ABSL_RETURN_IF_ERROR(AppendFixedTensorMapContract(
+        "METAL_DECODE_OUTPUTS_V1", decode_output_buffers_, &metal_policy));
+    AppendRuntimeI32(static_cast<int32_t>(state->allocation_policy()),
+                     &metal_policy);
+    AppendRuntimeI32(state->GetNumEntries(), &metal_policy);
+    AppendRuntimeI32(state->GetBatchSize(), &metal_policy);
+    AppendRuntimeBool(decode_state != nullptr, &metal_policy);
+    if (decode_state != nullptr) {
+      AppendRuntimeI32(
+          static_cast<int32_t>(decode_state->allocation_policy()),
+          &metal_policy);
+      AppendRuntimeI32(decode_state->GetNumEntries(), &metal_policy);
+      AppendRuntimeI32(decode_state->GetBatchSize(), &metal_policy);
+    }
+    derived_corun_evidence |=
+        MetalCoRunEvidenceBit(MetalCoRunEvidence::kFixedShapeDecode);
+
+    // LiteRT-LM-visible state has an authoritative reset inventory and reset
+    // recreates its backend-native Metal buffers. Delegate-owned mutable state
+    // is not enumerable, and GPU session handoff is still rejected by
+    // ValidateSessionHandoffSupport, so the combined session-and-reset bit must
+    // remain absent.
+    ABSL_RETURN_IF_ERROR(ValidateDeterministicProjectionSupport());
+    AppendRuntimeBool(/*litert_lm_visible_reset_inventory=*/true,
+                      &metal_policy);
+    AppendRuntimeBool(/*complete_delegate_reset_inventory=*/false,
+                      &metal_policy);
+    AppendRuntimeBool(/*complete_gpu_session_capsule=*/false, &metal_policy);
+
+    // Pinned LiteRT/ML Drift exposes neither the selected attention kernel's
+    // adaptive Split-KV policy nor an executor hook that enforces isolated,
+    // quiescent fixed-shape decode. Record the missing bits, never intended
+    // values. A future concrete hook must set them from the live delegate.
+    AppendRuntimeU32(RequiredMetalCoRunEvidence(), &metal_policy);
+    AppendRuntimeU32(derived_corun_evidence, &metal_policy);
+    AppendRuntimeBytes(
+        "MISSING_HOOK:ML_DRIFT_SELECTED_ATTENTION_SPLIT_KV_POLICY_V1",
+        &metal_policy);
+    AppendRuntimeBytes(
+        "MISSING_HOOK:ML_DRIFT_EFFECTIVE_METAL_COMPILATION_FLAGS_V1",
+        &metal_policy);
+    AppendRuntimeBytes(
+        "MISSING_HOOK:ML_DRIFT_SELECTED_METAL_PIPELINE_DIGEST_V1",
+        &metal_policy);
+    AppendRuntimeBytes(
+        "MISSING_HOOK:LITERT_METAL_QUIESCENT_FIXED_DECODE_BOUNDARY_V1",
+        &metal_policy);
+    AppendRuntimeBytes(
+        "MISSING_HOOK:LITERT_COMPLETE_GPU_SESSION_CAPSULE_INVENTORY_V1",
+        &metal_policy);
+    AppendRuntimeBytes(metal_policy, &profile);
+
+    const uintptr_t selected_accelerator_code_anchor =
+        reinterpret_cast<uintptr_t>(accelerator_callback);
+    if (selected_accelerator_code_anchor == 0) {
+      return absl::FailedPreconditionError(
+          "Selected Metal accelerator callback code anchor is zero.");
+    }
+    return SessionHandoffRuntimeProfile{
+        .runtime_class = SessionHandoffRuntimeClass::kLiteRtMetal,
+        .canonical_profile = std::move(profile),
+        .logits_element_type = runtime_logits_element_type,
+        .logits_batch_size = logits_dimensions[0],
+        .logits_sequence_size = logits_dimensions[1],
+        .logits_vocabulary_size = logits_vocabulary_size,
+        .logits_frame_byte_count = logits_frame_byte_count,
+        .cpu_thread_count = runtime_cpu_thread_count,
+        .prefill_chunk_size = runtime_prefill_chunk_size,
+        .runtime_code_anchor = runtime_code_anchor,
+        .metal_corun =
+            MetalCoRunRuntimeEvidence{
+                .metal_device = metal_device,
+                .metal_command_queue = metal_command_queue,
+                .selected_accelerator_code_anchor =
+                    selected_accelerator_code_anchor,
+                .derived_evidence = derived_corun_evidence,
+                .canonical_policy = std::move(metal_policy),
+            },
+    };
+#endif
+  }
+
   return SessionHandoffRuntimeProfile{
       .runtime_class = SessionHandoffRuntimeClass::kLiteRtCpu,
       .canonical_profile = std::move(profile),
+      .logits_element_type = runtime_logits_element_type,
+      .logits_batch_size = logits_dimensions[0],
+      .logits_sequence_size = logits_dimensions[1],
       .logits_vocabulary_size = logits_vocabulary_size,
+      .logits_frame_byte_count = logits_frame_byte_count,
+      .cpu_thread_count = runtime_cpu_thread_count,
+      .prefill_chunk_size = runtime_prefill_chunk_size,
       .runtime_code_anchor = runtime_code_anchor,
   };
 }

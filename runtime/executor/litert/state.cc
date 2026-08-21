@@ -654,6 +654,28 @@ absl::Status LitertState::ValidateDeterministicProjectionResetSupport() const {
   return ValidateStateInventory(/*allow_gpu_optimized=*/true);
 }
 
+absl::Status LitertState::ValidateMetalStateStorageForExactProfile() const {
+  RETURN_IF_ERROR(ValidateStateInventory(/*allow_gpu_optimized=*/true));
+  for (const auto& [name, state_buffer] : bank_1_state_buffers_) {
+    if (!state_buffer.buffer.IsMetalMemory()) {
+      return absl::UnimplementedError(absl::StrCat(
+          "Exact Metal profile requires Metal-backed state buffer ", name,
+          "."));
+    }
+  }
+  if (bank_2_state_buffers_.has_value()) {
+    for (const auto& [name, state_buffer] : *bank_2_state_buffers_) {
+      if (!state_buffer.buffer.IsMetalMemory()) {
+        return absl::UnimplementedError(absl::StrCat(
+            "Exact Metal profile requires Metal-backed secondary state "
+            "buffer ",
+            name, "."));
+      }
+    }
+  }
+  return absl::OkStatus();
+}
+
 absl::Status LitertState::ValidateStateInventory(
     bool allow_gpu_optimized) const {
   if (!authoritative_state_inventory_) {

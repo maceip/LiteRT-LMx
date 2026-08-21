@@ -82,6 +82,12 @@ class LitertState : public StateInterface {
   // because reset recreates them instead of serializing them.
   absl::Status ValidateDeterministicProjectionResetSupport() const;
 
+  // Stronger exact-profile check for a concrete Metal executor. Every
+  // authoritatively inventoried continuation buffer in every state bank must
+  // be backed by Metal memory. This proves the live backend allocation rather
+  // than trusting Backend::GPU.
+  absl::Status ValidateMetalStateStorageForExactProfile() const;
+
   // Serializes the logical input bank into a canonical, versioned snapshot.
   // The snapshot binds the state structure and buffer layout and includes an
   // integrity digest. The caller remains responsible for authenticating the

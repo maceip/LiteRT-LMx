@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 
 #include "absl/status/status.h"  // from @com_google_absl
 #include "runtime/engine/session_handoff.h"
@@ -50,6 +51,30 @@ enum class ExactLiteRtEvidence : uint32_t {
   kExecutionShapeThreadingAndChunking = uint32_t{1} << 7,
   kStableCpuGreedySampler = uint32_t{1} << 8,
   kSessionIdentity = uint32_t{1} << 9,
+  // The selected ML Drift Metal accelerator is proven by its live
+  // Environment handles, Metal-backed executor allocations, and an actual
+  // code address owned by the accelerator image. Backend::GPU is not this
+  // evidence.
+  kSelectedMetalDelegate = uint32_t{1} << 10,
+  // The immutable, ordered set of compiled prefill shapes and the exact
+  // deterministic decomposition rule are bound by the loaded executor.
+  kFixedPrefillSchedule = uint32_t{1} << 11,
+  // Decode uses one immutable batch-one shape rather than a runtime-selected
+  // shape family.
+  kFixedShapeDecode = uint32_t{1} << 12,
+  // The selected Metal attention implementation proves that adaptive
+  // Split-KV is disabled. Merely finding no LiteRT-LM setting is insufficient.
+  kAdaptiveSplitKvDisabled = uint32_t{1} << 13,
+  // Every exact GPU prefill/decode is run through an enforced quiescent,
+  // request-owned execution boundary.
+  kQuiescentGpuExecution = uint32_t{1} << 14,
+  // Both backend-native reset and the complete GPU continuation capsule have
+  // authoritative inventories. Reset-only support does not bind this bit.
+  kCompleteGpuSessionAndResetState = uint32_t{1} << 15,
+  // Identity of the selected, effective Metal compute pipelines/kernels after
+  // delegate compilation. Delegate library bytes and requested options alone
+  // do not prove this (for example, argument-buffer support may be downgraded).
+  kSelectedMetalKernelPipeline = uint32_t{1} << 16,
   // Sentinel used only for capability discovery. No profile may bind this
   // value; it means the concrete backend evidence inventory is not complete.
   kBackendEvidenceUnenumerated = uint32_t{1} << 31,
@@ -68,6 +93,9 @@ enum class ExactLiteRtProfileAvailability : uint8_t {
   kRuntimeEvidenceUnavailable = 2,
   kMetalEvidenceNotImplemented = 3,
   kNpuUnimplemented = 4,
+  // A concrete Metal delegate/device was measured, but one or more mandatory
+  // CoRun policy facts are unavailable from the loaded execution path.
+  kMetalPolicyEvidenceUnavailable = 5,
 };
 
 enum class ExactLiteRtQualificationRequirement : uint8_t {
@@ -81,6 +109,35 @@ enum class ExactLiteRtSamplerIdentity : uint8_t {
   kCpuGreedyArgmaxMinIndex = 1,
 };
 
+// Immutable loaded-logits payload contract. Qualification hashes exactly one
+// complete packed frame per generated token; it must never accept an arbitrary
+// caller-selected byte slice.
+enum class ExactLiteRtLogitsElementType : uint8_t {
+  kUnsupported = 0,
+  kFloat16 = 1,
+  kFloat32 = 2,
+};
+
+struct ExactLiteRtLogitsFrameContract {
+  ExactLiteRtLogitsElementType element_type =
+      ExactLiteRtLogitsElementType::kUnsupported;
+  uint32_t batch_size = 0;
+  uint32_t sequence_size = 0;
+  uint32_t vocabulary_size = 0;
+  uint64_t byte_count = 0;
+
+  bool operator==(const ExactLiteRtLogitsFrameContract& other) const {
+    return element_type == other.element_type &&
+           batch_size == other.batch_size &&
+           sequence_size == other.sequence_size &&
+           vocabulary_size == other.vocabulary_size &&
+           byte_count == other.byte_count;
+  }
+  bool operator!=(const ExactLiteRtLogitsFrameContract& other) const {
+    return !(*this == other);
+  }
+};
+
 struct ExactLiteRtProfileCapability {
   ExactLiteRtBackend backend = ExactLiteRtBackend::kUnsupported;
   ExactLiteRtProfileAvailability availability =
@@ -91,6 +148,10 @@ struct ExactLiteRtProfileCapability {
   // only while resolving a concrete SessionConfig.
   uint32_t required_evidence = 0;
   uint32_t engine_derived_evidence = 0;
+  // Always `required_evidence & ~engine_derived_evidence`. Session-scoped
+  // evidence remains missing until ResolveExactLiteRtProfile validates the
+  // concrete SessionConfig; capability discovery never pretends otherwise.
+  uint32_t missing_evidence = 0;
   ExactLiteRtQualificationRequirement qualification_requirement =
       ExactLiteRtQualificationRequirement::
           kIndependentColdProcessesTokensAndLogits;
@@ -119,10 +180,16 @@ struct ExactLiteRtProfile {
   Hash256 runtime_delegate_platform_hash;
 
   // Hash of the executor-owned canonical runtime profile. It binds concrete
-  // compiled backend, tensor/logits contract, allocation policy, compilation,
-  // activation/precision/quantization flags, cache policy, and resolved
-  // executor options.
+  // compiled backend, tensor/logits contract, allocation policy, compilation
+  // inputs, cache policy, and resolved executor options. A GPU backend must
+  // additionally attest effective precision/quantization and selected pipeline
+  // identity before profile construction; requested options are insufficient.
   Hash256 loaded_execution_profile_hash;
+
+  // Non-zero only for a concrete GPU profile. This binds the executor-owned
+  // fixed prefill schedule, fixed decode shape, Split-KV policy, quiescent
+  // scheduling contract, CPU argmax boundary, and complete state inventory.
+  Hash256 gpu_execution_policy_hash;
 
   // Identity derived by the loaded Engine for this fully-resolved session.
   // It includes the model, measured runtime, and resolved session profile.
@@ -137,10 +204,15 @@ struct ExactLiteRtProfile {
   ExactLiteRtSamplerIdentity sampler_identity =
       ExactLiteRtSamplerIdentity::kCpuGreedyArgmaxMinIndex;
 
+  ExactLiteRtLogitsFrameContract logits_frame;
+
   // Exact profiles are batch one and use the stable CPU GREEDY sampler whose
   // strict comparison gives an explicit lowest-token-index tie break.
   uint32_t batch_size = 1;
   uint32_t cpu_thread_count = 0;
+  // Positive for the loaded dynamic CPU executor. -1 means prefill uses the
+  // ordered static signature schedule bound by loaded_execution_profile_hash
+  // (CPU) or gpu_execution_policy_hash (Metal), not an unrecorded chunk size.
   int32_t prefill_chunk_size = 0;
 
   bool operator==(const ExactLiteRtProfile& other) const {
@@ -152,11 +224,13 @@ struct ExactLiteRtProfile {
                other.runtime_delegate_platform_hash &&
            loaded_execution_profile_hash ==
                other.loaded_execution_profile_hash &&
+           gpu_execution_policy_hash == other.gpu_execution_policy_hash &&
            session_identity == other.session_identity &&
            backend == other.backend &&
            bound_evidence == other.bound_evidence &&
            qualification_requirement == other.qualification_requirement &&
            sampler_identity == other.sampler_identity &&
+           logits_frame == other.logits_frame &&
            batch_size == other.batch_size &&
            cpu_thread_count == other.cpu_thread_count &&
            prefill_chunk_size == other.prefill_chunk_size;
@@ -178,6 +252,10 @@ struct ExactLiteRtProfileAssertion {
 absl::Status ValidateExactLiteRtProfileAssertion(
     const ExactLiteRtProfile& derived,
     const ExactLiteRtProfileAssertion& assertion);
+
+// Stable, human-readable names for missing evidence bits. Unknown bits are
+// retained numerically rather than being silently ignored.
+std::string DescribeMissingExactLiteRtEvidence(uint32_t missing_evidence);
 
 }  // namespace litert::lm
 

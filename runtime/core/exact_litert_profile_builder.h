@@ -54,6 +54,25 @@ absl::StatusOr<ExactLiteRtProfile> DeriveExactLiteRtCpuProfile(
     const LoadedExactLiteRtEvidence& loaded_exact_evidence,
     SessionHandoffRuntimeClass loaded_runtime_class,
     absl::string_view canonical_loaded_execution_profile,
+    const ExactLiteRtLogitsFrameContract& logits_frame,
+    uint32_t cpu_thread_count, int32_t prefill_chunk_size,
+    const Hash256& model_artifact_hash,
+    const Hash256& runtime_delegate_platform_hash,
+    const SessionHandoffIdentity& session_identity);
+
+// Constructs a Metal identity candidate only when every concrete CoRun bit is
+// executor-derived. This is still not ExactRegeneration admission: the
+// returned candidate always requires independent fresh-worker qualification.
+absl::StatusOr<ExactLiteRtProfile> DeriveExactLiteRtMetalProfile(
+    const EngineSettings& engine_settings,
+    const SessionConfig& resolved_session_config,
+    const LoadedExactLiteRtEvidence& loaded_exact_evidence,
+    SessionHandoffRuntimeClass loaded_runtime_class,
+    absl::string_view canonical_loaded_execution_profile,
+    uint32_t metal_corun_evidence,
+    absl::string_view canonical_metal_policy,
+    const ExactLiteRtLogitsFrameContract& logits_frame,
+    uint32_t cpu_thread_count, int32_t prefill_chunk_size,
     const Hash256& model_artifact_hash,
     const Hash256& runtime_delegate_platform_hash,
     const SessionHandoffIdentity& session_identity);
