@@ -222,6 +222,22 @@ class DPMAgentReplayRuntime {
       const DPMAgentGenerationRequest& execution_request,
       const DPMAgentExecutionRequest& logical_request) = 0;
 
+  // WinnerReplay-only recovery primitive. The caller supplies the already
+  // selected authenticated winner and a fresh or own-position-restored live
+  // session. A successful implementation must bypass the catalog, invoke the
+  // loaded inference runtime exactly once, and return success only when that
+  // live session reproduces the selected winner's complete canonical bytes and
+  // request-scoped evidence. ExactRegeneration has no parent session and keeps
+  // this fail-closed default.
+  virtual absl::StatusOr<DPMAgentReplayExecution>
+  RematerializeCanonicalWinner(
+      Engine::Session*, const DPMAgentGenerationRequest&,
+      const DPMAgentExecutionRequest&, const DPMAgentReplayExecution&) {
+    return absl::UnimplementedError(
+        "This DPM agent runtime cannot rematerialize a canonical winner in a "
+        "live parent session.");
+  }
+
   // Exact-only fresh-process full/delta/capture entry point. WinnerReplay
   // leaves this unavailable; it continues to use its live parent Session.
   virtual absl::StatusOr<ExactRegenerationDPMAgentPhysicalExecution>
@@ -261,6 +277,12 @@ class CanonicalWinnerDPMAgentRuntime final : public DPMAgentReplayRuntime {
       Engine::Session* producing_session,
       const DPMAgentGenerationRequest& execution_request,
       const DPMAgentExecutionRequest& logical_request) override;
+  absl::StatusOr<DPMAgentReplayExecution>
+  RematerializeCanonicalWinner(
+      Engine::Session* producing_session,
+      const DPMAgentGenerationRequest& execution_request,
+      const DPMAgentExecutionRequest& logical_request,
+      const DPMAgentReplayExecution& selected_winner) override;
 
  private:
   CanonicalWinnerDPMAgentRuntime(

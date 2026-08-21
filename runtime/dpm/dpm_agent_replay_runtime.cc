@@ -1393,6 +1393,107 @@ CanonicalWinnerDPMAgentRuntime::Generate(
   return execution;
 }
 
+absl::StatusOr<DPMAgentReplayExecution>
+CanonicalWinnerDPMAgentRuntime::RematerializeCanonicalWinner(
+    Engine::Session* producing_session,
+    const DPMAgentGenerationRequest& execution_request,
+    const DPMAgentExecutionRequest& logical_request,
+    const DPMAgentReplayExecution& selected_winner) {
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  ABSL_RETURN_IF_ERROR(ValidateDPMAgentExecutionRequest(logical_request));
+  ABSL_RETURN_IF_ERROR(ValidateGenerationRequest(execution_request));
+  ABSL_RETURN_IF_ERROR(ValidateDPMAgentReplayExecution(
+      selected_winner, logical_request.max_output_tokens));
+  if (producing_session == nullptr ||
+      static_cast<uint32_t>(execution_request.max_output_tokens) !=
+          logical_request.max_output_tokens) {
+    return absl::InvalidArgumentError(
+        "WinnerReplay rematerialization requires a live session and matching "
+        "execution and logical request limits.");
+  }
+  if (selected_winner.mode != DPMReplayMode::kCanonicalWinnerReplay ||
+      !selected_winner.reused_canonical_winner ||
+      selected_winner.producing_session_matches_output) {
+    return absl::FailedPreconditionError(
+        "WinnerReplay rematerialization requires an already selected catalog "
+        "winner without a live producing session.");
+  }
+
+  ABSL_ASSIGN_OR_RETURN(std::string encoded,
+                        EncodeDPMAgentExecutionRequest(logical_request));
+  const DPMCanonicalReplayRequest replay_request =
+      MakeReplayRequest(std::move(encoded), logical_request.max_output_tokens);
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 expected_request_hash,
+      ComputeDPMCanonicalReplayRequestHash(replay_request));
+  if (selected_winner.replay_request_hash != expected_request_hash) {
+    return absl::FailedPreconditionError(
+        "Selected WinnerReplay result belongs to another logical request.");
+  }
+
+  std::vector<int32_t> selected_token_ids;
+  selected_token_ids.reserve(selected_winner.decision_token_ids.size());
+  for (int token_id : selected_winner.decision_token_ids) {
+    if (token_id < 0 ||
+        static_cast<int64_t>(token_id) >
+            std::numeric_limits<int32_t>::max()) {
+      return absl::DataLossError(
+          "Selected WinnerReplay result contains a non-int32 token ID.");
+    }
+    selected_token_ids.push_back(static_cast<int32_t>(token_id));
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      std::string selected_token_bytes,
+      EncodeFreshWorkerTokenIds(selected_token_ids));
+  DPMAgentDecisionEnvelope selected_envelope{
+      .decision_output = selected_winner.decision_output,
+      .canonical_token_bytes = std::move(selected_token_bytes),
+  };
+  ABSL_ASSIGN_OR_RETURN(
+      const std::string selected_canonical_output,
+      EncodeDPMAgentDecisionEnvelope(selected_envelope));
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 selected_expected_evidence,
+      ComputeWinnerEvidenceHash(runtime_identity_, replay_request,
+                                selected_canonical_output));
+  if (selected_winner.execution_evidence_hash != selected_expected_evidence) {
+    return absl::DataLossError(
+        "Selected WinnerReplay evidence does not authenticate its canonical "
+        "request and output bytes.");
+  }
+
+  // Invoke the loaded runtime directly. Do not call replay_executor_: a catalog
+  // lookup would return the same winner without making this session its live
+  // producer. WinnerAgentInvocation itself rejects a second model call.
+  WinnerAgentInvocation invocation(inference_runtime_, producing_session,
+                                   &execution_request, &logical_request,
+                                   runtime_identity_);
+  ABSL_ASSIGN_OR_RETURN(
+      CanonicalWinnerGeneratedCandidate rematerialized,
+      invocation.Generate(replay_request));
+  ABSL_RETURN_IF_ERROR(
+      invocation.ValidateSupport(DPMReplayStage::kAgentDecision));
+  if (!invocation.generate_called() || !invocation.generation_succeeded()) {
+    return absl::InternalError(
+        "WinnerReplay rematerialization returned without exactly one "
+        "successful model call.");
+  }
+  if (rematerialized.canonical_output != selected_canonical_output ||
+      rematerialized.execution_evidence_hash !=
+          selected_winner.execution_evidence_hash) {
+    return absl::FailedPreconditionError(
+        "Live WinnerReplay rematerialization did not byte-match the selected "
+        "canonical winner and its execution evidence.");
+  }
+
+  DPMAgentReplayExecution live_execution = selected_winner;
+  live_execution.reused_canonical_winner = false;
+  live_execution.producing_session_matches_output = true;
+  ABSL_RETURN_IF_ERROR(ValidateDPMAgentReplayExecution(
+      live_execution, logical_request.max_output_tokens));
+  return live_execution;
+}
+
 absl::StatusOr<std::unique_ptr<ExactRegenerationDPMAgentRuntime>>
 ExactRegenerationDPMAgentRuntime::Create(
     ExactRegenerationExecutor* exact_executor) {
