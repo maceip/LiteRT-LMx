@@ -36,6 +36,7 @@
 namespace litert::lm {
 
 class DPMAgentReplayRuntime;
+struct ExactRegenerationDPMAgentPhysicalExecution;
 
 class DPMClock {
  public:
@@ -135,7 +136,12 @@ struct DPMEngineConfig {
   // interval therefore changes inference work, not merely checkpoint names.
   uint32_t checkpoint_interval_turns = 1;
   bool restore_session_checkpoints = true;
-  bool require_checkpoint_at_milestone = true;
+  // Optional by default because CanonicalWinnerReplay may recover an
+  // authenticated catalog winner that its current backend cannot independently
+  // rematerialize byte-for-byte. Setting this true makes that condition and any
+  // capture/publication failure abort the turn instead of committing without a
+  // disposable checkpoint.
+  bool require_checkpoint_at_milestone = false;
   // Product admission is capped by kMaximumDPMGenerationTokens; this is not
   // an unbounded backend integer knob.
   int max_decision_tokens = 512;
@@ -262,6 +268,15 @@ class DPMEngine {
       const Hash256& agent_request_hash,
       const Hash256& transcript_hash,
       const std::optional<Hash256>& restored_from_checkpoint_id,
+      int64_t created_unix_micros) const;
+  absl::StatusOr<DPMSessionCheckpointArtifact>
+  BuildExactWorkerCheckpointArtifact(
+      absl::string_view authenticated_envelope,
+      const ExactRegenerationDPMAgentPhysicalExecution& physical_execution,
+      const DPMLogSnapshot& source_snapshot, uint64_t response_event_index,
+      const DPMProjectionOutcome& projection,
+      const Hash256& agent_request_hash, const Hash256& transcript_hash,
+      const Hash256& capsule_restore_admission_record_id,
       int64_t created_unix_micros) const;
 
   DPMEventLog* log_;

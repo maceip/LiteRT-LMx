@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -762,7 +763,24 @@ absl::Status DPMEngine::ValidateConfiguration() const {
     return absl::InvalidArgumentError(
         "DPM checkpoint authentication key must contain at least 32 bytes.");
   }
-  return agent_runtime_->ValidateSessionHandoffSupport();
+  ABSL_RETURN_IF_ERROR(agent_runtime_->ValidateSessionHandoffSupport());
+  if (agent_replay_mode == DPMReplayMode::kExactRegeneration) {
+    ABSL_ASSIGN_OR_RETURN(
+        const std::optional<Hash256> capsule_restore_admission_id,
+        agent_runtime_->GetCapsuleRestoreAdmissionRecordId());
+    ABSL_ASSIGN_OR_RETURN(
+        const std::optional<Hash256> session_handoff_capability_id,
+        agent_runtime_->GetSessionHandoffCapabilityId());
+    if (!capsule_restore_admission_id.has_value() ||
+        IsZeroHash(*capsule_restore_admission_id) ||
+        !session_handoff_capability_id.has_value() ||
+        IsZeroHash(*session_handoff_capability_id)) {
+      return absl::FailedPreconditionError(
+          "Exact DPM checkpoints require current CapsuleRestore admission "
+          "and an Engine-derived session-handoff capability.");
+    }
+  }
+  return absl::OkStatus();
 }
 
 absl::StatusOr<std::optional<DPMTurnResult>>
@@ -861,6 +879,16 @@ absl::Status DPMEngine::ValidateRestoreCandidate(
       candidate.artifact.descriptor;
   const DPMTurnReceipt& receipt = candidate.receipt;
 
+  const bool legacy_receipt =
+      receipt.format_version == DPMTurnReceipt::kLegacyFormatVersion;
+  const bool legacy_descriptor =
+      descriptor.format_version ==
+      DPMSessionCheckpointDescriptor::kLegacyFormatVersion;
+  if (legacy_receipt != legacy_descriptor) {
+    return absl::FailedPreconditionError(
+        "DPM checkpoint receipt and descriptor provenance versions differ.");
+  }
+
   if (!receipt.session_checkpoint_id ||
       *receipt.session_checkpoint_id != descriptor.descriptor_id ||
       descriptor.log_id != current.log_id ||
@@ -947,14 +975,20 @@ absl::Status DPMEngine::ValidateRestoreCandidate(
     ABSL_ASSIGN_OR_RETURN(
         const std::optional<Hash256> current_profile_admission_id,
         agent_runtime_->GetExactProfileAdmissionRecordId());
+    ABSL_ASSIGN_OR_RETURN(
+        const std::optional<Hash256> current_capsule_restore_admission_id,
+        agent_runtime_->GetCapsuleRestoreAdmissionRecordId());
     if (!current_profile_id.has_value() ||
         !current_profile_admission_id.has_value() ||
+        !current_capsule_restore_admission_id.has_value() ||
         descriptor.exact_profile_id != current_profile_id ||
         descriptor.exact_profile_admission_record_id !=
-            *current_profile_admission_id) {
+            *current_profile_admission_id ||
+        descriptor.capsule_restore_admission_record_id !=
+            *current_capsule_restore_admission_id) {
       return absl::FailedPreconditionError(
           "DPM exact checkpoint does not match the currently derived and "
-          "admitted exact profile.");
+          "admitted exact profile and CapsuleRestore capability.");
     }
   }
   ABSL_ASSIGN_OR_RETURN(Hash256 prefix_hash,
@@ -1240,6 +1274,117 @@ DPMEngine::CaptureProducingSession(
   return artifact;
 }
 
+absl::StatusOr<DPMSessionCheckpointArtifact>
+DPMEngine::BuildExactWorkerCheckpointArtifact(
+    absl::string_view authenticated_envelope,
+    const ExactRegenerationDPMAgentPhysicalExecution& physical_execution,
+    const DPMLogSnapshot& source_snapshot, uint64_t response_event_index,
+    const DPMProjectionOutcome& projection,
+    const Hash256& agent_request_hash, const Hash256& transcript_hash,
+    const Hash256& capsule_restore_admission_record_id,
+    int64_t created_unix_micros) const {
+  ABSL_ASSIGN_OR_RETURN(
+      const std::optional<Hash256> current_capsule_restore_admission_id,
+      agent_runtime_->GetCapsuleRestoreAdmissionRecordId());
+  if (!current_capsule_restore_admission_id.has_value() ||
+      *current_capsule_restore_admission_id !=
+          capsule_restore_admission_record_id) {
+    return absl::AbortedError(
+        "CapsuleRestore admission changed before exact checkpoint "
+        "publication.");
+  }
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactRegenerationDPMAgentPhysicalExecution(
+          physical_execution,
+          static_cast<uint32_t>(config_.max_decision_tokens)));
+  const DPMAgentReplayExecution& replay =
+      physical_execution.replay_execution;
+  if (replay.mode != DPMReplayMode::kExactRegeneration ||
+      !replay.exact_profile_id.has_value() ||
+      !replay.exact_profile_admission_record_id.has_value() ||
+      !replay.exact_output_evidence_hash.has_value() ||
+      IsZeroHash(capsule_restore_admission_record_id) ||
+      !physical_execution.run_zero_transient_producing_capsule_evidence
+           .has_value() ||
+      !physical_execution.durable_producing_capsule_evidence.has_value() ||
+      physical_execution.request_evidence.runs.empty()) {
+    return absl::FailedPreconditionError(
+        "Exact DPM checkpoint capture lacks admitted run-zero producing "
+        "capsule evidence.");
+  }
+  const FreshWorkerProducingCapsuleEvidence& transient =
+      *physical_execution.run_zero_transient_producing_capsule_evidence;
+  const FreshWorkerDurableProducingCapsuleEvidence& durable =
+      *physical_execution.durable_producing_capsule_evidence;
+  const ExactRegenerationRunEvidence& run_zero =
+      physical_execution.request_evidence.runs.front();
+  if (physical_execution.capture_run_policy !=
+          ExactRegenerationCaptureRunPolicy::kRunZeroOnly ||
+      run_zero.run_index != 0 ||
+      durable.session_identity != agent_runtime_->GetSessionHandoffIdentity() ||
+      transient.session_identity != durable.session_identity ||
+      durable.key_id != config_.checkpoint_key_id ||
+      durable.envelope_size != authenticated_envelope.size() ||
+      durable.envelope_hash != Sha256(authenticated_envelope) ||
+      durable.output_evidence_hash != *replay.exact_output_evidence_hash ||
+      transient.output_evidence_hash != *replay.exact_output_evidence_hash) {
+    return absl::DataLossError(
+        "Exact DPM checkpoint bytes or producing-worker evidence disagree "
+        "with the consensus output and loaded runtime.");
+  }
+
+  DPMSessionCheckpointArtifact artifact;
+  artifact.authenticated_envelope.assign(authenticated_envelope.data(),
+                                         authenticated_envelope.size());
+  DPMSessionCheckpointDescriptor& descriptor = artifact.descriptor;
+  descriptor.log_id = source_snapshot.log_id;
+  descriptor.stage = DPMSessionCheckpointStage::kAgentDecision;
+  descriptor.source_event_count = source_snapshot.events.size();
+  descriptor.source_prefix_hash = source_snapshot.prefix_hash;
+  descriptor.response_event_index = response_event_index;
+  descriptor.projection_request_hash = projection.manifest.request_hash;
+  descriptor.projection_manifest_hash = projection.manifest.manifest_hash;
+  descriptor.correction_digest = projection.manifest.correction_digest;
+  descriptor.agent_request_hash = agent_request_hash;
+  descriptor.agent_transcript_hash = transcript_hash;
+  descriptor.session_identity = durable.session_identity;
+  descriptor.key_id = durable.key_id;
+  descriptor.envelope_hash = durable.envelope_hash;
+  descriptor.envelope_size = durable.envelope_size;
+  descriptor.created_unix_micros = created_unix_micros;
+  descriptor.replay_mode = DPMReplayMode::kExactRegeneration;
+  descriptor.capture_origin =
+      DPMCheckpointCaptureOrigin::kAuthenticatedFreshWorker;
+  descriptor.restored_from_checkpoint_id =
+      physical_execution.restored_checkpoint_id;
+  descriptor.exact_profile_id = replay.exact_profile_id;
+  descriptor.exact_profile_admission_record_id =
+      *replay.exact_profile_admission_record_id;
+  descriptor.capsule_restore_admission_record_id =
+      capsule_restore_admission_record_id;
+  descriptor.exact_request_execution_evidence_id =
+      physical_execution.request_evidence.evidence_id;
+  descriptor.worker_prefill_mode =
+      ToCheckpointWorkerPrefillMode(physical_execution.prefill_mode);
+  descriptor.execution_plan_hash =
+      physical_execution.physical_execution_plan_hash;
+  descriptor.exact_output_evidence_hash =
+      *replay.exact_output_evidence_hash;
+  descriptor.worker_provenance = DPMExactWorkerCheckpointProvenance{
+      .run_index = run_zero.run_index,
+      .execution_plan_hash = physical_execution.physical_execution_plan_hash,
+      .request_envelope_hash = run_zero.request_envelope_hash,
+      .result_envelope_hash = run_zero.result_envelope_hash,
+      .transient_envelope_size = transient.transient_envelope_size,
+      .transient_envelope_hash = transient.transient_envelope_hash,
+      .output_evidence_hash = transient.output_evidence_hash,
+  };
+  ABSL_ASSIGN_OR_RETURN(descriptor.descriptor_id,
+                        ComputeDPMSessionCheckpointId(descriptor));
+  ABSL_RETURN_IF_ERROR(ValidateDPMSessionCheckpointArtifact(artifact));
+  return artifact;
+}
+
 absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
     const DPMTurnRequest& request) {
   absl::MutexLock turn_lock(turn_mutex_);
@@ -1461,6 +1606,25 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
       config_.checkpoint_interval_turns != 0 &&
       turn_number % config_.checkpoint_interval_turns == 0;
 
+  std::optional<RestoreCandidate> restore_candidate;
+  if (config_.restore_session_checkpoints) {
+    ABSL_ASSIGN_OR_RETURN(restore_candidate,
+                          FindRestoreCandidate(source_snapshot, projection));
+  }
+
+  std::optional<Hash256> capsule_restore_admission_record_id;
+  if (agent_replay_mode == DPMReplayMode::kExactRegeneration &&
+      (restore_candidate.has_value() || capture_milestone)) {
+    ABSL_ASSIGN_OR_RETURN(capsule_restore_admission_record_id,
+                          agent_runtime_->GetCapsuleRestoreAdmissionRecordId());
+    if (!capsule_restore_admission_record_id.has_value() ||
+        IsZeroHash(*capsule_restore_admission_record_id)) {
+      return absl::FailedPreconditionError(
+          "Exact DPM checkpoint use requires a currently authenticated "
+          "CapsuleRestore admission record.");
+    }
+  }
+
   std::unique_ptr<Engine::Session> session;
   auto validate_created_session =
       [&loaded_identity](Engine::Session* candidate) -> absl::Status {
@@ -1483,20 +1647,37 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
   std::optional<Hash256> restored_from_checkpoint_id;
   std::optional<ExactRegenerationDPMAgentPhysicalExecution>
       exact_physical_execution;
+  std::string exact_staged_capsule;
   DPMAgentReplayExecution agent_execution;
+  std::function<absl::StatusOr<ExactRegenerationDPMAgentPhysicalExecution>(
+      const RestoreCandidate*, bool, std::string*)>
+      run_exact_attempt;
   if (agent_replay_mode == DPMReplayMode::kCanonicalWinnerReplay) {
-    ABSL_ASSIGN_OR_RETURN(std::optional<RestoreCandidate> restore_candidate,
-                          FindRestoreCandidate(source_snapshot, projection));
-    ABSL_ASSIGN_OR_RETURN(session, agent_runtime_->CreateSession());
-    ABSL_RETURN_IF_ERROR(validate_created_session(session.get()));
-    if (restore_candidate) {
+    struct PreparedWinnerSession {
+      std::unique_ptr<Engine::Session> session;
+      DPMAgentGenerationRequest generation_request;
+      std::optional<Hash256> restored_checkpoint_id;
+    };
+    auto prepare_winner_session =
+        [&](bool allow_restore)
+        -> absl::StatusOr<PreparedWinnerSession> {
+      PreparedWinnerSession prepared;
+      prepared.generation_request.max_output_tokens =
+          config_.max_decision_tokens;
+      prepared.generation_request.canonical_prefill_chunks = full_chunks;
+      ABSL_ASSIGN_OR_RETURN(prepared.session,
+                            agent_runtime_->CreateSession());
+      ABSL_RETURN_IF_ERROR(validate_created_session(prepared.session.get()));
+      if (!allow_restore || !restore_candidate.has_value()) return prepared;
+
       SessionHandoffOptions options;
       options.key_id = config_.checkpoint_key_id;
       options.authentication_key = config_.checkpoint_authentication_key;
-      options.expected_identity = agent_runtime_->GetSessionHandoffIdentity();
+      options.expected_identity = loaded_identity;
       StringByteSource source(
           restore_candidate->artifact.authenticated_envelope);
-      absl::Status import_status = session->ImportHandoffFrom(source, options);
+      absl::Status import_status =
+          prepared.session->ImportHandoffFrom(source, options);
       if (import_status.ok()) {
         absl::StatusOr<std::vector<DPMAgentGenerationRequest::PrefillChunk>>
             delta_chunks = BuildDeltaTranscriptChunks(
@@ -1505,26 +1686,31 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
                 canonical_agent_input,
                 projection.manifest.correction_digest);
         if (delta_chunks.ok()) {
-          generation_request.canonical_prefill_chunks =
+          prepared.generation_request.canonical_prefill_chunks =
               std::move(*delta_chunks);
-          restored = true;
-          restored_from_checkpoint_id =
+          prepared.restored_checkpoint_id =
               restore_candidate->artifact.descriptor.descriptor_id;
+          return prepared;
         }
       }
-      if (!restored) {
-        // Discard even though the import contract promises an unchanged fresh
-        // target on failure. This also covers a structurally imported capsule
-        // whose delta boundary cannot be reconstructed from the authoritative
-        // log. Neither condition may leak checkpoint state into generation.
-        session.reset();
-        ABSL_ASSIGN_OR_RETURN(session, agent_runtime_->CreateSession());
-        ABSL_RETURN_IF_ERROR(validate_created_session(session.get()));
-      }
-    }
-    if (!restored) {
-      generation_request.canonical_prefill_chunks = full_chunks;
-    }
+
+      // Even though import is transactional, discard its target. This also
+      // covers a structurally valid capsule whose exact delta boundary can no
+      // longer be reconstructed from the authoritative log.
+      prepared.session.reset();
+      ABSL_ASSIGN_OR_RETURN(prepared.session,
+                            agent_runtime_->CreateSession());
+      ABSL_RETURN_IF_ERROR(validate_created_session(prepared.session.get()));
+      prepared.generation_request.canonical_prefill_chunks = full_chunks;
+      return prepared;
+    };
+
+    ABSL_ASSIGN_OR_RETURN(PreparedWinnerSession prepared,
+                          prepare_winner_session(true));
+    session = std::move(prepared.session);
+    generation_request = std::move(prepared.generation_request);
+    restored_from_checkpoint_id = prepared.restored_checkpoint_id;
+    restored = restored_from_checkpoint_id.has_value();
 
     absl::StatusOr<DPMAgentReplayExecution> generated =
         agent_runtime_->Generate(session.get(), generation_request,
@@ -1533,10 +1719,9 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
       // A structurally valid capsule can still fail when its first dynamic
       // continuation is bound. Discard the mutated target and reconstruct the
       // same logical request from the authoritative log in a fresh session.
-      session.reset();
-      ABSL_ASSIGN_OR_RETURN(session, agent_runtime_->CreateSession());
-      ABSL_RETURN_IF_ERROR(validate_created_session(session.get()));
-      generation_request.canonical_prefill_chunks = full_chunks;
+      ABSL_ASSIGN_OR_RETURN(prepared, prepare_winner_session(false));
+      session = std::move(prepared.session);
+      generation_request = std::move(prepared.generation_request);
       generated = agent_runtime_->Generate(
           session.get(), generation_request, logical_generation_request);
       restored = false;
@@ -1545,99 +1730,263 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
     if (!generated.ok()) return generated.status();
     agent_execution = std::move(*generated);
     if (!agent_execution.producing_session_matches_output) {
-      // A catalog hit or lost publish race may have occurred after restoring a
-      // parent session. That session did not produce the selected winner, so
-      // the receipt must not claim that the restore contributed to output.
+      const DPMAgentReplayExecution selected_winner = agent_execution;
+      session.reset();
       restored = false;
       restored_from_checkpoint_id.reset();
+
+      // A catalog hit or lost publish race has no session corresponding to the
+      // selected bytes. Only checkpoint milestones need to rematerialize one.
+      // The direct runtime call bypasses the catalog and accepts the new live
+      // session only if its complete canonical output byte-matches the winner.
+      if (capture_milestone) {
+        absl::Status rematerialization_status =
+            absl::FailedPreconditionError(
+                "WinnerReplay rematerialization did not start.");
+        absl::StatusOr<PreparedWinnerSession> rematerialization_session =
+            prepare_winner_session(true);
+        if (rematerialization_session.ok()) {
+          absl::StatusOr<DPMAgentReplayExecution> rematerialized =
+              agent_runtime_->RematerializeCanonicalWinner(
+                  rematerialization_session->session.get(),
+                  rematerialization_session->generation_request,
+                  logical_generation_request, selected_winner);
+          if (!rematerialized.ok() &&
+              rematerialization_session->restored_checkpoint_id.has_value()) {
+            // A restored live attempt may fail or disagree. Discard it and
+            // perform one full-log rematerialization in a brand-new session.
+            rematerialization_session = prepare_winner_session(false);
+            if (rematerialization_session.ok()) {
+              rematerialized =
+                  agent_runtime_->RematerializeCanonicalWinner(
+                      rematerialization_session->session.get(),
+                      rematerialization_session->generation_request,
+                      logical_generation_request, selected_winner);
+            }
+          }
+          if (rematerialized.ok()) {
+            session = std::move(rematerialization_session->session);
+            generation_request =
+                std::move(rematerialization_session->generation_request);
+            restored_from_checkpoint_id =
+                rematerialization_session->restored_checkpoint_id;
+            restored = restored_from_checkpoint_id.has_value();
+            agent_execution = std::move(*rematerialized);
+            rematerialization_status = absl::OkStatus();
+          } else {
+            rematerialization_status = rematerialized.status();
+          }
+        } else {
+          rematerialization_status = rematerialization_session.status();
+        }
+        if (!rematerialization_status.ok() &&
+            config_.require_checkpoint_at_milestone) {
+          return rematerialization_status;
+        }
+      }
     }
   } else {
-    // Even a full-prefill exact turn uses the physical executor entry point so
-    // its receipt commits fresh request-scoped N-process evidence and the
-    // concrete model-affecting plan. No parent Session is manufactured.
     ABSL_ASSIGN_OR_RETURN(
         const Hash256 replay_request_hash,
         ComputeAgentReplayRequestHash(logical_generation_request));
-    FreshWorkerExecutionPlan full_plan;
-    full_plan.logical_replay_request_hash = replay_request_hash;
-    ABSL_ASSIGN_OR_RETURN(full_plan.plan_hash,
-                          ComputeFreshWorkerExecutionPlanHash(full_plan));
-    ExactRegenerationExecutionInput physical_input{
-        .execution_plan = full_plan,
+
+    // Every invocation of this helper is a brand-new N-process attempt. The
+    // caller owns and clears the staging string so a failed restored or capture
+    // attempt cannot leak any run-zero bytes into its fallback.
+    run_exact_attempt =
+        [&, replay_request_hash](const RestoreCandidate* selected_checkpoint,
+            bool capture_producing_capsule,
+            std::string* staged_capsule)
+        -> absl::StatusOr<ExactRegenerationDPMAgentPhysicalExecution> {
+      if (staged_capsule == nullptr) {
+        return absl::InvalidArgumentError(
+            "Exact DPM execution requires caller-owned capsule staging.");
+      }
+      staged_capsule->clear();
+
+      FreshWorkerExecutionPlan execution_plan;
+      execution_plan.logical_replay_request_hash = replay_request_hash;
+      if (selected_checkpoint != nullptr) {
+        const DPMSessionCheckpointDescriptor& descriptor =
+            selected_checkpoint->artifact.descriptor;
+        ABSL_ASSIGN_OR_RETURN(
+            std::vector<DPMAgentGenerationRequest::PrefillChunk> delta_chunks,
+            BuildDeltaTranscriptChunks(
+                source_snapshot, descriptor.response_event_index,
+                canonical_agent_input, projection.manifest.correction_digest));
+        DPMAgentDeltaExecutionRequest delta_request{
+            .logical_agent_request_hash = agent_request_hash,
+            .correction_digest = projection.manifest.correction_digest,
+            .restore_checkpoint_id = descriptor.descriptor_id,
+            .restored_response_event_index =
+                descriptor.response_event_index,
+            .restored_agent_transcript_hash =
+                descriptor.agent_transcript_hash,
+            .max_output_tokens = max_decision_tokens,
+            .canonical_delta_prefill_chunks = std::move(delta_chunks),
+        };
+        ABSL_ASSIGN_OR_RETURN(
+            execution_plan.canonical_execution_payload,
+            EncodeDPMAgentDeltaExecutionRequest(delta_request));
+        execution_plan.prefill_mode =
+            FreshWorkerPrefillMode::kOwnPositionCapsuleDelta;
+        execution_plan.restore_checkpoint_id = descriptor.descriptor_id;
+        execution_plan.session_identity = descriptor.session_identity;
+        execution_plan.restore_durable_envelope_hash =
+            descriptor.envelope_hash;
+        execution_plan.restore_durable_envelope_size =
+            descriptor.envelope_size;
+      }
+      execution_plan.capture_producing_capsule =
+          capture_producing_capsule;
+      ABSL_ASSIGN_OR_RETURN(
+          execution_plan.plan_hash,
+          ComputeFreshWorkerExecutionPlanHash(execution_plan));
+
+      SessionHandoffOptions restore_options;
+      SessionHandoffOptions capture_options;
+      std::optional<StringByteSource> restore_source;
+      std::optional<StringByteSink> capture_sink;
+      ExactRegenerationExecutionInput physical_input{
+          .execution_plan = execution_plan,
+      };
+      if (selected_checkpoint != nullptr) {
+        restore_options.key_id = config_.checkpoint_key_id;
+        restore_options.authentication_key =
+            config_.checkpoint_authentication_key;
+        restore_options.expected_identity = loaded_identity;
+        restore_source.emplace(
+            selected_checkpoint->artifact.authenticated_envelope);
+        physical_input.durable_restore_source = &*restore_source;
+        physical_input.durable_restore_options = &restore_options;
+      }
+      if (capture_producing_capsule) {
+        capture_options.key_id = config_.checkpoint_key_id;
+        capture_options.authentication_key =
+            config_.checkpoint_authentication_key;
+        capture_options.expected_identity = loaded_identity;
+        capture_sink.emplace(staged_capsule);
+        physical_input.staging_capture_destination = &*capture_sink;
+        physical_input.staging_capture_options = &capture_options;
+      }
+
+      ABSL_ASSIGN_OR_RETURN(
+          ExactRegenerationDPMAgentPhysicalExecution physical,
+          agent_runtime_->GeneratePhysicalExact(logical_generation_request,
+                                                physical_input));
+      ABSL_RETURN_IF_ERROR(
+          ValidateExactRegenerationDPMAgentPhysicalExecution(
+              physical, max_decision_tokens));
+      if (physical.physical_execution_plan_hash != execution_plan.plan_hash ||
+          physical.restored_checkpoint_id !=
+              execution_plan.restore_checkpoint_id) {
+        return absl::DataLossError(
+            "Exact DPM worker execution changed its parent-selected physical "
+            "checkpoint plan.");
+      }
+      return physical;
     };
-    ABSL_ASSIGN_OR_RETURN(
-        ExactRegenerationDPMAgentPhysicalExecution physical,
-        agent_runtime_->GeneratePhysicalExact(logical_generation_request,
-                                              physical_input));
-    ABSL_RETURN_IF_ERROR(
-        ValidateExactRegenerationDPMAgentPhysicalExecution(
-            physical, max_decision_tokens));
-    agent_execution = physical.replay_execution;
-    exact_physical_execution = std::move(physical);
+
+    const bool capture_exact_session = capture_milestone;
+    absl::StatusOr<ExactRegenerationDPMAgentPhysicalExecution>
+        generated_exact =
+            restore_candidate.has_value()
+                ? run_exact_attempt(&*restore_candidate,
+                                    capture_exact_session,
+                                    &exact_staged_capsule)
+                : run_exact_attempt(nullptr, capture_exact_session,
+                                    &exact_staged_capsule);
+    if (!generated_exact.ok() && restore_candidate.has_value()) {
+      // A failed restored attempt is never repaired in place. Discard run-zero
+      // staging and execute the entire logical request again in a new set of
+      // cold processes from the authoritative log.
+      generated_exact = run_exact_attempt(nullptr, capture_exact_session,
+                                          &exact_staged_capsule);
+    }
+    if (!generated_exact.ok() && capture_exact_session &&
+        !config_.require_checkpoint_at_milestone) {
+      // Optional capture is not allowed to turn a partially captured worker
+      // attempt into the decision. A clean all-worker full-prefill attempt
+      // without capture becomes the sole request evidence.
+      generated_exact =
+          run_exact_attempt(nullptr, false, &exact_staged_capsule);
+    }
+    if (!generated_exact.ok()) return generated_exact.status();
+    exact_physical_execution = std::move(*generated_exact);
+    agent_execution = exact_physical_execution->replay_execution;
+    restored_from_checkpoint_id =
+        exact_physical_execution->restored_checkpoint_id;
+    restored = restored_from_checkpoint_id.has_value();
   }
 
-  ABSL_RETURN_IF_ERROR(ValidateDPMAgentReplayExecution(
-      agent_execution, max_decision_tokens));
-  if (agent_execution.mode != agent_replay_mode) {
-    return absl::DataLossError(
-        "DPM agent execution returned evidence for another replay mode.");
-  }
-  DPMAgentGenerationOutcome agent_outcome{
-      .decision_output = agent_execution.decision_output,
-      .decision_token_ids = agent_execution.decision_token_ids,
+  struct MaterializedAgentDecision {
+    DPMAgentGenerationOutcome outcome;
+    std::optional<Hash256> exact_output_evidence_hash;
+    uint32_t exact_logit_frame_count = 0;
+    Hash256 transcript_hash;
   };
-  ABSL_RETURN_IF_ERROR(
-      ValidateAgentOutcome(agent_outcome, max_decision_tokens));
-  std::optional<Hash256> agent_exact_output_evidence_hash;
-  uint32_t agent_exact_logit_frame_count = 0;
-  if (agent_execution.mode == DPMReplayMode::kExactRegeneration) {
-    if (agent_execution.exact_logit_frames.size() >
-        std::numeric_limits<uint32_t>::max()) {
-      return absl::ResourceExhaustedError(
-          "Exact agent logits evidence exceeds the receipt count domain.");
-    }
-    DPMAgentDecisionEnvelope decision_envelope{
-        .decision_output = agent_execution.decision_output,
-        .canonical_token_bytes = agent_execution.exact_token_bytes,
-    };
-    ABSL_ASSIGN_OR_RETURN(
-        const std::string canonical_decision_envelope,
-        EncodeDPMAgentDecisionEnvelope(decision_envelope));
-    agent_exact_output_evidence_hash = ComputeFreshWorkerOutputEvidenceHash(
-        canonical_decision_envelope, agent_execution.exact_token_bytes,
-        agent_execution.exact_logit_frames);
-    if (!agent_execution.exact_output_evidence_hash.has_value() ||
-        *agent_execution.exact_output_evidence_hash !=
-            *agent_exact_output_evidence_hash) {
+  auto materialize_agent_decision =
+      [&](const DPMAgentReplayExecution& execution)
+      -> absl::StatusOr<MaterializedAgentDecision> {
+    ABSL_RETURN_IF_ERROR(
+        ValidateDPMAgentReplayExecution(execution, max_decision_tokens));
+    if (execution.mode != agent_replay_mode) {
       return absl::DataLossError(
-          "Exact agent runtime output-evidence commitment disagrees with "
-          "the canonical decision, token, and ordered logits evidence.");
+          "DPM agent execution returned evidence for another replay mode.");
     }
-    agent_exact_logit_frame_count =
-        static_cast<uint32_t>(agent_execution.exact_logit_frames.size());
-  }
-  ABSL_ASSIGN_OR_RETURN(
-      Hash256 transcript_hash,
-      ComputeTranscriptHash(source_snapshot, canonical_agent_input,
-                            agent_outcome.decision_output,
-                            agent_outcome.decision_token_ids,
-                            projection.manifest.correction_digest));
+    MaterializedAgentDecision material;
+    material.outcome.decision_output = execution.decision_output;
+    material.outcome.decision_token_ids = execution.decision_token_ids;
+    ABSL_RETURN_IF_ERROR(
+        ValidateAgentOutcome(material.outcome, max_decision_tokens));
+    if (execution.mode == DPMReplayMode::kExactRegeneration) {
+      if (execution.exact_logit_frames.size() >
+          std::numeric_limits<uint32_t>::max()) {
+        return absl::ResourceExhaustedError(
+            "Exact agent logits evidence exceeds the receipt count domain.");
+      }
+      DPMAgentDecisionEnvelope decision_envelope{
+          .decision_output = execution.decision_output,
+          .canonical_token_bytes = execution.exact_token_bytes,
+      };
+      ABSL_ASSIGN_OR_RETURN(
+          const std::string canonical_decision_envelope,
+          EncodeDPMAgentDecisionEnvelope(decision_envelope));
+      material.exact_output_evidence_hash =
+          ComputeFreshWorkerOutputEvidenceHash(
+              canonical_decision_envelope, execution.exact_token_bytes,
+              execution.exact_logit_frames);
+      if (!execution.exact_output_evidence_hash.has_value() ||
+          *execution.exact_output_evidence_hash !=
+              *material.exact_output_evidence_hash) {
+        return absl::DataLossError(
+            "Exact agent runtime output-evidence commitment disagrees with "
+            "the canonical decision, token, and ordered logits evidence.");
+      }
+      material.exact_logit_frame_count =
+          static_cast<uint32_t>(execution.exact_logit_frames.size());
+    }
+    ABSL_ASSIGN_OR_RETURN(
+        material.transcript_hash,
+        ComputeTranscriptHash(source_snapshot, canonical_agent_input,
+                              material.outcome.decision_output,
+                              material.outcome.decision_token_ids,
+                              projection.manifest.correction_digest));
+    return material;
+  };
+  ABSL_ASSIGN_OR_RETURN(MaterializedAgentDecision materialized_decision,
+                        materialize_agent_decision(agent_execution));
 
   std::optional<Hash256> checkpoint_id;
+  std::optional<DPMExactWorkerCheckpointProvenance>
+      exact_checkpoint_provenance;
   if (capture_milestone) {
-    if (!agent_execution.producing_session_matches_output ||
-        session == nullptr) {
-      if (config_.require_checkpoint_at_milestone) {
-        return absl::FailedPreconditionError(
-            "DPM checkpoint milestone selected an output whose producing "
-            "session is unavailable; catalog hits, lost WinnerReplay races, "
-            "and current exact workers cannot substitute a parent session.");
-      }
-    } else {
+    if (agent_replay_mode == DPMReplayMode::kCanonicalWinnerReplay &&
+        agent_execution.producing_session_matches_output && session != nullptr) {
       absl::StatusOr<DPMSessionCheckpointArtifact> artifact =
           CaptureProducingSession(
               session.get(), source_snapshot, response_event_index, projection,
-              agent_request_hash, transcript_hash,
+              agent_request_hash, materialized_decision.transcript_hash,
               restored_from_checkpoint_id, response_timestamp);
       if (artifact.ok()) {
         absl::Status put_status = checkpoint_repository_->Put(*artifact);
@@ -1649,8 +1998,66 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
       } else if (config_.require_checkpoint_at_milestone) {
         return artifact.status();
       }
+    } else if (agent_replay_mode == DPMReplayMode::kCanonicalWinnerReplay) {
+      if (config_.require_checkpoint_at_milestone) {
+        return absl::FailedPreconditionError(
+            "DPM checkpoint milestone selected a WinnerReplay catalog result "
+            "without its live producing parent session.");
+      }
+    } else if (exact_physical_execution.has_value() &&
+               exact_physical_execution->capture_run_policy ==
+                   ExactRegenerationCaptureRunPolicy::kRunZeroOnly) {
+      if (!capsule_restore_admission_record_id.has_value()) {
+        return absl::FailedPreconditionError(
+            "Exact DPM capture lost its CapsuleRestore admission binding.");
+      }
+      absl::Status publish_status;
+      absl::StatusOr<DPMSessionCheckpointArtifact> artifact =
+          BuildExactWorkerCheckpointArtifact(
+              exact_staged_capsule, *exact_physical_execution, source_snapshot,
+              response_event_index, projection, agent_request_hash,
+              materialized_decision.transcript_hash,
+              *capsule_restore_admission_record_id, response_timestamp);
+      if (artifact.ok()) {
+        publish_status = checkpoint_repository_->Put(*artifact);
+        if (publish_status.ok()) {
+          checkpoint_id = artifact->descriptor.descriptor_id;
+          exact_checkpoint_provenance = artifact->descriptor.worker_provenance;
+        }
+      } else {
+        publish_status = artifact.status();
+      }
+      if (!publish_status.ok()) {
+        if (config_.require_checkpoint_at_milestone) return publish_status;
+
+        // Durable publication is part of optional capture. If it fails, the
+        // captured attempt is discarded as a whole and a new all-process full
+        // prefill without capture becomes the decision evidence.
+        exact_staged_capsule.clear();
+        ABSL_ASSIGN_OR_RETURN(
+            ExactRegenerationDPMAgentPhysicalExecution clean_full_execution,
+            run_exact_attempt(nullptr, false, &exact_staged_capsule));
+        exact_physical_execution = std::move(clean_full_execution);
+        agent_execution = exact_physical_execution->replay_execution;
+        restored = false;
+        restored_from_checkpoint_id.reset();
+        ABSL_ASSIGN_OR_RETURN(
+            materialized_decision,
+            materialize_agent_decision(agent_execution));
+      }
+    } else if (config_.require_checkpoint_at_milestone) {
+      return absl::FailedPreconditionError(
+          "Required exact DPM checkpoint capture produced no authenticated "
+          "run-zero capsule.");
     }
   }
+
+  DPMAgentGenerationOutcome& agent_outcome = materialized_decision.outcome;
+  const std::optional<Hash256>& agent_exact_output_evidence_hash =
+      materialized_decision.exact_output_evidence_hash;
+  const uint32_t agent_exact_logit_frame_count =
+      materialized_decision.exact_logit_frame_count;
+  const Hash256& transcript_hash = materialized_decision.transcript_hash;
 
   DPMTurnReceipt receipt;
   receipt.operation_id = request.operation_id;
@@ -1693,6 +2100,30 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
         exact_physical_execution->prefill_mode);
     receipt.agent_physical_execution_plan_hash =
         exact_physical_execution->physical_execution_plan_hash;
+    if (restored_from_checkpoint_id.has_value() || checkpoint_id.has_value()) {
+      if (!capsule_restore_admission_record_id.has_value()) {
+        return absl::InternalError(
+            "Exact DPM capsule use lost its authenticated admission ID.");
+      }
+      ABSL_ASSIGN_OR_RETURN(
+          const std::optional<Hash256> current_capsule_admission_id,
+          agent_runtime_->GetCapsuleRestoreAdmissionRecordId());
+      if (current_capsule_admission_id !=
+          capsule_restore_admission_record_id) {
+        return absl::AbortedError(
+            "CapsuleRestore admission changed before DPM receipt commit.");
+      }
+      receipt.agent_capsule_restore_admission_record_id =
+          capsule_restore_admission_record_id;
+    }
+    if (checkpoint_id.has_value()) {
+      if (!exact_checkpoint_provenance.has_value()) {
+        return absl::InternalError(
+            "Exact DPM checkpoint publication lost run-zero provenance.");
+      }
+      receipt.agent_exact_worker_checkpoint_provenance =
+          exact_checkpoint_provenance;
+    }
   }
   ABSL_RETURN_IF_ERROR(ValidateDPMTurnReceiptReplayEvidence(receipt));
 
@@ -1756,6 +2187,8 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
       agent_execution.reused_canonical_winner;
   result.agent_producing_session_matched_output =
       agent_execution.producing_session_matches_output;
+  result.agent_worker_capsule_matched_output =
+      checkpoint_id.has_value() && exact_checkpoint_provenance.has_value();
   result.session_checkpoint_id = checkpoint_id;
   result.restored_from_session_checkpoint_id =
       restored_from_checkpoint_id;
@@ -1770,6 +2203,12 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
         exact_physical_execution->prefill_mode);
     result.agent_physical_execution_plan_hash =
         exact_physical_execution->physical_execution_plan_hash;
+    if (restored_from_checkpoint_id.has_value() || checkpoint_id.has_value()) {
+      result.agent_capsule_restore_admission_record_id =
+          capsule_restore_admission_record_id;
+    }
+    result.agent_exact_worker_checkpoint_provenance =
+        exact_checkpoint_provenance;
   }
   result.restored_session_checkpoint =
       restored_from_checkpoint_id.has_value();
