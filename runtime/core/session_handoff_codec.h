@@ -66,6 +66,17 @@ absl::StatusOr<DecodedSessionHandoff> DecodeSessionHandoffFrom(
 // for the duration of the call. As with other streaming encoders, callers
 // must discard destination bytes if a later source or destination I/O error
 // is returned; durable publication must be transactional around this call.
+absl::StatusOr<SessionHandoffReauthenticationEvidence>
+ReauthenticateSessionHandoffToWithEvidence(
+    const ByteSource& source,
+    const SessionHandoffIdentity& authoritative_identity,
+    const SessionHandoffOptions& source_options,
+    const SessionHandoffOptions& destination_options,
+    absl::string_view purpose, ByteSink* destination);
+
+// Compatibility adapter for callers that do not retain provenance. It uses a
+// stable generic purpose, delegates to the evidence-returning operation, and
+// discards only the resulting evidence after the complete operation succeeds.
 absl::Status ReauthenticateSessionHandoffTo(
     const ByteSource& source,
     const SessionHandoffIdentity& authoritative_identity,

@@ -37,6 +37,7 @@
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
+#include "runtime/engine/session_handoff_capability.h"
 #include "runtime/platform/hash/sha256_hasher.h"
 #include "runtime/proto/sampler_params.pb.h"
 
@@ -58,8 +59,32 @@ constexpr absl::string_view kContinuationStateWitnessDomain =
     "LITERT_LMX_SESSION_CONTINUATION_STATE_WITNESS_SHA256_V1";
 constexpr absl::string_view kContinuationStateWitnessContractDomain =
     "LITERT_LMX_SESSION_CONTINUATION_STATE_WITNESS_CONTRACT_SHA256_V1";
+constexpr absl::string_view kReauthenticationEvidenceDomain =
+    "LITERT_LMX_SESSION_HANDOFF_REAUTHENTICATION_EVIDENCE_SHA256_V1";
+constexpr absl::string_view kReauthenticationEvidenceContractDomain =
+    "LITERT_LMX_SESSION_HANDOFF_REAUTHENTICATION_EVIDENCE_CONTRACT_SHA256_V1";
+constexpr absl::string_view kCanonicalContinuationStateDomain =
+    "LITERT_LMX_CANONICAL_CONTINUATION_STATE_SHA256_V1";
+constexpr absl::string_view kCanonicalContinuationStateKeyId =
+    "litert-lmx-public-continuation-state-commitment-v1";
+// This fixed value is a non-secret, internal serialization device. It gives
+// EncodeSessionHandoffParts a deterministic HMAC context so the already
+// canonical codec can be reused as a state commitment encoder. Authenticity
+// continues to come exclusively from the separately validated operational
+// source and destination envelopes.
+constexpr absl::string_view kCanonicalContinuationStateCommitmentKey =
+    "LiteRT-LMx-public-state-commitment-key-v1-not-an-authentication-secret";
+constexpr absl::string_view kStatusOnlyReauthenticationPurpose =
+    "generic-status-only-reauthentication";
 
 bool IsZeroHash(const Hash256& hash) { return hash == Hash256{}; }
+
+bool HasControlByte(absl::string_view bytes) {
+  for (unsigned char byte : bytes) {
+    if (byte < 0x20 || byte == 0x7f) return true;
+  }
+  return false;
+}
 
 void AppendWitnessU32(uint32_t value, std::string* output) {
   for (int shift = 24; shift >= 0; shift -= 8) {
@@ -80,6 +105,108 @@ void AppendWitnessU64(uint64_t value, std::string* output) {
 void AppendWitnessHash(const Hash256& hash, std::string* output) {
   output->append(reinterpret_cast<const char*>(hash.bytes.data()),
                  hash.bytes.size());
+}
+
+void AppendWitnessString(absl::string_view value, std::string* output) {
+  AppendWitnessU32(static_cast<uint32_t>(value.size()), output);
+  output->append(value.data(), value.size());
+}
+
+bool IsCompleteSessionHandoffIdentity(
+    const SessionHandoffIdentity& identity) {
+  return !IsZeroHash(identity.model_artifact_hash) &&
+         !IsZeroHash(identity.runtime_artifact_hash) &&
+         !IsZeroHash(identity.inference_profile_hash);
+}
+
+absl::Status ValidateReauthenticationLabel(absl::string_view value,
+                                           uint32_t maximum_size,
+                                           absl::string_view field_name) {
+  if (value.empty() || value.size() > maximum_size || HasControlByte(value)) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Session handoff reauthentication ", field_name,
+        " is empty, oversized, or contains a control byte."));
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateReauthenticationEvidenceFields(
+    const SessionHandoffReauthenticationEvidence& evidence,
+    bool require_evidence_id) {
+  if (evidence.format_version !=
+      SessionHandoffReauthenticationEvidence::kFormatVersion) {
+    return absl::FailedPreconditionError(
+        "Unsupported session handoff reauthentication evidence version.");
+  }
+  if ((require_evidence_id && IsZeroHash(evidence.evidence_id)) ||
+      !IsCompleteSessionHandoffIdentity(evidence.session_identity) ||
+      IsZeroHash(evidence.canonical_continuation_state_hash) ||
+      IsZeroHash(evidence.source_envelope_hash) ||
+      evidence.source_envelope_size == 0 ||
+      evidence.source_envelope_size > kMaximumSessionHandoffEnvelopeBytes ||
+      IsZeroHash(evidence.destination_envelope_hash) ||
+      evidence.destination_envelope_size == 0 ||
+      evidence.destination_envelope_size >
+          kMaximumSessionHandoffEnvelopeBytes ||
+      IsZeroHash(evidence.capsule_codec_contract_hash) ||
+      IsZeroHash(evidence.reauthentication_contract_hash)) {
+    return absl::InvalidArgumentError(
+        "Session handoff reauthentication evidence is incomplete or outside "
+        "its canonical bounds.");
+  }
+  ABSL_RETURN_IF_ERROR(ValidateReauthenticationLabel(
+      evidence.source_key_id, kMaximumKeyIdSize, "source key ID"));
+  ABSL_RETURN_IF_ERROR(ValidateReauthenticationLabel(
+      evidence.destination_key_id, kMaximumKeyIdSize,
+      "destination key ID"));
+  ABSL_RETURN_IF_ERROR(ValidateReauthenticationLabel(
+      evidence.purpose, kMaximumSessionHandoffReauthenticationPurposeBytes,
+      "purpose"));
+  if (evidence.source_key_id == evidence.destination_key_id) {
+    return absl::InvalidArgumentError(
+        "Session handoff reauthentication requires distinct source and "
+        "destination key IDs.");
+  }
+  if (evidence.capsule_codec_contract_hash !=
+      GetSessionHandoffCapsuleCodecContractHash()) {
+    return absl::FailedPreconditionError(
+        "Session handoff reauthentication evidence does not bind the current "
+        "capsule codec contract.");
+  }
+  if (evidence.reauthentication_contract_hash !=
+      GetSessionHandoffReauthenticationEvidenceContractHash()) {
+    return absl::FailedPreconditionError(
+        "Session handoff reauthentication evidence does not bind the current "
+        "state-commitment and evidence contract.");
+  }
+  return absl::OkStatus();
+}
+
+std::string EncodeReauthenticationEvidenceFields(
+    const SessionHandoffReauthenticationEvidence& evidence) {
+  std::string canonical;
+  canonical.reserve(4 + 96 + 32 + 32 + 8 + 4 +
+                    evidence.source_key_id.size() + 32 + 8 + 4 +
+                    evidence.destination_key_id.size() + 32 + 32 + 4 +
+                    evidence.purpose.size());
+  AppendWitnessU32(evidence.format_version, &canonical);
+  AppendWitnessHash(evidence.session_identity.model_artifact_hash,
+                    &canonical);
+  AppendWitnessHash(evidence.session_identity.runtime_artifact_hash,
+                    &canonical);
+  AppendWitnessHash(evidence.session_identity.inference_profile_hash,
+                    &canonical);
+  AppendWitnessHash(evidence.canonical_continuation_state_hash, &canonical);
+  AppendWitnessHash(evidence.source_envelope_hash, &canonical);
+  AppendWitnessU64(evidence.source_envelope_size, &canonical);
+  AppendWitnessString(evidence.source_key_id, &canonical);
+  AppendWitnessHash(evidence.destination_envelope_hash, &canonical);
+  AppendWitnessU64(evidence.destination_envelope_size, &canonical);
+  AppendWitnessString(evidence.destination_key_id, &canonical);
+  AppendWitnessHash(evidence.capsule_codec_contract_hash, &canonical);
+  AppendWitnessHash(evidence.reauthentication_contract_hash, &canonical);
+  AppendWitnessString(evidence.purpose, &canonical);
+  return canonical;
 }
 
 absl::Status ValidateContinuationStateWitnessFields(
@@ -484,6 +611,45 @@ class AuthenticatedByteSink final : public ByteSink {
   HmacSha256State* hmac_;
 };
 
+// SHA-256 sink used either as a transparent destination wrapper or as a
+// digest-only canonical commitment sink. It accounts only bytes successfully
+// accepted by the downstream sink and enforces the public capsule bound.
+class BoundedSha256ByteSink final : public ByteSink {
+ public:
+  explicit BoundedSha256ByteSink(ByteSink* downstream)
+      : downstream_(downstream) {}
+
+  BoundedSha256ByteSink(absl::string_view domain,
+                        const Hash256& contract_hash)
+      : downstream_(nullptr) {
+    hasher_.Update(domain);
+    hasher_.Update(absl::string_view(
+        reinterpret_cast<const char*>(contract_hash.bytes.data()),
+        contract_hash.bytes.size()));
+  }
+
+  absl::Status Append(absl::string_view bytes) override {
+    if (bytes.size() > kMaximumSessionHandoffEnvelopeBytes - size_) {
+      return absl::ResourceExhaustedError(
+          "Session handoff digest sink exceeded the capsule bound.");
+    }
+    if (downstream_ != nullptr) {
+      ABSL_RETURN_IF_ERROR(downstream_->Append(bytes));
+    }
+    hasher_.Update(bytes);
+    size_ += bytes.size();
+    return absl::OkStatus();
+  }
+
+  uint64_t Size() const { return size_; }
+  Hash256 Finalize() { return hasher_.Finalize(); }
+
+ private:
+  ByteSink* downstream_;
+  Sha256Hasher hasher_;
+  uint64_t size_ = 0;
+};
+
 class ExactSizeByteSink final : public ByteSink {
  public:
   ExactSizeByteSink(ByteSink* downstream, uint64_t expected_size)
@@ -708,6 +874,101 @@ absl::StatusOr<Hash256> HmacSha256Source(absl::string_view key,
   return hmac.Finalize();
 }
 
+absl::StatusOr<Hash256> Sha256Source(const ByteSource& source,
+                                     uint64_t size) {
+  if (size == 0 || size > source.Size() ||
+      size > kMaximumSessionHandoffEnvelopeBytes) {
+    return absl::OutOfRangeError(
+        "Session handoff digest range is empty or exceeds its byte source.");
+  }
+  Sha256Hasher hasher;
+  std::string chunk(
+      static_cast<size_t>(std::min<uint64_t>(size, kIoChunkSize)), '\0');
+  uint64_t offset = 0;
+  while (offset < size) {
+    const size_t count = static_cast<size_t>(
+        std::min<uint64_t>(chunk.size(), size - offset));
+    ABSL_RETURN_IF_ERROR(
+        source.ReadAt(offset, absl::MakeSpan(chunk).subspan(0, count)));
+    hasher.Update(absl::string_view(chunk.data(), count));
+    offset += count;
+  }
+  const Hash256 hash = hasher.Finalize();
+  if (IsZeroHash(hash)) {
+    return absl::InternalError(
+        "Session handoff envelope produced a zero SHA-256 digest.");
+  }
+  return hash;
+}
+
+absl::Status StreamByteSource(const ByteSource& source, ByteSink* sink) {
+  if (sink == nullptr) {
+    return absl::InvalidArgumentError(
+        "Session handoff streaming destination must not be null.");
+  }
+  if (source.Size() == 0) return absl::OkStatus();
+  if (source.Size() > kMaximumSessionHandoffEnvelopeBytes) {
+    return absl::ResourceExhaustedError(
+        "Session handoff streaming source exceeds the capsule bound.");
+  }
+  std::string chunk(static_cast<size_t>(
+                        std::min<uint64_t>(source.Size(), kIoChunkSize)),
+                    '\0');
+  uint64_t offset = 0;
+  while (offset < source.Size()) {
+    const size_t count = static_cast<size_t>(
+        std::min<uint64_t>(chunk.size(), source.Size() - offset));
+    ABSL_RETURN_IF_ERROR(
+        source.ReadAt(offset, absl::MakeSpan(chunk).subspan(0, count)));
+    ABSL_RETURN_IF_ERROR(
+        sink->Append(absl::string_view(chunk.data(), count)));
+    offset += count;
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<Hash256> ComputeCanonicalContinuationStateHash(
+    const DecodedSessionHandoff& decoded,
+    const ByteSource& serialized_state,
+    const SessionHandoffIdentity& authoritative_identity) {
+  if (!decoded.snapshot.executor.serialized_state.empty() ||
+      serialized_state.Size() != decoded.serialized_state_size) {
+    return absl::DataLossError(
+        "Canonical continuation-state commitment received inconsistent "
+        "streamed state metadata.");
+  }
+  const Hash256 contract_hash =
+      GetSessionHandoffReauthenticationEvidenceContractHash();
+  if (IsZeroHash(contract_hash)) {
+    return absl::InternalError(
+        "Session handoff reauthentication contract hash is zero.");
+  }
+  SessionHandoffOptions commitment_options{
+      .key_id = std::string(kCanonicalContinuationStateKeyId),
+      .authentication_key =
+          std::string(kCanonicalContinuationStateCommitmentKey),
+      .expected_identity = authoritative_identity,
+  };
+  BoundedSha256ByteSink commitment_sink(kCanonicalContinuationStateDomain,
+                                        contract_hash);
+  ABSL_RETURN_IF_ERROR(EncodeSessionHandoffParts(
+      decoded.snapshot, decoded.serialized_state_size,
+      authoritative_identity, commitment_options, &commitment_sink,
+      [&serialized_state](ByteSink* state_sink) {
+        return StreamByteSource(serialized_state, state_sink);
+      }));
+  if (commitment_sink.Size() == 0) {
+    return absl::InternalError(
+        "Canonical continuation-state commitment encoded no state bytes.");
+  }
+  const Hash256 state_hash = commitment_sink.Finalize();
+  if (IsZeroHash(state_hash)) {
+    return absl::InternalError(
+        "Canonical continuation-state commitment produced a zero digest.");
+  }
+  return state_hash;
+}
+
 bool ConstantTimeEquals(absl::Span<const char> bytes, const Hash256& hash) {
   if (bytes.size() != hash.bytes.size()) return false;
   uint8_t difference = 0;
@@ -813,6 +1074,63 @@ class SourceReader {
 };
 
 }  // namespace
+
+Hash256 GetSessionHandoffReauthenticationEvidenceContractHash() {
+  Sha256Hasher commitment_key_hasher;
+  const Hash256 commitment_key_hash =
+      commitment_key_hasher.OneShot(kCanonicalContinuationStateCommitmentKey);
+  std::string canonical;
+  AppendWitnessU32(
+      SessionHandoffReauthenticationEvidence::kFormatVersion, &canonical);
+  AppendWitnessHash(GetSessionHandoffCapsuleCodecContractHash(), &canonical);
+  AppendWitnessU64(kMaximumSessionHandoffEnvelopeBytes, &canonical);
+  AppendWitnessU32(kMaximumKeyIdSize, &canonical);
+  AppendWitnessU32(kMaximumSessionHandoffReauthenticationPurposeBytes,
+                   &canonical);
+  AppendWitnessString(kReauthenticationEvidenceDomain, &canonical);
+  AppendWitnessString(kCanonicalContinuationStateDomain, &canonical);
+  AppendWitnessString(kCanonicalContinuationStateKeyId, &canonical);
+  AppendWitnessHash(commitment_key_hash, &canonical);
+  AppendWitnessString("FIXED_PUBLIC_NON_AUTHENTICATION_CONTEXT_V1",
+                      &canonical);
+  AppendWitnessString("CANONICAL_COMPLETE_LRTSESS1_REENCODE_V1",
+                      &canonical);
+  AppendWitnessString("OPERATIONAL_KEY_ID_AND_MAC_INVARIANT_V1",
+                      &canonical);
+  Sha256Hasher hasher;
+  hasher.Update(kReauthenticationEvidenceContractDomain);
+  hasher.Update(canonical);
+  return hasher.Finalize();
+}
+
+absl::StatusOr<Hash256> ComputeSessionHandoffReauthenticationEvidenceId(
+    const SessionHandoffReauthenticationEvidence& evidence) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateReauthenticationEvidenceFields(evidence, false));
+  Sha256Hasher hasher;
+  hasher.Update(kReauthenticationEvidenceDomain);
+  hasher.Update(EncodeReauthenticationEvidenceFields(evidence));
+  const Hash256 evidence_id = hasher.Finalize();
+  if (IsZeroHash(evidence_id)) {
+    return absl::InternalError(
+        "Session handoff reauthentication evidence produced a zero ID.");
+  }
+  return evidence_id;
+}
+
+absl::Status ValidateSessionHandoffReauthenticationEvidence(
+    const SessionHandoffReauthenticationEvidence& evidence) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateReauthenticationEvidenceFields(evidence, true));
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 canonical_id,
+      ComputeSessionHandoffReauthenticationEvidenceId(evidence));
+  if (evidence.evidence_id != canonical_id) {
+    return absl::DataLossError(
+        "Session handoff reauthentication evidence ID is not canonical.");
+  }
+  return absl::OkStatus();
+}
 
 Hash256 GetSessionContinuationStateWitnessContractHash() {
   std::string canonical;
@@ -1105,12 +1423,13 @@ absl::StatusOr<DecodedSessionHandoff> DecodeSessionHandoffFrom(
   return decoded;
 }
 
-absl::Status ReauthenticateSessionHandoffTo(
+absl::StatusOr<SessionHandoffReauthenticationEvidence>
+ReauthenticateSessionHandoffToWithEvidence(
     const ByteSource& source,
     const SessionHandoffIdentity& authoritative_identity,
     const SessionHandoffOptions& source_options,
     const SessionHandoffOptions& destination_options,
-    ByteSink* destination) {
+    absl::string_view purpose, ByteSink* destination) {
   if (destination == nullptr) {
     return absl::InvalidArgumentError(
         "Session handoff reauthentication destination must not be null.");
@@ -1125,6 +1444,24 @@ absl::Status ReauthenticateSessionHandoffTo(
         "Session handoff reauthentication source and destination must not "
         "be the same object.");
   }
+  ABSL_RETURN_IF_ERROR(
+      ValidateOptions(authoritative_identity, source_options));
+  ABSL_RETURN_IF_ERROR(
+      ValidateOptions(authoritative_identity, destination_options));
+  ABSL_RETURN_IF_ERROR(ValidateReauthenticationLabel(
+      source_options.key_id, kMaximumKeyIdSize, "source key ID"));
+  ABSL_RETURN_IF_ERROR(ValidateReauthenticationLabel(
+      destination_options.key_id, kMaximumKeyIdSize,
+      "destination key ID"));
+  ABSL_RETURN_IF_ERROR(ValidateReauthenticationLabel(
+      purpose, kMaximumSessionHandoffReauthenticationPurposeBytes,
+      "purpose"));
+  if (source_options.key_id == destination_options.key_id) {
+    return absl::InvalidArgumentError(
+        "Session handoff reauthentication requires distinct source and "
+        "destination key IDs.");
+  }
+  const uint64_t source_envelope_size = source.Size();
 
   // DecodeSessionHandoffFrom authenticates the complete source before parsing
   // metadata. Keep this operation ahead of every destination write so an
@@ -1133,6 +1470,10 @@ absl::Status ReauthenticateSessionHandoffTo(
       DecodedSessionHandoff decoded,
       DecodeSessionHandoffFrom(source, authoritative_identity,
                                source_options));
+  if (source.Size() != source_envelope_size) {
+    return absl::AbortedError(
+        "Session handoff source size changed after authenticated decode.");
+  }
   if (!decoded.snapshot.executor.serialized_state.empty()) {
     return absl::DataLossError(
         "Streamed session handoff decode unexpectedly materialized state.");
@@ -1152,31 +1493,75 @@ absl::Status ReauthenticateSessionHandoffTo(
         "Decoded session handoff state range is not readable.");
   }
 
-  return EncodeSessionHandoffParts(
-      decoded.snapshot, decoded.serialized_state_size,
-      authoritative_identity, destination_options, destination,
-      [&serialized_state](ByteSink* state_sink) -> absl::Status {
-        if (state_sink == nullptr) {
-          return absl::InternalError(
-              "Session handoff reauthentication state sink is null.");
-        }
-        if (serialized_state.Size() == 0) return absl::OkStatus();
+  // Both commitments are derived only after the complete source has passed
+  // HMAC authentication and canonical decode. The state commitment reuses the
+  // canonical codec under a fixed public, non-authentication context, so it is
+  // identical across operational durable/transient key rotations.
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 source_envelope_hash,
+      Sha256Source(source, source_envelope_size));
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 canonical_continuation_state_hash,
+      ComputeCanonicalContinuationStateHash(
+          decoded, serialized_state, authoritative_identity));
 
-        std::string chunk(static_cast<size_t>(std::min<uint64_t>(
-                              serialized_state.Size(), kIoChunkSize)),
-                          '\0');
-        uint64_t offset = 0;
-        while (offset < serialized_state.Size()) {
-          const size_t count = static_cast<size_t>(std::min<uint64_t>(
-              chunk.size(), serialized_state.Size() - offset));
-          ABSL_RETURN_IF_ERROR(serialized_state.ReadAt(
-              offset, absl::MakeSpan(chunk).subspan(0, count)));
-          ABSL_RETURN_IF_ERROR(
-              state_sink->Append(absl::string_view(chunk.data(), count)));
-          offset += count;
-        }
-        return absl::OkStatus();
-      });
+  BoundedSha256ByteSink destination_hashing_sink(destination);
+  ABSL_RETURN_IF_ERROR(EncodeSessionHandoffParts(
+      decoded.snapshot, decoded.serialized_state_size,
+      authoritative_identity, destination_options,
+      &destination_hashing_sink,
+      [&serialized_state](ByteSink* state_sink) {
+        return StreamByteSource(serialized_state, state_sink);
+      }));
+  if (destination_hashing_sink.Size() == 0) {
+    return absl::InternalError(
+        "Session handoff reauthentication emitted no destination bytes.");
+  }
+  const Hash256 destination_envelope_hash =
+      destination_hashing_sink.Finalize();
+  if (IsZeroHash(destination_envelope_hash)) {
+    return absl::InternalError(
+        "Session handoff reauthentication produced a zero destination "
+        "digest.");
+  }
+
+  SessionHandoffReauthenticationEvidence evidence{
+      .session_identity = authoritative_identity,
+      .canonical_continuation_state_hash =
+          canonical_continuation_state_hash,
+      .source_envelope_hash = source_envelope_hash,
+      .source_envelope_size = source_envelope_size,
+      .source_key_id = source_options.key_id,
+      .destination_envelope_hash = destination_envelope_hash,
+      .destination_envelope_size = destination_hashing_sink.Size(),
+      .destination_key_id = destination_options.key_id,
+      .capsule_codec_contract_hash =
+          GetSessionHandoffCapsuleCodecContractHash(),
+      .reauthentication_contract_hash =
+          GetSessionHandoffReauthenticationEvidenceContractHash(),
+      .purpose = std::string(purpose),
+  };
+  ABSL_ASSIGN_OR_RETURN(
+      evidence.evidence_id,
+      ComputeSessionHandoffReauthenticationEvidenceId(evidence));
+  ABSL_RETURN_IF_ERROR(
+      ValidateSessionHandoffReauthenticationEvidence(evidence));
+  return evidence;
+}
+
+absl::Status ReauthenticateSessionHandoffTo(
+    const ByteSource& source,
+    const SessionHandoffIdentity& authoritative_identity,
+    const SessionHandoffOptions& source_options,
+    const SessionHandoffOptions& destination_options,
+    ByteSink* destination) {
+  absl::StatusOr<SessionHandoffReauthenticationEvidence> evidence =
+      ReauthenticateSessionHandoffToWithEvidence(
+          source, authoritative_identity, source_options,
+          destination_options, kStatusOnlyReauthenticationPurpose,
+          destination);
+  if (!evidence.ok()) return evidence.status();
+  return absl::OkStatus();
 }
 
 absl::StatusOr<SessionHandoffSnapshot> DecodeSessionHandoff(

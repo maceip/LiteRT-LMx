@@ -30,6 +30,8 @@ namespace litert::lm {
 // envelopes have a separate, much smaller bound.
 inline constexpr uint64_t kMaximumSessionHandoffEnvelopeBytes =
     uint64_t{8} * 1024 * 1024 * 1024;
+inline constexpr uint32_t
+    kMaximumSessionHandoffReauthenticationPurposeBytes = 128;
 
 // Immutable identity of the loaded inference profile that is allowed to
 // consume a session handoff. Every field is the SHA-256 digest of the exact
@@ -122,6 +124,72 @@ absl::Status ValidateSessionContinuationStateWitness(
 // semantics. Coverage admission binds this value so a later witness evolution
 // cannot be accepted under an older operational contract.
 Hash256 GetSessionContinuationStateWitnessContractHash();
+
+// Canonical evidence that one fully authenticated LRTSESS1 envelope was
+// decoded and re-emitted with identical canonical continuation state under a
+// distinct authentication key ID. Both envelope hashes cover the complete
+// bytes, including their respective HMAC trailers. `purpose` is an explicit,
+// caller-selected transport direction or operation name; it is evidence-bound
+// context, not a substitute for the source/destination key and envelope
+// bindings.
+struct SessionHandoffReauthenticationEvidence {
+  static constexpr uint32_t kFormatVersion = 1;
+
+  uint32_t format_version = kFormatVersion;
+  Hash256 evidence_id;
+  SessionHandoffIdentity session_identity;
+  // Rewrap-invariant SHA-256 commitment to the complete validated canonical
+  // session metadata and exact serialized backend state. Operational key IDs,
+  // authentication keys, and envelope MACs cannot select this value.
+  Hash256 canonical_continuation_state_hash;
+  Hash256 source_envelope_hash;
+  uint64_t source_envelope_size = 0;
+  std::string source_key_id;
+  Hash256 destination_envelope_hash;
+  uint64_t destination_envelope_size = 0;
+  std::string destination_key_id;
+  Hash256 capsule_codec_contract_hash;
+  Hash256 reauthentication_contract_hash;
+  std::string purpose;
+
+  bool operator==(
+      const SessionHandoffReauthenticationEvidence& other) const {
+    return format_version == other.format_version &&
+           evidence_id == other.evidence_id &&
+           session_identity == other.session_identity &&
+           canonical_continuation_state_hash ==
+               other.canonical_continuation_state_hash &&
+           source_envelope_hash == other.source_envelope_hash &&
+           source_envelope_size == other.source_envelope_size &&
+           source_key_id == other.source_key_id &&
+           destination_envelope_hash == other.destination_envelope_hash &&
+           destination_envelope_size == other.destination_envelope_size &&
+           destination_key_id == other.destination_key_id &&
+           capsule_codec_contract_hash ==
+               other.capsule_codec_contract_hash &&
+           reauthentication_contract_hash ==
+               other.reauthentication_contract_hash &&
+           purpose == other.purpose;
+  }
+  bool operator!=(
+      const SessionHandoffReauthenticationEvidence& other) const {
+    return !(*this == other);
+  }
+};
+
+// Computes and validates the versioned SHA-256 content address for every
+// evidence field except evidence_id. Validation rejects unknown versions,
+// incomplete identities or envelope bindings, noncanonical labels, equal key
+// IDs, stale codec contracts, and a noncanonical evidence ID.
+absl::StatusOr<Hash256> ComputeSessionHandoffReauthenticationEvidenceId(
+    const SessionHandoffReauthenticationEvidence& evidence);
+absl::Status ValidateSessionHandoffReauthenticationEvidence(
+    const SessionHandoffReauthenticationEvidence& evidence);
+
+// Stable identity of the V1 reauthentication evidence field set and the
+// rewrap-invariant canonical continuation-state commitment algorithm. This is
+// layered on the current LRTSESS1/LRTST001 capsule codec contract.
+Hash256 GetSessionHandoffReauthenticationEvidenceContractHash();
 
 }  // namespace litert::lm
 
