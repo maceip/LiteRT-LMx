@@ -440,6 +440,12 @@ void AppendHash(const Hash256& hash, std::string* output) {
                  hash.bytes.size());
 }
 
+void AppendOptionalHash(const std::optional<Hash256>& hash,
+                        std::string* output) {
+  output->push_back(hash.has_value() ? '\1' : '\0');
+  if (hash.has_value()) AppendHash(*hash, output);
+}
+
 class CanonicalReader {
  public:
   explicit CanonicalReader(absl::string_view bytes) : bytes_(bytes) {}
@@ -498,6 +504,17 @@ class CanonicalReader {
     return hash;
   }
 
+  absl::StatusOr<std::optional<Hash256>> ReadOptionalHash() {
+    ABSL_ASSIGN_OR_RETURN(uint8_t present, ReadU8());
+    if (present > 1) {
+      return absl::DataLossError(
+          "Stored DPM descriptor has a non-canonical optional-hash marker.");
+    }
+    if (present == 0) return std::nullopt;
+    ABSL_ASSIGN_OR_RETURN(Hash256 hash, ReadHash());
+    return std::optional<Hash256>(hash);
+  }
+
  private:
   absl::Status Require(size_t count) const {
     if (count > bytes_.size() - offset_) {
@@ -540,6 +557,31 @@ absl::StatusOr<std::string> EncodeStoredDescriptor(
   AppendHash(descriptor.envelope_hash, &bytes);
   AppendU64(descriptor.envelope_size, &bytes);
   AppendI64(descriptor.created_unix_micros, &bytes);
+  if (descriptor.format_version ==
+      DPMSessionCheckpointDescriptor::kFormatVersion) {
+    bytes.push_back(static_cast<char>(descriptor.replay_mode));
+    bytes.push_back(static_cast<char>(descriptor.capture_origin));
+    AppendOptionalHash(descriptor.restored_from_checkpoint_id, &bytes);
+    AppendOptionalHash(descriptor.exact_profile_id, &bytes);
+    AppendHash(descriptor.exact_profile_admission_record_id, &bytes);
+    AppendHash(descriptor.capsule_restore_admission_record_id, &bytes);
+    AppendHash(descriptor.exact_request_execution_evidence_id, &bytes);
+    bytes.push_back(static_cast<char>(descriptor.worker_prefill_mode));
+    AppendHash(descriptor.execution_plan_hash, &bytes);
+    AppendHash(descriptor.exact_output_evidence_hash, &bytes);
+    bytes.push_back(descriptor.worker_provenance.has_value() ? '\1' : '\0');
+    if (descriptor.worker_provenance.has_value()) {
+      const DPMExactWorkerCheckpointProvenance& provenance =
+          *descriptor.worker_provenance;
+      AppendU32(provenance.run_index, &bytes);
+      AppendHash(provenance.execution_plan_hash, &bytes);
+      AppendHash(provenance.request_envelope_hash, &bytes);
+      AppendHash(provenance.result_envelope_hash, &bytes);
+      AppendU64(provenance.transient_envelope_size, &bytes);
+      AppendHash(provenance.transient_envelope_hash, &bytes);
+      AppendHash(provenance.output_evidence_hash, &bytes);
+    }
+  }
   if (bytes.size() > kMaxStoredDescriptorBytes) {
     return absl::ResourceExhaustedError(
         "DPM checkpoint descriptor exceeds its durable size limit.");
@@ -549,6 +591,10 @@ absl::StatusOr<std::string> EncodeStoredDescriptor(
 
 absl::StatusOr<DPMSessionCheckpointDescriptor> DecodeStoredDescriptor(
     absl::string_view bytes) {
+  if (bytes.size() > kMaxStoredDescriptorBytes) {
+    return absl::ResourceExhaustedError(
+        "Stored DPM descriptor exceeds its durable size limit.");
+  }
   if (bytes.size() < kStoredDescriptorMagic.size() ||
       std::memcmp(bytes.data(), kStoredDescriptorMagic.data(),
                   kStoredDescriptorMagic.size()) != 0) {
@@ -586,6 +632,72 @@ absl::StatusOr<DPMSessionCheckpointDescriptor> DecodeStoredDescriptor(
   ABSL_ASSIGN_OR_RETURN(descriptor.envelope_hash, reader.ReadHash());
   ABSL_ASSIGN_OR_RETURN(descriptor.envelope_size, reader.ReadU64());
   ABSL_ASSIGN_OR_RETURN(descriptor.created_unix_micros, reader.ReadI64());
+
+  switch (descriptor.format_version) {
+    case DPMSessionCheckpointDescriptor::kLegacyFormatVersion:
+      // These values are inferred rather than serialized in DPMDSC01 v1.
+      descriptor.replay_mode = DPMReplayMode::kCanonicalWinnerReplay;
+      descriptor.capture_origin =
+          DPMCheckpointCaptureOrigin::kLiveParentSession;
+      break;
+
+    case DPMSessionCheckpointDescriptor::kFormatVersion: {
+      uint8_t replay_mode;
+      ABSL_ASSIGN_OR_RETURN(replay_mode, reader.ReadU8());
+      descriptor.replay_mode = static_cast<DPMReplayMode>(replay_mode);
+      uint8_t capture_origin;
+      ABSL_ASSIGN_OR_RETURN(capture_origin, reader.ReadU8());
+      descriptor.capture_origin =
+          static_cast<DPMCheckpointCaptureOrigin>(capture_origin);
+      ABSL_ASSIGN_OR_RETURN(descriptor.restored_from_checkpoint_id,
+                            reader.ReadOptionalHash());
+      ABSL_ASSIGN_OR_RETURN(descriptor.exact_profile_id,
+                            reader.ReadOptionalHash());
+      ABSL_ASSIGN_OR_RETURN(descriptor.exact_profile_admission_record_id,
+                            reader.ReadHash());
+      ABSL_ASSIGN_OR_RETURN(descriptor.capsule_restore_admission_record_id,
+                            reader.ReadHash());
+      ABSL_ASSIGN_OR_RETURN(descriptor.exact_request_execution_evidence_id,
+                            reader.ReadHash());
+      uint8_t worker_prefill_mode;
+      ABSL_ASSIGN_OR_RETURN(worker_prefill_mode, reader.ReadU8());
+      descriptor.worker_prefill_mode =
+          static_cast<DPMCheckpointWorkerPrefillMode>(worker_prefill_mode);
+      ABSL_ASSIGN_OR_RETURN(descriptor.execution_plan_hash,
+                            reader.ReadHash());
+      ABSL_ASSIGN_OR_RETURN(descriptor.exact_output_evidence_hash,
+                            reader.ReadHash());
+      uint8_t has_worker_provenance;
+      ABSL_ASSIGN_OR_RETURN(has_worker_provenance, reader.ReadU8());
+      if (has_worker_provenance > 1) {
+        return absl::DataLossError(
+            "Stored DPM descriptor has a non-canonical worker-provenance "
+            "marker.");
+      }
+      if (has_worker_provenance != 0) {
+        DPMExactWorkerCheckpointProvenance provenance;
+        ABSL_ASSIGN_OR_RETURN(provenance.run_index, reader.ReadU32());
+        ABSL_ASSIGN_OR_RETURN(provenance.execution_plan_hash,
+                              reader.ReadHash());
+        ABSL_ASSIGN_OR_RETURN(provenance.request_envelope_hash,
+                              reader.ReadHash());
+        ABSL_ASSIGN_OR_RETURN(provenance.result_envelope_hash,
+                              reader.ReadHash());
+        ABSL_ASSIGN_OR_RETURN(provenance.transient_envelope_size,
+                              reader.ReadU64());
+        ABSL_ASSIGN_OR_RETURN(provenance.transient_envelope_hash,
+                              reader.ReadHash());
+        ABSL_ASSIGN_OR_RETURN(provenance.output_evidence_hash,
+                              reader.ReadHash());
+        descriptor.worker_provenance = std::move(provenance);
+      }
+      break;
+    }
+
+    default:
+      return absl::FailedPreconditionError(
+          "Unsupported DPM session checkpoint descriptor version.");
+  }
   if (!reader.empty()) {
     return absl::DataLossError("Trailing bytes in stored DPM descriptor.");
   }
