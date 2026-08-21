@@ -23,12 +23,13 @@
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "runtime/dpm/dpm_prepared_prefill_plan.h"
 #include "runtime/engine/session_handoff.h"
 #include "runtime/platform/hash/hasher.h"
 
 namespace litert::lm {
 
-inline constexpr uint32_t kFreshWorkerProtocolVersion = 2;
+inline constexpr uint32_t kFreshWorkerProtocolVersion = 3;
 // DPMTOK01 is an independent canonical product format. Worker-envelope
 // evolution must not silently change already-recorded exact token bytes.
 inline constexpr uint32_t kFreshWorkerTokenEncodingVersion = 1;
@@ -179,11 +180,24 @@ struct FreshWorkerProducingCapsuleEvidence {
   Hash256 transient_envelope_hash;
   Hash256 output_evidence_hash;
 
+  // Runtime-produced continuation witnesses. These must be canonical and
+  // byte-for-byte equal: the producing session's first export wrote the
+  // transient capsule, its second export used a digest-only sink, and a newly
+  // created target imported that sealed capsule and independently re-exported
+  // its committed live state. No field may be synthesized from request or
+  // checkpoint metadata.
+  SessionContinuationStateWitness producer_first_export;
+  SessionContinuationStateWitness producer_second_export;
+  SessionContinuationStateWitness fresh_import_target;
+
   bool operator==(const FreshWorkerProducingCapsuleEvidence& other) const {
     return session_identity == other.session_identity &&
            transient_envelope_size == other.transient_envelope_size &&
            transient_envelope_hash == other.transient_envelope_hash &&
-           output_evidence_hash == other.output_evidence_hash;
+           output_evidence_hash == other.output_evidence_hash &&
+           producer_first_export == other.producer_first_export &&
+           producer_second_export == other.producer_second_export &&
+           fresh_import_target == other.fresh_import_target;
   }
 };
 
@@ -200,7 +214,13 @@ struct FreshWorkerResult {
   Hash256 request_envelope_hash;
   Hash256 worker_instance_nonce;
   Hash256 execution_plan_hash;
+  // Present on every successful exact agent execution. Projection workers
+  // carry neither a prepared plan nor a restore witness.
+  std::optional<DPMPreparedPrefillPlan> prepared_prefill_plan;
   std::optional<Hash256> restored_checkpoint_id;
+  // Present only for a successful own-position delta run and copied from the
+  // live target returned by ImportHandoffFromWithWitness.
+  std::optional<SessionContinuationStateWitness> restored_state_witness;
   std::optional<FreshWorkerProducingCapsuleEvidence>
       producing_capsule_evidence;
   FreshWorkerReplayIsolation replay_isolation =
@@ -226,7 +246,8 @@ Hash256 ComputeFreshWorkerOutputEvidenceHash(
     const std::vector<FreshWorkerLogitFrameEvidence>& logit_frames);
 absl::Status ValidateFreshWorkerResult(const FreshWorkerResult& result);
 // Cross-checks a self-valid result against the authenticated request plan.
-// Failure results carry the plan hash but no claimed restore or capsule.
+// Failure results carry the execution-plan hash but no prepared-prefill,
+// restore, continuation-witness, or capsule claim.
 absl::Status ValidateFreshWorkerResultForRequest(
     const FreshWorkerResult& result, const FreshWorkerRequest& request);
 absl::Status ValidateFreshWorkerLogitFrameEvidence(

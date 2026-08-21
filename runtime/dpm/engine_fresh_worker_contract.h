@@ -32,7 +32,7 @@ namespace litert::lm {
 // bytes implement this contract. Changing the expected contract requires a
 // new value and therefore a new admission.
 inline constexpr absl::string_view kEngineFreshWorkerAdapterContractVersion =
-    "litert-lmx-engine-fresh-worker-v1";
+    "litert-lmx-engine-fresh-worker-v3";
 
 // Constructs the sole SessionConfig admitted by both sides of the concrete
 // Engine fresh-worker boundary. Parent-side exact-profile derivation and the

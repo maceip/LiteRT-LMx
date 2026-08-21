@@ -260,6 +260,13 @@ struct FreshWorkerDerivedExecution {
       FreshWorkerReplayIsolation::kUnverified;
   FreshWorkerExecutionOutput output;
 
+  // Runtime-produced physical agent prefill evidence. A successful exact
+  // agent execution must provide this plan. A delta execution must also carry
+  // the independently recomputed live import witness used to prepare and
+  // execute it. Projection and failed executions carry neither.
+  std::optional<DPMPreparedPrefillPlan> prepared_prefill_plan;
+  std::optional<SessionContinuationStateWitness> restored_state_witness;
+
   // Session-capable callbacks attest which own-position checkpoint was
   // restored and whether they exported the producing session through the
   // controlled sink. The producing identity is runtime-derived and is used by
@@ -271,19 +278,39 @@ struct FreshWorkerDerivedExecution {
   std::optional<Hash256> restored_checkpoint_id;
   bool exported_producing_capsule = false;
   SessionHandoffIdentity producing_session_identity;
+
+  struct ProducingCapsuleContinuationWitnesses {
+    SessionContinuationStateWitness producer_first_export;
+    SessionContinuationStateWitness producer_second_export;
+    SessionContinuationStateWitness fresh_import_target;
+  };
+  std::optional<ProducingCapsuleContinuationWitnesses>
+      producing_capsule_continuation_witnesses;
+};
+
+// Narrow worker-owned access to the transient producing-capsule file. It
+// exposes only the ByteSink used by live export and a one-way seal-for-read
+// operation. No durable source, key, destination, or publication capability
+// crosses this boundary. The callback must not retain this object.
+class FreshWorkerTransientCapsuleAccess {
+ public:
+  virtual ~FreshWorkerTransientCapsuleAccess() = default;
+  virtual ByteSink* sink() = 0;
+  virtual absl::StatusOr<const ByteSource*> SealForRead() = 0;
 };
 
 // The session-capable callback receives only per-request transient handoff
 // capabilities. A restore pair is present only for an own-position delta
-// plan; a producing pair is present only for post-output capture. No durable
-// parent key or parent Session is exposed. The callback must not retain any
-// context pointer after returning.
+// plan; a producing options/access set is present only for post-output
+// capture. No durable parent key or parent Session is exposed. The callback
+// must not retain any context pointer after returning.
 struct FreshWorkerExecutionContext {
   const FreshWorkerRequest& request;
   const ByteSource* const restore_source;
   const SessionHandoffOptions* const restore_options;
   ByteSink* const producing_sink;
   const SessionHandoffOptions* const producing_options;
+  FreshWorkerTransientCapsuleAccess* const producing_capsule_access;
 };
 
 using FreshWorkerExecutionCallback = std::function<

@@ -59,12 +59,12 @@ namespace litert::lm {
 namespace {
 
 constexpr std::array<char, 8> kIpcFrameMagic = {'D', 'P', 'M', 'I', 'P', 'C',
-                                                 '0', '1'};
+                                                 '0', '3'};
 constexpr std::array<char, 8> kCapsuleFrameMagic = {
-    'D', 'P', 'M', 'C', 'A', 'P', '0', '1'};
+    'D', 'P', 'M', 'C', 'A', 'P', '0', '3'};
 constexpr std::array<char, 8> kAuthenticationMagic = {
-    'D', 'P', 'M', 'K', 'E', 'Y', '0', '1'};
-constexpr uint32_t kAuthenticationPreludeVersion = 1;
+    'D', 'P', 'M', 'K', 'E', 'Y', '0', '3'};
+constexpr uint32_t kAuthenticationPreludeVersion = 3;
 constexpr uint32_t kMaximumAuthenticationKeyIdBytes = 256;
 constexpr uint32_t kMinimumAuthenticationKeyBytes = 32;
 constexpr uint32_t kMaximumAuthenticationKeyBytes = 4096;
@@ -74,20 +74,20 @@ constexpr uint64_t kMaximumFailureMessageBytes = 4096;
 constexpr absl::Duration kMaximumWorkerTimeout = absl::Hours(1);
 constexpr absl::Duration kMaximumTerminationGrace = absl::Seconds(5);
 constexpr absl::string_view kLaunchSpecDomain =
-    "LITERT_LMX_FRESH_WORKER_LAUNCH_SPEC_SHA256_V2";
+    "LITERT_LMX_FRESH_WORKER_LAUNCH_SPEC_SHA256_V3";
 constexpr absl::string_view kWorkerCertificationDomain =
     "LITERT_LMX_FRESH_WORKER_CERTIFICATION_SHA256_V1";
 constexpr absl::string_view kTransportKeyDomain =
-    "LITERT_LMX_FRESH_WORKER_PER_REQUEST_TRANSPORT_KEY_HMAC_SHA256_V2";
+    "LITERT_LMX_FRESH_WORKER_PER_REQUEST_TRANSPORT_KEY_HMAC_SHA256_V3";
 constexpr absl::string_view kCapsuleKeyDomain =
-    "LITERT_LMX_FRESH_WORKER_CAPSULE_KEY_HMAC_SHA256_V1";
+    "LITERT_LMX_FRESH_WORKER_CAPSULE_KEY_HMAC_SHA256_V3";
 constexpr absl::string_view kRestoreCapsuleDirection = "RESTORE_TO_WORKER";
 constexpr absl::string_view kProducingCapsuleDirection =
     "PRODUCING_FROM_WORKER";
 constexpr absl::string_view kRestoreCapsuleKeyId =
-    "litert-lmx-fresh-worker-restore-v1";
+    "litert-lmx-fresh-worker-restore-v3";
 constexpr absl::string_view kProducingCapsuleKeyId =
-    "litert-lmx-fresh-worker-producing-v1";
+    "litert-lmx-fresh-worker-producing-v3";
 constexpr uint64_t kCapsuleIoChunkBytes = uint64_t{1024} * 1024;
 
 bool IsZeroHash(const Hash256& hash) {
@@ -595,7 +595,9 @@ Hash256 ComputeWorkerCertificationHash(
 // a transient per-request key. No pathname survives construction, the
 // descriptor is never inherited across exec, and reads are unavailable until
 // the writer seals the exact extent.
-class UnlinkedTempByteFile final : public ByteSource, public ByteSink {
+class UnlinkedTempByteFile final : public ByteSource,
+                                   public ByteSink,
+                                   public FreshWorkerTransientCapsuleAccess {
  public:
   UnlinkedTempByteFile(const UnlinkedTempByteFile&) = delete;
   UnlinkedTempByteFile& operator=(const UnlinkedTempByteFile&) = delete;
@@ -641,6 +643,13 @@ class UnlinkedTempByteFile final : public ByteSource, public ByteSink {
   }
 
   uint64_t Size() const override { return size_; }
+
+  ByteSink* sink() override { return static_cast<ByteSink*>(this); }
+
+  absl::StatusOr<const ByteSource*> SealForRead() override {
+    ABSL_RETURN_IF_ERROR(Seal());
+    return static_cast<const ByteSource*>(this);
+  }
 
   absl::Status Append(absl::string_view bytes) override {
     if (sealed_) {
@@ -1840,6 +1849,11 @@ FreshWorkerProcessRunner::RunWithSessionHandoff(
     return absl::DataLossError(
         "Authenticated restore capsule rewrap produced no bytes.");
   }
+  std::optional<Hash256> transient_restore_hash;
+  if (restore_required) {
+    ABSL_ASSIGN_OR_RETURN(transient_restore_hash,
+                          HashCapsuleSource(transient_restore));
+  }
 
   // Allocate response storage before spawning when capture is requested so
   // every post-spawn local failure is a transport/process failure, never an
@@ -1902,6 +1916,7 @@ FreshWorkerProcessRunner::RunWithSessionHandoff(
         transient_producing_size,
         ReadCapsuleFrameWithDeadline(result_pipe.read.get(),
                                      &*transient_producing, control));
+    ABSL_RETURN_IF_ERROR(transient_producing->Seal());
   } else {
     ABSL_RETURN_IF_ERROR(
         ReadZeroCapsuleFrameWithDeadline(result_pipe.read.get(), control));
@@ -1925,6 +1940,26 @@ FreshWorkerProcessRunner::RunWithSessionHandoff(
     return absl::UnauthenticatedError(
         "Fresh-worker result is not bound to the authenticated request "
         "envelope.");
+  }
+  if (result.status_code == absl::StatusCode::kOk && restore_required) {
+    if (!result.restored_state_witness.has_value() ||
+        !transient_restore_hash.has_value()) {
+      return absl::DataLossError(
+          "Successful own-position worker omitted its live restore witness.");
+    }
+    const SessionContinuationStateWitness& restore_witness =
+        *result.restored_state_witness;
+    if (restore_witness.session_identity !=
+            request.execution_plan.session_identity ||
+        restore_witness.phase != SessionHandoffPhase::kDecoded ||
+        !restore_witness.ran_decode || restore_witness.current_step <= 0 ||
+        restore_witness.envelope_size != transient_restore.Size() ||
+        restore_witness.envelope_hash != *transient_restore_hash ||
+        restore_witness.key_id != transient_restore_options.key_id) {
+      return absl::DataLossError(
+          "Worker restore witness does not describe the exact authenticated "
+          "transient capsule supplied by the parent.");
+    }
   }
 
   std::optional<FreshWorkerDurableProducingCapsuleEvidence>
@@ -2020,7 +2055,8 @@ absl::Status RunFreshWorkerOnce(
             context.restore_source != nullptr ||
             context.restore_options != nullptr ||
             context.producing_sink != nullptr ||
-            context.producing_options != nullptr) {
+            context.producing_options != nullptr ||
+            context.producing_capsule_access != nullptr) {
           return absl::UnimplementedError(
               "The configured worker adapter is capsule-free.");
         }
@@ -2120,6 +2156,8 @@ absl::Status RunFreshWorkerOnce(
       return emit_failure(absl::DataLossError(
           "Own-position execution did not receive a restore capsule."));
     }
+    const absl::Status seal_restore = restore_storage->Seal();
+    if (!seal_restore.ok()) return emit_failure(seal_restore);
   } else {
     const absl::Status zero_restore = ReadZeroCapsuleFrameBlocking(
         input_fd.get(), "fresh-worker restore capsule");
@@ -2156,7 +2194,9 @@ absl::Status RunFreshWorkerOnce(
           restore_required ? &transient_restore_options : nullptr,
       .producing_sink = capture_requested ? &*producing_storage : nullptr,
       .producing_options =
-          capture_requested ? &transient_producing_options : nullptr};
+          capture_requested ? &transient_producing_options : nullptr,
+      .producing_capsule_access =
+          capture_requested ? &*producing_storage : nullptr};
 
   absl::StatusOr<FreshWorkerDerivedExecution> execution = execute(context);
   if (!execution.ok()) return emit_failure(execution.status());
@@ -2169,20 +2209,75 @@ absl::Status RunFreshWorkerOnce(
     return emit_failure(absl::FailedPreconditionError(
         "Exact worker did not attest catalog-free construction."));
   }
+  if (execution->prepared_prefill_plan.has_value()) {
+    const absl::Status plan_status = ValidateDPMPreparedPrefillPlan(
+        *execution->prepared_prefill_plan);
+    if (!plan_status.ok()) return emit_failure(plan_status);
+  }
+  if (execution->restored_state_witness.has_value()) {
+    const absl::Status witness_status =
+        ValidateSessionContinuationStateWitness(
+            *execution->restored_state_witness);
+    if (!witness_status.ok()) return emit_failure(witness_status);
+  }
   if (restore_required) {
     if (!execution->restored_checkpoint_id.has_value() ||
         execution->restored_checkpoint_id !=
-            request.execution_plan.restore_checkpoint_id) {
+            request.execution_plan.restore_checkpoint_id ||
+        !execution->prepared_prefill_plan.has_value() ||
+        execution->prepared_prefill_plan->start_kind !=
+            DPMPreparedPrefillStartKind::kOwnPositionRestore ||
+        execution->prepared_prefill_plan->restore_checkpoint_id !=
+            request.execution_plan.restore_checkpoint_id ||
+        execution->prepared_prefill_plan->session_identity !=
+            request.execution_plan.session_identity ||
+        !execution->restored_state_witness.has_value() ||
+        execution->restored_state_witness->session_identity !=
+            request.execution_plan.session_identity ||
+        execution->prepared_prefill_plan->start_state_witness_id !=
+            execution->restored_state_witness->witness_id ||
+        execution->restored_state_witness->phase !=
+            SessionHandoffPhase::kDecoded ||
+        !execution->restored_state_witness->ran_decode ||
+        execution->restored_state_witness->current_step <= 0 ||
+        execution->restored_state_witness->envelope_size !=
+            restore_storage->Size() ||
+        execution->restored_state_witness->key_id !=
+            transient_restore_options.key_id) {
       return emit_failure(absl::FailedPreconditionError(
-          "Worker did not attest the requested restored checkpoint."));
+          "Worker did not attest the requested checkpoint with its runtime "
+          "prepared plan and exact live restore witness."));
     }
-  } else if (execution->restored_checkpoint_id.has_value()) {
+    absl::StatusOr<Hash256> restore_hash_or =
+        HashCapsuleSource(*restore_storage);
+    if (!restore_hash_or.ok()) return emit_failure(restore_hash_or.status());
+    if (execution->restored_state_witness->envelope_hash != *restore_hash_or) {
+      return emit_failure(absl::DataLossError(
+          "Worker live restore witness does not hash the received transient "
+          "capsule."));
+    }
+  } else if (execution->restored_checkpoint_id.has_value() ||
+             execution->restored_state_witness.has_value() ||
+             (execution->prepared_prefill_plan.has_value() &&
+              execution->prepared_prefill_plan->start_kind !=
+                  DPMPreparedPrefillStartKind::kFreshSession)) {
     return emit_failure(absl::FailedPreconditionError(
-        "Full-prefill worker claimed a restored checkpoint."));
+        "Full-prefill worker claimed a restored start state."));
   }
   if (execution->exported_producing_capsule != capture_requested) {
     return emit_failure(absl::FailedPreconditionError(
         "Worker producing-capsule export disagrees with capture policy."));
+  }
+  if (execution->producing_capsule_continuation_witnesses.has_value() !=
+      capture_requested) {
+    return emit_failure(absl::FailedPreconditionError(
+        "Worker producing-capsule continuation witnesses disagree with "
+        "capture policy."));
+  }
+  if (capture_requested && !execution->prepared_prefill_plan.has_value()) {
+    return emit_failure(absl::FailedPreconditionError(
+        "A producing-capsule capture lacks its runtime prepared prefill "
+        "plan."));
   }
   const absl::Status output_status =
       ValidateFreshWorkerExecutionOutput(execution->output);
@@ -2197,7 +2292,11 @@ absl::Status RunFreshWorkerOnce(
   result.request_envelope_hash = request_envelope_hash;
   result.worker_instance_nonce = worker_nonce;
   result.execution_plan_hash = request.execution_plan.plan_hash;
+  result.prepared_prefill_plan =
+      std::move(execution->prepared_prefill_plan);
   result.restored_checkpoint_id = execution->restored_checkpoint_id;
+  result.restored_state_witness =
+      std::move(execution->restored_state_witness);
   result.replay_isolation = execution->replay_isolation;
   result.canonical_output = std::move(execution->output.canonical_output);
   result.token_bytes = std::move(execution->output.token_bytes);
@@ -2224,6 +2323,15 @@ absl::Status RunFreshWorkerOnce(
       return emit_failure(producing_hash_or.status());
     }
     const Hash256 producing_hash = *producing_hash_or;
+    const FreshWorkerDerivedExecution::
+        ProducingCapsuleContinuationWitnesses& witnesses =
+            *execution->producing_capsule_continuation_witnesses;
+    if (witnesses.producer_first_export.key_id !=
+        transient_producing_options.key_id) {
+      return emit_failure(absl::DataLossError(
+          "Producing-capsule continuation witness uses an unexpected "
+          "transient key ID."));
+    }
     result.producing_capsule_evidence =
         FreshWorkerProducingCapsuleEvidence{
             .session_identity = execution->producing_session_identity,
@@ -2231,7 +2339,10 @@ absl::Status RunFreshWorkerOnce(
             .transient_envelope_hash = producing_hash,
             .output_evidence_hash = ComputeFreshWorkerOutputEvidenceHash(
                 result.canonical_output, result.token_bytes,
-                result.logit_frames)};
+                result.logit_frames),
+            .producer_first_export = witnesses.producer_first_export,
+            .producer_second_export = witnesses.producer_second_export,
+            .fresh_import_target = witnesses.fresh_import_target};
     producing_capsule = &*producing_storage;
   }
   const absl::Status result_status =

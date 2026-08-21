@@ -28,6 +28,7 @@
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "runtime/dpm/dpm_agent_replay_runtime.h"
 #include "runtime/dpm/dpm_event_log.h"
+#include "runtime/dpm/dpm_prepared_prefill_runtime.h"
 #include "runtime/dpm/dpm_projection_prompt.h"
 #include "runtime/dpm/dpm_projection_replay_runtime.h"
 #include "runtime/dpm/dpm_replay_executor.h"
@@ -44,8 +45,8 @@
 #include "runtime/engine/io_types.h"
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/llm_executor_settings.h"
+#include "runtime/platform/hash/sha256_hasher.h"
 #include "runtime/proto/sampler_params.pb.h"
-#include "support/tokenizer/tokenizer.h"
 
 namespace litert::lm {
 namespace {
@@ -56,6 +57,35 @@ struct DecodedWorkerInvocation {
   std::optional<DPMAgentExecutionRequest> agent;
   std::optional<DPMAgentDeltaExecutionRequest> agent_delta;
   uint32_t max_output_tokens = 0;
+};
+
+class BoundedDigestByteSink final : public ByteSink {
+ public:
+  absl::Status Append(absl::string_view bytes) override {
+    if (finalized_) {
+      return absl::FailedPreconditionError(
+          "Continuation digest sink was already finalized.");
+    }
+    if (bytes.size() > kMaximumFreshWorkerCapsuleBytes - size_) {
+      return absl::ResourceExhaustedError(
+          "Continuation digest sink exceeded the capsule bound.");
+    }
+    hasher_.Update(bytes);
+    size_ += bytes.size();
+    return absl::OkStatus();
+  }
+
+  uint64_t Size() const { return size_; }
+
+  Hash256 Finalize() {
+    finalized_ = true;
+    return hasher_.Finalize();
+  }
+
+ private:
+  Sha256Hasher hasher_;
+  uint64_t size_ = 0;
+  bool finalized_ = false;
 };
 
 bool IsValidUtf8(absl::string_view text) {
@@ -351,64 +381,6 @@ absl::Status PrefillProjection(
   return session->RunPrefill(contents);
 }
 
-absl::Status PrefillAgent(Engine* engine, Engine::Session* session,
-                          const std::vector<
-                              DPMAgentGenerationRequest::PrefillChunk>&
-                              canonical_chunks) {
-  if (engine == nullptr || session == nullptr || canonical_chunks.empty()) {
-    return absl::InvalidArgumentError(
-        "Exact agent execution requires one Engine session and canonical "
-        "prefill input.");
-  }
-  const int vocabulary_size = engine->GetTokenizer().GetVocabSize();
-  if (vocabulary_size <= 0) {
-    return absl::FailedPreconditionError(
-        "Exact agent worker tokenizer has no measurable vocabulary.");
-  }
-  for (const DPMAgentGenerationRequest::PrefillChunk& chunk :
-       canonical_chunks) {
-    std::vector<InputData> contents;
-    switch (chunk.encoding) {
-      case DPMAgentGenerationRequest::PrefillChunk::Encoding::kUtf8Text:
-        if (chunk.text.empty() || !chunk.token_ids.empty() ||
-            !IsValidUtf8(chunk.text)) {
-          return absl::InvalidArgumentError(
-              "Exact agent text chunk is empty, mixed, or not UTF-8.");
-        }
-        contents.emplace_back(InputText(std::string(chunk.text)));
-        break;
-
-      case DPMAgentGenerationRequest::PrefillChunk::Encoding::kTokenIds: {
-        if (!chunk.text.empty() || chunk.token_ids.empty()) {
-          return absl::InvalidArgumentError(
-              "Exact agent token chunk is empty or mixed with text.");
-        }
-        for (int token_id : chunk.token_ids) {
-          if (token_id < 0 || token_id >= vocabulary_size) {
-            return absl::InvalidArgumentError(
-                "Exact agent token chunk contains an out-of-range ID.");
-          }
-        }
-        ABSL_ASSIGN_OR_RETURN(
-            auto token_buffer,
-            support::Tokenizer::TokenIdsToTensorBuffer(chunk.token_ids));
-        contents.emplace_back(InputText(std::move(token_buffer)));
-        break;
-      }
-
-      default:
-        return absl::InvalidArgumentError(
-            "Exact agent request contains an unknown chunk encoding.");
-    }
-    // Keeping one prefill call per canonical chunk preserves the exact
-    // text/token boundary and prevents historical decision IDs from being
-    // re-tokenized. The same helper is used for complete logical input and
-    // for the validated post-checkpoint suffix.
-    ABSL_RETURN_IF_ERROR(session->RunPrefill(contents));
-  }
-  return absl::OkStatus();
-}
-
 absl::Status ValidateImportedSession(
     const Engine::Session& session, const SessionConfig& resolved_config,
     const ExactLiteRtProfile& profile) {
@@ -506,7 +478,12 @@ absl::StatusOr<FreshWorkerDerivedExecution> ExecuteEngineFreshWorkerRequest(
       restore_requested != (context.restore_source != nullptr) ||
       restore_requested != (context.restore_options != nullptr) ||
       capture_requested != (context.producing_sink != nullptr) ||
-      capture_requested != (context.producing_options != nullptr)) {
+      capture_requested != (context.producing_options != nullptr) ||
+      capture_requested !=
+          (context.producing_capsule_access != nullptr) ||
+      (capture_requested &&
+       context.producing_capsule_access->sink() !=
+           context.producing_sink)) {
     return absl::FailedPreconditionError(
         "Exact Engine worker context disagrees with its authenticated "
         "execution plan.");
@@ -556,9 +533,11 @@ absl::StatusOr<FreshWorkerDerivedExecution> ExecuteEngineFreshWorkerRequest(
         "request.");
   }
 
-  // Exactly one session is created. An own-position capsule is imported only
-  // into this step-zero target; there is no parent Session and no worker-local
-  // fallback to full prefill.
+  // The execution session is always a fresh step-zero target. An own-position
+  // capsule is imported only into this target; there is no parent Session and
+  // no worker-local fallback to full prefill. Capture later creates a second
+  // same-Engine target solely to prove the sealed producer capsule restores to
+  // the same canonical continuation witness.
   ABSL_ASSIGN_OR_RETURN(std::unique_ptr<Engine::Session> session,
                         engine->CreateSession(session_config));
   if (session == nullptr) {
@@ -569,9 +548,13 @@ absl::StatusOr<FreshWorkerDerivedExecution> ExecuteEngineFreshWorkerRequest(
       ValidateFreshSession(*engine, *session, session_config,
                            profile_before));
 
+  std::optional<SessionContinuationStateWitness> restored_state_witness;
   if (restore_requested) {
-    ABSL_RETURN_IF_ERROR(session->ImportHandoffFrom(
-        *context.restore_source, *context.restore_options));
+    ABSL_ASSIGN_OR_RETURN(
+        SessionContinuationStateWitness witness,
+        session->ImportHandoffFromWithWitness(
+            *context.restore_source, *context.restore_options));
+    restored_state_witness = std::move(witness);
     ABSL_RETURN_IF_ERROR(
         ValidateImportedSession(*session, session_config, profile_before));
     ABSL_ASSIGN_OR_RETURN(
@@ -585,18 +568,35 @@ absl::StatusOr<FreshWorkerDerivedExecution> ExecuteEngineFreshWorkerRequest(
     }
   }
 
+  std::optional<DPMPreparedPrefillPlan> prepared_prefill_plan;
   switch (invocation.replay_request.stage) {
     case DPMReplayStage::kProjection:
       ABSL_RETURN_IF_ERROR(
           PrefillProjection(session.get(), *invocation.projection));
       break;
-    case DPMReplayStage::kAgentDecision:
-      ABSL_RETURN_IF_ERROR(PrefillAgent(
-          engine.get(), session.get(),
-          restore_requested
-              ? invocation.agent_delta->canonical_delta_prefill_chunks
-              : invocation.agent->full_canonical_prefill_chunks));
+    case DPMReplayStage::kAgentDecision: {
+      DPMPreparedPrefillStart start;
+      start.kind = restore_requested
+                       ? DPMPreparedPrefillStartKind::kOwnPositionRestore
+                       : DPMPreparedPrefillStartKind::kFreshSession;
+      start.restore_checkpoint_id =
+          request.execution_plan.restore_checkpoint_id;
+      start.restored_state_witness = restored_state_witness;
+      const std::vector<DPMAgentGenerationRequest::PrefillChunk>&
+          source_chunks =
+              restore_requested
+                  ? invocation.agent_delta->canonical_delta_prefill_chunks
+                  : invocation.agent->full_canonical_prefill_chunks;
+      ABSL_ASSIGN_OR_RETURN(
+          DPMPreparedPrefillPlan plan,
+          PrepareDPMEnginePrefillPlan(
+              engine.get(), session.get(), source_chunks,
+              invocation.agent->logical_agent_request_hash, start));
+      ABSL_RETURN_IF_ERROR(ExecuteDPMEnginePrefillPlan(
+          session.get(), plan, restored_state_witness));
+      prepared_prefill_plan = std::move(plan);
       break;
+    }
   }
 
   // This is the only decode call in the adapter. The API captures each full
@@ -637,6 +637,9 @@ absl::StatusOr<FreshWorkerDerivedExecution> ExecuteEngineFreshWorkerRequest(
       ComputeFreshWorkerOutputEvidenceHash(
           output.canonical_output, output.token_bytes, output.logit_frames);
 
+  std::optional<
+      FreshWorkerDerivedExecution::ProducingCapsuleContinuationWitnesses>
+      producing_capsule_continuation_witnesses;
   // Canonical output, exact token bytes, and every ordered logits hash are
   // finalized before exporting the producing session. A failed export fails
   // the whole request and cannot turn these bytes into an uncaptured success.
@@ -646,8 +649,72 @@ absl::StatusOr<FreshWorkerDerivedExecution> ExecuteEngineFreshWorkerRequest(
     ABSL_ASSIGN_OR_RETURN(
         const std::vector<std::vector<int>> post_decode_history,
         session->GetExactProcessedTokenHistory());
-    ABSL_RETURN_IF_ERROR(session->ExportHandoffTo(
-        *context.producing_options, context.producing_sink));
+
+    ABSL_ASSIGN_OR_RETURN(
+        const SessionContinuationStateWitness producer_first_export,
+        session->ExportHandoffToWithWitness(
+            *context.producing_options,
+            context.producing_capsule_access->sink()));
+    ABSL_RETURN_IF_ERROR(ValidateSessionContinuationStateWitness(
+        producer_first_export));
+    ABSL_ASSIGN_OR_RETURN(
+        const ByteSource* sealed_producing_source,
+        context.producing_capsule_access->SealForRead());
+    if (sealed_producing_source == nullptr ||
+        sealed_producing_source->Size() == 0 ||
+        producer_first_export.envelope_size !=
+            sealed_producing_source->Size() ||
+        producer_first_export.key_id != context.producing_options->key_id) {
+      return absl::DataLossError(
+          "First producing-session witness does not describe the sealed "
+          "transient capsule.");
+    }
+
+    BoundedDigestByteSink second_export_sink;
+    ABSL_ASSIGN_OR_RETURN(
+        const SessionContinuationStateWitness producer_second_export,
+        session->ExportHandoffToWithWitness(
+            *context.producing_options, &second_export_sink));
+    ABSL_RETURN_IF_ERROR(ValidateSessionContinuationStateWitness(
+        producer_second_export));
+    const Hash256 second_export_hash = second_export_sink.Finalize();
+    if (producer_second_export.envelope_size != second_export_sink.Size() ||
+        producer_second_export.envelope_hash != second_export_hash) {
+      return absl::DataLossError(
+          "Second producing-session witness does not describe the "
+          "digest-only export.");
+    }
+
+    ABSL_ASSIGN_OR_RETURN(
+        std::unique_ptr<Engine::Session> fresh_import_target,
+        engine->CreateSession(session_config));
+    if (fresh_import_target == nullptr) {
+      return absl::InternalError(
+          "Advanced LiteRT Engine returned a null capsule-verification "
+          "session.");
+    }
+    ABSL_RETURN_IF_ERROR(ValidateFreshSession(
+        *engine, *fresh_import_target, session_config, profile_after));
+    ABSL_ASSIGN_OR_RETURN(
+        const SessionContinuationStateWitness fresh_import_target_witness,
+        fresh_import_target->ImportHandoffFromWithWitness(
+            *sealed_producing_source, *context.producing_options));
+    ABSL_RETURN_IF_ERROR(ValidateSessionContinuationStateWitness(
+        fresh_import_target_witness));
+    ABSL_RETURN_IF_ERROR(ValidateImportedSession(
+        *fresh_import_target, session_config, profile_after));
+    ABSL_ASSIGN_OR_RETURN(
+        const ExactLiteRtProfile import_target_profile,
+        engine->ResolveExactLiteRtProfile(
+            fresh_import_target->GetSessionConfig(), profile_assertion));
+    if (import_target_profile != profile_after ||
+        producer_first_export != producer_second_export ||
+        producer_first_export != fresh_import_target_witness) {
+      return absl::DataLossError(
+          "Producing-session export and fresh-target import/re-export did "
+          "not produce one canonical continuation witness.");
+    }
+
     ABSL_ASSIGN_OR_RETURN(const int post_export_step,
                           session->GetCurrentStep());
     ABSL_ASSIGN_OR_RETURN(
@@ -662,6 +729,12 @@ absl::StatusOr<FreshWorkerDerivedExecution> ExecuteEngineFreshWorkerRequest(
           "Producing-session export changed exact continuation or output "
           "evidence.");
     }
+    producing_capsule_continuation_witnesses =
+        FreshWorkerDerivedExecution::
+            ProducingCapsuleContinuationWitnesses{
+                .producer_first_export = producer_first_export,
+                .producer_second_export = producer_second_export,
+                .fresh_import_target = fresh_import_target_witness};
   }
 
   ABSL_ASSIGN_OR_RETURN(
@@ -690,10 +763,14 @@ absl::StatusOr<FreshWorkerDerivedExecution> ExecuteEngineFreshWorkerRequest(
       .derived_exact_profile_hash = profile_final.profile_id,
       .replay_isolation = FreshWorkerReplayIsolation::kEmptyCatalogs,
       .output = std::move(output),
+      .prepared_prefill_plan = std::move(prepared_prefill_plan),
+      .restored_state_witness = std::move(restored_state_witness),
       .restored_checkpoint_id =
           request.execution_plan.restore_checkpoint_id,
       .exported_producing_capsule = capture_requested,
       .producing_session_identity = final_session_identity,
+      .producing_capsule_continuation_witnesses =
+          std::move(producing_capsule_continuation_witnesses),
   };
 }
 

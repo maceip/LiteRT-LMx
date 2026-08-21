@@ -34,9 +34,9 @@ namespace litert::lm {
 namespace {
 
 constexpr std::array<char, 8> kRequestMagic = {'D', 'P', 'M', 'W', 'R', 'Q',
-                                                '0', '2'};
+                                                '0', '3'};
 constexpr std::array<char, 8> kResultMagic = {'D', 'P', 'M', 'W', 'R', 'S',
-                                               '0', '2'};
+                                               '0', '3'};
 constexpr std::array<char, 8> kTokenBytesMagic = {'D', 'P', 'M', 'T', 'O', 'K',
                                                    '0', '1'};
 constexpr std::array<char, 8> kExecutionPlanMagic = {
@@ -46,11 +46,12 @@ constexpr uint32_t kResultKind = 2;
 constexpr uint64_t kMaximumResultStatusMessageBytes = 4096;
 constexpr uint64_t kMaximumKeyIdBytes = 256;
 constexpr uint64_t kMaximumAuthenticationKeyBytes = 4096;
+constexpr uint32_t kMaximumContinuationWitnessKeyIdBytes = 1024;
 constexpr uint64_t kEnvelopeFixedBytes = 8 + 4 + 4 + 4 + 8 + 32;
 constexpr absl::string_view kRequestMacDomain =
-    "LITERT_LMX_FRESH_WORKER_REQUEST_HMAC_SHA256_V2";
+    "LITERT_LMX_FRESH_WORKER_REQUEST_HMAC_SHA256_V3";
 constexpr absl::string_view kResultMacDomain =
-    "LITERT_LMX_FRESH_WORKER_RESULT_HMAC_SHA256_V2";
+    "LITERT_LMX_FRESH_WORKER_RESULT_HMAC_SHA256_V3";
 constexpr absl::string_view kExecutionPlanHashDomain =
     "LITERT_LMX_FRESH_WORKER_EXECUTION_PLAN_SHA256_V1";
 constexpr absl::string_view kOutputEvidenceHashDomain =
@@ -123,6 +124,21 @@ void AppendIdentity(const SessionHandoffIdentity& identity,
   AppendHash(identity.model_artifact_hash, output);
   AppendHash(identity.runtime_artifact_hash, output);
   AppendHash(identity.inference_profile_hash, output);
+}
+
+void AppendContinuationWitness(
+    const SessionContinuationStateWitness& witness, std::string* output) {
+  AppendU32(witness.format_version, output);
+  AppendHash(witness.witness_id, output);
+  AppendIdentity(witness.session_identity, output);
+  AppendU32(static_cast<uint32_t>(witness.phase), output);
+  AppendU32(static_cast<uint32_t>(witness.current_step), output);
+  AppendU32(witness.ran_decode ? 1 : 0, output);
+  AppendHash(witness.processed_history_token_bytes_hash, output);
+  AppendHash(witness.envelope_hash, output);
+  AppendU64(witness.envelope_size, output);
+  AppendU32(static_cast<uint32_t>(witness.key_id.size()), output);
+  output->append(witness.key_id);
 }
 
 Hash256 Sha256(absl::string_view bytes) {
@@ -287,6 +303,52 @@ absl::StatusOr<SessionHandoffIdentity> ReadIdentity(Reader* reader) {
   return identity;
 }
 
+absl::StatusOr<SessionContinuationStateWitness> ReadContinuationWitness(
+    Reader* reader) {
+  if (reader == nullptr) {
+    return absl::InternalError(
+        "Fresh-worker continuation witness reader is null.");
+  }
+  SessionContinuationStateWitness witness;
+  ABSL_ASSIGN_OR_RETURN(witness.format_version, reader->ReadU32());
+  ABSL_ASSIGN_OR_RETURN(witness.witness_id, reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(witness.session_identity, ReadIdentity(reader));
+  ABSL_ASSIGN_OR_RETURN(const uint32_t phase, reader->ReadU32());
+  if (phase > static_cast<uint32_t>(SessionHandoffPhase::kDecoded)) {
+    return absl::DataLossError(
+        "Fresh-worker continuation witness phase is invalid.");
+  }
+  witness.phase = static_cast<SessionHandoffPhase>(phase);
+  ABSL_ASSIGN_OR_RETURN(const uint32_t current_step, reader->ReadU32());
+  if (current_step >
+      static_cast<uint32_t>((std::numeric_limits<int32_t>::max)())) {
+    return absl::DataLossError(
+        "Fresh-worker continuation witness step is not representable.");
+  }
+  witness.current_step = static_cast<int32_t>(current_step);
+  ABSL_ASSIGN_OR_RETURN(const uint32_t ran_decode, reader->ReadU32());
+  if (ran_decode > 1) {
+    return absl::DataLossError(
+        "Fresh-worker continuation witness decode flag is invalid.");
+  }
+  witness.ran_decode = ran_decode != 0;
+  ABSL_ASSIGN_OR_RETURN(witness.processed_history_token_bytes_hash,
+                        reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(witness.envelope_hash, reader->ReadHash());
+  ABSL_ASSIGN_OR_RETURN(witness.envelope_size, reader->ReadU64());
+  ABSL_ASSIGN_OR_RETURN(const uint32_t key_id_size, reader->ReadU32());
+  if (key_id_size == 0 ||
+      key_id_size > kMaximumContinuationWitnessKeyIdBytes) {
+    return absl::DataLossError(
+        "Fresh-worker continuation witness key ID is invalid.");
+  }
+  ABSL_ASSIGN_OR_RETURN(const absl::string_view key_id,
+                        reader->ReadBytes(key_id_size));
+  witness.key_id.assign(key_id.data(), key_id.size());
+  ABSL_RETURN_IF_ERROR(ValidateSessionContinuationStateWitness(witness));
+  return witness;
+}
+
 absl::StatusOr<std::string> EncodeExecutionPlan(
     const FreshWorkerExecutionPlan& plan) {
   ABSL_RETURN_IF_ERROR(ValidateFreshWorkerExecutionPlan(plan));
@@ -384,6 +446,28 @@ absl::Status ValidateProducingCapsuleEvidence(
       IsZeroHash(evidence.output_evidence_hash)) {
     return absl::InvalidArgumentError(
         "Fresh-worker producing-capsule evidence is incomplete.");
+  }
+  ABSL_RETURN_IF_ERROR(ValidateSessionContinuationStateWitness(
+      evidence.producer_first_export));
+  ABSL_RETURN_IF_ERROR(ValidateSessionContinuationStateWitness(
+      evidence.producer_second_export));
+  ABSL_RETURN_IF_ERROR(ValidateSessionContinuationStateWitness(
+      evidence.fresh_import_target));
+  if (evidence.producer_first_export != evidence.producer_second_export ||
+      evidence.producer_first_export != evidence.fresh_import_target) {
+    return absl::DataLossError(
+        "Fresh-worker producing-capsule continuation witnesses disagree.");
+  }
+  const SessionContinuationStateWitness& witness =
+      evidence.producer_first_export;
+  if (witness.session_identity != evidence.session_identity ||
+      witness.phase != SessionHandoffPhase::kDecoded ||
+      !witness.ran_decode || witness.current_step <= 0 ||
+      witness.envelope_size != evidence.transient_envelope_size ||
+      witness.envelope_hash != evidence.transient_envelope_hash) {
+    return absl::DataLossError(
+        "Fresh-worker producing-capsule witness does not describe the "
+        "sealed decoded producer state.");
   }
   return absl::OkStatus();
 }
@@ -535,7 +619,14 @@ absl::StatusOr<FreshWorkerRequest> DecodeRequestBody(absl::string_view body) {
   return request;
 }
 
-std::string EncodeResultBody(const FreshWorkerResult& result) {
+absl::StatusOr<std::string> EncodeResultBody(
+    const FreshWorkerResult& result) {
+  std::string prepared_prefill_plan;
+  if (result.prepared_prefill_plan.has_value()) {
+    ABSL_ASSIGN_OR_RETURN(
+        prepared_prefill_plan,
+        EncodeDPMPreparedPrefillPlan(*result.prepared_prefill_plan));
+  }
   std::string body;
   body.reserve(4 + 32 * 10 + 96 + 8 + 4 * 6 + 8 +
                result.status_message.size() +
@@ -550,9 +641,18 @@ std::string EncodeResultBody(const FreshWorkerResult& result) {
   AppendHash(result.request_envelope_hash, &body);
   AppendHash(result.worker_instance_nonce, &body);
   AppendHash(result.execution_plan_hash, &body);
+  AppendU32(result.prepared_prefill_plan.has_value() ? 1 : 0, &body);
+  if (result.prepared_prefill_plan.has_value()) {
+    AppendU64(prepared_prefill_plan.size(), &body);
+    body.append(prepared_prefill_plan);
+  }
   AppendU32(result.restored_checkpoint_id.has_value() ? 1 : 0, &body);
   if (result.restored_checkpoint_id.has_value()) {
     AppendHash(*result.restored_checkpoint_id, &body);
+  }
+  AppendU32(result.restored_state_witness.has_value() ? 1 : 0, &body);
+  if (result.restored_state_witness.has_value()) {
+    AppendContinuationWitness(*result.restored_state_witness, &body);
   }
   AppendU32(result.producing_capsule_evidence.has_value() ? 1 : 0, &body);
   if (result.producing_capsule_evidence.has_value()) {
@@ -562,6 +662,9 @@ std::string EncodeResultBody(const FreshWorkerResult& result) {
     AppendU64(evidence.transient_envelope_size, &body);
     AppendHash(evidence.transient_envelope_hash, &body);
     AppendHash(evidence.output_evidence_hash, &body);
+    AppendContinuationWitness(evidence.producer_first_export, &body);
+    AppendContinuationWitness(evidence.producer_second_export, &body);
+    AppendContinuationWitness(evidence.fresh_import_target, &body);
   }
   AppendU32(static_cast<uint32_t>(result.replay_isolation), &body);
   AppendU32(static_cast<uint32_t>(result.status_code), &body);
@@ -596,6 +699,27 @@ absl::StatusOr<FreshWorkerResult> DecodeResultBody(absl::string_view body) {
   ABSL_ASSIGN_OR_RETURN(result.request_envelope_hash, reader.ReadHash());
   ABSL_ASSIGN_OR_RETURN(result.worker_instance_nonce, reader.ReadHash());
   ABSL_ASSIGN_OR_RETURN(result.execution_plan_hash, reader.ReadHash());
+  uint32_t has_prepared_prefill_plan;
+  ABSL_ASSIGN_OR_RETURN(has_prepared_prefill_plan, reader.ReadU32());
+  if (has_prepared_prefill_plan > 1) {
+    return absl::DataLossError(
+        "Fresh-worker prepared-prefill-plan flag is invalid.");
+  }
+  if (has_prepared_prefill_plan != 0) {
+    uint64_t prepared_prefill_plan_size;
+    ABSL_ASSIGN_OR_RETURN(prepared_prefill_plan_size, reader.ReadU64());
+    if (prepared_prefill_plan_size > kMaximumDPMPreparedPrefillPlanBytes) {
+      return absl::ResourceExhaustedError(
+          "Fresh-worker prepared prefill plan exceeds its protocol limit.");
+    }
+    absl::string_view prepared_prefill_plan;
+    ABSL_ASSIGN_OR_RETURN(
+        prepared_prefill_plan,
+        reader.ReadBytes(prepared_prefill_plan_size));
+    ABSL_ASSIGN_OR_RETURN(
+        result.prepared_prefill_plan,
+        DecodeDPMPreparedPrefillPlan(prepared_prefill_plan));
+  }
   uint32_t has_restored_checkpoint;
   ABSL_ASSIGN_OR_RETURN(has_restored_checkpoint, reader.ReadU32());
   if (has_restored_checkpoint > 1) {
@@ -606,6 +730,16 @@ absl::StatusOr<FreshWorkerResult> DecodeResultBody(absl::string_view body) {
     Hash256 checkpoint_id;
     ABSL_ASSIGN_OR_RETURN(checkpoint_id, reader.ReadHash());
     result.restored_checkpoint_id = checkpoint_id;
+  }
+  uint32_t has_restored_state_witness;
+  ABSL_ASSIGN_OR_RETURN(has_restored_state_witness, reader.ReadU32());
+  if (has_restored_state_witness > 1) {
+    return absl::DataLossError(
+        "Fresh-worker restored-state-witness flag is invalid.");
+  }
+  if (has_restored_state_witness != 0) {
+    ABSL_ASSIGN_OR_RETURN(result.restored_state_witness,
+                          ReadContinuationWitness(&reader));
   }
   uint32_t has_producing_capsule;
   ABSL_ASSIGN_OR_RETURN(has_producing_capsule, reader.ReadU32());
@@ -623,6 +757,12 @@ absl::StatusOr<FreshWorkerResult> DecodeResultBody(absl::string_view body) {
                           reader.ReadHash());
     ABSL_ASSIGN_OR_RETURN(evidence.output_evidence_hash,
                           reader.ReadHash());
+    ABSL_ASSIGN_OR_RETURN(evidence.producer_first_export,
+                          ReadContinuationWitness(&reader));
+    ABSL_ASSIGN_OR_RETURN(evidence.producer_second_export,
+                          ReadContinuationWitness(&reader));
+    ABSL_ASSIGN_OR_RETURN(evidence.fresh_import_target,
+                          ReadContinuationWitness(&reader));
     result.producing_capsule_evidence = evidence;
   }
   ABSL_ASSIGN_OR_RETURN(const uint32_t replay_isolation, reader.ReadU32());
@@ -892,6 +1032,14 @@ absl::Status ValidateFreshWorkerResult(const FreshWorkerResult& result) {
     return absl::InvalidArgumentError(
         "Fresh-worker restored checkpoint ID must be nonzero.");
   }
+  if (result.prepared_prefill_plan.has_value()) {
+    ABSL_RETURN_IF_ERROR(ValidateDPMPreparedPrefillPlan(
+        *result.prepared_prefill_plan));
+  }
+  if (result.restored_state_witness.has_value()) {
+    ABSL_RETURN_IF_ERROR(ValidateSessionContinuationStateWitness(
+        *result.restored_state_witness));
+  }
   if (result.producing_capsule_evidence.has_value()) {
     ABSL_RETURN_IF_ERROR(ValidateProducingCapsuleEvidence(
         *result.producing_capsule_evidence));
@@ -915,6 +1063,60 @@ absl::Status ValidateFreshWorkerResult(const FreshWorkerResult& result) {
         FreshWorkerExecutionOutput{.canonical_output = result.canonical_output,
                                    .token_bytes = result.token_bytes,
                                    .logit_frames = result.logit_frames}));
+    if (!result.prepared_prefill_plan.has_value()) {
+      if (result.restored_checkpoint_id.has_value() ||
+          result.restored_state_witness.has_value()) {
+        return absl::DataLossError(
+            "A successful worker result without a prepared prefill plan "
+            "cannot claim restored state.");
+      }
+    } else {
+      const DPMPreparedPrefillPlan& plan =
+          *result.prepared_prefill_plan;
+      switch (plan.start_kind) {
+        case DPMPreparedPrefillStartKind::kFreshSession:
+          if (result.restored_checkpoint_id.has_value() ||
+              result.restored_state_witness.has_value()) {
+            return absl::DataLossError(
+                "A fresh prepared prefill result claims restored state.");
+          }
+          break;
+        case DPMPreparedPrefillStartKind::kOwnPositionRestore:
+          if (!result.restored_checkpoint_id.has_value() ||
+              !result.restored_state_witness.has_value() ||
+              plan.restore_checkpoint_id != result.restored_checkpoint_id ||
+              plan.start_state_witness_id !=
+                  result.restored_state_witness->witness_id ||
+              plan.session_identity !=
+                  result.restored_state_witness->session_identity ||
+              plan.start_step != static_cast<uint64_t>(
+                                     result.restored_state_witness->current_step) ||
+              plan.start_history_token_count != plan.start_step ||
+              plan.start_history_token_bytes_hash !=
+                  result.restored_state_witness
+                      ->processed_history_token_bytes_hash ||
+              result.restored_state_witness->phase !=
+                  SessionHandoffPhase::kDecoded ||
+              !result.restored_state_witness->ran_decode ||
+              result.restored_state_witness->current_step <= 0) {
+            return absl::DataLossError(
+                "An own-position prepared prefill result lacks its exact "
+                "checkpoint and live restored-state witness bindings.");
+          }
+          break;
+        default:
+          return absl::InternalError(
+              "Validated prepared prefill plan lost its start kind.");
+      }
+    }
+    if (result.producing_capsule_evidence.has_value() &&
+        (!result.prepared_prefill_plan.has_value() ||
+         result.producing_capsule_evidence->session_identity !=
+             result.prepared_prefill_plan->session_identity)) {
+      return absl::DataLossError(
+          "Fresh-worker producing capsule lacks its prepared prefill plan "
+          "or has a different session identity.");
+    }
     if (result.producing_capsule_evidence.has_value() &&
         result.producing_capsule_evidence->output_evidence_hash !=
             ComputeFreshWorkerOutputEvidenceHash(
@@ -930,11 +1132,13 @@ absl::Status ValidateFreshWorkerResult(const FreshWorkerResult& result) {
       result.status_message.empty() || !result.canonical_output.empty() ||
       !result.token_bytes.empty() ||
       !result.logit_frames.empty() ||
+      result.prepared_prefill_plan.has_value() ||
       result.restored_checkpoint_id.has_value() ||
+      result.restored_state_witness.has_value() ||
       result.producing_capsule_evidence.has_value()) {
     return absl::InvalidArgumentError(
-        "Failed fresh-worker result has non-canonical output, restore, or "
-        "capsule fields.");
+        "Failed fresh-worker result has non-canonical output, prepared "
+        "prefill, restore, or capsule fields.");
   }
   return absl::OkStatus();
 }
@@ -960,17 +1164,32 @@ absl::Status ValidateFreshWorkerResultForRequest(
 
   switch (request.execution_plan.prefill_mode) {
     case FreshWorkerPrefillMode::kFullCanonicalPrefill:
-      if (result.restored_checkpoint_id.has_value()) {
+      if (result.restored_checkpoint_id.has_value() ||
+          result.restored_state_witness.has_value() ||
+          (result.prepared_prefill_plan.has_value() &&
+           result.prepared_prefill_plan->start_kind !=
+               DPMPreparedPrefillStartKind::kFreshSession)) {
         return absl::DataLossError(
-            "Full-prefill worker result claims a restored checkpoint.");
+            "Full-prefill worker result claims a restored start state.");
       }
       break;
     case FreshWorkerPrefillMode::kOwnPositionCapsuleDelta:
       if (!result.restored_checkpoint_id.has_value() ||
           result.restored_checkpoint_id !=
-              request.execution_plan.restore_checkpoint_id) {
+              request.execution_plan.restore_checkpoint_id ||
+          !result.restored_state_witness.has_value() ||
+          !result.prepared_prefill_plan.has_value() ||
+          result.prepared_prefill_plan->start_kind !=
+              DPMPreparedPrefillStartKind::kOwnPositionRestore ||
+          result.prepared_prefill_plan->restore_checkpoint_id !=
+              request.execution_plan.restore_checkpoint_id ||
+          result.prepared_prefill_plan->session_identity !=
+              request.execution_plan.session_identity ||
+          result.restored_state_witness->session_identity !=
+              request.execution_plan.session_identity) {
         return absl::DataLossError(
-            "Own-position worker result did not confirm its checkpoint.");
+            "Own-position worker result did not confirm its checkpoint, "
+            "runtime plan, and live restored-state witness.");
       }
       break;
     default:
@@ -985,13 +1204,16 @@ absl::Status ValidateFreshWorkerResultForRequest(
         "policy.");
   }
   if (result.producing_capsule_evidence.has_value() &&
-      request.execution_plan.prefill_mode ==
-          FreshWorkerPrefillMode::kOwnPositionCapsuleDelta &&
-      result.producing_capsule_evidence->session_identity !=
-          request.execution_plan.session_identity) {
+      (!result.prepared_prefill_plan.has_value() ||
+       result.producing_capsule_evidence->session_identity !=
+           result.prepared_prefill_plan->session_identity ||
+       (request.execution_plan.prefill_mode ==
+            FreshWorkerPrefillMode::kOwnPositionCapsuleDelta &&
+        result.producing_capsule_evidence->session_identity !=
+            request.execution_plan.session_identity))) {
     return absl::DataLossError(
-        "Fresh-worker producing capsule identity differs from the restored "
-        "session identity.");
+        "Fresh-worker producing capsule identity differs from its prepared "
+        "or restored session identity.");
   }
   return absl::OkStatus();
 }
@@ -1105,8 +1327,9 @@ absl::StatusOr<std::string> EncodeFreshWorkerResult(
     const FreshWorkerResult& result,
     const FreshWorkerAuthentication& authentication) {
   ABSL_RETURN_IF_ERROR(ValidateFreshWorkerResult(result));
+  ABSL_ASSIGN_OR_RETURN(const std::string body, EncodeResultBody(result));
   return EncodeEnvelope(kResultMagic, kResultKind, kResultMacDomain,
-                        EncodeResultBody(result), authentication);
+                        body, authentication);
 }
 
 absl::StatusOr<FreshWorkerResult> DecodeFreshWorkerResult(
