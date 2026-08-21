@@ -29,6 +29,10 @@
 #include <variant>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <dlfcn.h>
+#endif
+
 #include "absl/cleanup/cleanup.h"  // from @com_google_absl
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
 #include "absl/container/flat_hash_set.h"  // from @com_google_absl
@@ -77,6 +81,7 @@
 #include "runtime/executor/llm_executor_settings_utils.h"
 #include "runtime/executor/llm_litert_compiled_model_cache_utils.h"
 #include "runtime/executor/llm_litert_mtp_drafter.h"
+#include "runtime/executor/metal_delegate_exact_evidence_abi.h"
 #include "runtime/executor/state_interface.h"
 #include "runtime/platform/hash/sha256_hasher.h"
 #include "runtime/util/convert_tensor_buffer.h"
@@ -396,6 +401,451 @@ bool HasEnvironmentTag(const EnvironmentOptions& options,
   }
   return false;
 }
+
+#if defined(__APPLE__)
+
+struct ValidatedMetalDelegateExactEvidence {
+  bool effective_compilation_complete = false;
+  bool selected_pipeline_set_complete = false;
+  bool adaptive_split_kv_disabled = false;
+  bool synchronous_run_completion = false;
+  bool complete_continuation_and_reset_state = false;
+  std::string canonical_evidence;
+  std::string canonical_complete_state_evidence;
+};
+
+struct SelectedMetalDelegateBinding {
+  const void* metal_device = nullptr;
+  const void* metal_command_queue = nullptr;
+  const void* accelerator_user_data = nullptr;
+  uintptr_t accelerator_code_anchor = 0;
+};
+
+template <typename T, size_t N>
+bool AllZero(const T (&values)[N]) {
+  return std::all_of(values, values + N,
+                     [](T value) { return value == 0; });
+}
+
+template <size_t N>
+bool NonZeroDigest(const uint8_t (&digest)[N]) {
+  return !AllZero(digest);
+}
+
+absl::string_view DigestView(
+    const uint8_t (&digest)
+        [LITERT_LM_METAL_EXACT_EVIDENCE_SHA256_SIZE_V1]) {
+  return absl::string_view(reinterpret_cast<const char*>(digest),
+                           sizeof(digest));
+}
+
+bool IsValidMetalCalculationPrecision(uint32_t value) {
+  return value == kLiteRtLmMetalCalculationPrecisionFloat32V1 ||
+         value == kLiteRtLmMetalCalculationPrecisionFloat16V1 ||
+         value == kLiteRtLmMetalCalculationPrecisionFloat32Float16V1;
+}
+
+bool IsValidMetalBooleanFact(uint32_t value) {
+  return value == kLiteRtLmMetalBooleanFactFalseV1 ||
+         value == kLiteRtLmMetalBooleanFactTrueV1;
+}
+
+bool IsValidMetalWaitType(uint32_t value) {
+  return value == kLiteRtLmMetalWaitTypeActiveV1 ||
+         value == kLiteRtLmMetalWaitTypePassiveV1 ||
+         value == kLiteRtLmMetalWaitTypeDoNotWaitV1;
+}
+
+bool IsValidMetalSplitKvPolicy(uint32_t value) {
+  return value ==
+             kLiteRtLmMetalAdaptiveSplitKvDisabledForAllSelectedPipelinesV1 ||
+         value ==
+             kLiteRtLmMetalAdaptiveSplitKvEnabledOrShapeDependentV1;
+}
+
+bool IsValidMetalRunCompletionPolicy(uint32_t value) {
+  return value == kLiteRtLmMetalRunWaitsForAllSubmittedWorkV1 ||
+         value == kLiteRtLmMetalRunMayReturnWithSubmittedWorkPendingV1;
+}
+
+bool IsValidMetalContinuationStatePolicy(uint32_t value) {
+  return value ==
+             kLiteRtLmMetalAllContinuationStateInBoundStateTensorsV1 ||
+         value == kLiteRtLmMetalDelegateOwnsHiddenContinuationStateV1;
+}
+
+bool IsValidMetalResetStatePolicy(uint32_t value) {
+  return value ==
+             kLiteRtLmMetalFreshBoundStateTensorsResetAllContinuationStateV1 ||
+         value == kLiteRtLmMetalResetRequiresAdditionalDelegateMutationV1;
+}
+
+bool UnsupportedMetalEvidenceResponseIsCanonical(
+    const LiteRtLmMetalExactEvidenceV1& evidence) {
+  return evidence.compiled_model_instance == nullptr &&
+         evidence.selected_accelerator_state == nullptr &&
+         evidence.metal_device == nullptr &&
+         evidence.metal_command_queue == nullptr &&
+         evidence.evidence_flags == 0 &&
+         evidence.effective_calculation_precision == 0 &&
+         evidence.effective_f32_accumulation_for_fp16 == 0 &&
+         evidence.effective_argument_buffers == 0 &&
+         evidence.effective_wait_type == 0 &&
+         AllZero(evidence.effective_compilation_flags_sha256) &&
+         evidence.selected_pipeline_count == 0 &&
+         AllZero(evidence.selected_pipeline_set_sha256) &&
+         evidence.adaptive_split_kv_policy == 0 &&
+         evidence.synchronous_run_completion_policy == 0 &&
+         evidence.continuation_state_policy == 0 &&
+         evidence.reset_state_policy == 0 &&
+         AllZero(evidence.delegate_state_inventory_sha256) &&
+         AllZero(evidence.reserved);
+}
+
+absl::StatusOr<ValidatedMetalDelegateExactEvidence>
+QuerySelectedMetalDelegateExactEvidence(
+    uintptr_t selected_accelerator_code_anchor,
+    const void* selected_accelerator_state, const void* metal_device,
+    const void* metal_command_queue, const void* compiled_model_instance) {
+  if (selected_accelerator_code_anchor == 0 ||
+      selected_accelerator_state == nullptr || metal_device == nullptr ||
+      metal_command_queue == nullptr || compiled_model_instance == nullptr) {
+    return absl::FailedPreconditionError(
+        "Metal delegate evidence query has an incomplete live-instance "
+        "binding.");
+  }
+
+  ValidatedMetalDelegateExactEvidence result;
+  AppendRuntimeBytes("LITERT_LM_METAL_DELEGATE_EXACT_EVIDENCE_V1",
+                     &result.canonical_evidence);
+
+  Dl_info accelerator_image = {};
+  if (dladdr(reinterpret_cast<const void*>(
+                 selected_accelerator_code_anchor),
+             &accelerator_image) == 0 ||
+      accelerator_image.dli_fbase == nullptr) {
+    return absl::FailedPreconditionError(
+        "Cannot resolve the loaded image that owns the selected Metal "
+        "accelerator callback.");
+  }
+
+  // RTLD_DEFAULT is used so this works for both a dynamically discovered
+  // accelerator and an accelerator statically linked into the executable. A
+  // symbol collision cannot supply evidence: the resolved query function must
+  // belong to exactly the same loaded Mach-O instance as the accelerator-owned
+  // callback above.
+  void* query_symbol =
+      dlsym(RTLD_DEFAULT, LITERT_LM_QUERY_METAL_EXACT_EVIDENCE_SYMBOL_V1);
+  if (query_symbol == nullptr) {
+    AppendRuntimeU32(/*query_disposition_symbol_absent=*/0,
+                     &result.canonical_evidence);
+    AppendRuntimeU32(LITERT_LM_METAL_EXACT_EVIDENCE_ABI_VERSION_V1,
+                     &result.canonical_evidence);
+    AppendRuntimeU32(/*evidence_flags=*/0, &result.canonical_evidence);
+    return result;
+  }
+
+  Dl_info query_image = {};
+  if (dladdr(query_symbol, &query_image) == 0 ||
+      query_image.dli_fbase == nullptr ||
+      query_image.dli_fbase != accelerator_image.dli_fbase) {
+    return absl::FailedPreconditionError(
+        "Metal exact-evidence symbol is not owned by the selected accelerator "
+        "image.");
+  }
+
+  LiteRtLmQueryMetalExactEvidenceFnV1 query_function = nullptr;
+  static_assert(sizeof(query_function) == sizeof(query_symbol));
+  std::memcpy(&query_function, &query_symbol, sizeof(query_function));
+  if (query_function == nullptr) {
+    return absl::FailedPreconditionError(
+        "Metal exact-evidence query function is null.");
+  }
+
+  LiteRtLmMetalExactEvidenceQueryV1 query = {};
+  static_assert(sizeof(query) <= std::numeric_limits<uint32_t>::max());
+  query.struct_size = static_cast<uint32_t>(sizeof(query));
+  query.abi_version = LITERT_LM_METAL_EXACT_EVIDENCE_ABI_VERSION_V1;
+  query.compiled_model_instance = compiled_model_instance;
+  query.selected_accelerator_state = selected_accelerator_state;
+  query.metal_device = metal_device;
+  query.metal_command_queue = metal_command_queue;
+
+  LiteRtLmMetalExactEvidenceV1 evidence = {};
+  static_assert(sizeof(evidence) <= std::numeric_limits<uint32_t>::max());
+  evidence.struct_size = static_cast<uint32_t>(sizeof(evidence));
+  evidence.abi_version = LITERT_LM_METAL_EXACT_EVIDENCE_ABI_VERSION_V1;
+  const int32_t query_status = query_function(&query, &evidence);
+  if (evidence.struct_size != static_cast<uint32_t>(sizeof(evidence)) ||
+      evidence.abi_version !=
+          LITERT_LM_METAL_EXACT_EVIDENCE_ABI_VERSION_V1) {
+    return absl::FailedPreconditionError(
+        "Selected Metal delegate returned an incompatible exact-evidence "
+        "structure length or version.");
+  }
+  if (query_status == kLiteRtLmMetalExactEvidenceQueryUnsupportedV1) {
+    if (!UnsupportedMetalEvidenceResponseIsCanonical(evidence)) {
+      return absl::FailedPreconditionError(
+          "Selected Metal delegate returned noncanonical fields with an "
+          "unsupported exact-evidence result.");
+    }
+    AppendRuntimeU32(/*query_disposition_unsupported=*/1,
+                     &result.canonical_evidence);
+    AppendRuntimeU32(evidence.abi_version, &result.canonical_evidence);
+    AppendRuntimeU32(/*evidence_flags=*/0, &result.canonical_evidence);
+    return result;
+  }
+  if (query_status != kLiteRtLmMetalExactEvidenceQuerySuccessV1) {
+    if (query_status != kLiteRtLmMetalExactEvidenceQueryInvalidArgumentV1 &&
+        query_status != kLiteRtLmMetalExactEvidenceQueryInternalV1) {
+      return absl::FailedPreconditionError(
+          "Selected Metal delegate returned an unknown exact-evidence query "
+          "status.");
+    }
+    return absl::FailedPreconditionError(
+        "Selected Metal delegate could not produce exact evidence for the "
+        "live compiled model instance.");
+  }
+
+  if (evidence.compiled_model_instance != compiled_model_instance ||
+      evidence.selected_accelerator_state != selected_accelerator_state ||
+      evidence.metal_device != metal_device ||
+      evidence.metal_command_queue != metal_command_queue) {
+    return absl::FailedPreconditionError(
+        "Selected Metal delegate exact evidence is not bound to the queried "
+        "compiled model, accelerator state, device, and queue.");
+  }
+  if (!AllZero(evidence.reserved) ||
+      (evidence.evidence_flags &
+       ~LITERT_LM_METAL_EXACT_EVIDENCE_KNOWN_FLAGS_V1) != 0) {
+    return absl::FailedPreconditionError(
+        "Selected Metal delegate exact evidence has nonzero reserved data or "
+        "unknown presence bits.");
+  }
+
+  const bool has_effective_compilation =
+      (evidence.evidence_flags &
+       kLiteRtLmMetalExactEvidenceEffectiveCompilationV1) != 0;
+  if (has_effective_compilation) {
+    if (!IsValidMetalCalculationPrecision(
+            evidence.effective_calculation_precision) ||
+        !IsValidMetalBooleanFact(
+            evidence.effective_f32_accumulation_for_fp16) ||
+        !IsValidMetalBooleanFact(evidence.effective_argument_buffers) ||
+        !IsValidMetalWaitType(evidence.effective_wait_type) ||
+        !NonZeroDigest(evidence.effective_compilation_flags_sha256)) {
+      return absl::FailedPreconditionError(
+          "Selected Metal delegate returned an incomplete effective "
+          "compilation section.");
+    }
+    result.effective_compilation_complete = true;
+  } else if (evidence.effective_calculation_precision != 0 ||
+             evidence.effective_f32_accumulation_for_fp16 != 0 ||
+             evidence.effective_argument_buffers != 0 ||
+             evidence.effective_wait_type != 0 ||
+             !AllZero(evidence.effective_compilation_flags_sha256)) {
+    return absl::FailedPreconditionError(
+        "Selected Metal delegate returned effective compilation data without "
+        "its presence bit.");
+  }
+
+  const bool has_selected_pipelines =
+      (evidence.evidence_flags &
+       kLiteRtLmMetalExactEvidenceSelectedPipelineSetV1) != 0;
+  if (has_selected_pipelines) {
+    if (evidence.selected_pipeline_count == 0 ||
+        !NonZeroDigest(evidence.selected_pipeline_set_sha256)) {
+      return absl::FailedPreconditionError(
+          "Selected Metal delegate returned an incomplete selected-pipeline "
+          "section.");
+    }
+    result.selected_pipeline_set_complete = true;
+  } else if (evidence.selected_pipeline_count != 0 ||
+             !AllZero(evidence.selected_pipeline_set_sha256)) {
+    return absl::FailedPreconditionError(
+        "Selected Metal delegate returned selected-pipeline data without its "
+        "presence bit.");
+  }
+
+  const bool has_split_kv_policy =
+      (evidence.evidence_flags &
+       kLiteRtLmMetalExactEvidenceAdaptiveSplitKvPolicyV1) != 0;
+  if (has_split_kv_policy) {
+    if (!IsValidMetalSplitKvPolicy(evidence.adaptive_split_kv_policy)) {
+      return absl::FailedPreconditionError(
+          "Selected Metal delegate returned an unknown Split-KV policy.");
+    }
+    result.adaptive_split_kv_disabled =
+        evidence.adaptive_split_kv_policy ==
+        kLiteRtLmMetalAdaptiveSplitKvDisabledForAllSelectedPipelinesV1;
+  } else if (evidence.adaptive_split_kv_policy != 0) {
+    return absl::FailedPreconditionError(
+        "Selected Metal delegate returned Split-KV data without its presence "
+        "bit.");
+  }
+
+  const bool has_run_completion =
+      (evidence.evidence_flags &
+       kLiteRtLmMetalExactEvidenceSynchronousRunCompletionV1) != 0;
+  if (has_run_completion) {
+    if (!IsValidMetalRunCompletionPolicy(
+            evidence.synchronous_run_completion_policy)) {
+      return absl::FailedPreconditionError(
+          "Selected Metal delegate returned an unknown synchronous-run "
+          "completion policy.");
+    }
+    result.synchronous_run_completion =
+        evidence.synchronous_run_completion_policy ==
+        kLiteRtLmMetalRunWaitsForAllSubmittedWorkV1;
+  } else if (evidence.synchronous_run_completion_policy != 0) {
+    return absl::FailedPreconditionError(
+        "Selected Metal delegate returned run-completion data without its "
+        "presence bit.");
+  }
+
+  const bool has_continuation_state =
+      (evidence.evidence_flags &
+       kLiteRtLmMetalExactEvidenceCompleteContinuationStateV1) != 0;
+  const bool has_reset_state =
+      (evidence.evidence_flags &
+       kLiteRtLmMetalExactEvidenceCompleteResetStateV1) != 0;
+  if (has_continuation_state) {
+    if (!IsValidMetalContinuationStatePolicy(
+            evidence.continuation_state_policy)) {
+      return absl::FailedPreconditionError(
+          "Selected Metal delegate returned an unknown continuation-state "
+          "policy.");
+    }
+  } else if (evidence.continuation_state_policy != 0) {
+    return absl::FailedPreconditionError(
+        "Selected Metal delegate returned continuation-state data without its "
+        "presence bit.");
+  }
+  if (has_reset_state) {
+    if (!IsValidMetalResetStatePolicy(evidence.reset_state_policy)) {
+      return absl::FailedPreconditionError(
+          "Selected Metal delegate returned an unknown reset-state policy.");
+    }
+  } else if (evidence.reset_state_policy != 0) {
+    return absl::FailedPreconditionError(
+        "Selected Metal delegate returned reset-state data without its "
+        "presence bit.");
+  }
+  if (has_continuation_state && has_reset_state) {
+    if (!NonZeroDigest(evidence.delegate_state_inventory_sha256)) {
+      return absl::FailedPreconditionError(
+          "Selected Metal delegate returned complete state policies without "
+          "a delegate-state inventory digest.");
+    }
+    result.complete_continuation_and_reset_state =
+        evidence.continuation_state_policy ==
+            kLiteRtLmMetalAllContinuationStateInBoundStateTensorsV1 &&
+        evidence.reset_state_policy ==
+            kLiteRtLmMetalFreshBoundStateTensorsResetAllContinuationStateV1;
+    AppendRuntimeBytes("LITERT_LM_METAL_DELEGATE_STATE_INVENTORY_V1",
+                       &result.canonical_complete_state_evidence);
+    AppendRuntimeU32(evidence.continuation_state_policy,
+                     &result.canonical_complete_state_evidence);
+    AppendRuntimeU32(evidence.reset_state_policy,
+                     &result.canonical_complete_state_evidence);
+    AppendRuntimeBytes(DigestView(evidence.delegate_state_inventory_sha256),
+                       &result.canonical_complete_state_evidence);
+  } else if (!AllZero(evidence.delegate_state_inventory_sha256)) {
+    return absl::FailedPreconditionError(
+        "Selected Metal delegate returned a state-inventory digest without "
+        "both complete-state presence bits.");
+  }
+
+  AppendRuntimeU32(/*query_disposition_validated=*/2,
+                   &result.canonical_evidence);
+  AppendRuntimeU32(evidence.abi_version, &result.canonical_evidence);
+  AppendRuntimeBytes("LIVE_COMPILED_MODEL_AND_ACCELERATOR_BINDINGS_VERIFIED_V1",
+                     &result.canonical_evidence);
+  AppendRuntimeU32(evidence.evidence_flags, &result.canonical_evidence);
+  AppendRuntimeU32(evidence.effective_calculation_precision,
+                   &result.canonical_evidence);
+  AppendRuntimeU32(evidence.effective_f32_accumulation_for_fp16,
+                   &result.canonical_evidence);
+  AppendRuntimeU32(evidence.effective_argument_buffers,
+                   &result.canonical_evidence);
+  AppendRuntimeU32(evidence.effective_wait_type,
+                   &result.canonical_evidence);
+  AppendRuntimeBytes(DigestView(evidence.effective_compilation_flags_sha256),
+                     &result.canonical_evidence);
+  AppendRuntimeU32(evidence.selected_pipeline_count,
+                   &result.canonical_evidence);
+  AppendRuntimeBytes(DigestView(evidence.selected_pipeline_set_sha256),
+                     &result.canonical_evidence);
+  AppendRuntimeU32(evidence.adaptive_split_kv_policy,
+                   &result.canonical_evidence);
+  AppendRuntimeU32(evidence.synchronous_run_completion_policy,
+                   &result.canonical_evidence);
+  AppendRuntimeU32(evidence.continuation_state_policy,
+                   &result.canonical_evidence);
+  AppendRuntimeU32(evidence.reset_state_policy,
+                   &result.canonical_evidence);
+  AppendRuntimeBytes(DigestView(evidence.delegate_state_inventory_sha256),
+                     &result.canonical_evidence);
+  return result;
+}
+
+absl::StatusOr<SelectedMetalDelegateBinding>
+ResolveSelectedMetalDelegateBinding(Environment& environment) {
+  LITERT_ASSIGN_OR_RETURN(auto environment_options,
+                          environment.GetOptions());
+  if (HasEnvironmentTag(environment_options,
+                        EnvironmentOptions::Tag::kWebGpuDevice) ||
+      HasEnvironmentTag(environment_options,
+                        EnvironmentOptions::Tag::kWebGpuQueue) ||
+      HasEnvironmentTag(environment_options,
+                        EnvironmentOptions::Tag::kWebGpuInstance) ||
+      HasEnvironmentTag(environment_options,
+                        EnvironmentOptions::Tag::kOpenClDeviceId) ||
+      HasEnvironmentTag(environment_options,
+                        EnvironmentOptions::Tag::kOpenClCommandQueue) ||
+      HasEnvironmentTag(environment_options,
+                        EnvironmentOptions::Tag::kVulkanEnvironment)) {
+    return absl::UnimplementedError(
+        "Loaded GPU Environment exposes a non-Metal accelerator alongside "
+        "Metal; the concrete selected delegate is ambiguous.");
+  }
+
+  SelectedMetalDelegateBinding binding;
+  ABSL_ASSIGN_OR_RETURN(
+      binding.metal_device,
+      GetUniqueEnvironmentPointer(environment_options,
+                                  EnvironmentOptions::Tag::kMetalDevice,
+                                  "MTLDevice"));
+  ABSL_ASSIGN_OR_RETURN(
+      binding.metal_command_queue,
+      GetUniqueEnvironmentPointer(
+          environment_options, EnvironmentOptions::Tag::kMetalCommandQueue,
+          "MTLCommandQueue"));
+  ABSL_ASSIGN_OR_RETURN(
+      const void* accelerator_callback,
+      GetUniqueEnvironmentPointer(
+          environment_options,
+          EnvironmentOptions::Tag::kCallbackOnGpuEnvDestroy,
+          "selected accelerator destruction callback"));
+  // The callback user data is owned by the selected accelerator. Requiring it
+  // prevents caller-inserted device/queue labels from masquerading as a
+  // selected ML Drift Metal runtime.
+  ABSL_ASSIGN_OR_RETURN(
+      binding.accelerator_user_data,
+      GetUniqueEnvironmentPointer(
+          environment_options,
+          EnvironmentOptions::Tag::kCallbackUserDataOnGpuEnvDestroy,
+          "selected accelerator callback state"));
+  binding.accelerator_code_anchor =
+      reinterpret_cast<uintptr_t>(accelerator_callback);
+  if (binding.accelerator_code_anchor == 0) {
+    return absl::FailedPreconditionError(
+        "Selected Metal accelerator callback code anchor is zero.");
+  }
+  return binding;
+}
+
+#endif  // defined(__APPLE__)
 
 template <typename BufferMap>
 absl::Status AppendFixedTensorMapContract(absl::string_view label,
@@ -1261,7 +1711,7 @@ LlmLiteRtCompiledModelExecutorBase::ConsumePendingOrAddProcessedToken(
 
 absl::Status LlmLiteRtCompiledModelExecutorBase::DecodeInternal(
     const std::vector<std::shared_ptr<TokenData>>& token,
-    TensorBuffer& output_logits) {
+    TensorBuffer& output_logits, bool require_synchronous_execution) {
   int step = llm_context_->runtime_state().current_step - 1;
   if (sampler_ && sampler_->HandlesInput()) {
     // The sampler has already been running decode for this step. Check if
@@ -1359,11 +1809,12 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::DecodeInternal(
         decode_input_buffers_[signatures_.input_int32_param.value()], step, 1));
   }
 
-  return BindTensorsAndRunDecode(&output_logits);
+  return BindTensorsAndRunDecode(&output_logits,
+                                 require_synchronous_execution);
 }
 
 absl::Status LlmLiteRtCompiledModelExecutorBase::BindTensorsAndRunDecode(
-    TensorBuffer* output_logits) {
+    TensorBuffer* output_logits, bool require_synchronous_execution) {
   absl::flat_hash_map<absl::string_view, TensorBuffer> decode_input_buffers;
   for (const auto& [input_name, input_buffer] : decode_input_buffers_) {
     LITERT_ASSIGN_OR_RETURN(auto input_buffer_dup, input_buffer.Duplicate());
@@ -1411,10 +1862,22 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::BindTensorsAndRunDecode(
   }
 
   litert::Options run_options = GetRunOptions();
-  bool async = true;
-  LITERT_RETURN_IF_ERROR(
-      compiled_model_->RunAsync(kDecodeSignatureRunner, decode_input_buffers,
-                                decode_output_buffers, async, &run_options));
+  if (require_synchronous_execution) {
+    // Exact capture consumes logits on the CPU and may immediately publish a
+    // continuation capsule. A completion event on an asynchronously returned
+    // buffer is not accepted as request-level quiescence: the selected
+    // delegate must make synchronous Run a complete command-buffer boundary,
+    // and its optional exact-evidence ABI must attest that effective behavior
+    // before the Metal profile receives kQuiescentExecution.
+    LITERT_RETURN_IF_ERROR(compiled_model_->Run(
+        kDecodeSignatureRunner, decode_input_buffers, decode_output_buffers,
+        &run_options));
+  } else {
+    constexpr bool kAsync = true;
+    LITERT_RETURN_IF_ERROR(compiled_model_->RunAsync(
+        kDecodeSignatureRunner, decode_input_buffers, decode_output_buffers,
+        kAsync, &run_options));
+  }
 
   if (post_graph_run_callback_) {
     ABSL_ASSIGN_OR_RETURN(auto current_step, GetCurrentStep());
@@ -1429,7 +1892,8 @@ int LlmLiteRtCompiledModelExecutorBase::BindTensorsAndRunDecodeStatic(
     void* arg) {
   auto self = static_cast<LlmLiteRtCompiledModelExecutorBase*>(arg);
   // Run decode with default output_logits.
-  auto status = self->BindTensorsAndRunDecode(/*output_logits=*/nullptr);
+  auto status = self->BindTensorsAndRunDecode(
+      /*output_logits=*/nullptr, /*require_synchronous_execution=*/false);
   if (!status.ok()) {
     ABSL_LOG(ERROR) << "Failed to bind tensors and run decode: " << status;
   }
@@ -1787,7 +2251,9 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::Decode(
     const ExecutorInputs& inputs, TensorBuffer& output_logits) {
   ABSL_RETURN_IF_ERROR(PrepareFirstDecode());
   ABSL_ASSIGN_OR_RETURN(auto step_and_token, GetTokenToDecode(inputs));
-  ABSL_RETURN_IF_ERROR(DecodeInternal(step_and_token.token, output_logits));
+  ABSL_RETURN_IF_ERROR(DecodeInternal(
+      step_and_token.token, output_logits,
+      /*require_synchronous_execution=*/false));
   ABSL_RETURN_IF_ERROR(ConsumePendingOrAddProcessedToken(step_and_token.token));
   ++llm_context_->runtime_state().current_step;
   return absl::OkStatus();
@@ -1807,7 +2273,15 @@ absl::StatusOr<TensorBuffer> LlmLiteRtCompiledModelExecutorBase::DecodeLogits(
   bool last_run_is_decode = llm_context_->runtime_state().ran_decode;
   ABSL_RETURN_IF_ERROR(PrepareFirstDecode());
   ABSL_ASSIGN_OR_RETURN(auto step_and_token, GetTokenToDecode(inputs));
-  ABSL_RETURN_IF_ERROR(DecodeInternal(step_and_token.token, output_logits));
+  // An exact request is not allowed to inherit the ordinary asynchronous
+  // decode behavior. This is the executor half of the quiescent-worker
+  // contract; the execution manager must still exclude concurrent session
+  // work, and the selected delegate must attest that synchronous Run drains
+  // its submitted Metal work.
+  ABSL_RETURN_IF_ERROR(DecodeInternal(
+      step_and_token.token, output_logits,
+      /*require_synchronous_execution=*/
+          decode_params.GetExactLiteRtDecodeCapture() != nullptr));
   ABSL_RETURN_IF_ERROR(ConsumePendingOrAddProcessedToken(step_and_token.token));
 
   if (!decode_params.GetLogitsProcessorList().empty() &&
@@ -2565,10 +3039,24 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::
     return absl::FailedPreconditionError(
         "Session handoff has no loaded compiled LiteRT model.");
   }
-  if (compiled_backend_ != Backend::CPU) {
+  if (compiled_backend_ != Backend::CPU && compiled_backend_ != Backend::GPU) {
     return absl::UnimplementedError(
-        "Session handoff currently admits only a compiled LiteRT CPU "
-        "backend.");
+        "Session handoff currently admits only compiled LiteRT CPU and Metal "
+        "backends.");
+  }
+#if !defined(__APPLE__)
+  if (compiled_backend_ == Backend::GPU) {
+    return absl::UnimplementedError(
+        "Backend-native GPU session handoff is currently implemented only "
+        "for Apple Metal.");
+  }
+#endif
+  if (compiled_backend_ == Backend::GPU &&
+      dynamic_cast<const LlmLiteRtCompiledModelExecutorStatic*>(this) ==
+          nullptr) {
+    return absl::UnimplementedError(
+        "Metal session handoff requires the fixed-shape static LiteRT "
+        "executor.");
   }
   if (!session_handoff_compile_caches_disabled_) {
     return absl::UnimplementedError(
@@ -2605,6 +3093,9 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::
         "Session handoff requires an inventoried LitertState allocation.");
   }
   ABSL_RETURN_IF_ERROR(state->ValidateSessionHandoffSupport());
+  if (compiled_backend_ == Backend::GPU) {
+    ABSL_RETURN_IF_ERROR(state->ValidateMetalStateStorageForExactProfile());
+  }
   ABSL_RETURN_IF_ERROR(ValidateAuthoritativeStateMetadata(
       executor_metadata_, *state, "primary LiteRT state"));
   const auto* decode_state =
@@ -2615,6 +3106,10 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::
   }
   if (decode_state != nullptr) {
     ABSL_RETURN_IF_ERROR(decode_state->ValidateSessionHandoffSupport());
+    if (compiled_backend_ == Backend::GPU) {
+      ABSL_RETURN_IF_ERROR(
+          decode_state->ValidateMetalStateStorageForExactProfile());
+    }
     ABSL_RETURN_IF_ERROR(ValidateAuthoritativeStateMetadata(
         executor_metadata_, *decode_state, "LiteRT decode state"));
   }
@@ -2734,17 +3229,24 @@ LlmLiteRtCompiledModelExecutorBase::ValidateSessionHandoffSupport() const {
     return absl::UnimplementedError(
         "Session handoff does not preserve sampler-managed decode inputs.");
   }
+  if (compiled_backend_ == Backend::GPU) {
+    // Do not let a caller bypass capability discovery and export/import only
+    // the visible Metal tensors. The complete hook additionally requires the
+    // selected delegate's exact-instance hidden-state/reset evidence.
+    ABSL_ASSIGN_OR_RETURN(
+        const Hash256 complete_inventory_hash,
+        GetCompleteSessionHandoffStateInventoryHash());
+    if (complete_inventory_hash == Hash256{}) {
+      return absl::FailedPreconditionError(
+          "Metal session handoff has no complete state inventory.");
+    }
+  }
   return absl::OkStatus();
 }
 
 absl::StatusOr<Hash256> LlmLiteRtCompiledModelExecutorBase::
-    GetCompleteSessionHandoffStateInventoryHash() const {
+    GetLocalSessionHandoffStateInventoryHash() const {
   ABSL_RETURN_IF_ERROR(ValidateStaticSessionHandoffInventorySupport());
-  if (compiled_backend_ != Backend::CPU) {
-    return absl::UnimplementedError(
-        "Complete session handoff inventory is not implemented for "
-        "backend-native GPU or NPU state.");
-  }
 
   const auto* state = dynamic_cast<const LitertState*>(state_.get());
   if (state == nullptr) {
@@ -2784,7 +3286,6 @@ absl::StatusOr<Hash256> LlmLiteRtCompiledModelExecutorBase::
                           decode_state_inventory_hash->bytes.size()),
         &inventory);
   }
-
   // These labels are the exhaustive continuation contract implemented by
   // ResourceManager, LRTSESS1, and ImportSessionStateFrom. Values are encoded
   // in each authenticated capsule; this digest binds which values exist and
@@ -2814,6 +3315,64 @@ absl::StatusOr<Hash256> LlmLiteRtCompiledModelExecutorBase::
         "Complete executor session inventory produced a zero digest.");
   }
   return inventory_hash;
+}
+
+absl::StatusOr<Hash256> LlmLiteRtCompiledModelExecutorBase::
+    GetCompleteSessionHandoffStateInventoryHash() const {
+  ABSL_ASSIGN_OR_RETURN(const Hash256 local_inventory_hash,
+                        GetLocalSessionHandoffStateInventoryHash());
+  if (compiled_backend_ != Backend::GPU) {
+    return local_inventory_hash;
+  }
+
+#if !defined(__APPLE__)
+  return absl::UnimplementedError(
+      "Complete GPU session handoff inventory is available only for Apple "
+      "Metal.");
+#else
+  // LRTST001 accounts for every caller-bound generalized state tensor, but it
+  // cannot prove that the selected delegate retains no additional
+  // history-dependent state. A Metal capsule is therefore not called
+  // complete unless the exact loaded delegate image resolves this exact
+  // compiled-model instance and exports both continuation and reset sections.
+  // Stock ML Drift currently has no such export and fails closed here without,
+  // by itself, disabling otherwise-compatible ordinary or WinnerReplay
+  // runtime identity.
+  ABSL_ASSIGN_OR_RETURN(const SelectedMetalDelegateBinding binding,
+                        ResolveSelectedMetalDelegateBinding(env_));
+  ABSL_ASSIGN_OR_RETURN(
+      const ValidatedMetalDelegateExactEvidence delegate_evidence,
+      QuerySelectedMetalDelegateExactEvidence(
+          binding.accelerator_code_anchor, binding.accelerator_user_data,
+          binding.metal_device, binding.metal_command_queue,
+          reinterpret_cast<const void*>(compiled_model_->Get())));
+  if (!delegate_evidence.complete_continuation_and_reset_state ||
+      delegate_evidence.canonical_complete_state_evidence.empty()) {
+    return absl::UnimplementedError(
+        "Complete Metal session handoff inventory requires the selected "
+        "delegate to prove, for this compiled model, that all continuation "
+        "state is caller-bound and fresh state tensors fully reset it.");
+  }
+
+  std::string complete_inventory;
+  AppendRuntimeBytes(
+      "LITERT_LM_COMPLETE_METAL_SESSION_CAPSULE_INVENTORY_V1",
+      &complete_inventory);
+  AppendRuntimeBytes(
+      absl::string_view(reinterpret_cast<const char*>(
+                            local_inventory_hash.bytes.data()),
+                        local_inventory_hash.bytes.size()),
+      &complete_inventory);
+  AppendRuntimeBytes(delegate_evidence.canonical_complete_state_evidence,
+                     &complete_inventory);
+  Sha256Hasher hasher;
+  const Hash256 complete_inventory_hash = hasher.OneShot(complete_inventory);
+  if (complete_inventory_hash == Hash256{}) {
+    return absl::InternalError(
+        "Complete Metal session inventory produced a zero digest.");
+  }
+  return complete_inventory_hash;
+#endif
 }
 
 absl::Status LlmLiteRtCompiledModelExecutorBase::VisitSessionState(
@@ -3179,6 +3738,7 @@ LlmLiteRtCompiledModelExecutorBase::GetSessionHandoffRuntimeProfile() const {
   if (compiled_backend_ == Backend::CPU) {
     ABSL_RETURN_IF_ERROR(state->ValidateSessionHandoffSupport());
   } else {
+    ABSL_RETURN_IF_ERROR(state->ValidateSessionHandoffSupport());
     ABSL_RETURN_IF_ERROR(
         state->ValidateDeterministicProjectionResetSupport());
     ABSL_RETURN_IF_ERROR(state->ValidateMetalStateStorageForExactProfile());
@@ -3189,6 +3749,7 @@ LlmLiteRtCompiledModelExecutorBase::GetSessionHandoffRuntimeProfile() const {
     if (compiled_backend_ == Backend::CPU) {
       ABSL_RETURN_IF_ERROR(decode_state->ValidateSessionHandoffSupport());
     } else {
+      ABSL_RETURN_IF_ERROR(decode_state->ValidateSessionHandoffSupport());
       ABSL_RETURN_IF_ERROR(
           decode_state->ValidateDeterministicProjectionResetSupport());
       ABSL_RETURN_IF_ERROR(
@@ -3432,50 +3993,14 @@ LlmLiteRtCompiledModelExecutorBase::GetSessionHandoffRuntimeProfile() const {
           "Loaded Metal model is not fully accelerated; a CPU/delegate "
           "partition cannot satisfy the exact Metal profile.");
     }
-    LITERT_ASSIGN_OR_RETURN(auto environment_options, env_.GetOptions());
-    if (HasEnvironmentTag(environment_options,
-                          EnvironmentOptions::Tag::kWebGpuDevice) ||
-        HasEnvironmentTag(environment_options,
-                          EnvironmentOptions::Tag::kWebGpuQueue) ||
-        HasEnvironmentTag(environment_options,
-                          EnvironmentOptions::Tag::kWebGpuInstance) ||
-        HasEnvironmentTag(environment_options,
-                          EnvironmentOptions::Tag::kOpenClDeviceId) ||
-        HasEnvironmentTag(environment_options,
-                          EnvironmentOptions::Tag::kOpenClCommandQueue) ||
-        HasEnvironmentTag(environment_options,
-                          EnvironmentOptions::Tag::kVulkanEnvironment)) {
-      return absl::UnimplementedError(
-          "Loaded GPU Environment exposes a non-Metal accelerator alongside "
-          "Metal; the concrete selected delegate is ambiguous.");
-    }
-    ABSL_ASSIGN_OR_RETURN(
-        const void* metal_device,
-        GetUniqueEnvironmentPointer(environment_options,
-                                    EnvironmentOptions::Tag::kMetalDevice,
-                                    "MTLDevice"));
-    ABSL_ASSIGN_OR_RETURN(
-        const void* metal_command_queue,
-        GetUniqueEnvironmentPointer(
-            environment_options,
-            EnvironmentOptions::Tag::kMetalCommandQueue,
-            "MTLCommandQueue"));
-    ABSL_ASSIGN_OR_RETURN(
-        const void* accelerator_callback,
-        GetUniqueEnvironmentPointer(
-            environment_options,
-            EnvironmentOptions::Tag::kCallbackOnGpuEnvDestroy,
-            "selected accelerator destruction callback"));
-    // The callback user data is owned by the selected accelerator. Requiring
-    // it distinguishes the ML Drift Metal-owned Environment contract from a
-    // caller that merely inserted device-shaped labels.
-    ABSL_ASSIGN_OR_RETURN(
-        const void* accelerator_user_data,
-        GetUniqueEnvironmentPointer(
-            environment_options,
-            EnvironmentOptions::Tag::kCallbackUserDataOnGpuEnvDestroy,
-            "selected accelerator callback state"));
-    (void)accelerator_user_data;
+    ABSL_ASSIGN_OR_RETURN(const SelectedMetalDelegateBinding metal_binding,
+                          ResolveSelectedMetalDelegateBinding(env_));
+    const void* metal_device = metal_binding.metal_device;
+    const void* metal_command_queue = metal_binding.metal_command_queue;
+    const void* accelerator_user_data =
+        metal_binding.accelerator_user_data;
+    const uintptr_t selected_accelerator_code_anchor =
+        metal_binding.accelerator_code_anchor;
 
     const auto* static_executor =
         dynamic_cast<const LlmLiteRtCompiledModelExecutorStatic*>(this);
@@ -3486,7 +4011,7 @@ LlmLiteRtCompiledModelExecutorBase::GetSessionHandoffRuntimeProfile() const {
     const SortedPrefillSignatureMap& prefill_schedule =
         static_executor->prefill_signature_map_for_exact_profile();
     std::string metal_policy;
-    AppendRuntimeBytes("LITERT_LM_METAL_CORUN_POLICY_V1", &metal_policy);
+    AppendRuntimeBytes("LITERT_LM_METAL_CORUN_POLICY_V2", &metal_policy);
     // This is queried from the compiled model after delegate application. It
     // is stronger than the fully-delegated compilation hint, although it still
     // does not identify the selected kernels or their reduction policy.
@@ -3519,47 +4044,91 @@ LlmLiteRtCompiledModelExecutorBase::GetSessionHandoffRuntimeProfile() const {
     derived_corun_evidence |=
         MetalCoRunEvidenceBit(MetalCoRunEvidence::kFixedShapeDecode);
 
-    // LiteRT-LM-visible state has an authoritative reset inventory and reset
-    // recreates its backend-native Metal buffers. Delegate-owned mutable state
-    // is not enumerable, and GPU session handoff is still rejected by
-    // ValidateSessionHandoffSupport, so the combined session-and-reset bit must
-    // remain absent.
+    // The local half of the capsule contract is now complete: LRTST001 stages
+    // every authoritative Metal state tensor through LiteRT's synchronized
+    // lock contract, LoadFrom updates the live allocations transactionally,
+    // and reset recreates backend-native state. This is necessary but not
+    // sufficient: a delegate can still retain hidden history-dependent state.
+    ABSL_ASSIGN_OR_RETURN(const Hash256 local_session_inventory_hash,
+                          GetLocalSessionHandoffStateInventoryHash());
     ABSL_RETURN_IF_ERROR(ValidateDeterministicProjectionSupport());
-    AppendRuntimeBool(/*litert_lm_visible_reset_inventory=*/true,
+    const bool local_complete_capsule_and_reset_contract =
+        local_session_inventory_hash != Hash256{};
+    if (!local_complete_capsule_and_reset_contract) {
+      return absl::FailedPreconditionError(
+          "Metal session handoff produced an empty local capsule-state "
+          "inventory.");
+    }
+    AppendRuntimeBytes("LITERT_LM_METAL_LRTST001_CAPSULE_AND_RESET_V1",
+                       &metal_policy);
+    AppendRuntimeBytes(
+        absl::string_view(reinterpret_cast<const char*>(
+                              local_session_inventory_hash.bytes.data()),
+                          local_session_inventory_hash.bytes.size()),
+        &metal_policy);
+    // Exact requests route decode through synchronous CompiledModel::Run;
+    // projection prefill tasks pass wait_for_completion=true and the static
+    // executor runs every such prefill work group synchronously. Both serial
+    // and threaded execution managers hold ResourceManager's exclusive
+    // LockedLlmExecutor lease for those tasks and reject handoff while work is
+    // active. This source-owned execution contract is necessary but not proof
+    // that ML Drift drained its command buffers: the delegate ABI below must
+    // independently export that effective completion fact.
+    const bool local_synchronous_and_exclusive_execution_contract =
+        compiled_backend_ == Backend::GPU && static_executor != nullptr;
+    if (!local_synchronous_and_exclusive_execution_contract) {
+      return absl::FailedPreconditionError(
+          "Metal exact execution has no synchronous static-worker and "
+          "exclusive-manager contract.");
+    }
+    AppendRuntimeBytes(
+        "EXACT_CAPTURE_SYNCHRONOUS_DECODE_AND_MANAGER_HANDOFF_GUARD_V1",
+        &metal_policy);
+    AppendRuntimeBool(local_synchronous_and_exclusive_execution_contract,
                       &metal_policy);
-    AppendRuntimeBool(/*complete_delegate_reset_inventory=*/false,
+    AppendRuntimeBool(local_complete_capsule_and_reset_contract,
                       &metal_policy);
-    AppendRuntimeBool(/*complete_gpu_session_capsule=*/false, &metal_policy);
 
-    // Pinned LiteRT/ML Drift exposes neither the selected attention kernel's
-    // adaptive Split-KV policy nor an executor hook that enforces isolated,
-    // quiescent fixed-shape decode. Record the missing bits, never intended
-    // values. A future concrete hook must set them from the live delegate.
+    ABSL_ASSIGN_OR_RETURN(
+        ValidatedMetalDelegateExactEvidence delegate_evidence,
+        QuerySelectedMetalDelegateExactEvidence(
+            selected_accelerator_code_anchor, accelerator_user_data,
+            metal_device, metal_command_queue,
+            reinterpret_cast<const void*>(compiled_model_->Get())));
+    AppendRuntimeBytes(delegate_evidence.canonical_evidence, &metal_policy);
+
+    if (delegate_evidence.adaptive_split_kv_disabled) {
+      derived_corun_evidence |= MetalCoRunEvidenceBit(
+          MetalCoRunEvidence::kAdaptiveSplitKvDisabled);
+    }
+    // A pipeline digest without the effective precision/code-generation facts
+    // that produced it (or vice versa) is partial evidence and cannot identify
+    // the selected numerical implementation.
+    if (delegate_evidence.effective_compilation_complete &&
+        delegate_evidence.selected_pipeline_set_complete) {
+      derived_corun_evidence |= MetalCoRunEvidenceBit(
+          MetalCoRunEvidence::kSelectedKernelPipeline);
+    }
+    if (local_synchronous_and_exclusive_execution_contract &&
+        delegate_evidence.synchronous_run_completion) {
+      derived_corun_evidence |=
+          MetalCoRunEvidenceBit(MetalCoRunEvidence::kQuiescentExecution);
+    }
+    if (local_complete_capsule_and_reset_contract &&
+        delegate_evidence.complete_continuation_and_reset_state) {
+      derived_corun_evidence |= MetalCoRunEvidenceBit(
+          MetalCoRunEvidence::kCompleteSessionAndResetState);
+    }
+
+    // Preserve every missing capability as an absent bit. In particular, no
+    // requested GpuOptions value is promoted into effective Split-KV,
+    // precision, completion, pipeline, or delegate-state evidence.
     AppendRuntimeU32(RequiredMetalCoRunEvidence(), &metal_policy);
     AppendRuntimeU32(derived_corun_evidence, &metal_policy);
-    AppendRuntimeBytes(
-        "MISSING_HOOK:ML_DRIFT_SELECTED_ATTENTION_SPLIT_KV_POLICY_V1",
-        &metal_policy);
-    AppendRuntimeBytes(
-        "MISSING_HOOK:ML_DRIFT_EFFECTIVE_METAL_COMPILATION_FLAGS_V1",
-        &metal_policy);
-    AppendRuntimeBytes(
-        "MISSING_HOOK:ML_DRIFT_SELECTED_METAL_PIPELINE_DIGEST_V1",
-        &metal_policy);
-    AppendRuntimeBytes(
-        "MISSING_HOOK:LITERT_METAL_QUIESCENT_FIXED_DECODE_BOUNDARY_V1",
-        &metal_policy);
-    AppendRuntimeBytes(
-        "MISSING_HOOK:LITERT_COMPLETE_GPU_SESSION_CAPSULE_INVENTORY_V1",
-        &metal_policy);
+    AppendRuntimeU32(RequiredMetalCoRunEvidence() & ~derived_corun_evidence,
+                     &metal_policy);
     AppendRuntimeBytes(metal_policy, &profile);
 
-    const uintptr_t selected_accelerator_code_anchor =
-        reinterpret_cast<uintptr_t>(accelerator_callback);
-    if (selected_accelerator_code_anchor == 0) {
-      return absl::FailedPreconditionError(
-          "Selected Metal accelerator callback code anchor is zero.");
-    }
     return SessionHandoffRuntimeProfile{
         .runtime_class = SessionHandoffRuntimeClass::kLiteRtMetal,
         .canonical_profile = std::move(profile),
@@ -3754,8 +4323,15 @@ absl::Status LlmLiteRtCompiledModelExecutorStatic::Prefill(
           prefill_input_buffers_[prefill_signature].end(),
           [](const auto& pair) { return pair.second.IsMetalMemory(); });
     }
-    bool async = !*do_prefill_sync_ &&
-                 (i < work_groups.size() - 1 || !params.GetWaitForCompletion());
+    // A wait-for-completion request is a boundary for the entire prefill, not
+    // merely its final work group. In particular, projection prefills from
+    // both execution managers set this flag. Running an earlier chunk
+    // asynchronously would let a nominally quiescent capsule/profile boundary
+    // depend on delegate event chaining. Keep every work group synchronous
+    // when the caller requests completion; Metal-backed input buffers remain
+    // synchronous regardless of the flag.
+    const bool async =
+        !*do_prefill_sync_ && !params.GetWaitForCompletion();
     ABSL_RETURN_IF_ERROR(PrefillInternal(
         prefill_signature, prefill_input_buffers_[prefill_signature],
         prefill_output_buffers_[prefill_signature],
@@ -4107,7 +4683,7 @@ absl::Status LlmLiteRtCompiledModelExecutorDynamic::PrefillInternal(
 
 absl::Status LlmLiteRtCompiledModelExecutorDynamic::DecodeInternal(
     const std::vector<std::shared_ptr<TokenData>>& token,
-    TensorBuffer& output_logits) {
+    TensorBuffer& output_logits, bool require_synchronous_execution) {
   auto* litert_state = dynamic_cast<LitertState*>(state_.get());
   RET_CHECK(litert_state != nullptr);
 
@@ -4129,8 +4705,8 @@ absl::Status LlmLiteRtCompiledModelExecutorDynamic::DecodeInternal(
       compiled_model_->CreateInputBuffer("decode",
                                          signatures_.input_attn_mask.value()));
 
-  return LlmLiteRtCompiledModelExecutorBase::DecodeInternal(token,
-                                                            output_logits);
+  return LlmLiteRtCompiledModelExecutorBase::DecodeInternal(
+      token, output_logits, require_synchronous_execution);
 }
 
 // static

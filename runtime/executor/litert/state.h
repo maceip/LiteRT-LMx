@@ -75,8 +75,13 @@ class LitertState : public StateInterface {
   size_t StateBufferCount() const { return bank_1_state_buffers_.size(); }
 
   // Fails closed unless the allocation policy and every generalized state
-  // buffer type are admitted for exact session handoff. Heuristic KV discovery
-  // is deliberately insufficient proof of complete continuation state.
+  // buffer type are admitted for exact session handoff. GPU-optimized in-place
+  // state is admitted only when every authoritative buffer is live Metal
+  // memory and therefore participates in LRTST001's synchronized host staging
+  // and transactional in-place restore. Heuristic KV discovery is deliberately
+  // insufficient proof even of the caller-bound state inventory. This method
+  // does not prove that a Metal delegate has no hidden continuation state;
+  // complete capsule support additionally requires delegate-owned evidence.
   absl::Status ValidateSessionHandoffSupport() const;
 
   // Returns a canonical digest of the complete, executor-metadata-backed
@@ -94,7 +99,8 @@ class LitertState : public StateInterface {
   // Stronger exact-profile check for a concrete Metal executor. Every
   // authoritatively inventoried continuation buffer in every state bank must
   // be backed by Metal memory. This proves the live backend allocation rather
-  // than trusting Backend::GPU.
+  // than trusting Backend::GPU, but remains necessary rather than sufficient:
+  // selected-pipeline policy and hidden delegate state are outside LitertState.
   absl::Status ValidateMetalStateStorageForExactProfile() const;
 
   // Serializes the logical input bank into a canonical, versioned snapshot.

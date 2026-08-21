@@ -332,11 +332,14 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
   // the transformer model when this function returns absl::OkStatus().
   virtual absl::Status DecodeInternal(
       const std::vector<std::shared_ptr<TokenData>>& token,
-      TensorBuffer& output_logits);
+      TensorBuffer& output_logits, bool require_synchronous_execution);
 
   // Helper function of DecodeInternal to bind input/output tensors for decode
-  // and run decode signature.
-  absl::Status BindTensorsAndRunDecode(TensorBuffer* output_logits);
+  // and run decode signature. Exact logits capture always requires the
+  // synchronous path so capture, CPU GREEDY selection, and later capsule
+  // export cannot race delegate work still mutating logits or Metal state.
+  absl::Status BindTensorsAndRunDecode(TensorBuffer* output_logits,
+                                      bool require_synchronous_execution);
   // Static version of BindTensorsAndRunDecode to be used as a callback for
   // sampler.
   static int BindTensorsAndRunDecodeStatic(void* arg);
@@ -418,6 +421,15 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
   // Engine exact-profile resolution; keeping this seam separate lets Engine
   // measure structural evidence before its first Session exists.
   absl::Status ValidateStaticSessionHandoffInventorySupport() const;
+
+  // Hashes the complete LiteRT-LM-owned capsule inventory (generalized state
+  // tensors plus continuation metadata) without claiming that a GPU delegate
+  // has no hidden state. The public complete-inventory method combines this
+  // with model-instance-scoped delegate evidence on Metal; runtime identity
+  // uses the local hash so an absent delegate evidence export does not by
+  // itself disable otherwise-compatible ordinary or WinnerReplay modes while
+  // exact capsule capability fails closed.
+  absl::StatusOr<Hash256> GetLocalSessionHandoffStateInventoryHash() const;
 
   // Gets the LiteRT run options based on the current executor settings.
   litert::Options GetRunOptions() const;
@@ -639,7 +651,8 @@ class LlmLiteRtCompiledModelExecutorDynamic
   // Extends the base class DecodeInternal to handle KV cache buffers.
   absl::Status DecodeInternal(
       const std::vector<std::shared_ptr<TokenData>>& token,
-      TensorBuffer& output_logits) override;
+      TensorBuffer& output_logits,
+      bool require_synchronous_execution) override;
 
   int prefill_chunk_size_;
   uint32_t kv_increament_size_;

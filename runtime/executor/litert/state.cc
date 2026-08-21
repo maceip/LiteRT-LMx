@@ -641,8 +641,12 @@ absl::StatusOr<std::unique_ptr<LitertState>> LitertState::Create(
 
 absl::Status LitertState::ValidateSessionHandoffSupport() const {
   if (allocation_policy_ == AllocationPolicy::kGpuOptimizedInplace) {
-    return absl::UnimplementedError(
-        "Session handoff has not admitted GPU-optimized LiteRT state.");
+    // GPU-optimized state is created from compiled-model output buffers and is
+    // deliberately omitted from most graph inputs. It is restorable only when
+    // those authoritative buffers are the actual Metal allocations whose
+    // synchronized lock contract SerializeTo/LoadFrom use. A generic GPU label
+    // or a host buffer with this allocation-policy enum is not sufficient.
+    return ValidateMetalStateStorageForExactProfile();
   }
   return ValidateStateInventory(/*allow_gpu_optimized=*/false);
 }
