@@ -31,7 +31,8 @@ namespace litert::lm {
 // already possess the exact expected evidence ID from an authoritative DPM log
 // or receipt and must still reauthenticate current runtime admission/capability
 // before using a returned artifact.
-class FilesystemCapsuleRestoreEvidenceRepository final {
+class FilesystemCapsuleRestoreEvidenceRepository final
+    : public CapsuleRestoreEvidenceRepository {
  public:
   static absl::StatusOr<
       std::unique_ptr<FilesystemCapsuleRestoreEvidenceRepository>>
@@ -39,11 +40,11 @@ class FilesystemCapsuleRestoreEvidenceRepository final {
 
   absl::Status PutIfAbsent(
       const CapsuleCaptureEvidenceV2& evidence,
-      const FreshWorkerAuthentication& authentication);
+      const FreshWorkerAuthentication& authentication) override;
 
   absl::StatusOr<CapsuleCaptureEvidenceV2> Get(
       const Hash256& checkpoint_id, const Hash256& expected_evidence_id,
-      const FreshWorkerAuthentication& authentication) const;
+      const FreshWorkerAuthentication& authentication) const override;
 
  private:
   explicit FilesystemCapsuleRestoreEvidenceRepository(

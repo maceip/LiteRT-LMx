@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <string>
 
+#include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "runtime/dpm/capsule_restore_evidence.h"
@@ -48,6 +49,24 @@ absl::StatusOr<CapsuleCaptureEvidenceV2>
 DecodeAuthenticatedCapsuleCaptureEvidenceV2(
     absl::string_view envelope,
     const FreshWorkerAuthentication& authentication);
+
+// Durable evidence is a disposable authenticated derivative. Implementations
+// must use the composite checkpoint/evidence identity and create-once
+// publication; callers must already have the exact expected evidence ID from
+// an authoritative receipt before Get. Presence in this repository never
+// authorizes restore by itself.
+class CapsuleRestoreEvidenceRepository {
+ public:
+  virtual ~CapsuleRestoreEvidenceRepository() = default;
+
+  virtual absl::Status PutIfAbsent(
+      const CapsuleCaptureEvidenceV2& evidence,
+      const FreshWorkerAuthentication& authentication) = 0;
+
+  virtual absl::StatusOr<CapsuleCaptureEvidenceV2> Get(
+      const Hash256& checkpoint_id, const Hash256& expected_evidence_id,
+      const FreshWorkerAuthentication& authentication) const = 0;
+};
 
 }  // namespace litert::lm
 
