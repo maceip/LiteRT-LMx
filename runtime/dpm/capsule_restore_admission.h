@@ -712,6 +712,25 @@ struct AuthenticatedCapsuleRestoreAdmission {
   CapsuleRestoreOperationalCoverage operational_coverage;
 };
 
+// Coverage V2 binding. The coverage ID and optional profile/capability fields
+// are assertions only: repository lookup and record validation always use the
+// complete profile, capability, and session identity freshly derived from the
+// loaded Engine and resolved SessionConfig.
+struct CapsuleRestoreStateWitnessAdmissionBinding {
+  const CapsuleRestoreAdmissionRepository* repository = nullptr;
+  Hash256 expected_coverage_id;
+  ExactLiteRtProfileAssertion profile_assertion;
+  SessionHandoffCapabilityAssertion capability_assertion;
+  FreshWorkerAuthentication record_authentication;
+};
+
+struct AuthenticatedCapsuleRestoreStateWitnessAdmission {
+  CapsuleRestoreStateWitnessAdmissionRecord record;
+  ExactLiteRtProfile profile;
+  SessionHandoffCapability capability;
+  CapsuleRestoreStateWitnessOperationalCoverage operational_coverage;
+};
+
 // Resolves `runtime_session_config` and the qualification specification
 // independently through the same loaded Engine, requires their complete
 // profile/capability/session semantics to agree, and reauthenticates the
@@ -722,6 +741,15 @@ absl::StatusOr<AuthenticatedCapsuleRestoreAdmission>
 ResolveAuthenticatedCapsuleRestoreAdmission(
     const Engine* engine, const SessionConfig& runtime_session_config,
     const CapsuleRestoreAdmissionBinding& binding);
+
+// Re-resolves all runtime-owned evidence and reauthenticates the create-once
+// Coverage V2 record on every operation boundary. No finite qualification case
+// is promoted to content authority by this resolver; per-operation witness,
+// capture, and restore evidence remain mandatory downstream.
+absl::StatusOr<AuthenticatedCapsuleRestoreStateWitnessAdmission>
+ResolveAuthenticatedCapsuleRestoreStateWitnessAdmission(
+    const Engine* engine, const SessionConfig& runtime_session_config,
+    const CapsuleRestoreStateWitnessAdmissionBinding& binding);
 
 class CapsuleRestoreQualifier {
  public:

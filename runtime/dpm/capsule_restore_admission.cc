@@ -2699,6 +2699,83 @@ ResolveAuthenticatedCapsuleRestoreAdmission(
   };
 }
 
+absl::StatusOr<AuthenticatedCapsuleRestoreStateWitnessAdmission>
+ResolveAuthenticatedCapsuleRestoreStateWitnessAdmission(
+    const Engine* engine, const SessionConfig& runtime_session_config,
+    const CapsuleRestoreStateWitnessAdmissionBinding& binding) {
+  if (engine == nullptr) {
+    return absl::InvalidArgumentError(
+        "CapsuleRestore Coverage V2 requires a loaded authoritative Engine.");
+  }
+  if (binding.repository == nullptr ||
+      IsZeroHash(binding.expected_coverage_id)) {
+    return absl::InvalidArgumentError(
+        "CapsuleRestore Coverage V2 binding lacks its repository or expected "
+        "coverage ID.");
+  }
+  ABSL_RETURN_IF_ERROR(
+      ValidateFreshWorkerAuthentication(binding.record_authentication));
+
+  SessionConfig resolved_runtime_config = runtime_session_config;
+  ABSL_RETURN_IF_ERROR(resolved_runtime_config.MaybeUpdateAndValidate(
+      engine->GetEngineSettings()));
+  ABSL_RETURN_IF_ERROR(
+      ValidateResolvedSessionConfig(resolved_runtime_config, *engine));
+
+  ABSL_ASSIGN_OR_RETURN(
+      ExactLiteRtProfile runtime_profile,
+      engine->ResolveExactLiteRtProfile(resolved_runtime_config,
+                                        binding.profile_assertion));
+  ABSL_ASSIGN_OR_RETURN(
+      SessionHandoffCapability runtime_capability,
+      engine->ResolveSessionHandoffCapability(
+          resolved_runtime_config, binding.capability_assertion));
+  ABSL_ASSIGN_OR_RETURN(
+      const SessionHandoffIdentity runtime_identity,
+      engine->ResolveSessionHandoffIdentity(resolved_runtime_config));
+  ABSL_RETURN_IF_ERROR(
+      ValidateProfileCapabilityAgreement(runtime_profile, runtime_capability));
+  if (runtime_identity != runtime_profile.session_identity ||
+      runtime_identity != runtime_capability.session_identity) {
+    return absl::FailedPreconditionError(
+        "Coverage V2 runtime SessionConfig identity disagrees with its "
+        "Engine-derived profile or capability.");
+  }
+
+  ABSL_ASSIGN_OR_RETURN(
+      CapsuleRestoreStateWitnessAdmissionRecord record,
+      binding.repository->GetStateWitnessedOwnPosition(
+          runtime_profile, runtime_capability, binding.expected_coverage_id,
+          binding.record_authentication));
+  ABSL_RETURN_IF_ERROR(
+      ValidateCapsuleRestoreStateWitnessAdmissionRecordForRuntime(
+          record, runtime_profile, runtime_capability,
+          binding.expected_coverage_id));
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 canonical_record_id,
+      ComputeCapsuleRestoreStateWitnessAdmissionRecordId(record));
+  if (record.record_id != canonical_record_id ||
+      record.record_authentication_key_id !=
+          binding.record_authentication.key_id ||
+      record.operational_coverage.runtime_derived_profile != runtime_profile ||
+      record.operational_coverage.runtime_derived_capability !=
+          runtime_capability ||
+      record.operational_coverage.runtime_derived_session_identity !=
+          runtime_identity) {
+    return absl::DataLossError(
+        "Authenticated Coverage V2 admission is not canonically bound to the "
+        "current Engine evidence and record key.");
+  }
+  CapsuleRestoreStateWitnessOperationalCoverage operational_coverage =
+      record.operational_coverage;
+  return AuthenticatedCapsuleRestoreStateWitnessAdmission{
+      .record = std::move(record),
+      .profile = std::move(runtime_profile),
+      .capability = std::move(runtime_capability),
+      .operational_coverage = std::move(operational_coverage),
+  };
+}
+
 absl::StatusOr<CapsuleRestoreAdmissionRecord>
 CapsuleRestoreQualifier::Qualify(
     const CapsuleRestoreQualificationSpec& spec,
