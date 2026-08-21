@@ -94,6 +94,11 @@ bool IsValidUtf8(absl::string_view text) {
 }
 
 absl::Status ValidateFixedEngineSettings(const EngineSettings& settings) {
+#ifdef LITERT_LM_DEBUGGER_ENABLED
+  return absl::UnimplementedError(
+      "Exact fresh workers do not admit debugger-installed graph "
+      "callbacks.");
+#endif
   if (settings.IsBenchmarkEnabled() ||
       settings.GetBenchmarkParams().has_value()) {
     return absl::UnimplementedError(
