@@ -28,6 +28,7 @@
 #include "absl/time/time.h"  // from @com_google_absl
 #include "litert/cc/litert_macros.h"  // from @litert
 #include "runtime/components/model_resources.h"
+#include "runtime/core/exact_litert_profile_builder.h"
 #include "runtime/core/session_handoff_identity.h"
 #include "runtime/core/session_advanced.h"
 #include "runtime/engine/engine.h"
@@ -61,6 +62,7 @@
 namespace litert::lm {
 
 struct LoadedRuntimeIdentity {
+  SessionHandoffRuntimeClass runtime_class;
   Hash256 runtime_artifact_hash;
   std::string canonical_profile;
 };
@@ -95,6 +97,8 @@ class EngineAdvancedImpl : public Engine {
                      std::optional<BenchmarkInfo> benchmark_info,
                      Hash256 model_artifact_hash,
                      absl::Status model_artifact_post_load_status,
+                     absl::StatusOr<LoadedExactLiteRtEvidence>
+                         loaded_exact_litert_evidence,
                      absl::StatusOr<LoadedRuntimeIdentity>
                          loaded_runtime_identity)
       : engine_settings_(std::move(engine_settings)),
@@ -106,6 +110,8 @@ class EngineAdvancedImpl : public Engine {
         model_artifact_hash_(model_artifact_hash),
         model_artifact_post_load_status_(
             std::move(model_artifact_post_load_status)),
+        loaded_exact_litert_evidence_(
+            std::move(loaded_exact_litert_evidence)),
         loaded_runtime_identity_(std::move(loaded_runtime_identity)) {}
 
   // Method to create the Session.
@@ -212,6 +218,126 @@ class EngineAdvancedImpl : public Engine {
     };
   }
 
+  ExactLiteRtProfileCapability GetExactLiteRtProfileCapability()
+      const override {
+    uint32_t engine_evidence = 0;
+    const bool retained_model_is_current =
+        model_artifact_hash_ != Hash256{} &&
+        model_artifact_post_load_status_.ok() &&
+        litert_model_resources_ != nullptr &&
+        litert_model_resources_->VerifyModelArtifactSize().ok();
+    if (retained_model_is_current) {
+      engine_evidence |=
+          ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kModelArtifact);
+    }
+    if (retained_model_is_current && loaded_exact_litert_evidence_.ok()) {
+      engine_evidence |=
+          ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kTokenizerContract) |
+          ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kLiteRtModelBytecode);
+    }
+    if (loaded_runtime_identity_.ok() &&
+        engine_settings_.GetMainExecutorSettings().GetBackend() ==
+            Backend::CPU &&
+        loaded_runtime_identity_->runtime_class ==
+            SessionHandoffRuntimeClass::kLiteRtCpu) {
+      engine_evidence |=
+          ExactLiteRtEvidenceBit(
+              ExactLiteRtEvidence::kRuntimeAndDelegateBinary) |
+          ExactLiteRtEvidenceBit(
+              ExactLiteRtEvidence::kOperatingSystemAndDevice) |
+          ExactLiteRtEvidenceBit(
+              ExactLiteRtEvidence::kCompilationPrecisionAndQuantization) |
+          ExactLiteRtEvidenceBit(
+              ExactLiteRtEvidence::kExecutionShapeThreadingAndChunking);
+    }
+    return DescribeExactLiteRtProfileCapability(
+        engine_settings_.GetMainExecutorSettings().GetBackend(),
+        engine_evidence);
+  }
+
+  absl::StatusOr<ExactLiteRtProfile> ResolveExactLiteRtProfile(
+      const SessionConfig& session_config,
+      const ExactLiteRtProfileAssertion& assertion) const override {
+    const ExactLiteRtProfileCapability capability =
+        GetExactLiteRtProfileCapability();
+    switch (capability.availability) {
+      case ExactLiteRtProfileAvailability::kCandidateDerivationAvailable:
+        break;
+      case ExactLiteRtProfileAvailability::kMetalEvidenceNotImplemented:
+        return absl::UnimplementedError(
+            "Exact LiteRT GPU profiles require executor-derived proof of the "
+            "selected Metal delegate/plugin binary, MTLDevice, Metal family, "
+            "OS build, and pinned GPU execution policy. A configured GPU "
+            "label is not sufficient.");
+      case ExactLiteRtProfileAvailability::kNpuUnimplemented:
+        return absl::UnimplementedError(
+            "Exact LiteRT NPU profiles remain unimplemented until concrete "
+            "compiler-plugin, device, topology, and execution-state evidence "
+            "is enumerated.");
+      case ExactLiteRtProfileAvailability::kRuntimeEvidenceUnavailable:
+        if (litert_model_resources_ == nullptr) {
+          return absl::FailedPreconditionError(
+              "The retained model resources are unavailable.");
+        }
+        if (absl::Status status =
+                litert_model_resources_->VerifyModelArtifactSize();
+            !status.ok()) {
+          return status;
+        }
+        if (!model_artifact_post_load_status_.ok()) {
+          return model_artifact_post_load_status_;
+        }
+        if (!loaded_exact_litert_evidence_.ok()) {
+          return loaded_exact_litert_evidence_.status();
+        }
+        if (!loaded_runtime_identity_.ok()) {
+          return loaded_runtime_identity_.status();
+        }
+        return absl::FailedPreconditionError(
+            "The loaded Engine lacks complete exact LiteRT evidence.");
+      default:
+        return absl::UnimplementedError(
+            "The loaded Engine backend cannot derive an exact LiteRT "
+            "profile.");
+    }
+
+    if (litert_model_resources_ == nullptr) {
+      return absl::FailedPreconditionError(
+          "The retained model resources are unavailable.");
+    }
+    // Exact-profile resolution is expected to happen once at worker/session
+    // admission, so pay the full retained-artifact rehash here. Later handoff
+    // checks use the cheaper size guard, but a same-size mutation must not be
+    // able to mint a new exact profile.
+    ABSL_RETURN_IF_ERROR(litert_model_resources_->VerifyModelArtifactHash());
+    if (!model_artifact_post_load_status_.ok()) {
+      return model_artifact_post_load_status_;
+    }
+    if (!loaded_exact_litert_evidence_.ok()) {
+      return loaded_exact_litert_evidence_.status();
+    }
+    if (!loaded_runtime_identity_.ok()) {
+      return loaded_runtime_identity_.status();
+    }
+
+    SessionConfig resolved = session_config;
+    ABSL_RETURN_IF_ERROR(resolved.MaybeUpdateAndValidate(engine_settings_));
+    ABSL_ASSIGN_OR_RETURN(const SessionHandoffIdentity session_identity,
+                          ResolveSessionHandoffIdentity(resolved));
+    ABSL_ASSIGN_OR_RETURN(
+        ExactLiteRtProfile profile,
+        DeriveExactLiteRtCpuProfile(
+            engine_settings_, resolved, *loaded_exact_litert_evidence_,
+            loaded_runtime_identity_->runtime_class,
+            loaded_runtime_identity_->canonical_profile,
+            model_artifact_hash_,
+            loaded_runtime_identity_->runtime_artifact_hash,
+            session_identity));
+    ABSL_RETURN_IF_ERROR(
+        ValidateExactLiteRtProfileAssertion(profile, assertion));
+    return profile;
+  }
+
   absl::StatusOr<AudioExecutorProperties> GetAudioExecutorProperties()
       const override {
     return GetAudioExecutorPropertiesFromModelResources(
@@ -255,6 +381,11 @@ class EngineAdvancedImpl : public Engine {
   // tokenizer loading. Failure disables exact handoff identity without
   // changing ordinary Engine creation or inference.
   const absl::Status model_artifact_post_load_status_;
+
+  // Ordered tokenizer and exact embedded LiteRT model bytes measured after
+  // the executor and tokenizer have both finished loading.
+  const absl::StatusOr<LoadedExactLiteRtEvidence>
+      loaded_exact_litert_evidence_;
 
   // Measured runtime/delegate evidence and canonical concrete executor
   // profile. Unsupported platforms/backends retain the failure status so
@@ -476,10 +607,18 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
         BenchmarkInfo::InitPhase::kTokenizer, tokenizer_duration));
   }
 
-  // Detect persistent drift across lazy model/tokenizer reads. This does not
-  // claim atomic protection from a concurrently mutable caller alias; exact
-  // handoff requires that retained source to remain unchanged for the Engine
-  // lifetime.
+  // Capture the ordered tokenizer contract and the exact embedded LiteRT
+  // prefill/decode bytecode after all lazy model/tokenizer reads have
+  // completed. Failure is retained as exact-profile capability evidence and
+  // does not disable ordinary inference.
+  absl::StatusOr<LoadedExactLiteRtEvidence> loaded_exact_litert_evidence =
+      DeriveLoadedExactLiteRtEvidence(model_artifact_hash, *tokenizer,
+                                      *model_resources);
+
+  // Detect persistent drift after every identity-related lazy model/tokenizer
+  // read. This does not claim atomic protection from a concurrently mutable
+  // caller alias; exact modes require that retained source to remain unchanged
+  // for the Engine lifetime.
   absl::Status model_artifact_post_load_status =
       model_resources->VerifyModelArtifactHash();
 
@@ -510,6 +649,7 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
           "Measured loaded runtime/delegate artifact hash is zero.");
     }
     return LoadedRuntimeIdentity{
+        .runtime_class = runtime_profile.runtime_class,
         .runtime_artifact_hash = runtime_artifact_hash,
         .canonical_profile = std::move(runtime_profile.canonical_profile),
     };
@@ -543,6 +683,7 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
       std::move(owned_env), std::move(tokenizer), std::move(execution_manager),
       std::move(benchmark_info), model_artifact_hash,
       std::move(model_artifact_post_load_status),
+      std::move(loaded_exact_litert_evidence),
       std::move(loaded_runtime_identity));
 
   return llm_impl;

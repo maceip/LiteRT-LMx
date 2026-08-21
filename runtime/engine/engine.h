@@ -30,6 +30,7 @@
 #include "absl/time/time.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
 #include "runtime/engine/engine_settings.h"
+#include "runtime/engine/exact_litert_profile.h"
 #include "runtime/engine/io_types.h"
 #include "runtime/engine/session_handoff.h"
 #include "runtime/util/byte_stream.h"
@@ -446,6 +447,26 @@ class EngineT {
     (void)session_config;
     return absl::UnimplementedError(
         "Engine-derived session handoff identity is not available.");
+  }
+
+  // Reports whether this loaded Engine can derive an ExactLiteRtProfile.
+  // Candidate availability is not ExactRegeneration admission; admission
+  // requires a separate independent cold-process equality record.
+  virtual ExactLiteRtProfileCapability GetExactLiteRtProfileCapability()
+      const {
+    return {};
+  }
+
+  // Derives an exact-profile identity from the already-loaded Engine and a
+  // fully-resolved SessionConfig. `assertion` can only reject the derived
+  // result; it cannot supply model, backend, runtime, or profile identity.
+  virtual absl::StatusOr<ExactLiteRtProfile> ResolveExactLiteRtProfile(
+      const SessionConfig& session_config,
+      const ExactLiteRtProfileAssertion& assertion = {}) const {
+    (void)session_config;
+    (void)assertion;
+    return absl::UnimplementedError(
+        "Engine-derived exact LiteRT profile is not available.");
   }
 
   // Get the audio model properties for the session. This is only available
