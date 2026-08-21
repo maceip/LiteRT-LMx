@@ -884,6 +884,80 @@ absl::StatusOr<DecodedSessionHandoff> DecodeSessionHandoffFrom(
   return decoded;
 }
 
+absl::Status ReauthenticateSessionHandoffTo(
+    const ByteSource& source,
+    const SessionHandoffIdentity& authoritative_identity,
+    const SessionHandoffOptions& source_options,
+    const SessionHandoffOptions& destination_options,
+    ByteSink* destination) {
+  if (destination == nullptr) {
+    return absl::InvalidArgumentError(
+        "Session handoff reauthentication destination must not be null.");
+  }
+  // ByteSource and ByteSink do not expose their backing storage, so callers
+  // must also honor the documented non-aliasing contract. This catches the
+  // directly-identical interface-object case before any source or destination
+  // operation.
+  if (static_cast<const void*>(&source) ==
+      static_cast<const void*>(destination)) {
+    return absl::InvalidArgumentError(
+        "Session handoff reauthentication source and destination must not "
+        "be the same object.");
+  }
+
+  // DecodeSessionHandoffFrom authenticates the complete source before parsing
+  // metadata. Keep this operation ahead of every destination write so an
+  // unauthenticated or malformed source can never produce a partial rewrap.
+  ABSL_ASSIGN_OR_RETURN(
+      DecodedSessionHandoff decoded,
+      DecodeSessionHandoffFrom(source, authoritative_identity,
+                               source_options));
+  if (!decoded.snapshot.executor.serialized_state.empty()) {
+    return absl::DataLossError(
+        "Streamed session handoff decode unexpectedly materialized state.");
+  }
+  if (decoded.serialized_state_offset > source.Size() ||
+      decoded.serialized_state_size >
+          source.Size() - decoded.serialized_state_offset) {
+    return absl::DataLossError(
+        "Decoded session handoff state range exceeds its source.");
+  }
+
+  const ByteSourceView serialized_state(
+      &source, decoded.serialized_state_offset,
+      decoded.serialized_state_size);
+  if (serialized_state.Size() != decoded.serialized_state_size) {
+    return absl::DataLossError(
+        "Decoded session handoff state range is not readable.");
+  }
+
+  return EncodeSessionHandoffParts(
+      decoded.snapshot, decoded.serialized_state_size,
+      authoritative_identity, destination_options, destination,
+      [&serialized_state](ByteSink* state_sink) -> absl::Status {
+        if (state_sink == nullptr) {
+          return absl::InternalError(
+              "Session handoff reauthentication state sink is null.");
+        }
+        if (serialized_state.Size() == 0) return absl::OkStatus();
+
+        std::string chunk(static_cast<size_t>(std::min<uint64_t>(
+                              serialized_state.Size(), kIoChunkSize)),
+                          '\0');
+        uint64_t offset = 0;
+        while (offset < serialized_state.Size()) {
+          const size_t count = static_cast<size_t>(std::min<uint64_t>(
+              chunk.size(), serialized_state.Size() - offset));
+          ABSL_RETURN_IF_ERROR(serialized_state.ReadAt(
+              offset, absl::MakeSpan(chunk).subspan(0, count)));
+          ABSL_RETURN_IF_ERROR(
+              state_sink->Append(absl::string_view(chunk.data(), count)));
+          offset += count;
+        }
+        return absl::OkStatus();
+      });
+}
+
 absl::StatusOr<SessionHandoffSnapshot> DecodeSessionHandoff(
     absl::string_view envelope,
     const SessionHandoffIdentity& authoritative_identity,

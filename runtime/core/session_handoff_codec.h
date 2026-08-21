@@ -63,6 +63,21 @@ absl::StatusOr<DecodedSessionHandoff> DecodeSessionHandoffFrom(
     const SessionHandoffIdentity& authoritative_identity,
     const SessionHandoffOptions& options);
 
+// Authenticates and canonically decodes the complete source before emitting
+// any destination bytes, then streams the exact serialized-state subrange
+// into an otherwise identical envelope authenticated by destination_options.
+// This performs no session creation, import, or executor mutation. `source`
+// must remain immutable and must not alias storage mutated by `destination`
+// for the duration of the call. As with other streaming encoders, callers
+// must discard destination bytes if a later source or destination I/O error
+// is returned; durable publication must be transactional around this call.
+absl::Status ReauthenticateSessionHandoffTo(
+    const ByteSource& source,
+    const SessionHandoffIdentity& authoritative_identity,
+    const SessionHandoffOptions& source_options,
+    const SessionHandoffOptions& destination_options,
+    ByteSink* destination);
+
 // Produces a canonical versioned envelope authenticated with HMAC-SHA256.
 // The key itself is caller-owned and is never serialized.
 absl::StatusOr<std::string> EncodeSessionHandoff(
