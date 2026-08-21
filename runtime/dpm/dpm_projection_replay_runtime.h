@@ -26,6 +26,7 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "runtime/dpm/canonical_replay_catalog.h"
+#include "runtime/dpm/dpm_capabilities.h"
 #include "runtime/dpm/dpm_projection_prompt.h"
 #include "runtime/dpm/dpm_projection_runtime.h"
 #include "runtime/dpm/dpm_replay_executor.h"
@@ -103,6 +104,7 @@ class DPMProjectionReplayRuntime {
   // profile ID, so baseline selection cannot silently cross exact profiles.
   virtual absl::StatusOr<std::optional<Hash256>> GetExactProfileId() const = 0;
   virtual uint32_t GetMaxOutputTokens() const = 0;
+  virtual absl::StatusOr<DPMStageCapabilities> GetCapabilities() const = 0;
   virtual absl::Status ValidateSupport() const = 0;
   virtual absl::StatusOr<DPMProjectionReplayExecution> Generate(
       const CanonicalDPMProjectionRequest& request) = 0;
@@ -126,6 +128,7 @@ class CanonicalWinnerDPMProjectionRuntime final
   const SessionHandoffIdentity& GetRuntimeIdentity() const override;
   absl::StatusOr<std::optional<Hash256>> GetExactProfileId() const override;
   uint32_t GetMaxOutputTokens() const override;
+  absl::StatusOr<DPMStageCapabilities> GetCapabilities() const override;
   absl::Status ValidateSupport() const override;
   absl::StatusOr<DPMProjectionReplayExecution> Generate(
       const CanonicalDPMProjectionRequest& request) override;
@@ -172,6 +175,7 @@ class ExactRegenerationDPMProjectionRuntime final
   uint32_t GetMaxOutputTokens() const override {
     return config_.max_output_tokens;
   }
+  absl::StatusOr<DPMStageCapabilities> GetCapabilities() const override;
   absl::Status ValidateSupport() const override;
   absl::StatusOr<DPMProjectionReplayExecution> Generate(
       const CanonicalDPMProjectionRequest& request) override;

@@ -26,6 +26,7 @@
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
 #include "runtime/dpm/dpm_event_log.h"
+#include "runtime/dpm/dpm_capabilities.h"
 #include "runtime/dpm/dpm_projection_manifest.h"
 #include "runtime/dpm/dpm_replay_mode.h"
 #include "runtime/dpm/session_checkpoint.h"
@@ -83,8 +84,13 @@ class DPMProjectionProvider {
   // appends a recoverable input event; a provider that cannot disclose its
   // mode fails closed through the default implementation.
   virtual absl::StatusOr<DPMReplayMode> GetReplayMode() const {
+    absl::StatusOr<DPMStageCapabilities> capabilities = GetCapabilities();
+    if (!capabilities.ok()) return capabilities.status();
+    return capabilities->replay_mode;
+  }
+  virtual absl::StatusOr<DPMStageCapabilities> GetCapabilities() const {
     return absl::UnimplementedError(
-        "DPM projection provider does not expose its replay mode.");
+        "DPM projection provider does not expose capabilities.");
   }
   virtual absl::StatusOr<DPMProjectionOutcome> Project(
       const DPMProjectionRequest& request) = 0;
@@ -124,6 +130,13 @@ class DPMAgentRuntime {
 
   // This identity is owned by the loaded runtime, not supplied by DPM callers.
   virtual const SessionHandoffIdentity& GetSessionHandoffIdentity() const = 0;
+  // Read-only generation preflight. This is deliberately separate from
+  // capsule support so WinnerReplay capability discovery can revalidate the
+  // loaded Engine without requiring handoff support.
+  virtual absl::Status ValidateSupport() const {
+    return absl::UnimplementedError(
+        "DPM agent runtime does not expose generation support preflight.");
+  }
   // Must validate the fully resolved loaded session profile without creating
   // durable DPM input. A profile that cannot export and restore a complete
   // capsule fails here rather than trapping a milestone retry after inference.
@@ -148,7 +161,8 @@ struct DPMEngineConfig {
   // authenticated catalog winner that its current backend cannot independently
   // rematerialize byte-for-byte. Setting this true makes that condition and any
   // capture/publication failure abort the turn instead of committing without a
-  // disposable checkpoint.
+  // disposable checkpoint. It is invalid when automatic capture milestones
+  // are disabled.
   bool require_checkpoint_at_milestone = false;
   // Product admission is capped by kMaximumDPMGenerationTokens; this is not
   // an unbounded backend integer knob.
@@ -231,6 +245,10 @@ class DPMEngine {
             DPMEngineConfig config, DPMClock* clock = nullptr);
 
   absl::Status ValidateConfiguration() const;
+  // Read-only, runtime-derived product contract. This reauthenticates current
+  // exact/CapsuleRestore admission and never exposes checkpoint keys or lets a
+  // caller select a derivative cache object.
+  absl::StatusOr<DPMCapabilities> GetCapabilities() const;
   absl::StatusOr<DPMTurnResult> RunTurn(const DPMTurnRequest& request);
   absl::StatusOr<DPMCorrectionResult> AppendCorrection(
       const DPMCorrectionRequest& request);

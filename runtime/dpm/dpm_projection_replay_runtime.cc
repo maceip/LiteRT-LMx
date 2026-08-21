@@ -433,6 +433,19 @@ uint32_t CanonicalWinnerDPMProjectionRuntime::GetMaxOutputTokens() const {
   return config_.max_output_tokens;
 }
 
+absl::StatusOr<DPMStageCapabilities>
+CanonicalWinnerDPMProjectionRuntime::GetCapabilities() const {
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  DPMStageCapabilities capabilities{
+      .stage = DPMCapabilityStage::kProjection,
+      .replay_mode = DPMReplayMode::kCanonicalWinnerReplay,
+      .runtime_identity = runtime_identity_,
+      .max_output_tokens = config_.max_output_tokens,
+  };
+  ABSL_RETURN_IF_ERROR(ValidateDPMStageCapabilities(capabilities));
+  return capabilities;
+}
+
 absl::Status CanonicalWinnerDPMProjectionRuntime::ValidateSupport() const {
   return ValidateSupport(DPMReplayStage::kProjection);
 }
@@ -566,6 +579,7 @@ ExactRegenerationDPMProjectionRuntime::Create(
   }
   ABSL_ASSIGN_OR_RETURN(const ExactLiteRtProfile profile,
                         exact_executor->GetDerivedProfile());
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(profile));
   ABSL_RETURN_IF_ERROR(ValidateRuntimeIdentity(profile.session_identity));
   auto runtime = std::unique_ptr<ExactRegenerationDPMProjectionRuntime>(
       new ExactRegenerationDPMProjectionRuntime(
@@ -588,6 +602,7 @@ absl::Status ExactRegenerationDPMProjectionRuntime::ValidateSupport() const {
   }
   ABSL_RETURN_IF_ERROR(
       ValidateRuntimeIdentity(derived_profile_.session_identity));
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(derived_profile_));
   ABSL_RETURN_IF_ERROR(exact_executor_->ValidateSupport());
   ABSL_ASSIGN_OR_RETURN(const ExactLiteRtProfile profile,
                         exact_executor_->GetDerivedProfile());
@@ -602,6 +617,32 @@ absl::StatusOr<std::optional<Hash256>>
 ExactRegenerationDPMProjectionRuntime::GetExactProfileId() const {
   ABSL_RETURN_IF_ERROR(ValidateSupport());
   return std::optional<Hash256>(derived_profile_.profile_id);
+}
+
+absl::StatusOr<DPMStageCapabilities>
+ExactRegenerationDPMProjectionRuntime::GetCapabilities() const {
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  ABSL_ASSIGN_OR_RETURN(const ExactLiteRtProfile current_profile,
+                        exact_executor_->GetDerivedProfile());
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 current_admission_record_id,
+      exact_executor_->GetProfileAdmissionRecordId());
+  if (current_profile != derived_profile_ ||
+      IsZeroHash(current_admission_record_id)) {
+    return absl::AbortedError(
+        "Exact projection profile or current admission changed during "
+        "capability discovery.");
+  }
+  DPMStageCapabilities capabilities{
+      .stage = DPMCapabilityStage::kProjection,
+      .replay_mode = DPMReplayMode::kExactRegeneration,
+      .runtime_identity = derived_profile_.session_identity,
+      .exact_profile = derived_profile_,
+      .exact_profile_admission_record_id = current_admission_record_id,
+      .max_output_tokens = config_.max_output_tokens,
+  };
+  ABSL_RETURN_IF_ERROR(ValidateDPMStageCapabilities(capabilities));
+  return capabilities;
 }
 
 absl::StatusOr<DPMProjectionReplayExecution>
@@ -627,6 +668,7 @@ ExactRegenerationDPMProjectionRuntime::Generate(
   ABSL_ASSIGN_OR_RETURN(
       ExactRegenerationExecution exact,
       exact_executor_->Run(replay_request));
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(exact.derived_profile));
   if (exact.mode != DPMReplayMode::kExactRegeneration ||
       exact.derived_profile != derived_profile_ ||
       exact.canonical_request_hash != expected_replay_request_hash ||

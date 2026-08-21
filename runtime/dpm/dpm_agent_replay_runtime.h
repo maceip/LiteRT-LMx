@@ -26,6 +26,7 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "runtime/dpm/canonical_replay_catalog.h"
+#include "runtime/dpm/dpm_capabilities.h"
 #include "runtime/dpm/dpm_engine.h"
 #include "runtime/dpm/dpm_replay_executor.h"
 #include "runtime/dpm/dpm_replay_mode.h"
@@ -189,6 +190,9 @@ class DPMAgentReplayRuntime {
   GetCapsuleRestoreAdmissionRecordId() const = 0;
   virtual absl::StatusOr<std::optional<Hash256>>
   GetSessionHandoffCapabilityId() const = 0;
+  virtual absl::StatusOr<DPMStageCapabilities> GetCapabilities() const = 0;
+  virtual absl::StatusOr<std::optional<SessionHandoffCapability>>
+  GetSessionHandoffCapability() const = 0;
   // Replay/generation capability is independent from CapsuleRestore. This
   // method must not reject a usable WinnerReplay runtime merely because the
   // loaded session cannot export a complete handoff.
@@ -268,6 +272,9 @@ class CanonicalWinnerDPMAgentRuntime final : public DPMAgentReplayRuntime {
   GetCapsuleRestoreAdmissionRecordId() const override;
   absl::StatusOr<std::optional<Hash256>>
   GetSessionHandoffCapabilityId() const override;
+  absl::StatusOr<DPMStageCapabilities> GetCapabilities() const override;
+  absl::StatusOr<std::optional<SessionHandoffCapability>>
+  GetSessionHandoffCapability() const override;
   absl::Status ValidateSupport() const override;
   absl::Status ValidateGenerationLimit(
       uint32_t max_output_tokens) const override;
@@ -321,6 +328,9 @@ class ExactRegenerationDPMAgentRuntime final : public DPMAgentReplayRuntime {
   GetCapsuleRestoreAdmissionRecordId() const override;
   absl::StatusOr<std::optional<Hash256>>
   GetSessionHandoffCapabilityId() const override;
+  absl::StatusOr<DPMStageCapabilities> GetCapabilities() const override;
+  absl::StatusOr<std::optional<SessionHandoffCapability>>
+  GetSessionHandoffCapability() const override;
   absl::Status ValidateSupport() const override;
   absl::Status ValidateGenerationLimit(
       uint32_t max_output_tokens) const override;

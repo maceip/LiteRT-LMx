@@ -113,6 +113,15 @@ absl::Status ValidateRequestedFeatures(const Engine& engine,
     return absl::UnimplementedError(
         "DPM projection does not support MTP or speculative decode.");
   }
+  if (executor.GetAdvancedSettings().has_value() &&
+      (executor.GetAdvancedSettings()->is_benchmark ||
+       executor.GetAdvancedSettings()->enable_profiling ||
+       executor.GetAdvancedSettings()->num_logits_to_print_after_decode !=
+           0)) {
+    return absl::UnimplementedError(
+        "DPM projection does not support benchmark, profiling, or logits "
+        "debug execution paths.");
+  }
   if (config.UseExternalSampler()) {
     return absl::UnimplementedError(
         "DPM projection does not support an external sampler.");
@@ -120,6 +129,11 @@ absl::Status ValidateRequestedFeatures(const Engine& engine,
   if (config.GetNumOutputCandidates() != 1) {
     return absl::InvalidArgumentError(
         "DPM projection requires exactly one output candidate.");
+  }
+  if (config.GetSuppressTokensConfig().enabled()) {
+    return absl::UnimplementedError(
+        "DPM projection does not support inherited or requested token "
+        "suppression.");
   }
   if (config.GetSamplerBackend() != Backend::UNSPECIFIED &&
       config.GetSamplerBackend() != Backend::CPU) {
@@ -214,6 +228,7 @@ absl::Status EngineDPMProjectionRuntime::ValidateResolvedConfig(
   if (config.GetNumOutputCandidates() != 1 ||
       config.GetSamplerBackend() != Backend::CPU ||
       config.GetMaxOutputTokens() != static_cast<int>(max_output_tokens_) ||
+      config.GetSuppressTokensConfig().enabled() ||
       config.GetApplyPromptTemplateInSession() ||
       config.GetMemoryStrategy() !=
           SessionConfig::MemoryStrategy::kStatelessDeterministicProjection) {

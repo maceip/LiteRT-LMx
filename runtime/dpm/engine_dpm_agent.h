@@ -44,6 +44,7 @@ class EngineDPMAgentRuntime final : public DPMAgentRuntime {
     return session_handoff_identity_;
   }
 
+  absl::Status ValidateSupport() const override;
   absl::Status ValidateSessionHandoffSupport() const override;
 
   absl::StatusOr<std::unique_ptr<Engine::Session>> CreateSession() override;

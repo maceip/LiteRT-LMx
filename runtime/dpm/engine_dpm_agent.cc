@@ -32,12 +32,43 @@
 #include "runtime/engine/io_types.h"
 #include "runtime/engine/session_handoff.h"
 #include "runtime/executor/executor_settings_base.h"
+#include "runtime/executor/llm_executor_settings.h"
 #include "runtime/proto/sampler_params.pb.h"
 #include "runtime/util/byte_stream.h"
 #include "support/tokenizer/tokenizer.h"
 
 namespace litert::lm {
 namespace {
+
+absl::Status ValidateDPMEngineSettings(const EngineSettings& settings) {
+  if (settings.IsBenchmarkEnabled() ||
+      settings.GetVisionExecutorSettings().has_value() ||
+      settings.GetAudioExecutorSettings().has_value()) {
+    return absl::UnimplementedError(
+        "DPM agent generation requires the ordinary text-only, "
+        "non-benchmark Engine path.");
+  }
+  const LlmExecutorSettings& executor = settings.GetMainExecutorSettings();
+  if (executor.GetLoraRank() != 0) {
+    return absl::UnimplementedError(
+        "DPM agent generation does not support a LoRA-enabled executor.");
+  }
+  if (executor.GetAdvancedSettings().has_value() &&
+      executor.GetAdvancedSettings()->enable_speculative_decoding) {
+    return absl::UnimplementedError(
+        "DPM agent generation does not support MTP or speculative decode.");
+  }
+  if (executor.GetAdvancedSettings().has_value() &&
+      (executor.GetAdvancedSettings()->is_benchmark ||
+       executor.GetAdvancedSettings()->enable_profiling ||
+       executor.GetAdvancedSettings()->num_logits_to_print_after_decode !=
+           0)) {
+    return absl::UnimplementedError(
+        "DPM agent generation does not support benchmark, profiling, or "
+        "logits debug execution paths.");
+  }
+  return absl::OkStatus();
+}
 
 absl::Status ValidateDPMConfig(const SessionConfig& config) {
   if (config.GetMemoryStrategy() !=
@@ -63,6 +94,11 @@ absl::Status ValidateDPMConfig(const SessionConfig& config) {
   if (config.GetNumOutputCandidates() != 1) {
     return absl::FailedPreconditionError(
         "DPM agent runtime did not resolve exactly one output candidate.");
+  }
+  if (config.GetSuppressTokensConfig().enabled()) {
+    return absl::UnimplementedError(
+        "DPM agent generation does not support inherited or requested token "
+        "suppression.");
   }
   if (config.GetSamplerBackend() != Backend::CPU) {
     return absl::FailedPreconditionError(
@@ -149,11 +185,8 @@ EngineDPMAgentRuntime::Create(
     return absl::InvalidArgumentError(
         "DPM agent runtime requires a loaded Engine.");
   }
-  if (engine->GetEngineSettings().IsBenchmarkEnabled()) {
-    return absl::UnimplementedError(
-        "DPM agent runtime does not admit benchmark sessions because their "
-        "prefill path may replace canonical input token lengths.");
-  }
+  ABSL_RETURN_IF_ERROR(
+      ValidateDPMEngineSettings(engine->GetEngineSettings()));
   if (session_config.GetMemoryStrategy() ==
       SessionConfig::MemoryStrategy::kStatelessDeterministicProjection) {
     return absl::InvalidArgumentError(
@@ -246,6 +279,8 @@ absl::Status EngineDPMAgentRuntime::ValidateRuntimeSupport() const {
     return absl::FailedPreconditionError(
         "DPM agent runtime has lost its loaded Engine.");
   }
+  ABSL_RETURN_IF_ERROR(
+      ValidateDPMEngineSettings(engine_->GetEngineSettings()));
   ABSL_RETURN_IF_ERROR(ValidateDPMConfig(resolved_session_config_));
   ABSL_ASSIGN_OR_RETURN(
       SessionHandoffIdentity current_identity,
@@ -255,6 +290,10 @@ absl::Status EngineDPMAgentRuntime::ValidateRuntimeSupport() const {
         "Loaded Engine identity changed after DPM agent admission.");
   }
   return absl::OkStatus();
+}
+
+absl::Status EngineDPMAgentRuntime::ValidateSupport() const {
+  return ValidateRuntimeSupport();
 }
 
 absl::Status EngineDPMAgentRuntime::ValidateSessionHandoffSupport() const {

@@ -751,6 +751,12 @@ absl::Status DPMEngine::ValidateConfiguration() const {
     return absl::InvalidArgumentError(
         "DPM decision token limit must be between 1 and 65,536.");
   }
+  if (config_.require_checkpoint_at_milestone &&
+      config_.checkpoint_interval_turns == 0) {
+    return absl::InvalidArgumentError(
+        "DPM cannot require a checkpoint at a milestone while automatic "
+        "checkpoint milestones are disabled.");
+  }
   ABSL_RETURN_IF_ERROR(projection_provider_->ValidateSupport());
   ABSL_RETURN_IF_ERROR(agent_runtime_->ValidateSupport());
   ABSL_RETURN_IF_ERROR(agent_runtime_->ValidateGenerationLimit(
@@ -819,6 +825,200 @@ absl::Status DPMEngine::ValidateConfiguration() const {
     }
   }
   return absl::OkStatus();
+}
+
+absl::StatusOr<DPMCapabilities> DPMEngine::GetCapabilities() const {
+  ABSL_RETURN_IF_ERROR(ValidateConfiguration());
+  ABSL_ASSIGN_OR_RETURN(DPMStageCapabilities projection,
+                        projection_provider_->GetCapabilities());
+  ABSL_ASSIGN_OR_RETURN(DPMStageCapabilities agent,
+                        agent_runtime_->GetCapabilities());
+  ABSL_RETURN_IF_ERROR(ValidateDPMStageCapabilities(projection));
+  ABSL_RETURN_IF_ERROR(ValidateDPMStageCapabilities(agent));
+  if (projection.stage != DPMCapabilityStage::kProjection ||
+      agent.stage != DPMCapabilityStage::kAgentDecision ||
+      projection.replay_mode != agent.replay_mode ||
+      agent.runtime_identity !=
+          agent_runtime_->GetSessionHandoffIdentity() ||
+      projection.max_output_tokens == 0 ||
+      agent.max_output_tokens <
+          static_cast<uint32_t>(config_.max_decision_tokens)) {
+    return absl::DataLossError(
+        "DPM runtime returned inconsistent assembled stage capabilities.");
+  }
+  const bool exact_mode =
+      agent.replay_mode == DPMReplayMode::kExactRegeneration;
+  ABSL_ASSIGN_OR_RETURN(
+      const std::optional<Hash256> current_agent_exact_profile_id,
+      agent_runtime_->GetExactProfileId());
+  ABSL_ASSIGN_OR_RETURN(
+      const std::optional<Hash256> current_agent_exact_admission_id,
+      agent_runtime_->GetExactProfileAdmissionRecordId());
+  const bool projection_exact_complete =
+      projection.exact_profile.has_value() &&
+      projection.exact_profile_admission_record_id.has_value() &&
+      !IsZeroHash(*projection.exact_profile_admission_record_id);
+  const bool agent_exact_complete =
+      agent.exact_profile.has_value() &&
+      agent.exact_profile_admission_record_id.has_value() &&
+      !IsZeroHash(*agent.exact_profile_admission_record_id);
+  if (exact_mode != projection_exact_complete ||
+      exact_mode != agent_exact_complete ||
+      exact_mode != current_agent_exact_profile_id.has_value() ||
+      exact_mode != current_agent_exact_admission_id.has_value() ||
+      (!exact_mode &&
+       (projection.exact_profile.has_value() ||
+        projection.exact_profile_admission_record_id.has_value() ||
+        agent.exact_profile.has_value() ||
+        agent.exact_profile_admission_record_id.has_value()))) {
+    return absl::DataLossError(
+        "DPM stage capabilities confuse an exact profile candidate with "
+        "current ExactRegeneration admission.");
+  }
+  if (exact_mode) {
+    ABSL_RETURN_IF_ERROR(
+        ValidateExactLiteRtProfile(*projection.exact_profile));
+    ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(*agent.exact_profile));
+    if (*current_agent_exact_profile_id != agent.exact_profile->profile_id ||
+        *current_agent_exact_admission_id !=
+            *agent.exact_profile_admission_record_id ||
+        projection.exact_profile->session_identity !=
+            projection.runtime_identity ||
+        agent.exact_profile->session_identity != agent.runtime_identity) {
+      return absl::DataLossError(
+          "DPM exact stage profile identity differs from its loaded runtime "
+          "identity.");
+    }
+  }
+
+  DPMAgentCheckpointCapabilities checkpoints;
+  const bool has_checkpoint_key_id = !config_.checkpoint_key_id.empty();
+  const bool has_checkpoint_key =
+      !config_.checkpoint_authentication_key.empty();
+  if (has_checkpoint_key_id != has_checkpoint_key) {
+    return absl::FailedPreconditionError(
+        "DPM checkpoint transport has only one authentication credential.");
+  }
+  if (has_checkpoint_key_id && checkpoint_repository_ == nullptr) {
+    return absl::FailedPreconditionError(
+        "DPM checkpoint credentials have no checkpoint repository.");
+  }
+  if (has_checkpoint_key_id &&
+      (config_.checkpoint_key_id.size() > kMaximumCheckpointKeyIdSize ||
+       config_.checkpoint_authentication_key.size() < 32)) {
+    return absl::FailedPreconditionError(
+        "DPM checkpoint transport credentials do not satisfy the "
+        "authenticated transport contract.");
+  }
+  checkpoints.checkpoint_transport_configured =
+      checkpoint_repository_ != nullptr && has_checkpoint_key_id &&
+      has_checkpoint_key;
+  checkpoints.restore_enabled = config_.restore_session_checkpoints;
+  checkpoints.capture_interval_turns = config_.checkpoint_interval_turns;
+  checkpoints.capture_required_at_milestone =
+      config_.require_checkpoint_at_milestone;
+  if ((checkpoints.restore_enabled ||
+       checkpoints.capture_interval_turns != 0) &&
+      !checkpoints.checkpoint_transport_configured) {
+    return absl::FailedPreconditionError(
+        "DPM checkpoint restore or capture cannot be reported without an "
+        "authenticated checkpoint transport.");
+  }
+  ABSL_ASSIGN_OR_RETURN(checkpoints.session_handoff_capability,
+                        agent_runtime_->GetSessionHandoffCapability());
+  ABSL_ASSIGN_OR_RETURN(
+      checkpoints.capsule_restore_admission_record_id,
+      agent_runtime_->GetCapsuleRestoreAdmissionRecordId());
+  ABSL_ASSIGN_OR_RETURN(
+      const std::optional<Hash256> current_session_handoff_capability_id,
+      agent_runtime_->GetSessionHandoffCapabilityId());
+  const bool has_session_handoff_capability =
+      checkpoints.session_handoff_capability.has_value();
+  const bool has_capsule_restore_admission =
+      checkpoints.capsule_restore_admission_record_id.has_value();
+  if (has_session_handoff_capability != has_capsule_restore_admission ||
+      has_session_handoff_capability !=
+          current_session_handoff_capability_id.has_value()) {
+    return absl::DataLossError(
+        "DPM agent returned a partial CapsuleRestore capability and admission "
+        "binding.");
+  }
+  const bool capsule_admitted = has_session_handoff_capability;
+  if (checkpoints.session_handoff_capability.has_value()) {
+    ABSL_RETURN_IF_ERROR(ValidateSessionHandoffCapability(
+        *checkpoints.session_handoff_capability));
+    if (IsZeroHash(*checkpoints.capsule_restore_admission_record_id) ||
+        IsZeroHash(*current_session_handoff_capability_id) ||
+        *current_session_handoff_capability_id !=
+            checkpoints.session_handoff_capability->capability_id) {
+      return absl::DataLossError(
+          "DPM agent CapsuleRestore capability or admission identity is "
+          "inconsistent.");
+    }
+  }
+  if (capsule_admitted &&
+      (checkpoints.session_handoff_capability->session_identity !=
+           agent.runtime_identity ||
+       !agent.exact_profile.has_value() ||
+       checkpoints.session_handoff_capability->exact_profile_id !=
+           agent.exact_profile->profile_id ||
+       checkpoints.session_handoff_capability->backend !=
+           agent.exact_profile->backend)) {
+    return absl::DataLossError(
+        "DPM CapsuleRestore capability belongs to another agent runtime.");
+  }
+  if (!exact_mode &&
+      (checkpoints.session_handoff_capability.has_value() ||
+       checkpoints.capsule_restore_admission_record_id.has_value())) {
+    return absl::DataLossError(
+        "WinnerReplay capability must not claim formal CapsuleRestore "
+        "admission.");
+  }
+
+  DPMCapabilities capabilities;
+  capabilities.projection = std::move(projection);
+  capabilities.agent = std::move(agent);
+  capabilities.checkpoints = std::move(checkpoints);
+  capabilities.guarantees = {
+      DPMGuaranteeAvailability{
+          .guarantee = DPMGuarantee::kLogAuthority,
+          .available = true,
+      },
+      DPMGuaranteeAvailability{
+          .guarantee = DPMGuarantee::kCanonicalWinnerReplay,
+          .available = !exact_mode,
+          .unavailable_reason =
+              exact_mode ? "active_mode_is_exact_regeneration" : "",
+      },
+      DPMGuaranteeAvailability{
+          .guarantee = DPMGuarantee::kCapsuleRestore,
+          .available = exact_mode && capsule_admitted &&
+                       capabilities.checkpoints
+                           .checkpoint_transport_configured,
+          .unavailable_reason =
+              !capabilities.checkpoints.checkpoint_transport_configured
+                  ? "checkpoint_transport_not_configured"
+                  : (!exact_mode ? "active_mode_is_canonical_winner_replay"
+                                 : (capsule_admitted
+                                        ? ""
+                                        : "capsule_restore_not_admitted")),
+      },
+      DPMGuaranteeAvailability{
+          .guarantee = DPMGuarantee::kExactRegeneration,
+          .available = exact_mode,
+          .unavailable_reason =
+              exact_mode ? "" : "active_mode_is_canonical_winner_replay",
+      },
+      DPMGuaranteeAvailability{
+          .guarantee = DPMGuarantee::kFailClosedCapabilities,
+          .available = true,
+      },
+  };
+  const absl::Span<const DPMFeatureRestriction> restrictions =
+      GetDPMFeatureRestrictions();
+  capabilities.fail_closed_features.assign(restrictions.begin(),
+                                            restrictions.end());
+  return capabilities;
 }
 
 absl::StatusOr<std::optional<DPMTurnResult>>

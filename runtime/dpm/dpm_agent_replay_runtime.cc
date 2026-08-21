@@ -473,6 +473,8 @@ absl::StatusOr<DPMAgentReplayExecution> BuildExactAgentReplayExecution(
     const ExactRegenerationExecution& exact,
     const ExactLiteRtProfile& expected_profile,
     const Hash256& expected_request_hash, uint32_t max_output_tokens) {
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(expected_profile));
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(exact.derived_profile));
   if (exact.mode != DPMReplayMode::kExactRegeneration ||
       exact.derived_profile != expected_profile ||
       exact.canonical_request_hash != expected_request_hash ||
@@ -1255,6 +1257,25 @@ CanonicalWinnerDPMAgentRuntime::GetSessionHandoffCapabilityId() const {
   return std::optional<Hash256>();
 }
 
+absl::StatusOr<DPMStageCapabilities>
+CanonicalWinnerDPMAgentRuntime::GetCapabilities() const {
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  DPMStageCapabilities capabilities{
+      .stage = DPMCapabilityStage::kAgentDecision,
+      .replay_mode = DPMReplayMode::kCanonicalWinnerReplay,
+      .runtime_identity = runtime_identity_,
+      .max_output_tokens = kMaximumDPMGenerationTokens,
+  };
+  ABSL_RETURN_IF_ERROR(ValidateDPMStageCapabilities(capabilities));
+  return capabilities;
+}
+
+absl::StatusOr<std::optional<SessionHandoffCapability>>
+CanonicalWinnerDPMAgentRuntime::GetSessionHandoffCapability() const {
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  return std::optional<SessionHandoffCapability>();
+}
+
 absl::Status CanonicalWinnerDPMAgentRuntime::ValidateSupport() const {
   if (inference_runtime_ == nullptr) {
     return absl::InvalidArgumentError(
@@ -1264,6 +1285,11 @@ absl::Status CanonicalWinnerDPMAgentRuntime::ValidateSupport() const {
   if (inference_runtime_->GetSessionHandoffIdentity() != runtime_identity_) {
     return absl::FailedPreconditionError(
         "WinnerReplay agent runtime identity changed after construction.");
+  }
+  ABSL_RETURN_IF_ERROR(inference_runtime_->ValidateSupport());
+  if (inference_runtime_->GetSessionHandoffIdentity() != runtime_identity_) {
+    return absl::FailedPreconditionError(
+        "WinnerReplay agent runtime changed while validating support.");
   }
   return absl::OkStatus();
 }
@@ -1508,6 +1534,7 @@ ExactRegenerationDPMAgentRuntime::Create(
   }
   ABSL_ASSIGN_OR_RETURN(ExactLiteRtProfile profile,
                         exact_executor->GetDerivedProfile());
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(profile));
   ABSL_RETURN_IF_ERROR(ValidateRuntimeIdentity(profile.session_identity));
   if (IsZeroHash(profile.profile_id)) {
     return absl::FailedPreconditionError(
@@ -1537,6 +1564,7 @@ ExactRegenerationDPMAgentRuntime::Create(
   }
   ABSL_ASSIGN_OR_RETURN(ExactLiteRtProfile profile,
                         exact_executor->GetDerivedProfile());
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(profile));
   ABSL_RETURN_IF_ERROR(ValidateRuntimeIdentity(profile.session_identity));
   if (IsZeroHash(profile.profile_id)) {
     return absl::FailedPreconditionError(
@@ -1640,6 +1668,40 @@ ExactRegenerationDPMAgentRuntime::GetSessionHandoffCapabilityId() const {
   return std::optional<Hash256>(current.capability.capability_id);
 }
 
+absl::StatusOr<DPMStageCapabilities>
+ExactRegenerationDPMAgentRuntime::GetCapabilities() const {
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 current_admission_record_id,
+      exact_executor_->GetProfileAdmissionRecordId());
+  if (IsZeroHash(current_admission_record_id)) {
+    return absl::DataLossError(
+        "Exact agent capability has an empty current admission record.");
+  }
+  DPMStageCapabilities capabilities{
+      .stage = DPMCapabilityStage::kAgentDecision,
+      .replay_mode = DPMReplayMode::kExactRegeneration,
+      .runtime_identity = derived_profile_.session_identity,
+      .exact_profile = derived_profile_,
+      .exact_profile_admission_record_id = current_admission_record_id,
+      .max_output_tokens = exact_executor_->GetMaxOutputTokens(),
+  };
+  ABSL_RETURN_IF_ERROR(ValidateDPMStageCapabilities(capabilities));
+  return capabilities;
+}
+
+absl::StatusOr<std::optional<SessionHandoffCapability>>
+ExactRegenerationDPMAgentRuntime::GetSessionHandoffCapability() const {
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  if (!capsule_restore_admission_.has_value()) {
+    return std::optional<SessionHandoffCapability>();
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      const ExactRegenerationAuthenticatedCapsuleRestoreAdmission current,
+      ResolveCurrentCapsuleRestoreAdmission());
+  return std::optional<SessionHandoffCapability>(current.capability);
+}
+
 absl::Status ExactRegenerationDPMAgentRuntime::ValidateSupport() const {
   if (exact_executor_ == nullptr) {
     return absl::InvalidArgumentError(
@@ -1663,6 +1725,8 @@ absl::Status ExactRegenerationDPMAgentRuntime::ValidateSupport() const {
   ABSL_RETURN_IF_ERROR(exact_executor_->ValidateSupport());
   ABSL_ASSIGN_OR_RETURN(const ExactLiteRtProfile current,
                         exact_executor_->GetDerivedProfile());
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(current));
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(derived_profile_));
   if (current != derived_profile_) {
     return absl::FailedPreconditionError(
         "Exact agent Engine profile changed after construction.");

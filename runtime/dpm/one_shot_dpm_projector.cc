@@ -80,6 +80,28 @@ absl::StatusOr<DPMReplayMode> OneShotDPMProjector::GetReplayMode() const {
   return replay_mode;
 }
 
+absl::StatusOr<DPMStageCapabilities>
+OneShotDPMProjector::GetCapabilities() const {
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  ABSL_ASSIGN_OR_RETURN(DPMStageCapabilities capabilities,
+                        runtime_->GetCapabilities());
+  ABSL_RETURN_IF_ERROR(ValidateDPMStageCapabilities(capabilities));
+  ABSL_ASSIGN_OR_RETURN(const std::optional<Hash256> exact_profile_id,
+                        runtime_->GetExactProfileId());
+  if (capabilities.stage != DPMCapabilityStage::kProjection ||
+      capabilities.replay_mode != runtime_->GetReplayMode() ||
+      capabilities.runtime_identity != runtime_->GetRuntimeIdentity() ||
+      capabilities.max_output_tokens != config_.max_output_tokens ||
+      (capabilities.exact_profile.has_value() !=
+       exact_profile_id.has_value()) ||
+      (exact_profile_id.has_value() &&
+       capabilities.exact_profile->profile_id != *exact_profile_id)) {
+    return absl::DataLossError(
+        "DPM projection runtime returned inconsistent stage capabilities.");
+  }
+  return capabilities;
+}
+
 absl::StatusOr<DPMLogSnapshot>
 OneShotDPMProjector::ResolveAuthoritativeSnapshot(
     const DPMProjectionRequest& request) const {
