@@ -377,6 +377,22 @@ class LockedLlmExecutor : public LlmExecutor {
     return llm_executor_->RestoreContext(std::move(llm_context));
   }
 
+  absl::Status ValidateSessionHandoffSupport() const override {
+    return llm_executor_->ValidateSessionHandoffSupport();
+  }
+
+  absl::Status VisitSessionState(
+      absl::FunctionRef<absl::Status(const StateInterface&)> visitor) const
+      override {
+    return llm_executor_->VisitSessionState(visitor);
+  }
+
+  absl::Status ImportSessionStateFrom(
+      const ExecutorSessionSnapshot& snapshot,
+      const ByteSource& serialized_state) override {
+    return llm_executor_->ImportSessionStateFrom(snapshot, serialized_state);
+  }
+
   absl::Status UpdateRuntimeConfig(
       const RuntimeConfig& runtime_config) override {
     return llm_executor_->UpdateRuntimeConfig(runtime_config);
@@ -788,6 +804,106 @@ ResourceManager::AcquireExecutorWithContextHandler(
 
   return std::make_unique<LockedLlmExecutor>(llm_executor_, std::move(lock),
                                              current_handler_);
+}
+
+absl::StatusOr<ExecutorSessionSnapshot> ResourceManager::ExportSessionSnapshot(
+    std::shared_ptr<ContextHandler> context_handler,
+    int last_prefill_token_id) {
+  ExecutorSessionSnapshot result;
+  absl::Status status = ExportSessionSnapshotTo(
+      std::move(context_handler), last_prefill_token_id,
+      [&result](const ExecutorSessionSnapshot& metadata,
+                const StateInterface& state) -> absl::Status {
+        result = metadata;
+        absl::StatusOr<std::string> serialized = state.Serialize();
+        if (!serialized.ok()) return serialized.status();
+        result.serialized_state = std::move(*serialized);
+        return absl::OkStatus();
+      });
+  if (!status.ok()) return status;
+  return result;
+}
+
+absl::Status ResourceManager::ExportSessionSnapshotTo(
+    std::shared_ptr<ContextHandler> context_handler,
+    int last_prefill_token_id,
+    absl::FunctionRef<absl::Status(const ExecutorSessionSnapshot&,
+                                   const StateInterface&)>
+        consumer) {
+  if (context_handler == nullptr) {
+    return absl::InvalidArgumentError(
+        "Session handoff context handler must not be null.");
+  }
+  if (context_handler->HasAudioContext()) {
+    return absl::UnimplementedError(
+        "Session handoff does not support audio context state.");
+  }
+  ABSL_ASSIGN_OR_RETURN(auto executor,
+                        AcquireExecutorWithContextHandler(context_handler));
+  ABSL_RETURN_IF_ERROR(executor->ValidateSessionHandoffSupport());
+  ABSL_ASSIGN_OR_RETURN(RuntimeConfig runtime_config,
+                        executor->GetRuntimeConfig());
+  ABSL_ASSIGN_OR_RETURN(RuntimeState runtime_state,
+                        executor->GetRuntimeState());
+  ABSL_ASSIGN_OR_RETURN(const ProcessedTokens* processed_tokens,
+                        executor->GetProcessedTokens());
+  if (processed_tokens == nullptr) {
+    return absl::FailedPreconditionError(
+        "LiteRT session handoff has no processed-token state.");
+  }
+  if (runtime_state.current_step < 0 || runtime_state.rand_gen == nullptr) {
+    return absl::FailedPreconditionError(
+        "LiteRT session handoff runtime state is incomplete.");
+  }
+
+  ExecutorSessionSnapshot snapshot;
+  snapshot.current_step = runtime_state.current_step;
+  snapshot.runtime_config = std::move(runtime_config);
+  snapshot.ran_decode = runtime_state.ran_decode;
+  snapshot.random_engine = *runtime_state.rand_gen;
+  ABSL_ASSIGN_OR_RETURN(snapshot.processed_tokens,
+                        processed_tokens->ExportSnapshot());
+  if (snapshot.processed_tokens.processed_token_ids.size() != 1) {
+    return absl::UnimplementedError(
+        "Session handoff currently supports exactly one token candidate.");
+  }
+  snapshot.last_prefill_token_id = last_prefill_token_id;
+  return executor->VisitSessionState(
+      [&snapshot, consumer](const StateInterface& state) {
+        return consumer(snapshot, state);
+      });
+}
+
+absl::Status ResourceManager::ImportSessionSnapshot(
+    std::shared_ptr<ContextHandler> context_handler,
+    const ExecutorSessionSnapshot& snapshot) {
+  StringByteSource serialized_state(snapshot.serialized_state);
+  ExecutorSessionSnapshot metadata = snapshot;
+  metadata.serialized_state.clear();
+  return ImportSessionSnapshotFrom(std::move(context_handler), metadata,
+                                   serialized_state);
+}
+
+absl::Status ResourceManager::ImportSessionSnapshotFrom(
+    std::shared_ptr<ContextHandler> context_handler,
+    const ExecutorSessionSnapshot& snapshot,
+    const ByteSource& serialized_state) {
+  if (!snapshot.serialized_state.empty()) {
+    return absl::InvalidArgumentError(
+        "Streamed session handoff metadata must not duplicate state bytes.");
+  }
+  if (context_handler == nullptr) {
+    return absl::InvalidArgumentError(
+        "Session handoff context handler must not be null.");
+  }
+  if (context_handler->HasAudioContext()) {
+    return absl::UnimplementedError(
+        "Session handoff does not support audio context state.");
+  }
+  ABSL_ASSIGN_OR_RETURN(auto executor,
+                        AcquireExecutorWithContextHandler(context_handler));
+  ABSL_RETURN_IF_ERROR(executor->ValidateSessionHandoffSupport());
+  return executor->ImportSessionStateFrom(snapshot, serialized_state);
 }
 
 absl::Status ResourceManager::TryLoadingVisionExecutor() {

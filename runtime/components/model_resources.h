@@ -39,6 +39,7 @@
 #include "runtime/proto/embedding_metadata.pb.h"
 #include "runtime/proto/executor_metadata.pb.h"
 #include "runtime/proto/llm_metadata.pb.h"
+#include "runtime/platform/hash/hasher.h"
 #include "runtime/util/scoped_file.h"
 #include "support/tokenizer/tokenizer.h"
 
@@ -171,6 +172,33 @@ struct FileRegion {
 class ModelResources {
  public:
   virtual ~ModelResources() = default;
+
+  // SHA-256 of the exact retained .litertlm/.task bytes from which these
+  // resources were constructed. Implementations must compute this from their
+  // mmap or already-open file descriptor, never by reopening a caller path.
+  virtual const Hash256& GetModelArtifactHash() const {
+    static const Hash256 unavailable;
+    return unavailable;
+  }
+
+  // Recomputes the artifact hash from the exact retained source and verifies
+  // that it still matches GetModelArtifactHash(). Implementations backed by
+  // caller-accessible mappings or file descriptors provide a cooperative
+  // integrity check at handoff admission; callers must not mutate the source
+  // concurrently with loading or verification. Resources that cannot recheck
+  // their retained source fail closed for exact session handoff identity.
+  virtual absl::Status VerifyModelArtifactHash() const {
+    return absl::UnimplementedError(
+        "Exact retained model artifact revalidation is unavailable.");
+  }
+
+  // Cheap later guard used after the full post-load revalidation. This only
+  // detects size drift; same-size mutations remain prohibited by the retained
+  // source lifetime invariant above.
+  virtual absl::Status VerifyModelArtifactSize() const {
+    return absl::UnimplementedError(
+        "Retained model artifact size revalidation is unavailable.");
+  }
 
   // Returns the litert model. We will create the model if it is not created
   // yet. And the model is created from memory mapped file, so physical memory

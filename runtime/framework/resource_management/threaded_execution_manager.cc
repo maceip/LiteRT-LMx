@@ -24,6 +24,7 @@
 #include <variant>
 #include <vector>
 
+#include "absl/cleanup/cleanup.h"  // from @com_google_absl
 #include "absl/base/attributes.h"  // from @com_google_absl
 #include "absl/base/nullability.h"  // from @com_google_absl
 #include "absl/base/thread_annotations.h"  // from @com_google_absl
@@ -196,6 +197,10 @@ absl::Status ThreadedExecutionManager::ReleaseSession(SessionId session_id) {
     return absl::InvalidArgumentError(
         absl::StrCat("Session ", session_id, " not found in session list."));
   }
+  if (session_lookup_.at(session_id)->handoff_in_progress) {
+    return absl::FailedPreconditionError(
+        "Cannot release a session while handoff is in progress.");
+  }
   // If the session is the only session and it is audio modality enabled, we
   // need to reset the audio executor, so the streaming audio executor would
   // have a clean state for the next usage.
@@ -257,6 +262,112 @@ ThreadedExecutionManager::GetMutableBenchmarkInfo(SessionId session_id) {
   return &session_lookup_.at(session_id)->benchmark_info.value();
 }
 
+absl::StatusOr<ExecutorSessionSnapshot>
+ThreadedExecutionManager::ExportSessionSnapshot(
+    SessionId session_id, const absl::flat_hash_set<TaskId>& boundary_tasks) {
+  ExecutorSessionSnapshot result;
+  absl::Status status = ExportSessionSnapshotTo(
+      session_id, boundary_tasks,
+      [&result](const ExecutorSessionSnapshot& metadata,
+                const StateInterface& state) -> absl::Status {
+        result = metadata;
+        absl::StatusOr<std::string> serialized = state.Serialize();
+        if (!serialized.ok()) return serialized.status();
+        result.serialized_state = std::move(*serialized);
+        return absl::OkStatus();
+      });
+  if (!status.ok()) return status;
+  return result;
+}
+
+absl::Status ThreadedExecutionManager::ExportSessionSnapshotTo(
+    SessionId session_id, const absl::flat_hash_set<TaskId>& boundary_tasks,
+    absl::FunctionRef<absl::Status(const ExecutorSessionSnapshot&,
+                                   const StateInterface&)>
+        consumer) {
+  std::shared_ptr<SessionInfo> session_info;
+  {
+    absl::MutexLock lock(session_and_task_lookup_mutex_);
+    if (!session_lookup_.contains(session_id)) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("Session ", session_id, " not found in session list."));
+    }
+    session_info = session_lookup_.at(session_id);
+    if (!session_info->active_tasks.empty() ||
+        session_info->handoff_in_progress) {
+      return absl::FailedPreconditionError(
+          "Session must be quiescent before handoff export.");
+    }
+    for (TaskId task_id : boundary_tasks) {
+      if (!task_lookup_.contains(task_id) ||
+          task_lookup_.at(task_id).session_id != session_id ||
+          (task_lookup_.at(task_id).task_state != TaskState::kDone &&
+           task_lookup_.at(task_id).task_state !=
+               TaskState::kMaxNumTokensReached)) {
+        return absl::FailedPreconditionError(absl::StrCat(
+            "Session handoff boundary task did not complete successfully: ",
+            task_id));
+      }
+    }
+    session_info->handoff_in_progress = true;
+  }
+  absl::Cleanup clear_handoff = [this, session_id, session_info] {
+    absl::MutexLock lock(session_and_task_lookup_mutex_);
+    if (session_lookup_.contains(session_id) &&
+        session_lookup_.at(session_id) == session_info) {
+      session_info->handoff_in_progress = false;
+    }
+  };
+  return resource_manager_->ExportSessionSnapshotTo(
+      session_info->context_handler, session_info->last_prefill_token_id,
+      consumer);
+}
+
+absl::Status ThreadedExecutionManager::ImportSessionSnapshot(
+    SessionId session_id, const ExecutorSessionSnapshot& snapshot) {
+  StringByteSource serialized_state(snapshot.serialized_state);
+  ExecutorSessionSnapshot metadata = snapshot;
+  metadata.serialized_state.clear();
+  return ImportSessionSnapshotFrom(session_id, metadata, serialized_state);
+}
+
+absl::Status ThreadedExecutionManager::ImportSessionSnapshotFrom(
+    SessionId session_id, const ExecutorSessionSnapshot& snapshot,
+    const ByteSource& serialized_state) {
+  std::shared_ptr<SessionInfo> session_info;
+  {
+    absl::MutexLock lock(session_and_task_lookup_mutex_);
+    if (!session_lookup_.contains(session_id)) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("Session ", session_id, " not found in session list."));
+    }
+    session_info = session_lookup_.at(session_id);
+    if (!session_info->active_tasks.empty() ||
+        session_info->handoff_in_progress) {
+      return absl::FailedPreconditionError(
+          "Session must be quiescent before handoff import.");
+    }
+    session_info->handoff_in_progress = true;
+  }
+  absl::Cleanup clear_handoff = [this, session_id, session_info] {
+    absl::MutexLock lock(session_and_task_lookup_mutex_);
+    if (session_lookup_.contains(session_id) &&
+        session_lookup_.at(session_id) == session_info) {
+      session_info->handoff_in_progress = false;
+    }
+  };
+  absl::Status status = resource_manager_->ImportSessionSnapshotFrom(
+      session_info->context_handler, snapshot, serialized_state);
+  {
+    absl::MutexLock lock(session_and_task_lookup_mutex_);
+    if (session_lookup_.contains(session_id) &&
+        session_lookup_.at(session_id) == session_info && status.ok()) {
+      session_info->last_prefill_token_id = snapshot.last_prefill_token_id;
+    }
+  }
+  return status;
+}
+
 absl::StatusOr<TaskId> ThreadedExecutionManager::GetNewTaskId() {
   return next_task_id_.fetch_add(1);
 }
@@ -272,6 +383,10 @@ absl::Status ThreadedExecutionManager::CreateTask(
     return absl::InvalidArgumentError(absl::StrCat(
         "Session ", session_id, " not found in session list. Task ", task_id,
         " cannot be created."));
+  }
+  if (session_lookup_.at(session_id)->handoff_in_progress) {
+    return absl::FailedPreconditionError(
+        "Cannot create a task while session handoff is in progress.");
   }
   if (task_lookup_.contains(task_id)) {
     return absl::InvalidArgumentError(

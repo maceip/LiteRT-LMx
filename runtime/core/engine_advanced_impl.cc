@@ -28,6 +28,7 @@
 #include "absl/time/time.h"  // from @com_google_absl
 #include "litert/cc/litert_macros.h"  // from @litert
 #include "runtime/components/model_resources.h"
+#include "runtime/core/session_handoff_identity.h"
 #include "runtime/core/session_advanced.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_factory.h"
@@ -40,6 +41,7 @@
 #include "runtime/executor/llm_executor.h"
 #include "runtime/executor/llm_executor_settings.h"
 #include "runtime/executor/llm_litert_compiled_model_executor_factory.h"
+#include "runtime/executor/session_handoff_runtime.h"
 #include "runtime/executor/vision_executor_settings.h"
 #include "runtime/executor/vision_executor_utils.h"
 #include "runtime/framework/resource_management/execution_manager.h"
@@ -47,6 +49,7 @@
 #include "runtime/framework/resource_management/threaded_execution_manager.h"
 #include "runtime/proto/llm_metadata.pb.h"
 #include "runtime/proto/sampler_params.pb.h"
+#include "runtime/platform/runtime_artifact_identity.h"
 #include "runtime/util/litert_util.h"
 #include "runtime/util/logging.h"
 #include "runtime/util/status_macros.h"  // NOLINT
@@ -56,6 +59,11 @@
 #endif  // defined(LITERT_LM_DEBUGGER_ENABLED)
 
 namespace litert::lm {
+
+struct LoadedRuntimeIdentity {
+  Hash256 runtime_artifact_hash;
+  std::string canonical_profile;
+};
 
 class EngineAdvancedImpl : public Engine {
  public:
@@ -84,13 +92,21 @@ class EngineAdvancedImpl : public Engine {
                      std::unique_ptr<OwnedEnvironment> owned_env,
                      std::unique_ptr<Tokenizer> tokenizer,
                      std::unique_ptr<ExecutionManager> execution_manager,
-                     std::optional<BenchmarkInfo> benchmark_info)
+                     std::optional<BenchmarkInfo> benchmark_info,
+                     Hash256 model_artifact_hash,
+                     absl::Status model_artifact_post_load_status,
+                     absl::StatusOr<LoadedRuntimeIdentity>
+                         loaded_runtime_identity)
       : engine_settings_(std::move(engine_settings)),
         litert_model_resources_(std::move(litert_model_resources)),
         owned_env_(std::move(owned_env)),
         tokenizer_(std::move(tokenizer)),
         execution_manager_(std::move(execution_manager)),
-        benchmark_info_(std::move(benchmark_info)) {}
+        benchmark_info_(std::move(benchmark_info)),
+        model_artifact_hash_(model_artifact_hash),
+        model_artifact_post_load_status_(
+            std::move(model_artifact_post_load_status)),
+        loaded_runtime_identity_(std::move(loaded_runtime_identity)) {}
 
   // Method to create the Session.
   absl::StatusOr<std::unique_ptr<Session>> CreateSession(
@@ -109,6 +125,13 @@ class EngineAdvancedImpl : public Engine {
     // class.
     ABSL_RETURN_IF_ERROR(config.MaybeUpdateAndValidate(engine_settings_));
 
+    std::optional<SessionHandoffIdentity> session_handoff_identity;
+    absl::StatusOr<SessionHandoffIdentity> identity =
+        ResolveSessionHandoffIdentity(config);
+    if (identity.ok()) {
+      session_handoff_identity = *identity;
+    }
+
     if (litert_model_resources_ == nullptr) {
       return absl::FailedPreconditionError(
           "Model resources are not initialized.");
@@ -118,7 +141,8 @@ class EngineAdvancedImpl : public Engine {
         auto session,
         SessionAdvanced::Create(execution_manager_, tokenizer_.get(), config,
                                 std::move(session_benchmark_info),
-                                &living_sessions_));
+                                &living_sessions_,
+                                std::move(session_handoff_identity)));
 
     if (benchmark_info_.has_value()) {
       auto session_benchmark_info_or = session->GetMutableBenchmarkInfo();
@@ -139,6 +163,54 @@ class EngineAdvancedImpl : public Engine {
   }
 
   const Tokenizer& GetTokenizer() const override { return *tokenizer_; }
+
+  absl::StatusOr<SessionHandoffIdentity> ResolveSessionHandoffIdentity(
+      const SessionConfig& session_config) const override {
+    if (model_artifact_hash_ == Hash256{}) {
+      return absl::FailedPreconditionError(
+          "The exact retained model artifact was not measurable.");
+    }
+    if (!model_artifact_post_load_status_.ok()) {
+      return model_artifact_post_load_status_;
+    }
+    if (litert_model_resources_ == nullptr) {
+      return absl::FailedPreconditionError(
+          "The retained model resources are unavailable.");
+    }
+    // Full hashing is deliberately confined to initialization and post-load
+    // admission: repeating a multi-GB digest on every DPM turn would make the
+    // product path unusable. Later checks reject descriptor-size drift, or
+    // mapped-extent drift when a caller supplied only a mapping. The retained
+    // source must remain unmodified for the complete Engine lifetime; this is
+    // a cooperative invariant, not hostile-alias protection.
+    ABSL_RETURN_IF_ERROR(litert_model_resources_->VerifyModelArtifactSize());
+    if (!loaded_runtime_identity_.ok()) {
+      return loaded_runtime_identity_.status();
+    }
+    if (loaded_runtime_identity_->runtime_artifact_hash == Hash256{} ||
+        loaded_runtime_identity_->canonical_profile.empty()) {
+      return absl::FailedPreconditionError(
+          "The loaded runtime/delegate evidence is incomplete.");
+    }
+    SessionConfig resolved = session_config;
+    ABSL_RETURN_IF_ERROR(resolved.MaybeUpdateAndValidate(engine_settings_));
+    ABSL_ASSIGN_OR_RETURN(
+        Hash256 inference_profile_hash,
+        DeriveSessionHandoffInferenceProfileHash(
+            engine_settings_, resolved,
+            loaded_runtime_identity_->canonical_profile,
+            tokenizer_->GetTokenizerType()));
+    if (inference_profile_hash == Hash256{}) {
+      return absl::FailedPreconditionError(
+          "The resolved inference profile hash is zero.");
+    }
+    return SessionHandoffIdentity{
+        .model_artifact_hash = model_artifact_hash_,
+        .runtime_artifact_hash =
+            loaded_runtime_identity_->runtime_artifact_hash,
+        .inference_profile_hash = inference_profile_hash,
+    };
+  }
 
   absl::StatusOr<AudioExecutorProperties> GetAudioExecutorProperties()
       const override {
@@ -175,6 +247,19 @@ class EngineAdvancedImpl : public Engine {
 
   // Benchmark info for the engine.
   std::optional<BenchmarkInfo> benchmark_info_;
+
+  // Exact artifact identity retained from model/resource initialization.
+  const Hash256 model_artifact_hash_;
+
+  // Result of rehashing the retained source after model compilation and
+  // tokenizer loading. Failure disables exact handoff identity without
+  // changing ordinary Engine creation or inference.
+  const absl::Status model_artifact_post_load_status_;
+
+  // Measured runtime/delegate evidence and canonical concrete executor
+  // profile. Unsupported platforms/backends retain the failure status so
+  // ordinary inference remains available while capsule mode fails closed.
+  const absl::StatusOr<LoadedRuntimeIdentity> loaded_runtime_identity_;
 };
 
 // Method to create Engine.
@@ -207,6 +292,8 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
                         BuildLiteRtCompiledModelResources(
                             model_assets, enable_file_backed_model_loading,
                             /*enable_file_backed_for_aot_npu=*/is_npu));
+  const Hash256 model_artifact_hash =
+      model_resources->GetModelArtifactHash();
   if (benchmark_info.has_value()) {
     ABSL_RETURN_IF_ERROR(benchmark_info->TimeInitPhaseEnd(
         BenchmarkInfo::InitPhase::kModelAssets));
@@ -388,6 +475,45 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
     ABSL_RETURN_IF_ERROR(benchmark_info->InitPhaseRecord(
         BenchmarkInfo::InitPhase::kTokenizer, tokenizer_duration));
   }
+
+  // Detect persistent drift across lazy model/tokenizer reads. This does not
+  // claim atomic protection from a concurrently mutable caller alias; exact
+  // handoff requires that retained source to remain unchanged for the Engine
+  // lifetime.
+  absl::Status model_artifact_post_load_status =
+      model_resources->VerifyModelArtifactHash();
+
+  absl::StatusOr<LoadedRuntimeIdentity> loaded_runtime_identity = [&]()
+      -> absl::StatusOr<LoadedRuntimeIdentity> {
+    ABSL_ASSIGN_OR_RETURN(
+        SessionHandoffRuntimeProfile runtime_profile,
+        executor->GetSessionHandoffRuntimeProfile());
+    if (runtime_profile.logits_vocabulary_size <= 0) {
+      return absl::FailedPreconditionError(
+          "Loaded executor has no measurable logits vocabulary.");
+    }
+    const int tokenizer_vocabulary_size = tokenizer->GetVocabSize();
+    if (tokenizer_vocabulary_size <= 0) {
+      return absl::FailedPreconditionError(
+          "Loaded tokenizer has no positive vocabulary size.");
+    }
+    if (runtime_profile.logits_vocabulary_size != tokenizer_vocabulary_size) {
+      return absl::FailedPreconditionError(
+          "Loaded decode logits vocabulary does not match the loaded "
+          "tokenizer vocabulary.");
+    }
+    ABSL_ASSIGN_OR_RETURN(
+        Hash256 runtime_artifact_hash,
+        MeasureLoadedRuntimeArtifact(runtime_profile));
+    if (runtime_artifact_hash == Hash256{}) {
+      return absl::FailedPreconditionError(
+          "Measured loaded runtime/delegate artifact hash is zero.");
+    }
+    return LoadedRuntimeIdentity{
+        .runtime_artifact_hash = runtime_artifact_hash,
+        .canonical_profile = std::move(runtime_profile.canonical_profile),
+    };
+  }();
   std::unique_ptr<ExecutionManager> execution_manager;
   if (!engine_settings.GetSingleThreadedExecution()) {
     ABSL_ASSIGN_OR_RETURN(
@@ -415,7 +541,9 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
   auto llm_impl = std::make_unique<EngineAdvancedImpl>(
       std::move(engine_settings), std::move(model_resources),
       std::move(owned_env), std::move(tokenizer), std::move(execution_manager),
-      std::move(benchmark_info));
+      std::move(benchmark_info), model_artifact_hash,
+      std::move(model_artifact_post_load_status),
+      std::move(loaded_runtime_identity));
 
   return llm_impl;
 };

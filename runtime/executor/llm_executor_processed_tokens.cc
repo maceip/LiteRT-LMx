@@ -15,12 +15,14 @@
 #include "runtime/executor/llm_executor_processed_tokens.h"
 
 #include <cstddef>
+#include <limits>
 #include <memory>
 #include <utility>
 #include <vector>
 
 #include "absl/log/absl_check.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 
 namespace litert::lm {
@@ -165,6 +167,81 @@ void ProcessedTokens::InvalidatePendingInputToken() {
   for (auto& t : tokens_) {
     t.pending_input_token = nullptr;
   }
+}
+
+absl::StatusOr<ProcessedTokens::Snapshot> ProcessedTokens::ExportSnapshot()
+    const {
+  if (tokens_.empty()) {
+    return absl::InternalError("ProcessedTokens has no token candidates.");
+  }
+  const size_t processed_count = tokens_[0].token_ids.size();
+  const bool has_pending = tokens_[0].pending_input_token != nullptr;
+  Snapshot snapshot;
+  snapshot.processed_token_ids.reserve(tokens_.size());
+  if (has_pending) {
+    snapshot.pending_token_ids.reserve(tokens_.size());
+  }
+  for (const Tokens& tokens : tokens_) {
+    if (tokens.token_ids.size() != processed_count) {
+      return absl::FailedPreconditionError(
+          "Processed token candidates have different lengths.");
+    }
+    if ((tokens.pending_input_token != nullptr) != has_pending) {
+      return absl::FailedPreconditionError(
+          "Processed token candidates disagree about pending-token state.");
+    }
+    snapshot.processed_token_ids.push_back(tokens.token_ids);
+    if (has_pending) {
+      if (!tokens.pending_input_token->embedding().empty() ||
+          !tokens.pending_input_token->per_layer_embedding().empty()) {
+        return absl::UnimplementedError(
+            "Session handoff does not support pending token embeddings.");
+      }
+      snapshot.pending_token_ids.push_back(tokens.pending_input_token->id());
+    }
+  }
+  return snapshot;
+}
+
+absl::StatusOr<ProcessedTokens> ProcessedTokens::FromSnapshot(
+    const Snapshot& snapshot) {
+  if (snapshot.processed_token_ids.empty()) {
+    return absl::InvalidArgumentError(
+        "Processed token snapshot must contain at least one candidate.");
+  }
+  const size_t processed_count = snapshot.processed_token_ids[0].size();
+  for (const auto& candidate : snapshot.processed_token_ids) {
+    if (candidate.size() != processed_count) {
+      return absl::InvalidArgumentError(
+          "Processed token snapshot candidates have different lengths.");
+    }
+  }
+  if (!snapshot.pending_token_ids.empty() &&
+      snapshot.pending_token_ids.size() !=
+          snapshot.processed_token_ids.size()) {
+    return absl::InvalidArgumentError(
+        "Pending token count must be zero or equal the candidate count.");
+  }
+  const size_t pending_count = snapshot.pending_token_ids.empty() ? 0 : 1;
+  if (processed_count >
+      static_cast<size_t>(std::numeric_limits<int>::max()) - pending_count) {
+    return absl::ResourceExhaustedError(
+        "Processed token snapshot exceeds the supported step range.");
+  }
+
+  ProcessedTokens restored;
+  restored.tokens_.clear();
+  restored.tokens_.reserve(snapshot.processed_token_ids.size());
+  for (size_t i = 0; i < snapshot.processed_token_ids.size(); ++i) {
+    Tokens tokens;
+    tokens.token_ids = snapshot.processed_token_ids[i];
+    if (!snapshot.pending_token_ids.empty()) {
+      tokens.pending_input_token =
+          std::make_shared<TokenData>(snapshot.pending_token_ids[i]);
+    }
+    restored.tokens_.push_back(std::move(tokens));
+  }
+  return restored;
 }
 
 int ProcessedTokens::GetStep() const { return tokens_[0].token_ids.size(); }

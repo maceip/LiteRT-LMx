@@ -41,6 +41,18 @@ class ModelResourcesTask : public ModelResources {
   static absl::StatusOr<std::unique_ptr<ModelResources>> Create(
       std::unique_ptr<ModelAssetBundleResources> model_asset_bundle_resources);
 
+  const Hash256& GetModelArtifactHash() const override {
+    return model_asset_bundle_resources_->GetModelArtifactHash();
+  }
+
+  absl::Status VerifyModelArtifactHash() const override {
+    return model_asset_bundle_resources_->VerifyModelArtifactHash();
+  }
+
+  absl::Status VerifyModelArtifactSize() const override {
+    return model_asset_bundle_resources_->VerifyModelArtifactSize();
+  }
+
   absl::StatusOr<const litert::Model*> GetTFLiteModel(
       ModelType model_type) override;
   absl::StatusOr<absl::string_view> GetTFLiteModelBuffer(
@@ -81,15 +93,13 @@ class ModelResourcesTask : public ModelResources {
       : model_asset_bundle_resources_(std::move(model_asset_bundle_resources)) {
   }
 
+  // Owns the bytes backing every model and metadata view below. It must be
+  // declared first so reverse member destruction releases it last.
+  std::unique_ptr<ModelAssetBundleResources> model_asset_bundle_resources_;
+
   absl::flat_hash_map<ModelType, std::shared_ptr<litert::Model>> model_map_;
   std::unique_ptr<proto::LlmMetadata> llm_metadata_;
   std::unique_ptr<proto::ExecutorMetadata> executor_metadata_;
-
-  // The model asset bundle resources produced by reading task bundle. Not null
-  // only when the model is provided through .task format. If the model is
-  // retrieved from this resource, releasing this resource will also invalidate
-  // the model.
-  std::unique_ptr<ModelAssetBundleResources> model_asset_bundle_resources_;
 };
 
 }  // namespace litert::lm

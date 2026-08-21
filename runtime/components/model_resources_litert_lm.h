@@ -40,6 +40,18 @@ class ModelResourcesLitertLm : public ModelResources {
       std::unique_ptr<LitertLmLoader> litert_lm_loader,
       bool enable_file_backed_model_loading = false);
 
+  const Hash256& GetModelArtifactHash() const override {
+    return litert_lm_loader_->GetModelArtifactHash();
+  }
+
+  absl::Status VerifyModelArtifactHash() const override {
+    return litert_lm_loader_->VerifyModelArtifactHash();
+  }
+
+  absl::Status VerifyModelArtifactSize() const override {
+    return litert_lm_loader_->VerifyModelArtifactSize();
+  }
+
   absl::StatusOr<const litert::Model*> GetTFLiteModel(
       ModelType model_type) override;
 

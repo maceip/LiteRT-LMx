@@ -32,6 +32,7 @@
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
 #include "litert/cc/litert_buffer_ref.h"  // from @litert
 #include "runtime/components/model_resources.h"
+#include "runtime/platform/hash/hasher.h"
 #include "runtime/util/memory_mapped_file.h"
 #include "runtime/util/scoped_file.h"
 #include "schema/core/litertlm_header_schema_generated.h"
@@ -207,6 +208,19 @@ class LitertLmLoader {
 
   absl::StatusOr<std::shared_ptr<ScopedFile>> GetSharedScopedFile();
 
+  const Hash256& GetModelArtifactHash() const {
+    return model_artifact_hash_;
+  }
+
+  // Rehashes the exact retained mapping or already-open descriptor. This
+  // detects persistent source drift at explicit checkpoints but is not an
+  // atomic seal against a caller mutating an aliased source concurrently.
+  absl::Status VerifyModelArtifactHash() const;
+
+  // Checks only that the retained mapping or descriptor still has the size
+  // captured with the initial digest.
+  absl::Status VerifyModelArtifactSize() const;
+
  private:
   explicit LitertLmLoader(ScopedFile model_file)
       : model_source_(std::make_shared<ScopedFile>(std::move(model_file))) {}
@@ -229,6 +243,11 @@ class LitertLmLoader {
   // memory-mapped file.
   std::variant<std::shared_ptr<ScopedFile>, std::shared_ptr<MemoryMappedFile>>
       model_source_;
+
+  // Computed once from model_source_ during Initialize(), before any section
+  // is handed to a tokenizer or compiled-model factory.
+  Hash256 model_artifact_hash_;
+  uint64_t model_artifact_size_ = 0;
 
   // The header of the model file. Use this to understand what sections are
   // available and their offsets.

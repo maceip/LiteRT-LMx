@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -33,11 +34,12 @@
 #include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/ascii.h"  // from @com_google_absl
-#include "absl/strings/str_format.h"  // from @com_google_absl
+#include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
 #include "litert/cc/litert_buffer_ref.h"  // from @litert
 #include "runtime/components/model_resources.h"
+#include "runtime/platform/hash/sha256_hasher.h"
 #include "runtime/util/memory_mapped_file.h"
 #include "runtime/util/scoped_file.h"
 #include "runtime/util/status_macros.h"
@@ -197,28 +199,63 @@ absl::StatusOr<std::unique_ptr<LitertLmLoader>> LitertLmLoader::Create(
 absl::Status LitertLmLoader::Initialize() {
   ABSL_VLOG(1) << "LitertLmLoader::Initialize";
 
-  // Map the header of the model file.
+  // Resolve and bound the retained artifact before creating any mappings.
   uint64_t model_file_size;
-  uint64_t header_size;
-  void* header_data;
-  std::unique_ptr<MemoryMappedFile> header_memory_mapped_file;
   if (std::holds_alternative<std::shared_ptr<MemoryMappedFile>>(
           model_source_)) {
     auto& memory_mapped_model_file =
         std::get<std::shared_ptr<MemoryMappedFile>>(model_source_);
+    if (memory_mapped_model_file == nullptr) {
+      return absl::InvalidArgumentError(
+          "The memory-mapped model source is null.");
+    }
     model_file_size = memory_mapped_model_file->length();
-    header_size = std::min(kLitertLmHeaderMaxSize, model_file_size);
-    header_data = memory_mapped_model_file->data();
   } else {
     auto& model_file = *std::get<std::shared_ptr<ScopedFile>>(model_source_);
     ABSL_ASSIGN_OR_RETURN(model_file_size, model_file.GetSize());
-    header_size = std::min(kLitertLmHeaderMaxSize, model_file_size);
+  }
+  if (model_file_size > std::numeric_limits<size_t>::max()) {
+    return absl::ResourceExhaustedError(
+        "Model artifact exceeds addressable memory for hashing.");
+  }
+
+  // Map the header and the complete artifact used for the initial identity.
+  const uint64_t header_size =
+      std::min(kLitertLmHeaderMaxSize, model_file_size);
+  void* header_data;
+  void* artifact_data;
+  std::unique_ptr<MemoryMappedFile> header_memory_mapped_file;
+  std::unique_ptr<MemoryMappedFile> artifact_memory_mapped_file;
+  if (std::holds_alternative<std::shared_ptr<MemoryMappedFile>>(
+          model_source_)) {
+    auto& memory_mapped_model_file =
+        std::get<std::shared_ptr<MemoryMappedFile>>(model_source_);
+    header_data = memory_mapped_model_file->data();
+    artifact_data = memory_mapped_model_file->data();
+  } else {
+    auto& model_file = *std::get<std::shared_ptr<ScopedFile>>(model_source_);
     ABSL_ASSIGN_OR_RETURN(
         header_memory_mapped_file,
         CreateMemoryMapFromScopedFile(model_file, /*offset=*/0,
                                       /*size=*/header_size));
     header_data = header_memory_mapped_file->data();
+    ABSL_ASSIGN_OR_RETURN(
+        artifact_memory_mapped_file,
+        CreateMemoryMapFromScopedFile(model_file, /*offset=*/0,
+                                      /*size=*/model_file_size));
+    artifact_data = artifact_memory_mapped_file->data();
   }
+  if ((header_size != 0 && header_data == nullptr) ||
+      (model_file_size != 0 && artifact_data == nullptr)) {
+    return absl::FailedPreconditionError(
+        "The retained model artifact has no readable bytes.");
+  }
+  Sha256Hasher model_hasher;
+  model_hasher.Update(absl::string_view(
+      static_cast<const char*>(artifact_data),
+      static_cast<size_t>(model_file_size)));
+  model_artifact_hash_ = model_hasher.Finalize();
+  model_artifact_size_ = model_file_size;
   ABSL_VLOG(1) << "mmap_status is ok";
 
   // Read the header information.
@@ -251,11 +288,12 @@ absl::Status LitertLmLoader::Initialize() {
                    << *section_hint.prefer_activation_type;
     }
 
-    if (section->begin_offset() > section->end_offset()) {
-      return absl::InvalidArgumentError(
-          absl::StrFormat("Section %d has invalid offsets: begin_offset (%d) > "
-                          "end_offset (%d).",
-                          i, section->begin_offset(), section->end_offset()));
+    if (section->begin_offset() > section->end_offset() ||
+        section->end_offset() > model_artifact_size_) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Section ", i, " has invalid offsets: begin_offset=",
+          section->begin_offset(), ", end_offset=", section->end_offset(),
+          ", artifact_size=", model_artifact_size_, "."));
     }
     section_locations_[buffer_key] =
         std::make_pair(section->begin_offset(), section->end_offset());
@@ -265,6 +303,75 @@ absl::Status LitertLmLoader::Initialize() {
                  << EnumNameAnySectionDataType(section->data_type());
     ABSL_VLOG(1) << "section_begin_offset: " << section->begin_offset();
     ABSL_VLOG(1) << "section_end_offset: " << section->end_offset();
+  }
+  return absl::OkStatus();
+}
+
+absl::Status LitertLmLoader::VerifyModelArtifactSize() const {
+  if (std::holds_alternative<std::shared_ptr<MemoryMappedFile>>(
+          model_source_)) {
+    const auto& memory_mapped_model_file =
+        std::get<std::shared_ptr<MemoryMappedFile>>(model_source_);
+    if (memory_mapped_model_file == nullptr) {
+      return absl::FailedPreconditionError(
+          "The retained memory-mapped model source is null.");
+    }
+    const uint64_t current_size = memory_mapped_model_file->length();
+    if (current_size != model_artifact_size_) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "The retained model artifact size changed from ",
+          model_artifact_size_, " to ", current_size, " bytes."));
+    }
+  } else {
+    auto& model_file = *std::get<std::shared_ptr<ScopedFile>>(model_source_);
+    if (!model_file.IsValid()) {
+      return absl::FailedPreconditionError(
+          "The retained model artifact descriptor is no longer valid.");
+    }
+    ABSL_ASSIGN_OR_RETURN(const uint64_t current_size, model_file.GetSize());
+    if (current_size != model_artifact_size_) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "The retained model artifact size changed from ",
+          model_artifact_size_, " to ", current_size, " bytes."));
+    }
+  }
+  return absl::OkStatus();
+}
+
+absl::Status LitertLmLoader::VerifyModelArtifactHash() const {
+  ABSL_RETURN_IF_ERROR(VerifyModelArtifactSize());
+
+  void* artifact_data = nullptr;
+  std::unique_ptr<MemoryMappedFile> artifact_memory_mapped_file;
+  if (std::holds_alternative<std::shared_ptr<MemoryMappedFile>>(
+          model_source_)) {
+    const auto& memory_mapped_model_file =
+        std::get<std::shared_ptr<MemoryMappedFile>>(model_source_);
+    artifact_data = memory_mapped_model_file->data();
+  } else {
+    auto& model_file = *std::get<std::shared_ptr<ScopedFile>>(model_source_);
+    ABSL_ASSIGN_OR_RETURN(
+        artifact_memory_mapped_file,
+        CreateMemoryMapFromScopedFile(model_file, /*offset=*/0,
+                                      /*size=*/model_artifact_size_));
+    artifact_data = artifact_memory_mapped_file->data();
+  }
+
+  if (model_artifact_size_ > std::numeric_limits<size_t>::max()) {
+    return absl::ResourceExhaustedError(
+        "Model artifact exceeds addressable memory for revalidation.");
+  }
+  if (model_artifact_size_ != 0 && artifact_data == nullptr) {
+    return absl::FailedPreconditionError(
+        "The retained model artifact has no readable bytes.");
+  }
+  Sha256Hasher model_hasher;
+  model_hasher.Update(absl::string_view(
+      static_cast<const char*>(artifact_data),
+      static_cast<size_t>(model_artifact_size_)));
+  if (model_hasher.Finalize() != model_artifact_hash_) {
+    return absl::FailedPreconditionError(
+        "The retained model artifact bytes changed after initialization.");
   }
   return absl::OkStatus();
 }

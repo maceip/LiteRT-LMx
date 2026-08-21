@@ -60,13 +60,33 @@ class LitertState : public StateInterface {
 
   int GetBatchSize() const override { return batch_size_; };
 
-  absl::StatusOr<std::string> Serialize() const override {
-    return absl::UnimplementedError("Not implemented");
-  }
+  AllocationPolicy allocation_policy() const { return allocation_policy_; }
 
-  absl::Status Load(absl::string_view serialized_state) override {
-    return absl::UnimplementedError("Not implemented");
-  }
+  // Serializes the logical input bank into a canonical, versioned snapshot.
+  // The snapshot binds the state structure and buffer layout and includes an
+  // integrity digest. The caller remains responsible for authenticating the
+  // snapshot and binding it to a model/backend/profile identity.
+  //
+  // Serialization requires every buffer to support a host-readable lock. GPU
+  // buffers, including Metal buffers, are staged through LiteRT's synchronized
+  // lock contract. A backend that cannot provide that contract is rejected
+  // rather than producing a partial snapshot. The caller must keep inference
+  // quiescent until this operation returns.
+  absl::StatusOr<std::string> Serialize() const override;
+  absl::StatusOr<uint64_t> SerializedSize() const override;
+  absl::Status SerializeTo(ByteSink* sink) const override;
+
+  // Loads a snapshot only when its complete structure matches this state. A
+  // dynamic sequence dimension may differ: non-Metal buffers are recreated at
+  // the producer's canonical shape and committed with the entry count only
+  // after every payload has been validated and staged. All other dimensions
+  // and layout properties must match exactly. Metal buffers retain their live
+  // GPU allocations and use a host rollback copy; a Metal shape change is
+  // rejected to avoid the known managed-Metal allocation leak. The caller must
+  // keep inference quiescent until this operation returns.
+  absl::Status Load(absl::string_view serialized_state) override;
+  absl::Status LoadFrom(const ByteSource& source,
+                        bool target_is_disposable = false) override;
 
   absl::Status SelectAndCopyFrom(StateInterface& other,
                                  int batch_index) override;

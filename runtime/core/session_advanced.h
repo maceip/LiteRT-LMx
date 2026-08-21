@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/base/attributes.h"  // from @com_google_absl
@@ -87,7 +88,9 @@ class SessionAdvanced : public SessionInterface {
       support::Tokenizer* absl_nonnull tokenizer,
       const SessionConfig& session_config,
       std::optional<BenchmarkInfo> benchmark_info,
-      std::atomic<int>* living_sessions_count = nullptr);
+      std::atomic<int>* living_sessions_count = nullptr,
+      std::optional<SessionHandoffIdentity> session_handoff_identity =
+          std::nullopt);
 
   // Destroys the SessionAdvanced object. It will wait for all tasks to be
   // done and release the session from the execution manager.
@@ -178,6 +181,23 @@ class SessionAdvanced : public SessionInterface {
   // Get the current step of the session.
   absl::StatusOr<int> GetCurrentStep() const override;
 
+  absl::StatusOr<std::string> ExportHandoff(
+      const SessionHandoffOptions& options) override
+      ABSL_LOCKS_EXCLUDED(mutex_);
+
+  absl::Status ExportHandoffTo(const SessionHandoffOptions& options,
+                               ByteSink* sink) override
+      ABSL_LOCKS_EXCLUDED(mutex_);
+
+  absl::Status ImportHandoff(absl::string_view envelope,
+                             const SessionHandoffOptions& expected) override
+      ABSL_LOCKS_EXCLUDED(mutex_);
+
+  absl::Status ImportHandoffFrom(
+      const ByteSource& envelope,
+      const SessionHandoffOptions& expected) override
+      ABSL_LOCKS_EXCLUDED(mutex_);
+
   // Cancels the ongoing inference process.
   //
   // NOTE: Reusing the session after calling CancelProcess() is neither
@@ -202,6 +222,13 @@ class SessionAdvanced : public SessionInterface {
   const SessionConfig& GetSessionConfig() const override {
     return session_info_->session_config;
   }
+
+  absl::StatusOr<SessionHandoffIdentity> GetSessionHandoffIdentity()
+      const override;
+
+  absl::StatusOr<std::vector<std::vector<int>>>
+  GetExactProcessedTokenHistory() const override
+      ABSL_LOCKS_EXCLUDED(mutex_);
 
   // Returns debug info for this session.
   std::optional<SessionDebugInfo> GetSessionDebugInfo() const override;
@@ -245,14 +272,17 @@ class SessionAdvanced : public SessionInterface {
                            std::shared_ptr<const SessionInfo> session_info,
                            SessionState session_state = SessionState::kFresh,
                            absl::flat_hash_set<TaskId> last_task_ids = {},
-                           std::atomic<int>* living_sessions_count = nullptr)
+                           std::atomic<int>* living_sessions_count = nullptr,
+                           std::optional<SessionHandoffIdentity>
+                               session_handoff_identity = std::nullopt)
       : session_id_(session_id),
         execution_manager_(execution_manager),
         tokenizer_(tokenizer),
         session_info_(session_info),
         session_state_(session_state),
         last_task_ids_(last_task_ids),
-        living_sessions_count_(living_sessions_count) {
+        living_sessions_count_(living_sessions_count),
+        session_handoff_identity_(std::move(session_handoff_identity)) {
     if (living_sessions_count_) {
       (*living_sessions_count_)++;
     }
@@ -292,10 +322,15 @@ class SessionAdvanced : public SessionInterface {
       ABSL_GUARDED_BY(mutex_) = {};
 
   // Mutex for protecting the session state and last task IDs.
-  absl::Mutex mutex_;
+  mutable absl::Mutex mutex_;
 
   // Pointer to the counter of living sessions in Engine.
   std::atomic<int>* living_sessions_count_;
+
+  // Immutable identity derived by the Engine from loaded artifacts and this
+  // session's fully-resolved configuration. Sessions created through legacy
+  // engines leave this absent and fail closed for handoff.
+  const std::optional<SessionHandoffIdentity> session_handoff_identity_;
 };
 
 }  // namespace litert::lm

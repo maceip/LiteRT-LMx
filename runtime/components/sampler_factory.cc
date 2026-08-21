@@ -35,6 +35,7 @@
 #include "litert/cc/litert_environment_options.h"  // from @litert
 #include "litert/cc/litert_macros.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
+#include "runtime/components/greedy_cpu_sampler.h"
 #include "runtime/components/sampler.h"
 #include "runtime/components/top_p_cpu_sampler.h"
 #include "runtime/executor/executor_settings_base.h"
@@ -624,6 +625,9 @@ absl::StatusOr<std::unique_ptr<Sampler>> CreateCpuSampler(
       return TopPSampler::Create(sampler_params.k(), sampler_params.p(),
                                  sampler_params.temperature(), batch_size,
                                  sequence_size, sampler_params.seed());
+    case proto::SamplerParameters::GREEDY:
+      return GreedyCpuSampler::Create(batch_size, sequence_size,
+                                      sampler_params);
     default:
       return absl::UnimplementedError(absl::StrCat(
           "Sampler type: ", sampler_params.type(), " not implemented yet."));
@@ -745,6 +749,11 @@ absl::StatusOr<std::unique_ptr<Sampler>> CreateSampler(
     std::optional<int> sequence_size, std::optional<int> vocab_size,
     std::optional<ActivationDataType> activation_data_type) {
   int sequence_size_value = sequence_size.value_or(1);
+  if (sampler_params.type() == proto::SamplerParameters::GREEDY &&
+      backend != Backend::CPU) {
+    return absl::UnimplementedError(
+        "GREEDY sampling is supported only on CPU.");
+  }
   switch (backend) {
     case Backend::GPU: {
       RET_CHECK(env.has_value())

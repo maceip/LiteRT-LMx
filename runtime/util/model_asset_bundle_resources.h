@@ -16,14 +16,17 @@ limitations under the License.
 #ifndef THIRD_PARTY_ODML_LITERT_LM_RUNTIME_UTIL_MODEL_ASSET_BUNDLE_RESOURCES_H_
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_UTIL_MODEL_ASSET_BUNDLE_RESOURCES_H_
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
+#include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "runtime/util/memory_mapped_file.h"
+#include "runtime/platform/hash/hasher.h"
 #include "runtime/util/scoped_file.h"
 #include "runtime/util/zip_utils.h"
 
@@ -77,17 +80,38 @@ class ModelAssetBundleResources {
   // Lists all the file names in the model asset model.
   std::vector<absl::string_view> ListFiles() const;
 
+  // SHA-256 of the complete retained task bundle, including its container
+  // metadata. The digest is calculated from mapped_model_asset_bundle_file_.
+  const Hash256& GetModelArtifactHash() const { return model_artifact_hash_; }
+
+  // Rehashes the retained bundle mapping. This is a cooperative drift check,
+  // not an atomic seal against concurrent writes through a caller-held alias.
+  absl::Status VerifyModelArtifactHash() const;
+
+  // Checks the retained descriptor size when file-backed, or the retained
+  // mapped extent when the caller supplied only a MemoryMappedFile.
+  absl::Status VerifyModelArtifactSize() const;
+
  private:
   ModelAssetBundleResources(
       std::string tag,
       std::shared_ptr<MemoryMappedFile> mapped_model_asset_bundle_file,
-      absl::flat_hash_map<std::string, OffsetAndSize> files);
+      std::shared_ptr<ScopedFile> retained_model_asset_bundle_file,
+      absl::flat_hash_map<std::string, OffsetAndSize> files,
+      Hash256 model_artifact_hash);
 
   // The model asset bundle resources tag.
   const std::string tag_;
 
   // This owns the memory backing `files_`.
   const std::shared_ptr<MemoryMappedFile> mapped_model_asset_bundle_file_;
+
+  // Kept only for file-backed construction so later admission can fstat the
+  // exact already-open source rather than reopening a caller path.
+  const std::shared_ptr<ScopedFile> retained_model_asset_bundle_file_;
+
+  const uint64_t model_artifact_size_;
+  const Hash256 model_artifact_hash_;
 
   // The files bundled in model asset bundle, as a map with the filename
   // (corresponding to a basename, e.g. "hand_detector.tflite") as key and

@@ -21,6 +21,7 @@
 #include <optional>
 #include <ostream>
 #include <random>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -88,6 +89,20 @@ struct RuntimeState {
   // This is only used by the compiled model executor to determine whether
   // KVCache preparation for prefill or decode should be done.
   bool ran_decode = false;
+};
+
+// Quiescent executor state required for same-profile text-session handoff.
+// Model/runtime/profile identity and authentication live above this layer.
+struct ExecutorSessionSnapshot {
+  // Populated only by the compatibility in-memory path. Streaming paths leave
+  // this empty and transport state through ByteSource/ByteSink.
+  std::string serialized_state;
+  RuntimeConfig runtime_config;
+  int current_step = 0;
+  bool ran_decode = false;
+  std::default_random_engine random_engine;
+  ProcessedTokens::Snapshot processed_tokens;
+  int last_prefill_token_id = 0;
 };
 
 // A resource interface to hold the llm context.

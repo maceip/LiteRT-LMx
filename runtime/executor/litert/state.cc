@@ -15,6 +15,7 @@
 #include "runtime/executor/litert/state.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -22,6 +23,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -44,6 +46,7 @@
 #include "runtime/executor/common_utils.h"
 #include "runtime/executor/litert_compiled_model_executor_utils.h"
 #include "runtime/executor/state_interface.h"
+#include "runtime/platform/hash/sha256_hasher.h"
 #include "runtime/util/status_macros.h"
 #include "runtime/util/tensor_buffer_util.h"
 
@@ -52,6 +55,431 @@ namespace litert::lm {
 namespace {
 
 constexpr int kDynamicDimValue = -1;
+
+// The wire encoding is deliberately independent of host endianness and hash
+// map iteration order. Version 1 always uses SHA-256 as the final 32 bytes.
+// This state format intentionally has a distinct magic from the older
+// LitertKVCache format because LitertState also carries generalized state
+// kinds and allocation policies.
+constexpr std::array<char, 8> kSnapshotMagic = {'L', 'R', 'T', 'S',
+                                                'T', '0', '0', '1'};
+constexpr uint32_t kSnapshotVersion = 1;
+constexpr size_t kSnapshotDigestSize = 32;
+
+using SnapshotDigest = Hash256;
+static_assert(std::tuple_size<decltype(SnapshotDigest::bytes)>::value ==
+                  kSnapshotDigestSize,
+              "LRTST001 requires a 32-byte digest");
+constexpr uint64_t kMaxSha256InputBytes =
+    std::numeric_limits<uint64_t>::max() / 8;
+
+absl::StatusOr<SnapshotDigest> Sha256SourcePrefix(const ByteSource& source,
+                                                  uint64_t size) {
+  if (size > source.Size()) {
+    return absl::OutOfRangeError(
+        "LiteRT state digest range exceeds its byte source.");
+  }
+  if (size > kMaxSha256InputBytes) {
+    return absl::ResourceExhaustedError(
+        "LiteRT state snapshot exceeds the SHA-256 input limit.");
+  }
+  constexpr size_t kDigestChunkBytes = 2 * 1024 * 1024;
+  std::string chunk;
+  chunk.resize(static_cast<size_t>(
+      std::min<uint64_t>(size, static_cast<uint64_t>(kDigestChunkBytes))));
+  Sha256Hasher hasher;
+  uint64_t offset = 0;
+  while (offset < size) {
+    const size_t count = static_cast<size_t>(std::min<uint64_t>(
+        chunk.size(), size - offset));
+    RETURN_IF_ERROR(
+        source.ReadAt(offset, absl::MakeSpan(chunk).subspan(0, count)));
+    hasher.Update(absl::string_view(chunk.data(), count));
+    offset += count;
+  }
+  return hasher.Finalize();
+}
+
+class DigestingByteSink {
+ public:
+  explicit DigestingByteSink(ByteSink* sink) : sink_(sink) {}
+
+  absl::Status Append(absl::string_view bytes) {
+    if (sink_ == nullptr) {
+      return absl::InvalidArgumentError(
+          "LiteRT state snapshot sink must not be null.");
+    }
+    const uintmax_t byte_count = static_cast<uintmax_t>(bytes.size());
+    if (byte_count > kMaxSha256InputBytes - bytes_hashed_) {
+      return absl::ResourceExhaustedError(
+          "LiteRT state snapshot exceeds the SHA-256 input limit.");
+    }
+    RETURN_IF_ERROR(sink_->Append(bytes));
+    hasher_.Update(bytes);
+    bytes_hashed_ += static_cast<uint64_t>(byte_count);
+    return absl::OkStatus();
+  }
+
+  SnapshotDigest Finalize() { return hasher_.Finalize(); }
+
+ private:
+  ByteSink* sink_;
+  Sha256Hasher hasher_;
+  uint64_t bytes_hashed_ = 0;
+};
+
+struct ConstSnapshotBuffer {
+  absl::string_view name;
+  const TensorBuffer* buffer;
+  int32_t state_type;
+  int32_t dynamic_dim;
+};
+
+struct MutableSnapshotBuffer {
+  absl::string_view name;
+  TensorBuffer* buffer;
+  int32_t state_type;
+  int32_t dynamic_dim;
+  proto::StateBuffer::Type live_state_type;
+  std::optional<int> live_dynamic_dim;
+};
+
+struct ParsedSnapshotBuffer {
+  MutableSnapshotBuffer target;
+  TensorBufferType buffer_type = TensorBufferType::kUnknown;
+  uint64_t payload_offset = 0;
+  size_t payload_size = 0;
+  bool shape_changed = false;
+};
+
+struct MetalSnapshotBuffer {
+  ParsedSnapshotBuffer parsed;
+  std::string rollback_bytes;
+  bool has_rollback = false;
+};
+
+template <typename NamedBuffer>
+void SortSnapshotBuffers(std::vector<NamedBuffer>& buffers) {
+  std::sort(buffers.begin(), buffers.end(),
+            [](const NamedBuffer& lhs, const NamedBuffer& rhs) {
+              return lhs.name < rhs.name;
+            });
+}
+
+void AppendU8(uint8_t value, std::string& output) {
+  output.push_back(static_cast<char>(value));
+}
+
+void AppendU32(uint32_t value, std::string& output) {
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    output.push_back(static_cast<char>((value >> shift) & 0xff));
+  }
+}
+
+void AppendI32(int32_t value, std::string& output) {
+  AppendU32(static_cast<uint32_t>(value), output);
+}
+
+void AppendU64(uint64_t value, std::string& output) {
+  for (int shift = 56; shift >= 0; shift -= 8) {
+    output.push_back(static_cast<char>((value >> shift) & 0xff));
+  }
+}
+
+class SourceSnapshotReader {
+ public:
+  SourceSnapshotReader(const ByteSource& source, uint64_t size)
+      : source_(source), size_(size) {}
+
+  absl::StatusOr<uint8_t> ReadU8() {
+    std::array<char, 1> bytes;
+    RETURN_IF_ERROR(ReadBytes(absl::MakeSpan(bytes)));
+    return static_cast<uint8_t>(bytes[0]);
+  }
+
+  absl::StatusOr<uint32_t> ReadU32() {
+    std::array<char, 4> bytes;
+    RETURN_IF_ERROR(ReadBytes(absl::MakeSpan(bytes)));
+    uint32_t value = 0;
+    for (char byte : bytes) {
+      value = (value << 8) | static_cast<uint8_t>(byte);
+    }
+    return value;
+  }
+
+  absl::StatusOr<int32_t> ReadI32() {
+    ASSIGN_OR_RETURN(uint32_t value, ReadU32());
+    if (value <= static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+      return static_cast<int32_t>(value);
+    }
+    return -1 - static_cast<int32_t>(
+                    std::numeric_limits<uint32_t>::max() - value);
+  }
+
+  absl::StatusOr<uint64_t> ReadU64() {
+    std::array<char, 8> bytes;
+    RETURN_IF_ERROR(ReadBytes(absl::MakeSpan(bytes)));
+    uint64_t value = 0;
+    for (char byte : bytes) {
+      value = (value << 8) | static_cast<uint8_t>(byte);
+    }
+    return value;
+  }
+
+  absl::StatusOr<std::string> ReadString(size_t size) {
+    if (size > remaining()) {
+      return absl::DataLossError("Truncated LiteRT state snapshot");
+    }
+    std::string value(size, '\0');
+    RETURN_IF_ERROR(ReadBytes(absl::MakeSpan(value)));
+    return value;
+  }
+
+  absl::Status ReadBytes(absl::Span<char> destination) {
+    if (destination.size() > remaining()) {
+      return absl::DataLossError("Truncated LiteRT state snapshot");
+    }
+    RETURN_IF_ERROR(source_.ReadAt(offset_, destination));
+    offset_ += destination.size();
+    return absl::OkStatus();
+  }
+
+  absl::Status Skip(uint64_t size) {
+    if (size > remaining()) {
+      return absl::DataLossError("Truncated LiteRT state snapshot");
+    }
+    offset_ += size;
+    return absl::OkStatus();
+  }
+
+  uint64_t offset() const { return offset_; }
+  uint64_t remaining() const { return size_ - offset_; }
+  bool empty() const { return offset_ == size_; }
+
+ private:
+  const ByteSource& source_;
+  uint64_t size_;
+  uint64_t offset_ = 0;
+};
+
+absl::Status IncompatibleSnapshot(absl::string_view field,
+                                  absl::string_view tensor_name = {}) {
+  if (tensor_name.empty()) {
+    return absl::FailedPreconditionError(
+        absl::StrCat("LiteRT state snapshot has incompatible ", field));
+  }
+  return absl::FailedPreconditionError(absl::StrCat(
+      "LiteRT state snapshot has incompatible ", field, " for ", tensor_name));
+}
+
+template <typename CanonicalBank, typename SecondaryBank>
+absl::Status ValidateMatchingStateBankNames(
+    const CanonicalBank& canonical_bank, const SecondaryBank& secondary_bank) {
+  if (canonical_bank.size() != secondary_bank.size()) {
+    return absl::FailedPreconditionError(
+        "LiteRT state banks have different tensor counts");
+  }
+  for (const auto& [name, _] : secondary_bank) {
+    if (!canonical_bank.contains(name)) {
+      return absl::FailedPreconditionError(
+          "LiteRT state banks have different tensor names");
+    }
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateBufferByteRange(size_t packed_size, size_t size,
+                                     size_t offset,
+                                     absl::string_view tensor_name) {
+  if (offset > size || packed_size > size - offset) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "LiteRT state buffer has an invalid byte range for ", tensor_name));
+  }
+  return absl::OkStatus();
+}
+
+absl::Status NullMappedAddress(TensorBuffer& buffer,
+                               absl::string_view operation) {
+  const absl::Status unlock_status = buffer.Unlock();
+  if (!unlock_status.ok()) {
+    return absl::InternalError(absl::StrCat(
+        "LiteRT tensor buffer returned a null mapped address during ",
+        operation, "; unlock also failed: ", unlock_status.message()));
+  }
+  return absl::InternalError(absl::StrCat(
+      "LiteRT tensor buffer returned a null mapped address during ",
+      operation));
+}
+
+absl::Status ValidateEquivalentBuffer(const TensorBuffer& expected,
+                                      const TensorBuffer& actual,
+                                      absl::string_view tensor_name) {
+  LITERT_ASSIGN_OR_RETURN(auto expected_buffer_type, expected.BufferType());
+  LITERT_ASSIGN_OR_RETURN(auto actual_buffer_type, actual.BufferType());
+  if (expected_buffer_type != actual_buffer_type) {
+    return IncompatibleSnapshot("staging buffer type", tensor_name);
+  }
+
+  LITERT_ASSIGN_OR_RETURN(auto expected_tensor_type, expected.TensorType());
+  LITERT_ASSIGN_OR_RETURN(auto actual_tensor_type, actual.TensorType());
+  if (expected_tensor_type != actual_tensor_type) {
+    return IncompatibleSnapshot("staging tensor type", tensor_name);
+  }
+
+  LITERT_ASSIGN_OR_RETURN(size_t expected_packed_size, expected.PackedSize());
+  LITERT_ASSIGN_OR_RETURN(size_t actual_packed_size, actual.PackedSize());
+  LITERT_ASSIGN_OR_RETURN(size_t expected_size, expected.Size());
+  LITERT_ASSIGN_OR_RETURN(size_t actual_size, actual.Size());
+  LITERT_ASSIGN_OR_RETURN(size_t expected_offset, expected.Offset());
+  LITERT_ASSIGN_OR_RETURN(size_t actual_offset, actual.Offset());
+  RETURN_IF_ERROR(ValidateBufferByteRange(expected_packed_size, expected_size,
+                                          expected_offset, tensor_name));
+  RETURN_IF_ERROR(ValidateBufferByteRange(actual_packed_size, actual_size,
+                                          actual_offset, tensor_name));
+  if (expected_packed_size != actual_packed_size ||
+      expected_size != actual_size || expected_offset != actual_offset) {
+    return IncompatibleSnapshot("staging buffer layout", tensor_name);
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<TensorBuffer> CreateStagingBuffer(
+    Environment& env, const TensorBuffer& target,
+    absl::string_view tensor_name) {
+  LITERT_ASSIGN_OR_RETURN(auto tensor_type, target.TensorType());
+  LITERT_ASSIGN_OR_RETURN(auto buffer_type, target.BufferType());
+  LITERT_ASSIGN_OR_RETURN(size_t size, target.Size());
+  LITERT_ASSIGN_OR_RETURN(
+      TensorBuffer staged,
+      TensorBuffer::CreateManaged(env, buffer_type, tensor_type, size));
+  ABSL_RETURN_IF_ERROR(ValidateEquivalentBuffer(target, staged, tensor_name));
+  return staged;
+}
+
+absl::StatusOr<TensorBuffer> CreateReshapedStagingBuffer(
+    Environment& env, const TensorBuffer& target, int dynamic_dim,
+    int num_entries, absl::string_view tensor_name) {
+  LITERT_ASSIGN_OR_RETURN(auto target_tensor_type, target.TensorType());
+  const Layout& target_layout = target_tensor_type.Layout();
+  if (dynamic_dim < 0 ||
+      static_cast<uint32_t>(dynamic_dim) >= target_layout.Rank()) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "LiteRT state has an invalid dynamic dimension for ", tensor_name));
+  }
+  if (target_layout.HasStrides()) {
+    return absl::UnimplementedError(absl::StrCat(
+        "Cannot reshape a strided LiteRT state buffer for ", tensor_name));
+  }
+
+  std::vector<int> dimensions(target_layout.Dimensions().begin(),
+                              target_layout.Dimensions().end());
+  dimensions[dynamic_dim] = num_entries;
+  Layout reshaped_layout(Dimensions(dimensions.begin(), dimensions.end()));
+  RankedTensorType reshaped_tensor_type(target_tensor_type.ElementType(),
+                                        std::move(reshaped_layout));
+  LITERT_ASSIGN_OR_RETURN(size_t reshaped_size,
+                          reshaped_tensor_type.Bytes());
+  LITERT_ASSIGN_OR_RETURN(auto buffer_type, target.BufferType());
+  LITERT_ASSIGN_OR_RETURN(
+      TensorBuffer staged,
+      TensorBuffer::CreateManaged(env, buffer_type, reshaped_tensor_type,
+                                  reshaped_size));
+
+  LITERT_ASSIGN_OR_RETURN(auto staged_buffer_type, staged.BufferType());
+  LITERT_ASSIGN_OR_RETURN(auto staged_tensor_type, staged.TensorType());
+  LITERT_ASSIGN_OR_RETURN(size_t staged_packed_size, staged.PackedSize());
+  LITERT_ASSIGN_OR_RETURN(size_t staged_size, staged.Size());
+  LITERT_ASSIGN_OR_RETURN(size_t staged_offset, staged.Offset());
+  RETURN_IF_ERROR(ValidateBufferByteRange(
+      staged_packed_size, staged_size, staged_offset, tensor_name));
+  if (staged_buffer_type != buffer_type ||
+      staged_tensor_type != reshaped_tensor_type ||
+      staged_packed_size != reshaped_size || staged_size != reshaped_size ||
+      staged_offset != 0) {
+    return IncompatibleSnapshot("reshaped staging buffer layout", tensor_name);
+  }
+  return staged;
+}
+
+absl::StatusOr<std::string> ReadBufferBytes(TensorBuffer& buffer,
+                                            size_t packed_size) {
+  std::string bytes;
+  if (packed_size > bytes.max_size()) {
+    return absl::ResourceExhaustedError(
+        "LiteRT rollback buffer exceeds std::string capacity.");
+  }
+  bytes.resize(packed_size);
+  LITERT_ASSIGN_OR_RETURN(void* address,
+                          buffer.Lock(TensorBuffer::LockMode::kRead));
+  if (packed_size != 0) {
+    if (address == nullptr) {
+      return NullMappedAddress(buffer, "rollback read");
+    }
+    std::memcpy(bytes.data(), address, packed_size);
+  }
+  LITERT_RETURN_IF_ERROR(buffer.Unlock());
+  return bytes;
+}
+
+absl::Status WriteBufferBytes(TensorBuffer& buffer, absl::string_view bytes,
+                              bool* bytes_written) {
+  *bytes_written = false;
+  LITERT_ASSIGN_OR_RETURN(void* address,
+                          buffer.Lock(TensorBuffer::LockMode::kWrite));
+  if (!bytes.empty()) {
+    if (address == nullptr) {
+      return NullMappedAddress(buffer, "rollback write");
+    }
+    std::memcpy(address, bytes.data(), bytes.size());
+  }
+  *bytes_written = true;
+  return buffer.Unlock();
+}
+
+absl::Status WriteBufferFromSource(TensorBuffer& buffer,
+                                   const ByteSource& source,
+                                   uint64_t source_offset, size_t size,
+                                   bool* buffer_may_be_modified) {
+  *buffer_may_be_modified = false;
+  LITERT_ASSIGN_OR_RETURN(void* address,
+                          buffer.Lock(TensorBuffer::LockMode::kWrite));
+  absl::Status read_status = absl::OkStatus();
+  if (size != 0) {
+    if (address == nullptr) {
+      // A backend that reports a successful write lock with no mapped address
+      // is already outside the lock contract. Conservatively include this
+      // buffer in Metal rollback because unlock may still have synchronized
+      // backend-owned staging memory.
+      *buffer_may_be_modified = true;
+      return NullMappedAddress(buffer, "snapshot restore");
+    }
+    // A failing source is allowed to have filled a prefix before reporting its
+    // error, so mark the buffer dirty before entering the call.
+    *buffer_may_be_modified = true;
+    read_status = source.ReadAt(
+        source_offset, absl::Span<char>(static_cast<char*>(address), size));
+  }
+  const absl::Status unlock_status = buffer.Unlock();
+  if (!read_status.ok()) return read_status;
+  if (!unlock_status.ok()) return unlock_status;
+  *buffer_may_be_modified = size != 0;
+  return absl::OkStatus();
+}
+
+absl::Status RollBackMetalBuffers(std::vector<MetalSnapshotBuffer>& buffers,
+                                  size_t count) {
+  absl::Status first_failure = absl::OkStatus();
+  while (count > 0) {
+    --count;
+    if (!buffers[count].has_rollback) continue;
+    bool bytes_written = false;
+    const absl::Status rollback = WriteBufferBytes(
+        *buffers[count].parsed.target.buffer, buffers[count].rollback_bytes,
+        &bytes_written);
+    if (!rollback.ok() && first_failure.ok()) first_failure = rollback;
+  }
+  return first_failure;
+}
 
 absl::StatusOr<std::optional<int>> GetDynamicDimIndex(
     const CompiledModel& compiled_model, absl::string_view signature,
@@ -214,6 +642,666 @@ absl::StatusOr<std::unique_ptr<LitertState>> LitertState::Create(
                              clear_kv_cache_before_prefill);
 }
 
+absl::StatusOr<uint64_t> LitertState::SerializedSize() const {
+  if (batch_size_ < 0 || num_entries_ < 0) {
+    return absl::FailedPreconditionError(
+        "Cannot size an invalid LiteRT state shape");
+  }
+  switch (allocation_policy_) {
+    case AllocationPolicy::kInplace:
+    case AllocationPolicy::kGpuOptimizedInplace:
+      if (bank_2_state_buffers_.has_value()) {
+        return absl::FailedPreconditionError(
+            "In-place LiteRT state unexpectedly has a second bank");
+      }
+      break;
+    case AllocationPolicy::kPingPong:
+      if (!bank_2_state_buffers_.has_value()) {
+        return absl::FailedPreconditionError(
+            "Ping-pong LiteRT state is missing its second bank");
+      }
+      break;
+    default:
+      return absl::FailedPreconditionError(
+          "LiteRT state has an unknown allocation policy");
+  }
+  if (bank_2_state_buffers_.has_value()) {
+    RETURN_IF_ERROR(ValidateMatchingStateBankNames(
+        bank_1_state_buffers_, *bank_2_state_buffers_));
+  }
+
+  const auto* active_state_buffers = &bank_1_state_buffers_;
+  if (bank_2_state_buffers_.has_value() && !bank_1_is_input_) {
+    active_state_buffers = &*bank_2_state_buffers_;
+  }
+  if (active_state_buffers->size() != bank_1_state_buffers_.size() ||
+      active_state_buffers->size() > std::numeric_limits<uint32_t>::max()) {
+    return absl::FailedPreconditionError(
+        "LiteRT state has an invalid active tensor bank");
+  }
+
+  uint64_t total = kSnapshotMagic.size() + 5 * sizeof(uint32_t);
+  auto add = [&total](uint64_t bytes) -> absl::Status {
+    if (bytes > std::numeric_limits<uint64_t>::max() - total) {
+      return absl::ResourceExhaustedError(
+          "LiteRT state snapshot byte count overflow.");
+    }
+    total += bytes;
+    return absl::OkStatus();
+  };
+  for (const auto& [name, active_state_buffer] : *active_state_buffers) {
+    const auto canonical = bank_1_state_buffers_.find(name);
+    if (canonical == bank_1_state_buffers_.end()) {
+      return absl::FailedPreconditionError(
+          "LiteRT state banks have different tensor names");
+    }
+    if (active_state_buffer.type != canonical->second.type) {
+      return absl::FailedPreconditionError(
+          "LiteRT state banks have different state types");
+    }
+    const int dynamic_dim =
+        canonical->second.dynamic_dim.value_or(kDynamicDimValue);
+    if (dynamic_dim < kDynamicDimValue ||
+        name.size() > std::numeric_limits<uint32_t>::max()) {
+      return absl::FailedPreconditionError(
+          "LiteRT state has invalid snapshot metadata");
+    }
+    LITERT_ASSIGN_OR_RETURN(auto buffer_type,
+                            active_state_buffer.buffer.BufferType());
+    (void)buffer_type;
+    LITERT_ASSIGN_OR_RETURN(auto tensor_type,
+                            active_state_buffer.buffer.TensorType());
+    const Layout& layout = tensor_type.Layout();
+    if (dynamic_dim >= 0 &&
+        static_cast<uint32_t>(dynamic_dim) >= layout.Rank()) {
+      return absl::FailedPreconditionError(
+          "LiteRT state has an out-of-range dynamic dimension");
+    }
+    LITERT_ASSIGN_OR_RETURN(size_t packed_size,
+                            active_state_buffer.buffer.PackedSize());
+    LITERT_ASSIGN_OR_RETURN(size_t size,
+                            active_state_buffer.buffer.Size());
+    LITERT_ASSIGN_OR_RETURN(size_t offset,
+                            active_state_buffer.buffer.Offset());
+    RETURN_IF_ERROR(
+        ValidateBufferByteRange(packed_size, size, offset, name));
+
+    RETURN_IF_ERROR(add(sizeof(uint32_t)));
+    RETURN_IF_ERROR(add(name.size()));
+    // state type, dynamic dim, buffer type, element type, and rank.
+    RETURN_IF_ERROR(add(5 * sizeof(uint32_t)));
+    RETURN_IF_ERROR(
+        add(static_cast<uint64_t>(layout.Dimensions().size()) *
+            sizeof(uint32_t)));
+    RETURN_IF_ERROR(add(sizeof(uint8_t)));
+    if (layout.HasStrides()) {
+      RETURN_IF_ERROR(
+          add(static_cast<uint64_t>(layout.Strides().size()) *
+              sizeof(uint32_t)));
+    }
+    RETURN_IF_ERROR(add(3 * sizeof(uint64_t)));
+    RETURN_IF_ERROR(add(packed_size));
+  }
+  if (total > kMaxSha256InputBytes) {
+    return absl::ResourceExhaustedError(
+        "LiteRT state snapshot exceeds the SHA-256 input limit.");
+  }
+  RETURN_IF_ERROR(add(kSnapshotDigestSize));
+  return total;
+}
+
+absl::StatusOr<std::string> LitertState::Serialize() const {
+  ASSIGN_OR_RETURN(const uint64_t serialized_size, SerializedSize());
+  std::string output;
+  if (serialized_size > std::numeric_limits<size_t>::max() ||
+      serialized_size > output.max_size()) {
+    return absl::ResourceExhaustedError(
+        "LiteRT state snapshot exceeds std::string capacity.");
+  }
+  output.reserve(static_cast<size_t>(serialized_size));
+  StringByteSink sink(&output);
+  RETURN_IF_ERROR(SerializeTo(&sink));
+  if (output.size() != serialized_size) {
+    return absl::InternalError(
+        "LiteRT state snapshot size changed during serialization.");
+  }
+  return output;
+}
+
+absl::Status LitertState::SerializeTo(ByteSink* sink) const {
+  if (sink == nullptr) {
+    return absl::InvalidArgumentError(
+        "LiteRT state snapshot sink must not be null.");
+  }
+  if (batch_size_ < 0 || num_entries_ < 0) {
+    return absl::FailedPreconditionError(
+        "Cannot serialize an invalid LiteRT state shape");
+  }
+
+  switch (allocation_policy_) {
+    case AllocationPolicy::kInplace:
+    case AllocationPolicy::kGpuOptimizedInplace:
+      if (bank_2_state_buffers_.has_value()) {
+        return absl::FailedPreconditionError(
+            "In-place LiteRT state unexpectedly has a second bank");
+      }
+      break;
+    case AllocationPolicy::kPingPong:
+      if (!bank_2_state_buffers_.has_value()) {
+        return absl::FailedPreconditionError(
+            "Ping-pong LiteRT state is missing its second bank");
+      }
+      break;
+    default:
+      return absl::FailedPreconditionError(
+          "LiteRT state has an unknown allocation policy");
+  }
+  if (bank_2_state_buffers_.has_value()) {
+    RETURN_IF_ERROR(ValidateMatchingStateBankNames(
+        bank_1_state_buffers_, *bank_2_state_buffers_));
+  }
+
+  const auto* active_state_buffers = &bank_1_state_buffers_;
+  if (bank_2_state_buffers_.has_value() && !bank_1_is_input_) {
+    active_state_buffers = &*bank_2_state_buffers_;
+  }
+  if (active_state_buffers->size() != bank_1_state_buffers_.size()) {
+    return absl::FailedPreconditionError(
+        "LiteRT state banks have different tensor counts");
+  }
+
+  std::vector<ConstSnapshotBuffer> buffers;
+  buffers.reserve(active_state_buffers->size());
+  for (const auto& [name, active_state_buffer] : *active_state_buffers) {
+    auto canonical = bank_1_state_buffers_.find(name);
+    if (canonical == bank_1_state_buffers_.end()) {
+      return absl::FailedPreconditionError(
+          "LiteRT state banks have different tensor names");
+    }
+    if (active_state_buffer.type != canonical->second.type) {
+      return absl::FailedPreconditionError(
+          "LiteRT state banks have different state types");
+    }
+    const int dynamic_dim =
+        canonical->second.dynamic_dim.value_or(kDynamicDimValue);
+    if (dynamic_dim < kDynamicDimValue) {
+      return absl::FailedPreconditionError(
+          "LiteRT state has an invalid dynamic dimension");
+    }
+    buffers.push_back(ConstSnapshotBuffer{
+        .name = name,
+        .buffer = &active_state_buffer.buffer,
+        .state_type = static_cast<int32_t>(canonical->second.type),
+        .dynamic_dim = dynamic_dim,
+    });
+  }
+  SortSnapshotBuffers(buffers);
+  if (buffers.size() > std::numeric_limits<uint32_t>::max()) {
+    return absl::ResourceExhaustedError(
+        "Too many tensors in LiteRT state snapshot");
+  }
+
+  DigestingByteSink writer(sink);
+  std::string header(kSnapshotMagic.data(), kSnapshotMagic.size());
+  AppendU32(kSnapshotVersion, header);
+  AppendU32(static_cast<uint32_t>(allocation_policy_), header);
+  AppendU32(static_cast<uint32_t>(batch_size_), header);
+  AppendU32(static_cast<uint32_t>(num_entries_), header);
+  AppendU32(static_cast<uint32_t>(buffers.size()), header);
+  RETURN_IF_ERROR(writer.Append(header));
+
+  for (const ConstSnapshotBuffer& named_buffer : buffers) {
+    if (named_buffer.name.size() > std::numeric_limits<uint32_t>::max()) {
+      return absl::ResourceExhaustedError(
+          "Tensor name is too large for LiteRT state snapshot");
+    }
+
+    LITERT_ASSIGN_OR_RETURN(auto buffer_type,
+                            named_buffer.buffer->BufferType());
+    LITERT_ASSIGN_OR_RETURN(auto tensor_type,
+                            named_buffer.buffer->TensorType());
+    const Layout& layout = tensor_type.Layout();
+    if (named_buffer.dynamic_dim >= 0 &&
+        static_cast<uint32_t>(named_buffer.dynamic_dim) >= layout.Rank()) {
+      return absl::FailedPreconditionError(
+          "LiteRT state has an out-of-range dynamic dimension");
+    }
+    LITERT_ASSIGN_OR_RETURN(size_t packed_size,
+                            named_buffer.buffer->PackedSize());
+    LITERT_ASSIGN_OR_RETURN(size_t size, named_buffer.buffer->Size());
+    LITERT_ASSIGN_OR_RETURN(size_t offset, named_buffer.buffer->Offset());
+    RETURN_IF_ERROR(ValidateBufferByteRange(
+        packed_size, size, offset, named_buffer.name));
+
+    std::string metadata;
+    AppendU32(static_cast<uint32_t>(named_buffer.name.size()), metadata);
+    metadata.append(named_buffer.name.data(), named_buffer.name.size());
+    AppendI32(named_buffer.state_type, metadata);
+    AppendI32(named_buffer.dynamic_dim, metadata);
+    AppendU32(static_cast<uint32_t>(buffer_type), metadata);
+    AppendU32(static_cast<uint32_t>(tensor_type.ElementType()), metadata);
+    AppendU32(layout.Rank(), metadata);
+    for (int32_t dimension : layout.Dimensions()) {
+      AppendI32(dimension, metadata);
+    }
+    AppendU8(layout.HasStrides() ? 1 : 0, metadata);
+    if (layout.HasStrides()) {
+      for (uint32_t stride : layout.Strides()) {
+        AppendU32(stride, metadata);
+      }
+    }
+    AppendU64(static_cast<uint64_t>(packed_size), metadata);
+    AppendU64(static_cast<uint64_t>(size), metadata);
+    AppendU64(static_cast<uint64_t>(offset), metadata);
+    RETURN_IF_ERROR(writer.Append(metadata));
+
+    // Duplicate provides a non-const handle to the same allocation so that an
+    // unlock failure can be observed and returned to the caller.
+    LITERT_ASSIGN_OR_RETURN(TensorBuffer readable,
+                            named_buffer.buffer->Duplicate());
+    LITERT_ASSIGN_OR_RETURN(void* address,
+                            readable.Lock(TensorBuffer::LockMode::kRead));
+    absl::Status append_status = absl::OkStatus();
+    if (packed_size != 0) {
+      if (address == nullptr) {
+        return NullMappedAddress(readable, "snapshot serialization");
+      }
+      append_status = writer.Append(absl::string_view(
+          static_cast<const char*>(address), packed_size));
+    }
+    const absl::Status unlock_status = readable.Unlock();
+    if (!append_status.ok()) return append_status;
+    LITERT_RETURN_IF_ERROR(unlock_status);
+  }
+
+  const SnapshotDigest digest = writer.Finalize();
+  return sink->Append(absl::string_view(
+      reinterpret_cast<const char*>(digest.bytes.data()),
+      digest.bytes.size()));
+}
+
+absl::Status LitertState::Load(absl::string_view serialized_state) {
+  StringByteSource source(serialized_state);
+  return LoadFrom(source, /*target_is_disposable=*/false);
+}
+
+absl::Status LitertState::LoadFrom(const ByteSource& source,
+                                   bool target_is_disposable) {
+  const uint64_t source_size = source.Size();
+  if (source_size <= kSnapshotDigestSize) {
+    return absl::DataLossError("Truncated LiteRT state snapshot");
+  }
+  if (batch_size_ < 0 || num_entries_ < 0) {
+    return absl::FailedPreconditionError(
+        "Cannot load into an invalid LiteRT state shape");
+  }
+
+  switch (allocation_policy_) {
+    case AllocationPolicy::kInplace:
+    case AllocationPolicy::kGpuOptimizedInplace:
+      if (bank_2_state_buffers_.has_value()) {
+        return absl::FailedPreconditionError(
+            "In-place LiteRT state unexpectedly has a second bank");
+      }
+      break;
+    case AllocationPolicy::kPingPong:
+      if (!bank_2_state_buffers_.has_value()) {
+        return absl::FailedPreconditionError(
+            "Ping-pong LiteRT state is missing its second bank");
+      }
+      break;
+    default:
+      return absl::FailedPreconditionError(
+          "LiteRT state has an unknown allocation policy");
+  }
+  if (bank_2_state_buffers_.has_value()) {
+    RETURN_IF_ERROR(ValidateMatchingStateBankNames(
+        bank_1_state_buffers_, *bank_2_state_buffers_));
+  }
+
+  const uint64_t encoded_size = source_size - kSnapshotDigestSize;
+  ASSIGN_OR_RETURN(const SnapshotDigest expected_digest,
+                   Sha256SourcePrefix(source, encoded_size));
+  std::array<char, kSnapshotDigestSize> encoded_digest;
+  RETURN_IF_ERROR(source.ReadAt(encoded_size, absl::MakeSpan(encoded_digest)));
+  uint8_t digest_difference = 0;
+  for (size_t i = 0; i < expected_digest.bytes.size(); ++i) {
+    digest_difference |=
+        expected_digest.bytes[i] ^ static_cast<uint8_t>(encoded_digest[i]);
+  }
+  if (digest_difference != 0) {
+    return absl::DataLossError("LiteRT state snapshot digest mismatch");
+  }
+
+  auto* active_state_buffers = &bank_1_state_buffers_;
+  if (bank_2_state_buffers_.has_value() && !bank_1_is_input_) {
+    active_state_buffers = &*bank_2_state_buffers_;
+  }
+  if (active_state_buffers->size() != bank_1_state_buffers_.size()) {
+    return absl::FailedPreconditionError(
+        "LiteRT state banks have different tensor counts");
+  }
+
+  std::vector<MutableSnapshotBuffer> expected_buffers;
+  expected_buffers.reserve(active_state_buffers->size());
+  for (auto& [name, active_state_buffer] : *active_state_buffers) {
+    auto canonical = bank_1_state_buffers_.find(name);
+    if (canonical == bank_1_state_buffers_.end()) {
+      return absl::FailedPreconditionError(
+          "LiteRT state banks have different tensor names");
+    }
+    if (active_state_buffer.type != canonical->second.type) {
+      return absl::FailedPreconditionError(
+          "LiteRT state banks have different state types");
+    }
+    expected_buffers.push_back(MutableSnapshotBuffer{
+        .name = name,
+        .buffer = &active_state_buffer.buffer,
+        .state_type = static_cast<int32_t>(canonical->second.type),
+        .dynamic_dim =
+            canonical->second.dynamic_dim.value_or(kDynamicDimValue),
+        .live_state_type = active_state_buffer.type,
+        .live_dynamic_dim = active_state_buffer.dynamic_dim,
+    });
+  }
+  SortSnapshotBuffers(expected_buffers);
+
+  SourceSnapshotReader reader(source, encoded_size);
+  std::array<char, kSnapshotMagic.size()> magic;
+  RETURN_IF_ERROR(reader.ReadBytes(absl::MakeSpan(magic)));
+  if (!std::equal(magic.begin(), magic.end(), kSnapshotMagic.begin())) {
+    return absl::DataLossError("Invalid LiteRT state snapshot magic");
+  }
+  ABSL_ASSIGN_OR_RETURN(uint32_t version, reader.ReadU32());
+  if (version != kSnapshotVersion) {
+    return IncompatibleSnapshot("format version");
+  }
+  ABSL_ASSIGN_OR_RETURN(uint32_t allocation_policy, reader.ReadU32());
+  if (allocation_policy >
+      static_cast<uint32_t>(AllocationPolicy::kGpuOptimizedInplace)) {
+    return absl::DataLossError(
+        "Invalid allocation policy in LiteRT state snapshot");
+  }
+  if (allocation_policy != static_cast<uint32_t>(allocation_policy_)) {
+    return IncompatibleSnapshot("allocation policy");
+  }
+
+  ABSL_ASSIGN_OR_RETURN(uint32_t batch_size, reader.ReadU32());
+  ABSL_ASSIGN_OR_RETURN(uint32_t num_entries, reader.ReadU32());
+  ABSL_ASSIGN_OR_RETURN(uint32_t tensor_count, reader.ReadU32());
+  if (batch_size != static_cast<uint32_t>(batch_size_)) {
+    return IncompatibleSnapshot("batch size");
+  }
+  if (num_entries >
+      static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+    return absl::DataLossError(
+        "Invalid entry count in LiteRT state snapshot");
+  }
+  if (tensor_count != expected_buffers.size()) {
+    return IncompatibleSnapshot("tensor count");
+  }
+  const int snapshot_num_entries = static_cast<int>(num_entries);
+  const bool entry_count_changed = snapshot_num_entries != num_entries_;
+  if (entry_count_changed) {
+    if (snapshot_num_entries == 0) {
+      return IncompatibleSnapshot("entry count");
+    }
+    if (bank_2_state_buffers_.has_value()) {
+      return absl::UnimplementedError(
+          "Cannot reshape a ping-pong LiteRT state during snapshot restore");
+    }
+    const bool has_dynamic_buffer =
+        std::any_of(expected_buffers.begin(), expected_buffers.end(),
+                    [](const MutableSnapshotBuffer& buffer) {
+                      return buffer.dynamic_dim >= 0;
+                    });
+    if (!has_dynamic_buffer) {
+      return IncompatibleSnapshot("entry count");
+    }
+  }
+
+  std::vector<ParsedSnapshotBuffer> parsed_buffers;
+  parsed_buffers.reserve(expected_buffers.size());
+  for (const MutableSnapshotBuffer& expected : expected_buffers) {
+    ABSL_ASSIGN_OR_RETURN(uint32_t name_size, reader.ReadU32());
+    if (name_size > 1024 * 1024) {
+      return absl::ResourceExhaustedError(
+          "Tensor name exceeds LiteRT state snapshot limit");
+    }
+    ASSIGN_OR_RETURN(std::string name, reader.ReadString(name_size));
+    if (name != expected.name) {
+      return IncompatibleSnapshot("canonical tensor order or name");
+    }
+
+    ABSL_ASSIGN_OR_RETURN(int32_t state_type, reader.ReadI32());
+    ABSL_ASSIGN_OR_RETURN(int32_t dynamic_dim, reader.ReadI32());
+    if (state_type != expected.state_type) {
+      return IncompatibleSnapshot("state type", name);
+    }
+    if (dynamic_dim != expected.dynamic_dim) {
+      return IncompatibleSnapshot("dynamic dimension", name);
+    }
+
+    LITERT_ASSIGN_OR_RETURN(auto target_buffer_type,
+                            expected.buffer->BufferType());
+    LITERT_ASSIGN_OR_RETURN(auto target_tensor_type,
+                            expected.buffer->TensorType());
+    const Layout& target_layout = target_tensor_type.Layout();
+    if (expected.dynamic_dim >= 0 &&
+        static_cast<uint32_t>(expected.dynamic_dim) >= target_layout.Rank()) {
+      return absl::FailedPreconditionError(
+          "LiteRT state has an out-of-range dynamic dimension");
+    }
+    LITERT_ASSIGN_OR_RETURN(size_t target_packed_size,
+                            expected.buffer->PackedSize());
+    LITERT_ASSIGN_OR_RETURN(size_t target_size, expected.buffer->Size());
+    LITERT_ASSIGN_OR_RETURN(size_t target_offset, expected.buffer->Offset());
+    RETURN_IF_ERROR(ValidateBufferByteRange(
+        target_packed_size, target_size, target_offset, name));
+
+    ABSL_ASSIGN_OR_RETURN(uint32_t buffer_type, reader.ReadU32());
+    ABSL_ASSIGN_OR_RETURN(uint32_t element_type, reader.ReadU32());
+    ABSL_ASSIGN_OR_RETURN(uint32_t rank, reader.ReadU32());
+    if (buffer_type != static_cast<uint32_t>(target_buffer_type)) {
+      return IncompatibleSnapshot("buffer type", name);
+    }
+    if (element_type !=
+        static_cast<uint32_t>(target_tensor_type.ElementType())) {
+      return IncompatibleSnapshot("element type", name);
+    }
+    if (rank != target_layout.Rank()) {
+      return IncompatibleSnapshot("rank", name);
+    }
+    std::vector<int32_t> snapshot_dimensions;
+    snapshot_dimensions.reserve(rank);
+    bool shape_changed = false;
+    for (uint32_t dimension_index = 0; dimension_index < rank;
+         ++dimension_index) {
+      ABSL_ASSIGN_OR_RETURN(int32_t dimension, reader.ReadI32());
+      const int32_t target_dimension =
+          target_layout.Dimensions()[dimension_index];
+      if (dimension < 0) {
+        return absl::DataLossError(absl::StrCat(
+            "Invalid dimension in LiteRT state snapshot for ", name));
+      }
+      if (expected.dynamic_dim == static_cast<int32_t>(dimension_index)) {
+        if (target_dimension != num_entries_) {
+          return absl::FailedPreconditionError(absl::StrCat(
+              "LiteRT state has an inconsistent live dynamic dimension for ",
+              name));
+        }
+        if (dimension != snapshot_num_entries) {
+          return IncompatibleSnapshot("dynamic dimension size", name);
+        }
+      } else if (dimension != target_dimension) {
+        return IncompatibleSnapshot("dimensions", name);
+      }
+      shape_changed |= dimension != target_dimension;
+      snapshot_dimensions.push_back(dimension);
+    }
+    ABSL_ASSIGN_OR_RETURN(uint8_t has_strides, reader.ReadU8());
+    if (has_strides > 1) {
+      return absl::DataLossError(
+          "Invalid stride flag in LiteRT state snapshot");
+    }
+    if ((has_strides != 0) != target_layout.HasStrides()) {
+      return IncompatibleSnapshot("stride layout", name);
+    }
+    if (target_layout.HasStrides()) {
+      for (uint32_t target_stride : target_layout.Strides()) {
+        ABSL_ASSIGN_OR_RETURN(uint32_t stride, reader.ReadU32());
+        if (stride != target_stride) {
+          return IncompatibleSnapshot("strides", name);
+        }
+      }
+    }
+
+    size_t expected_packed_size = target_packed_size;
+    size_t expected_size = target_size;
+    size_t expected_offset = target_offset;
+    if (shape_changed) {
+      if (expected.dynamic_dim < 0 || target_layout.HasStrides()) {
+        return IncompatibleSnapshot("dynamic dimensions", name);
+      }
+      Layout snapshot_layout(
+          Dimensions(snapshot_dimensions.begin(), snapshot_dimensions.end()));
+      RankedTensorType snapshot_tensor_type(target_tensor_type.ElementType(),
+                                            std::move(snapshot_layout));
+      LITERT_ASSIGN_OR_RETURN(expected_packed_size,
+                              snapshot_tensor_type.Bytes());
+      // LitertState::Resize produces a managed, tightly packed allocation.
+      // Requiring that canonical layout prevents a snapshot from using a
+      // shape change to smuggle arbitrary backing-store offsets or padding.
+      expected_size = expected_packed_size;
+      expected_offset = 0;
+    }
+
+    ABSL_ASSIGN_OR_RETURN(uint64_t packed_size, reader.ReadU64());
+    ABSL_ASSIGN_OR_RETURN(uint64_t size, reader.ReadU64());
+    ABSL_ASSIGN_OR_RETURN(uint64_t offset, reader.ReadU64());
+    if (packed_size != static_cast<uint64_t>(expected_packed_size)) {
+      return IncompatibleSnapshot("packed byte size", name);
+    }
+    if (size != static_cast<uint64_t>(expected_size)) {
+      return IncompatibleSnapshot("underlying byte size", name);
+    }
+    if (offset != static_cast<uint64_t>(expected_offset)) {
+      return IncompatibleSnapshot("buffer offset", name);
+    }
+    const uint64_t payload_offset = reader.offset();
+    RETURN_IF_ERROR(reader.Skip(expected_packed_size));
+    parsed_buffers.push_back(ParsedSnapshotBuffer{
+        .target = expected,
+        .buffer_type = target_buffer_type,
+        .payload_offset = payload_offset,
+        .payload_size = expected_packed_size,
+        .shape_changed = shape_changed,
+    });
+  }
+  if (!reader.empty()) {
+    return absl::DataLossError("Trailing data in LiteRT state snapshot");
+  }
+
+  // Stage and populate every non-Metal tensor before replacing the live map.
+  // LiteRT currently avoids managed Metal allocations because they leak on the
+  // supported Apple GPU path (b/505373949). Metal tensors therefore retain
+  // their existing allocation: first retain an ordinary duplicate handle and
+  // a host rollback copy, then update them only after every other allocation,
+  // lock, copy, and structural check has succeeded. Any failed Metal write is
+  // rolled back before this method returns.
+  absl::flat_hash_map<std::string, StateBuffer> staged_state_buffers;
+  staged_state_buffers.reserve(active_state_buffers->size());
+  std::vector<MetalSnapshotBuffer> metal_buffers;
+  for (const ParsedSnapshotBuffer& parsed : parsed_buffers) {
+    if (::litert::IsMetalMemory(parsed.buffer_type)) {
+      if (parsed.shape_changed) {
+        return absl::UnimplementedError(
+            "Cannot reshape a Metal LiteRT state during snapshot restore");
+      }
+      LITERT_ASSIGN_OR_RETURN(TensorBuffer retained,
+                              parsed.target.buffer->Duplicate());
+      ABSL_RETURN_IF_ERROR(ValidateEquivalentBuffer(
+          *parsed.target.buffer, retained, parsed.target.name));
+      std::string rollback_bytes;
+      if (!target_is_disposable) {
+        ABSL_ASSIGN_OR_RETURN(
+            rollback_bytes,
+            ReadBufferBytes(*parsed.target.buffer, parsed.payload_size));
+      }
+      staged_state_buffers.emplace(
+          std::string(parsed.target.name),
+          StateBuffer{
+              .buffer = std::move(retained),
+              .type = parsed.target.live_state_type,
+              .dynamic_dim = parsed.target.live_dynamic_dim,
+          });
+      metal_buffers.push_back(MetalSnapshotBuffer{
+          .parsed = parsed,
+          .rollback_bytes = std::move(rollback_bytes),
+          .has_rollback = !target_is_disposable,
+      });
+      continue;
+    }
+    absl::StatusOr<TensorBuffer> staged_or =
+        parsed.shape_changed
+            ? CreateReshapedStagingBuffer(
+                  env_, *parsed.target.buffer, parsed.target.dynamic_dim,
+                  snapshot_num_entries, parsed.target.name)
+            : CreateStagingBuffer(env_, *parsed.target.buffer,
+                                  parsed.target.name);
+    if (!staged_or.ok()) return staged_or.status();
+    TensorBuffer staged = std::move(*staged_or);
+    LITERT_ASSIGN_OR_RETURN(void* address,
+                            staged.Lock(TensorBuffer::LockMode::kWrite));
+    absl::Status read_status = absl::OkStatus();
+    if (parsed.payload_size != 0) {
+      if (address == nullptr) {
+        return NullMappedAddress(staged, "staged snapshot restore");
+      }
+      read_status = source.ReadAt(
+          parsed.payload_offset,
+          absl::Span<char>(static_cast<char*>(address), parsed.payload_size));
+    }
+    const absl::Status unlock_status = staged.Unlock();
+    if (!read_status.ok()) return read_status;
+    LITERT_RETURN_IF_ERROR(unlock_status);
+    staged_state_buffers.emplace(
+        std::string(parsed.target.name),
+        StateBuffer{
+            .buffer = std::move(staged),
+            .type = parsed.target.live_state_type,
+            .dynamic_dim = parsed.target.live_dynamic_dim,
+        });
+  }
+
+  for (size_t i = 0; i < metal_buffers.size(); ++i) {
+    bool buffer_may_be_modified = false;
+    const absl::Status write = WriteBufferFromSource(
+        *metal_buffers[i].parsed.target.buffer, source,
+        metal_buffers[i].parsed.payload_offset,
+        metal_buffers[i].parsed.payload_size, &buffer_may_be_modified);
+    if (!write.ok()) {
+      if (!target_is_disposable) {
+        const size_t rollback_count =
+            i + (buffer_may_be_modified ? 1 : 0);
+        const absl::Status rollback =
+            RollBackMetalBuffers(metal_buffers, rollback_count);
+        if (!rollback.ok()) {
+          return absl::DataLossError(absl::StrCat(
+              "LiteRT Metal state restore failed and rollback could not be "
+              "verified: restore=",
+              write.message(), "; rollback=", rollback.message()));
+        }
+      }
+      return write;
+    }
+  }
+
+  active_state_buffers->swap(staged_state_buffers);
+  num_entries_ = snapshot_num_entries;
+  return absl::OkStatus();
+}
+
 absl::Status LitertState::SelectAndCopyFrom(StateInterface& other,
                                             int batch_index) {
   auto other_litert = dynamic_cast<LitertState*>(&other);
@@ -301,6 +1389,10 @@ absl::Status LitertState::Clear() {
       LITERT_RETURN_IF_ERROR(state_buffer.buffer.Clear());
     }
   }
+  // A cleared ping-pong state must start from the same physical input bank as
+  // a newly created state. Otherwise an even/odd number of prior executions
+  // changes which cleared bank is presented first after reset.
+  bank_1_is_input_ = true;
   return absl::OkStatus();
 }
 

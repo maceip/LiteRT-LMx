@@ -24,6 +24,7 @@
 #include "absl/base/nullability.h"  // from @com_google_absl
 #include "absl/base/thread_annotations.h"  // from @com_google_absl
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
+#include "absl/functional/function_ref.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
@@ -35,9 +36,11 @@
 #include "runtime/executor/audio_executor_settings.h"
 #include "runtime/executor/llm_executor.h"
 #include "runtime/executor/llm_executor_settings.h"
+#include "runtime/executor/state_interface.h"
 #include "runtime/executor/vision_executor.h"
 #include "runtime/executor/vision_executor_settings.h"
 #include "runtime/framework/resource_management/context_handler/context_handler.h"
+#include "runtime/util/byte_stream.h"
 
 namespace litert::lm {
 
@@ -118,6 +121,36 @@ class ResourceManager {
   absl::StatusOr<std::unique_ptr<LlmExecutor>>
   AcquireExecutorWithContextHandler(
       std::shared_ptr<ContextHandler> new_context_handle)
+      ABSL_LOCKS_EXCLUDED(executor_mutex_)
+          ABSL_LOCKS_EXCLUDED(audio_executor_mutex_);
+
+  // Exports a quiescent text-only executor snapshot while holding the same
+  // lock used for context switching and inference.
+  absl::StatusOr<ExecutorSessionSnapshot> ExportSessionSnapshot(
+      std::shared_ptr<ContextHandler> context_handler,
+      int last_prefill_token_id) ABSL_LOCKS_EXCLUDED(executor_mutex_)
+      ABSL_LOCKS_EXCLUDED(audio_executor_mutex_);
+
+  absl::Status ExportSessionSnapshotTo(
+      std::shared_ptr<ContextHandler> context_handler,
+      int last_prefill_token_id,
+      absl::FunctionRef<absl::Status(const ExecutorSessionSnapshot&,
+                                     const StateInterface&)>
+          consumer) ABSL_LOCKS_EXCLUDED(executor_mutex_)
+      ABSL_LOCKS_EXCLUDED(audio_executor_mutex_);
+
+  // Imports validated metadata and canonical state into a fresh compatible
+  // backend context. Concrete state loading is transactional.
+  absl::Status ImportSessionSnapshot(
+      std::shared_ptr<ContextHandler> context_handler,
+      const ExecutorSessionSnapshot& snapshot)
+      ABSL_LOCKS_EXCLUDED(executor_mutex_)
+          ABSL_LOCKS_EXCLUDED(audio_executor_mutex_);
+
+  absl::Status ImportSessionSnapshotFrom(
+      std::shared_ptr<ContextHandler> context_handler,
+      const ExecutorSessionSnapshot& snapshot,
+      const ByteSource& serialized_state)
       ABSL_LOCKS_EXCLUDED(executor_mutex_)
           ABSL_LOCKS_EXCLUDED(audio_executor_mutex_);
 

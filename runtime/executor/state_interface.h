@@ -15,12 +15,15 @@
 #ifndef THIRD_PARTY_ODML_LITERT_LM_RUNTIME_EXECUTOR_STATE_INTERFACE_H_
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_EXECUTOR_STATE_INTERFACE_H_
 
+#include <cstdint>
 #include <memory>
+#include <limits>
 #include <string>
 
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "runtime/util/byte_stream.h"
 
 namespace litert::lm {
 
@@ -38,8 +41,51 @@ class StateInterface {
   // Serializes the KV cache to a byte string.
   virtual absl::StatusOr<std::string> Serialize() const = 0;
 
+  // Returns the exact byte count produced by SerializeTo. Implementations with
+  // large device state should override this without materializing the bytes.
+  virtual absl::StatusOr<uint64_t> SerializedSize() const {
+    absl::StatusOr<std::string> bytes = Serialize();
+    if (!bytes.ok()) return bytes.status();
+    return static_cast<uint64_t>(bytes->size());
+  }
+
+  // Streams the canonical serialization to `sink`. The default adapter keeps
+  // legacy state implementations source-compatible; production LiteRT state
+  // overrides it with direct tensor-buffer streaming.
+  virtual absl::Status SerializeTo(ByteSink* sink) const {
+    if (sink == nullptr) {
+      return absl::InvalidArgumentError("State byte sink must not be null.");
+    }
+    absl::StatusOr<std::string> bytes = Serialize();
+    if (!bytes.ok()) return bytes.status();
+    return sink->Append(*bytes);
+  }
+
   // Loads the KV cache from a serialized byte string.
   virtual absl::Status Load(absl::string_view serialized_state) = 0;
+
+  // Loads from random-access bytes. `target_is_disposable` permits an
+  // implementation to avoid retaining rollback copies while populating a
+  // staged context that the caller guarantees will be discarded on failure.
+  // The default adapter materializes legacy state and ignores that hint.
+  virtual absl::Status LoadFrom(const ByteSource& source,
+                                bool target_is_disposable = false) {
+    (void)target_is_disposable;
+    const uint64_t source_size = source.Size();
+    if (source_size > std::numeric_limits<size_t>::max()) {
+      return absl::ResourceExhaustedError(
+          "Serialized state exceeds addressable memory.");
+    }
+    std::string bytes;
+    if (source_size > bytes.max_size()) {
+      return absl::ResourceExhaustedError(
+          "Serialized state exceeds std::string capacity.");
+    }
+    bytes.resize(static_cast<size_t>(source_size));
+    absl::Status read = source.ReadAt(0, absl::MakeSpan(bytes));
+    if (!read.ok()) return read;
+    return Load(bytes);
+  }
 
   // Selects a single batch from the other KV cache and copies it to this KV
   // cache.

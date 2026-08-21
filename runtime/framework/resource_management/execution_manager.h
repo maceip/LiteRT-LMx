@@ -25,6 +25,7 @@
 #include "absl/base/nullability.h"  // from @com_google_absl
 #include "absl/container/flat_hash_set.h"  // from @com_google_absl
 #include "absl/functional/any_invocable.h"  // from @com_google_absl
+#include "absl/functional/function_ref.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
@@ -37,7 +38,10 @@
 #include "runtime/components/stop_token_detector.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
+#include "runtime/executor/llm_executor_io_types.h"
+#include "runtime/executor/state_interface.h"
 #include "runtime/framework/resource_management/context_handler/context_handler.h"
+#include "runtime/util/byte_stream.h"
 
 namespace litert::lm {
 
@@ -60,6 +64,9 @@ struct SessionInfo {
   std::unique_ptr<StopTokenDetector> stop_token_detector;
   std::optional<BenchmarkInfo> benchmark_info = std::nullopt;
   absl::flat_hash_set<TaskId> active_tasks = {};
+  // Prevents task creation and release while a quiescent handoff is copied or
+  // committed. Protected by the owning manager's session lock.
+  bool handoff_in_progress = false;
 };
 
 // All the information about a task.
@@ -141,6 +148,26 @@ class ExecutionManager {
   // - INVALID_ARGUMENT if the session ID is not found.
   virtual absl::StatusOr<BenchmarkInfo*> GetMutableBenchmarkInfo(
       SessionId session_id) = 0;
+
+  virtual absl::StatusOr<ExecutorSessionSnapshot> ExportSessionSnapshot(
+      SessionId session_id,
+      const absl::flat_hash_set<TaskId>& boundary_tasks) = 0;
+
+  // Invokes `consumer` synchronously while the session remains quiescent and
+  // the backend-native state reference is valid.
+  virtual absl::Status ExportSessionSnapshotTo(
+      SessionId session_id,
+      const absl::flat_hash_set<TaskId>& boundary_tasks,
+      absl::FunctionRef<absl::Status(const ExecutorSessionSnapshot&,
+                                     const StateInterface&)>
+          consumer) = 0;
+
+  virtual absl::Status ImportSessionSnapshot(
+      SessionId session_id, const ExecutorSessionSnapshot& snapshot) = 0;
+
+  virtual absl::Status ImportSessionSnapshotFrom(
+      SessionId session_id, const ExecutorSessionSnapshot& snapshot,
+      const ByteSource& serialized_state) = 0;
 
   // Returns a new task ID.
   // The returned task ID is guaranteed to be unique.

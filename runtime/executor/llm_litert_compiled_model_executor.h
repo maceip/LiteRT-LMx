@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,6 +27,7 @@
 #include "absl/base/nullability.h"  // from @com_google_absl
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
 #include "absl/functional/any_invocable.h"  // from @com_google_absl
+#include "absl/functional/function_ref.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
@@ -49,6 +51,7 @@
 #include "runtime/executor/llm_litert_mtp_drafter.h"
 #include "runtime/executor/llm_processed_context.h"
 #include "runtime/executor/state_interface.h"
+#include "runtime/util/byte_stream.h"
 #include "runtime/proto/executor_metadata.pb.h"
 
 namespace litert::lm {
@@ -101,6 +104,19 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
   absl::Status RestoreContext(
       std::unique_ptr<LlmContext> context_data) override;
 
+  absl::Status ValidateSessionHandoffSupport() const override;
+
+  absl::Status VisitSessionState(
+      absl::FunctionRef<absl::Status(const StateInterface&)> visitor) const
+      override;
+
+  absl::Status ImportSessionStateFrom(
+      const ExecutorSessionSnapshot& snapshot,
+      const ByteSource& serialized_state) override;
+
+  absl::StatusOr<SessionHandoffRuntimeProfile>
+  GetSessionHandoffRuntimeProfile() const override;
+
   absl::string_view ExecutorBackendName() const override {
     return "LiteRT Compiled Model";
   }
@@ -131,10 +147,7 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
 
   // Updates the runtime configuration.
   absl::Status UpdateRuntimeConfig(
-      const RuntimeConfig& runtime_config) override {
-    llm_context_->runtime_config() = runtime_config;
-    return absl::OkStatus();
-  }
+      const RuntimeConfig& runtime_config) override;
 
   // Gets the runtime state.
   absl::StatusOr<RuntimeState> GetRuntimeState() const override {
@@ -142,10 +155,7 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
   }
 
   // Updates the runtime state.
-  absl::Status UpdateRuntimeState(const RuntimeState& runtime_state) override {
-    llm_context_->runtime_state() = runtime_state;
-    return absl::OkStatus();
-  }
+  absl::Status UpdateRuntimeState(const RuntimeState& runtime_state) override;
 
   // Sets the current step of the executor.
   absl::Status SetCurrentStep(int new_step) override;
@@ -221,7 +231,13 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
       const proto::ExecutorMetadata* executor_metadata = nullptr,
       GraphRunCallback pre_graph_run_callback = nullptr,
       GraphRunCallback post_graph_run_callback = nullptr)
-      : executor_settings_(std::move(executor_settings)),
+      : session_handoff_compile_caches_disabled_(
+            executor_settings.GetScopedCacheFile() == nullptr &&
+            executor_settings.GetScopedProgramCacheFile() == nullptr &&
+            (executor_settings.GetCacheDir() == ":nocache" ||
+             (executor_settings.IsWeightCacheDisabled() &&
+              executor_settings.IsProgramCacheDisabled()))),
+        executor_settings_(std::move(executor_settings)),
         env_(env),
         model_(*model),
         compiled_model_(std::move(compiled_model)),
@@ -235,6 +251,8 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
         per_layer_embedding_lookup_(std::move(per_layer_embedding_lookup)),
         use_fp16_precision_(use_fp16_precision),
         logits_data_type_(logits_data_type),
+        gpu_optimized_single_buffer_cache_(
+            signatures_.input_int32_param.has_value()),
         mtp_drafter_(std::move(mtp_drafter)),
         executor_metadata_(executor_metadata),
         pre_graph_run_callback_(std::move(pre_graph_run_callback)),
@@ -244,6 +262,9 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
     auto runtime_config = std::make_unique<RuntimeConfig>();
     runtime_config->output_heads = output_batch_size;
     auto runtime_state = std::make_unique<RuntimeState>();
+    // Direct executor users historically sample from seed zero. Make that
+    // generator context-owned so it can be snapshotted and rebound exactly.
+    runtime_state->rand_gen = std::make_shared<std::default_random_engine>(0);
     llm_context_ = std::make_unique<LlmContext>(std::move(processed_context),
                                                 std::move(runtime_config),
                                                 std::move(runtime_state));
@@ -357,8 +378,18 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
 
   absl::Status RestoreState(std::unique_ptr<StateInterface> state);
 
+  // Rebinds the shared internal sampler to the active session's configuration
+  // and PRNG whenever the ResourceManager switches contexts.
+  absl::Status BindSamplerToContext(const RuntimeConfig& runtime_config,
+                                    const RuntimeState& runtime_state);
+
   // Gets the LiteRT run options based on the current executor settings.
   litert::Options GetRunOptions() const;
+
+  // Sealed from the exact settings used to create `compiled_model_`. Runtime
+  // settings updates must never be able to relabel a cache-backed compiled
+  // executor as eligible for exact session handoff identity.
+  const bool session_handoff_compile_caches_disabled_;
 
   mutable absl::Mutex executor_settings_mutex_;
   LlmExecutorSettings executor_settings_
@@ -386,6 +417,14 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
 
   // Sampler for internal sampling.
   std::unique_ptr<Sampler> sampler_;
+  // Requested backend used to construct the live sampler. Kept separately
+  // from mutable executor settings so handoff support cannot be enabled by
+  // relabeling an already-created GPU sampler as CPU.
+  std::optional<Backend> initialized_sampler_backend_;
+  // Proto enum value used to construct the live sampler. Sampling algorithms
+  // cannot be rebound in place because their UpdateConfig implementations do
+  // not change the concrete algorithm.
+  std::optional<int> initialized_sampler_type_;
   int gpu_sampler_max_top_k_ = 0;
   bool sampler_handles_input_ = true;
 
@@ -411,8 +450,10 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
   // logits tensor for gpu sampling.
   LogitsDataType logits_data_type_;
 
-  // GPU optimized single buffer cache
-  bool gpu_optimized_single_buffer_cache_ = false;
+  // Whether the immutable model signature uses the single-buffer-cache
+  // position parameter. Derive this at construction so runtime identity and a
+  // fresh restored executor do not depend on whether prefill has already run.
+  const bool gpu_optimized_single_buffer_cache_;
 
   // The MTP drafter model.
   std::unique_ptr<LlmLiteRtMtpDrafter> mtp_drafter_;

@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "absl/functional/function_ref.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
@@ -30,6 +31,9 @@
 #include "runtime/executor/llm_executor_io_types.h"
 #include "runtime/executor/llm_executor_processed_tokens.h"
 #include "runtime/executor/llm_executor_settings.h"
+#include "runtime/executor/session_handoff_runtime.h"
+#include "runtime/executor/state_interface.h"
+#include "runtime/util/byte_stream.h"
 
 namespace litert::lm {
 
@@ -213,6 +217,44 @@ class LlmExecutorBase {
     return absl::UnimplementedError(absl::StrCat(
         "RestoreContext not implemented for backend: ", ExecutorBackendName()));
   };
+
+  // Returns OK only when the backend can preserve every state element needed
+  // for exact same-profile continuation. Backends opt in explicitly.
+  virtual absl::Status ValidateSessionHandoffSupport() const {
+    return absl::UnimplementedError(
+        absl::StrCat("Session handoff not implemented for backend: ",
+                     ExecutorBackendName()));
+  }
+
+  // Provides synchronous access to active backend-native state while the
+  // caller owns the executor lock. Implementations must not silently replace
+  // accelerator state with a host clone.
+  virtual absl::Status VisitSessionState(
+      absl::FunctionRef<absl::Status(const StateInterface&)> visitor) const {
+    return absl::UnimplementedError(absl::StrCat(
+        "Session state export not implemented for backend: ",
+        ExecutorBackendName()));
+  }
+
+  // Restores backend-native state and continuation metadata into a fresh
+  // context. A failed import must leave the live session fresh and reusable.
+  virtual absl::Status ImportSessionStateFrom(
+      const ExecutorSessionSnapshot& snapshot,
+      const ByteSource& serialized_state) {
+    return absl::UnimplementedError(absl::StrCat(
+        "Session state import not implemented for backend: ",
+        ExecutorBackendName()));
+  }
+
+  // Returns an executor-owned canonical profile captured from the concrete
+  // compiled executor and its live allocation policy. The default fails
+  // closed so an unsupported executor cannot be relabeled by a caller.
+  virtual absl::StatusOr<SessionHandoffRuntimeProfile>
+  GetSessionHandoffRuntimeProfile() const {
+    return absl::UnimplementedError(absl::StrCat(
+        "Loaded runtime identity is not implemented for backend: ",
+        ExecutorBackendName()));
+  }
 
   // ------------Profiling APIs------------:
   // Starts profiling if supported by the underlying executor/backend.

@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
 
 namespace litert::lm {
@@ -71,6 +72,19 @@ class TokenData {
 // processed tokens are maintained.
 class ProcessedTokens {
  public:
+  // Complete token history for an exact session handoff. Pending token IDs
+  // remain separate because they have not yet been consumed by the model.
+  // Embedding-bearing pending tokens are intentionally not representable.
+  struct Snapshot {
+    std::vector<std::vector<int>> processed_token_ids;
+    std::vector<int> pending_token_ids;
+
+    bool operator==(const Snapshot& other) const {
+      return processed_token_ids == other.processed_token_ids &&
+             pending_token_ids == other.pending_token_ids;
+    }
+  };
+
   // Tokens and their corresponding step. Number of tokens will be:
   // - Empty if the step does not correspond to the tokens in this
   //   ProcessedTokens.
@@ -139,6 +153,14 @@ class ProcessedTokens {
 
   // Invalidates the pending input token, if any.
   void InvalidatePendingInputToken();
+
+  // Exports the exact processed/pending distinction. Inconsistent candidate
+  // state and pending embeddings fail closed instead of being discarded.
+  absl::StatusOr<Snapshot> ExportSnapshot() const;
+
+  // Constructs a validated token history without partially mutating a live
+  // ProcessedTokens instance.
+  static absl::StatusOr<ProcessedTokens> FromSnapshot(const Snapshot& snapshot);
 
  private:
   int GetStep() const;

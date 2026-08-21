@@ -15,8 +15,10 @@
 #ifndef THIRD_PARTY_ODML_LITERT_LM_RUNTIME_ENGINE_ENGINE_H_
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_ENGINE_ENGINE_H_
 
+#include <limits>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "absl/base/attributes.h"  // from @com_google_absl
@@ -26,8 +28,11 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
+#include "absl/types/span.h"  // from @com_google_absl
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
+#include "runtime/engine/session_handoff.h"
+#include "runtime/util/byte_stream.h"
 #include "support/tokenizer/tokenizer.h"
 
 namespace litert::lm {
@@ -330,8 +335,66 @@ class SessionInterface {
     return absl::UnimplementedError("GetCurrentStep not implemented.");
   }
 
+  // Exports a canonical authenticated snapshot for exact continuation by a
+  // fresh session with the same model, runtime build, and inference profile.
+  virtual absl::StatusOr<std::string> ExportHandoff(
+      const SessionHandoffOptions& options) {
+    return absl::UnimplementedError("ExportHandoff not implemented.");
+  }
+
+  // Streams the envelope without a second full KV-state allocation.
+  virtual absl::Status ExportHandoffTo(const SessionHandoffOptions& options,
+                                       ByteSink* sink) {
+    if (sink == nullptr) {
+      return absl::InvalidArgumentError(
+          "Session handoff output sink must not be null.");
+    }
+    absl::StatusOr<std::string> envelope = ExportHandoff(options);
+    if (!envelope.ok()) return envelope.status();
+    return sink->Append(*envelope);
+  }
+
+  // Imports into a fresh compatible session after authenticating and
+  // validating the complete envelope.
+  virtual absl::Status ImportHandoff(absl::string_view envelope,
+                                     const SessionHandoffOptions& expected) {
+    return absl::UnimplementedError("ImportHandoff not implemented.");
+  }
+
+  // Compatibility adapter for alternate session implementations. The native
+  // implementation authenticates and loads directly from the ByteSource.
+  virtual absl::Status ImportHandoffFrom(
+      const ByteSource& envelope, const SessionHandoffOptions& expected) {
+    if (envelope.Size() > std::numeric_limits<size_t>::max()) {
+      return absl::ResourceExhaustedError(
+          "Session handoff envelope exceeds addressable memory.");
+    }
+    std::string bytes(static_cast<size_t>(envelope.Size()), '\0');
+    absl::Status read = envelope.ReadAt(0, absl::MakeSpan(bytes));
+    if (!read.ok()) return read;
+    return ImportHandoff(bytes, expected);
+  }
+
   // Get the reference to the session config for the session.
   virtual const SessionConfig& GetSessionConfig() const = 0;
+
+  // Returns the engine-derived identity owned by this concrete session.
+  // Implementations that cannot bind the session to measured model,
+  // runtime/delegate, and resolved-profile evidence fail closed.
+  virtual absl::StatusOr<SessionHandoffIdentity> GetSessionHandoffIdentity()
+      const {
+    return absl::UnimplementedError(
+        "Engine-derived session handoff identity is not available.");
+  }
+
+  // Returns each candidate's exact executor token history, including a
+  // backend pending token when present. Unlike Responses::GetTokenIds(), this
+  // history is not filtered for stop sequences or detokenizer output.
+  virtual absl::StatusOr<std::vector<std::vector<int>>>
+  GetExactProcessedTokenHistory() const {
+    return absl::UnimplementedError(
+        "Exact processed-token history is not available.");
+  }
 
   // Returns the debug info for the session, or nullopt if unsupported
   // or debugger is disabled.
@@ -373,6 +436,17 @@ class EngineT {
 
   // Get the reference to the tokenizer for the engine.
   virtual const support::Tokenizer& GetTokenizer() const = 0;
+
+  // Derives the authoritative handoff identity from the exact artifacts and
+  // concrete runtime already loaded by this engine plus a fully-resolved copy
+  // of `session_config`. The default preserves source compatibility while
+  // failing closed for engines that do not own measurable identity evidence.
+  virtual absl::StatusOr<SessionHandoffIdentity>
+  ResolveSessionHandoffIdentity(const SessionConfig& session_config) const {
+    (void)session_config;
+    return absl::UnimplementedError(
+        "Engine-derived session handoff identity is not available.");
+  }
 
   // Get the audio model properties for the session. This is only available
   // if the engine is created with audio modality enabled.

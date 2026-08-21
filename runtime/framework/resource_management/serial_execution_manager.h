@@ -127,6 +127,25 @@ class SerialExecutionManager : public ExecutionManager {
   absl::StatusOr<BenchmarkInfo*> GetMutableBenchmarkInfo(
       SessionId session_id) override;
 
+  absl::StatusOr<ExecutorSessionSnapshot> ExportSessionSnapshot(
+      SessionId session_id,
+      const absl::flat_hash_set<TaskId>& boundary_tasks) override;
+
+  absl::Status ExportSessionSnapshotTo(
+      SessionId session_id,
+      const absl::flat_hash_set<TaskId>& boundary_tasks,
+      absl::FunctionRef<absl::Status(const ExecutorSessionSnapshot&,
+                                     const StateInterface&)>
+          consumer) override;
+
+  absl::Status ImportSessionSnapshot(
+      SessionId session_id,
+      const ExecutorSessionSnapshot& snapshot) override;
+
+  absl::Status ImportSessionSnapshotFrom(
+      SessionId session_id, const ExecutorSessionSnapshot& snapshot,
+      const ByteSource& serialized_state) override;
+
   // Returns a new task ID.
   // The returned task ID is guaranteed to be unique.
   absl::StatusOr<TaskId> GetNewTaskId() override;

@@ -138,6 +138,29 @@ class ThreadedExecutionManager : public ExecutionManager {
   absl::StatusOr<BenchmarkInfo*> GetMutableBenchmarkInfo(SessionId session_id)
       override ABSL_LOCKS_EXCLUDED(session_and_task_lookup_mutex_);
 
+  absl::StatusOr<ExecutorSessionSnapshot> ExportSessionSnapshot(
+      SessionId session_id,
+      const absl::flat_hash_set<TaskId>& boundary_tasks) override
+      ABSL_LOCKS_EXCLUDED(session_and_task_lookup_mutex_);
+
+  absl::Status ExportSessionSnapshotTo(
+      SessionId session_id,
+      const absl::flat_hash_set<TaskId>& boundary_tasks,
+      absl::FunctionRef<absl::Status(const ExecutorSessionSnapshot&,
+                                     const StateInterface&)>
+          consumer) override
+      ABSL_LOCKS_EXCLUDED(session_and_task_lookup_mutex_);
+
+  absl::Status ImportSessionSnapshot(
+      SessionId session_id,
+      const ExecutorSessionSnapshot& snapshot) override
+      ABSL_LOCKS_EXCLUDED(session_and_task_lookup_mutex_);
+
+  absl::Status ImportSessionSnapshotFrom(
+      SessionId session_id, const ExecutorSessionSnapshot& snapshot,
+      const ByteSource& serialized_state) override
+      ABSL_LOCKS_EXCLUDED(session_and_task_lookup_mutex_);
+
   // Returns a new task ID.
   // The returned task ID is guaranteed to be unique.
   absl::StatusOr<TaskId> GetNewTaskId() override;

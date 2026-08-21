@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <memory>
 #include <optional>
 #include <string>
@@ -35,6 +36,7 @@
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
+#include "runtime/core/session_handoff_codec.h"
 #include "runtime/core/session_utils.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_settings.h"
@@ -53,6 +55,32 @@ namespace {
 
 using TaskController = SessionInterface::TaskController;
 
+absl::Status ValidateSessionHandoffConfig(const SessionConfig& config) {
+  if (config.UseExternalSampler()) {
+    return absl::UnimplementedError(
+        "Session handoff does not support external sampler state.");
+  }
+  if (config.GetSamplerBackend() != Backend::CPU) {
+    return absl::UnimplementedError(
+        "Session handoff currently supports only the CPU sampler backend.");
+  }
+  if (config.GetNumOutputCandidates() != 1) {
+    return absl::UnimplementedError(
+        "Session handoff currently supports exactly one output candidate.");
+  }
+  if (config.AudioModalityEnabled() || config.VisionModalityEnabled() ||
+      config.GetAudioEmbeddingsCallback() != nullptr) {
+    return absl::UnimplementedError(
+        "Session handoff currently supports text-only sessions.");
+  }
+  if (config.GetScopedLoraFile() != nullptr ||
+      config.GetAudioScopedLoraFile() != nullptr) {
+    return absl::UnimplementedError(
+        "Session handoff does not support LoRA state.");
+  }
+  return absl::OkStatus();
+}
+
 }  // namespace
 
 // static
@@ -61,7 +89,8 @@ absl::StatusOr<std::unique_ptr<SessionAdvanced>> SessionAdvanced::Create(
     support::Tokenizer* absl_nonnull tokenizer,
     const SessionConfig& session_config,
     std::optional<BenchmarkInfo> benchmark_info,
-    std::atomic<int>* living_sessions_count) {
+    std::atomic<int>* living_sessions_count,
+    std::optional<SessionHandoffIdentity> session_handoff_identity) {
   auto execution_manager_lock = execution_manager.lock();
   if (execution_manager_lock == nullptr) {
     return absl::FailedPreconditionError("Execution manager is not available.");
@@ -74,7 +103,8 @@ absl::StatusOr<std::unique_ptr<SessionAdvanced>> SessionAdvanced::Create(
   return absl::WrapUnique(new SessionAdvanced(
       session_id, execution_manager, tokenizer, session_info_,
       /*session_state=*/SessionState::kFresh,
-      /*last_task_ids=*/{}, living_sessions_count));
+      /*last_task_ids=*/{}, living_sessions_count,
+      std::move(session_handoff_identity)));
 }
 
 absl::Status SessionAdvanced::RunPrefill(
@@ -471,7 +501,9 @@ SessionAdvanced::CloneAsyncLocked(
 
   return absl::WrapUnique(new SessionAdvanced(session_id, execution_manager_,
                                               tokenizer_, session_info,
-                                              session_state_, last_task_ids_));
+                                              session_state_, last_task_ids_,
+                                              /*living_sessions_count=*/nullptr,
+                                              session_handoff_identity_));
 }
 
 SessionAdvanced::~SessionAdvanced() {
@@ -562,6 +594,166 @@ absl::StatusOr<int> SessionAdvanced::GetCurrentStep() const {
     return absl::FailedPreconditionError("Execution manager is not available.");
   }
   return execution_manager_lock->GetCurrentStep(*session_info_);
+}
+
+absl::StatusOr<SessionHandoffIdentity>
+SessionAdvanced::GetSessionHandoffIdentity() const {
+  if (!session_handoff_identity_.has_value()) {
+    return absl::FailedPreconditionError(
+        "Session was not created with an engine-derived handoff identity.");
+  }
+  return *session_handoff_identity_;
+}
+
+absl::StatusOr<std::vector<std::vector<int>>>
+SessionAdvanced::GetExactProcessedTokenHistory() const {
+  auto execution_manager = execution_manager_.lock();
+  if (execution_manager == nullptr) {
+    return absl::FailedPreconditionError("Execution manager is not available.");
+  }
+  ABSL_RETURN_IF_ERROR(execution_manager->WaitUntilSessionDone(
+      session_id_, Engine::kDefaultTimeout));
+
+  std::vector<std::vector<int>> token_history;
+  absl::MutexLock lock(mutex_);
+  ABSL_RETURN_IF_ERROR(execution_manager->ExportSessionSnapshotTo(
+      session_id_, last_task_ids_,
+      [&token_history](const ExecutorSessionSnapshot& snapshot,
+                       const StateInterface& state) -> absl::Status {
+        (void)state;
+        token_history = snapshot.processed_tokens.processed_token_ids;
+        if (token_history.empty()) {
+          return absl::FailedPreconditionError(
+              "Exact token history contains no candidates.");
+        }
+        if (!snapshot.processed_tokens.pending_token_ids.empty()) {
+          if (snapshot.processed_tokens.pending_token_ids.size() !=
+              token_history.size()) {
+            return absl::DataLossError(
+                "Exact token history has inconsistent pending candidates.");
+          }
+          for (size_t i = 0; i < token_history.size(); ++i) {
+            token_history[i].push_back(
+                snapshot.processed_tokens.pending_token_ids[i]);
+          }
+        }
+        if (snapshot.current_step < 0 ||
+            static_cast<size_t>(snapshot.current_step) !=
+                token_history[0].size()) {
+          return absl::DataLossError(
+              "Exact token history does not match the executor step.");
+        }
+        return absl::OkStatus();
+      }));
+  return token_history;
+}
+
+absl::StatusOr<std::string> SessionAdvanced::ExportHandoff(
+    const SessionHandoffOptions& options) {
+  std::string envelope;
+  StringByteSink sink(&envelope);
+  ABSL_RETURN_IF_ERROR(ExportHandoffTo(options, &sink));
+  return envelope;
+}
+
+absl::Status SessionAdvanced::ExportHandoffTo(
+    const SessionHandoffOptions& options, ByteSink* sink) {
+  if (sink == nullptr) {
+    return absl::InvalidArgumentError(
+        "Session handoff output sink must not be null.");
+  }
+  auto execution_manager = execution_manager_.lock();
+  if (execution_manager == nullptr) {
+    return absl::FailedPreconditionError("Execution manager is not available.");
+  }
+  ABSL_ASSIGN_OR_RETURN(SessionHandoffIdentity authoritative_identity,
+                        GetSessionHandoffIdentity());
+  // Let already-running asynchronous work finish before taking the session
+  // mutex. The manager guard then keeps the complete synchronous stream
+  // quiescent; sinks must not re-enter this session.
+  ABSL_RETURN_IF_ERROR(execution_manager->WaitUntilSessionDone(
+      session_id_, Engine::kDefaultTimeout));
+
+  absl::MutexLock lock(mutex_);
+  ABSL_RETURN_IF_ERROR(
+      ValidateSessionHandoffConfig(session_info_->session_config));
+  if (!checkpoint_map_.empty()) {
+    return absl::UnimplementedError(
+        "Session handoff does not preserve rewind checkpoints.");
+  }
+  SessionHandoffSnapshot snapshot;
+  switch (session_state_) {
+    case SessionState::kFresh:
+      snapshot.phase = SessionHandoffPhase::kFresh;
+      break;
+    case SessionState::kPrefilled:
+      snapshot.phase = SessionHandoffPhase::kPrefilled;
+      break;
+    case SessionState::kDecoded:
+      snapshot.phase = SessionHandoffPhase::kDecoded;
+      break;
+  }
+  return execution_manager->ExportSessionSnapshotTo(
+      session_id_, last_task_ids_,
+      [&snapshot, &authoritative_identity, &options,
+       sink](const ExecutorSessionSnapshot& executor_snapshot,
+             const StateInterface& state) -> absl::Status {
+        snapshot.executor = executor_snapshot;
+        return EncodeSessionHandoffTo(snapshot, state, authoritative_identity,
+                                      options, sink);
+      });
+}
+
+absl::Status SessionAdvanced::ImportHandoff(
+    absl::string_view envelope, const SessionHandoffOptions& expected) {
+  StringByteSource source(envelope);
+  return ImportHandoffFrom(source, expected);
+}
+
+absl::Status SessionAdvanced::ImportHandoffFrom(
+    const ByteSource& envelope, const SessionHandoffOptions& expected) {
+  ABSL_ASSIGN_OR_RETURN(SessionHandoffIdentity authoritative_identity,
+                        GetSessionHandoffIdentity());
+  // Authenticate and validate identity, structure, PRNG, and token semantics
+  // before touching the target session.
+  ABSL_ASSIGN_OR_RETURN(DecodedSessionHandoff decoded,
+                        DecodeSessionHandoffFrom(
+                            envelope, authoritative_identity, expected));
+  SessionHandoffSnapshot& snapshot = decoded.snapshot;
+  ByteSourceView serialized_state(&envelope, decoded.serialized_state_offset,
+                                  decoded.serialized_state_size);
+
+  auto execution_manager = execution_manager_.lock();
+  if (execution_manager == nullptr) {
+    return absl::FailedPreconditionError("Execution manager is not available.");
+  }
+  ABSL_RETURN_IF_ERROR(execution_manager->WaitUntilSessionDone(
+      session_id_, Engine::kDefaultTimeout));
+
+  absl::MutexLock lock(mutex_);
+  ABSL_RETURN_IF_ERROR(
+      ValidateSessionHandoffConfig(session_info_->session_config));
+  if (session_state_ != SessionState::kFresh || !last_task_ids_.empty() ||
+      !checkpoint_map_.empty()) {
+    return absl::FailedPreconditionError(
+        "Session handoff import target must be a new, fresh session.");
+  }
+  ABSL_RETURN_IF_ERROR(execution_manager->ImportSessionSnapshotFrom(
+      session_id_, snapshot.executor, serialized_state));
+
+  switch (snapshot.phase) {
+    case SessionHandoffPhase::kFresh:
+      session_state_ = SessionState::kFresh;
+      break;
+    case SessionHandoffPhase::kPrefilled:
+      session_state_ = SessionState::kPrefilled;
+      break;
+    case SessionHandoffPhase::kDecoded:
+      session_state_ = SessionState::kDecoded;
+      break;
+  }
+  last_task_ids_.clear();
+  return absl::OkStatus();
 }
 
 std::optional<SessionDebugInfo> SessionAdvanced::GetSessionDebugInfo() const {
