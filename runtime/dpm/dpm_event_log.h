@@ -165,6 +165,13 @@ struct DPMLogSnapshot {
   std::string case_id;
   uint64_t generation = 0;
   Hash256 prefix_hash;
+  // Snapshot-bound proof for every raw-log prefix. Entry N authenticates
+  // exactly events [0, N); the vector therefore contains generation + 1
+  // entries, starts with the log genesis hash, and ends with prefix_hash.
+  // Projection/checkpoint selection must use this immutable index instead of
+  // performing a second mutable log lookup whose transient outcome could
+  // change the canonical request selected for the same snapshot.
+  std::vector<Hash256> prefix_hashes;
   std::vector<DPMEvent> events;
 };
 

@@ -17,6 +17,7 @@
 
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "absl/types/span.h"  // from @com_google_absl
 #include "runtime/dpm/dpm_event_log.h"
 #include "runtime/platform/hash/hasher.h"
 
@@ -31,6 +32,17 @@ absl::StatusOr<Hash256> InitialDPMCorrectionDigest(
 // event. The event's index and exact durable fields are included in the chain.
 absl::StatusOr<Hash256> AdvanceDPMCorrectionDigest(
     const Hash256& previous, const DPMEvent& correction);
+
+// Derives the correction lineage for exactly events [0, event_count). This is
+// the proof used when an older projection is treated as the last valid
+// ancestor: its stored digest must match its own prefix, while corrections in
+// the subsequent delta advance that digest to the current lineage.
+absl::StatusOr<Hash256> ComputeDPMCorrectionDigestForPrefix(
+    absl::string_view log_id, absl::string_view case_id,
+    absl::Span<const DPMEvent> events, uint64_t event_count);
+
+absl::StatusOr<Hash256> ComputeDPMCorrectionDigestForPrefix(
+    const DPMLogSnapshot& snapshot, uint64_t event_count);
 
 // Derives the identity of the active immutable correction lineage directly
 // from the raw authoritative log. Projection providers may report this value,

@@ -223,6 +223,18 @@ absl::Status ValidateSnapshotShape(const DPMLogSnapshot& snapshot) {
     return absl::DataLossError(
         "DPM log snapshot has no cryptographic prefix hash.");
   }
+  if (snapshot.prefix_hashes.size() != snapshot.events.size() + 1 ||
+      snapshot.prefix_hashes.empty() ||
+      snapshot.prefix_hashes.back() != snapshot.prefix_hash) {
+    return absl::DataLossError(
+        "DPM log snapshot has no complete immutable prefix-proof index.");
+  }
+  for (const Hash256& prefix : snapshot.prefix_hashes) {
+    if (IsZeroHash(prefix)) {
+      return absl::DataLossError(
+          "DPM log snapshot prefix-proof index contains an empty digest.");
+    }
+  }
   for (uint64_t i = 0; i < snapshot.events.size(); ++i) {
     if (snapshot.events[i].index != i ||
         snapshot.events[i].case_id != snapshot.case_id) {
@@ -242,6 +254,24 @@ absl::Status ValidateSnapshotShape(const DPMLogSnapshot& snapshot) {
     }
   }
   return absl::OkStatus();
+}
+
+absl::StatusOr<Hash256> SnapshotPrefixHashAt(
+    const DPMLogSnapshot& snapshot, uint64_t event_count) {
+  if (event_count > snapshot.generation ||
+      snapshot.prefix_hashes.size() != snapshot.events.size() + 1 ||
+      snapshot.prefix_hashes.empty() ||
+      snapshot.prefix_hashes.back() != snapshot.prefix_hash) {
+    return absl::DataLossError(
+        "DPM snapshot cannot authenticate the requested raw-log prefix.");
+  }
+  const Hash256 prefix =
+      snapshot.prefix_hashes[static_cast<size_t>(event_count)];
+  if (IsZeroHash(prefix)) {
+    return absl::DataLossError(
+        "DPM snapshot contains an empty raw-log prefix proof.");
+  }
+  return prefix;
 }
 
 bool IsDecisionInputKind(DPMEvent::Kind kind) {
@@ -991,8 +1021,9 @@ absl::Status DPMEngine::ValidateRestoreCandidate(
           "admitted exact profile and CapsuleRestore capability.");
     }
   }
-  ABSL_ASSIGN_OR_RETURN(Hash256 prefix_hash,
-                        log_->PrefixHash(descriptor.source_event_count));
+  ABSL_ASSIGN_OR_RETURN(
+      Hash256 prefix_hash,
+      SnapshotPrefixHashAt(current, descriptor.source_event_count));
   if (prefix_hash != descriptor.source_prefix_hash) {
     return absl::FailedPreconditionError(
         "DPM checkpoint raw-log prefix has changed.");
@@ -1439,7 +1470,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
         "DPM turn case id does not match the immutable log case.");
   }
   ABSL_ASSIGN_OR_RETURN(Hash256 initial_prefix,
-                        log_->PrefixHash(initial.generation));
+                        SnapshotPrefixHashAt(initial, initial.generation));
   if (initial_prefix != initial.prefix_hash) {
     return absl::AbortedError(
         "DPM log changed while acquiring its authoritative snapshot.");
@@ -1534,8 +1565,9 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
     return absl::FailedPreconditionError(
         "DPM log agent identity changed before generation.");
   }
-  ABSL_ASSIGN_OR_RETURN(Hash256 source_prefix,
-                        log_->PrefixHash(source_snapshot.generation));
+  ABSL_ASSIGN_OR_RETURN(
+      Hash256 source_prefix,
+      SnapshotPrefixHashAt(source_snapshot, source_snapshot.generation));
   if (source_prefix != source_snapshot.prefix_hash) {
     return absl::AbortedError(
         "DPM log changed after publishing the recoverable input.");
@@ -2154,8 +2186,10 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
     return absl::DataLossError(
         "DPM response commit did not close exactly one authoritative turn.");
   }
-  ABSL_ASSIGN_OR_RETURN(Hash256 committed_prefix,
-                        log_->PrefixHash(committed.snapshot.generation));
+  ABSL_ASSIGN_OR_RETURN(
+      Hash256 committed_prefix,
+      SnapshotPrefixHashAt(committed.snapshot,
+                           committed.snapshot.generation));
   if (committed_prefix != committed.snapshot.prefix_hash) {
     return absl::AbortedError(
         "DPM log changed after committing the authoritative response.");
@@ -2261,7 +2295,7 @@ absl::StatusOr<DPMCorrectionResult> DPMEngine::AppendCorrection(
         "DPM correction case id does not match the immutable log case.");
   }
   ABSL_ASSIGN_OR_RETURN(Hash256 prefix,
-                        log_->PrefixHash(snapshot.generation));
+                        SnapshotPrefixHashAt(snapshot, snapshot.generation));
   if (prefix != snapshot.prefix_hash) {
     return absl::AbortedError(
         "DPM log changed while acquiring its correction snapshot.");

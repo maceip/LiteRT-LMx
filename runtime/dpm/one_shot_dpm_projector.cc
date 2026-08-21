@@ -81,6 +81,8 @@ OneShotDPMProjector::ResolveAuthoritativeSnapshot(
       current.generation != request.log.generation ||
       current.prefix_hash != request.log.prefix_hash ||
       current.generation != current.events.size() || current.events.empty() ||
+      current.prefix_hashes.size() != current.events.size() + 1 ||
+      current.prefix_hashes.back() != current.prefix_hash ||
       request.input_event_index != current.events.size() - 1 ||
       current.events.back().index != request.input_event_index ||
       current.events.back().case_id != current.case_id ||
@@ -91,13 +93,6 @@ OneShotDPMProjector::ResolveAuthoritativeSnapshot(
     return absl::AbortedError(
         "DPM projection request does not name the current authoritative "
         "pending input prefix.");
-  }
-  ABSL_ASSIGN_OR_RETURN(
-      Hash256 authoritative_prefix,
-      authoritative_log_->PrefixHash(current.events.size()));
-  if (authoritative_prefix != current.prefix_hash) {
-    return absl::DataLossError(
-        "DPM projection source prefix hash differs from the raw event log.");
   }
   return current;
 }
@@ -116,7 +111,6 @@ absl::Status OneShotDPMProjector::ValidateBaseline(
       baseline.manifest.source_event_count >= request.log.events.size() ||
       baseline.manifest.input_event_index + 1 !=
           baseline.manifest.source_event_count ||
-      baseline.manifest.correction_digest != correction_digest ||
       baseline.manifest.config_hash != config_hash ||
       baseline.manifest.runtime_identity != runtime_identity ||
       baseline.manifest.replay_mode != replay_mode ||
@@ -128,13 +122,32 @@ absl::Status OneShotDPMProjector::ValidateBaseline(
   // The baseline's source count is exactly the new prompt's event_range_start;
   // never renumber the remaining events from zero.
   const uint64_t event_range_start = baseline.manifest.source_event_count;
-  ABSL_ASSIGN_OR_RETURN(
-      Hash256 authoritative_baseline_prefix,
-      authoritative_log_->PrefixHash(event_range_start));
+  if (request.log.prefix_hashes.size() != request.log.events.size() + 1) {
+    return absl::DataLossError(
+        "DPM authoritative snapshot has no complete prefix-proof index.");
+  }
+  const Hash256 authoritative_baseline_prefix =
+      request.log.prefix_hashes[static_cast<size_t>(event_range_start)];
   if (authoritative_baseline_prefix != baseline.manifest.source_prefix_hash) {
     return absl::DataLossError(
         "DPM projection baseline does not derive from the current raw-log "
         "prefix.");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 baseline_correction_digest,
+      ComputeDPMCorrectionDigestForPrefix(request.log, event_range_start));
+  if (baseline.manifest.correction_digest != baseline_correction_digest) {
+    return absl::FailedPreconditionError(
+        "DPM projection baseline correction lineage does not match its own "
+        "authoritative prefix.");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 current_correction_digest,
+      ComputeDPMCorrectionDigest(request.log));
+  if (current_correction_digest != correction_digest) {
+    return absl::DataLossError(
+        "DPM projection correction lineage changed during baseline "
+        "selection.");
   }
   ABSL_ASSIGN_OR_RETURN(
       std::string canonical_baseline,
@@ -161,12 +174,6 @@ OneShotDPMProjector::SelectNewestCompatibleBaseline(
   // every process observing this exact raw-log prefix.
   for (auto event = authoritative_request.log.events.rbegin();
        event != authoritative_request.log.events.rend(); ++event) {
-    if (event->kind == DPMEvent::Kind::kCorrection) {
-      // The newest immutable correction starts a new projection lineage.
-      // Every earlier projection is invalidated, so a miss in this interval
-      // must rebuild from event zero rather than search the stale branch.
-      break;
-    }
     if (event->kind != DPMEvent::Kind::kModelTurn ||
         !event->turn_receipt.has_value()) {
       continue;
@@ -212,9 +219,11 @@ OneShotDPMProjector::SelectNewestCompatibleBaseline(
           std::move(candidate));
     }
     // Projection receipts are disposable derivatives. A malformed manifest,
-    // stale prefix, unavailable prefix lookup, invalid output, or any other
-    // candidate-specific failure is a cache miss and cannot block rebuilding
-    // from the authoritative raw log.
+    // stale prefix, invalid correction lineage, invalid output, or any other
+    // candidate-specific failure is a cache miss. Scanning continues across
+    // corrections because a receipt before a correction remains the last
+    // valid ancestor: the absolute delta begins at that response and contains
+    // every correction needed to advance its lineage to the current digest.
   }
   return std::optional<DPMProjectionBaselineArtifact>();
 }

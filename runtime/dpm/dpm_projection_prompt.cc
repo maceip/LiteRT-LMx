@@ -31,6 +31,7 @@
 #include "absl/strings/str_append.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "nlohmann/json.hpp"  // from @nlohmann_json
+#include "runtime/dpm/correction_digest.h"
 #include "runtime/platform/hash/sha256_hasher.h"
 
 namespace litert::lm {
@@ -196,9 +197,18 @@ absl::Status ValidateSnapshot(const DPMLogSnapshot& snapshot) {
         "DPM projection requires valid immutable log and case identities.");
   }
   if (snapshot.generation != snapshot.events.size() ||
-      IsZeroHash(snapshot.prefix_hash)) {
+      IsZeroHash(snapshot.prefix_hash) ||
+      snapshot.prefix_hashes.size() != snapshot.events.size() + 1 ||
+      snapshot.prefix_hashes.empty() ||
+      snapshot.prefix_hashes.back() != snapshot.prefix_hash) {
     return absl::DataLossError(
         "DPM projection received an inconsistent authoritative snapshot.");
+  }
+  for (const Hash256& prefix : snapshot.prefix_hashes) {
+    if (IsZeroHash(prefix)) {
+      return absl::DataLossError(
+          "DPM projection received an empty snapshot prefix proof.");
+    }
   }
   for (uint64_t index = 0; index < snapshot.events.size(); ++index) {
     const DPMEvent& event = snapshot.events[index];
@@ -898,12 +908,27 @@ BuildCanonicalDPMProjectionRequest(
         baseline->manifest.case_id != snapshot.case_id ||
         baseline->manifest.source_event_count == 0 ||
         baseline->manifest.source_event_count >= snapshot.events.size() ||
+        baseline->manifest.source_prefix_hash !=
+            snapshot.prefix_hashes[static_cast<size_t>(
+                baseline->manifest.source_event_count)] ||
         baseline->manifest.config_hash != config_hash ||
-        baseline->manifest.correction_digest != correction_digest ||
         baseline->manifest.runtime_identity != runtime_identity) {
       return absl::FailedPreconditionError(
           "DPM projection baseline is not compatible with the requested "
           "source, configuration, correction lineage, and runtime.");
+    }
+    ABSL_ASSIGN_OR_RETURN(
+        const Hash256 baseline_correction_digest,
+        ComputeDPMCorrectionDigestForPrefix(
+            snapshot, baseline->manifest.source_event_count));
+    ABSL_ASSIGN_OR_RETURN(const Hash256 current_correction_digest,
+                          ComputeDPMCorrectionDigest(snapshot));
+    if (baseline->manifest.correction_digest !=
+            baseline_correction_digest ||
+        correction_digest != current_correction_digest) {
+      return absl::FailedPreconditionError(
+          "DPM projection baseline/current correction lineages do not match "
+          "their authoritative raw-log prefixes.");
     }
     ABSL_ASSIGN_OR_RETURN(
         std::string canonical_baseline,
@@ -946,7 +971,10 @@ BuildCanonicalDPMProjectionRequest(
         &prompt, "[BASELINE MANIFEST SHA256]\n",
         baseline->manifest.manifest_hash.ToHex(), "\n\n",
         "[BASELINE OUTPUT SHA256]\n", baseline->manifest.output_hash.ToHex(),
-        "\n\n", "[BASELINE PROJECTED MEMORY]\n",
+        "\n\n", "[BASELINE CORRECTION LINEAGE SHA256]\n",
+        baseline->manifest.correction_digest.ToHex(), "\n\n",
+        "[CURRENT CORRECTION LINEAGE SHA256]\n",
+        correction_digest.ToHex(), "\n\n", "[BASELINE PROJECTED MEMORY]\n",
         baseline->projected_memory, "\n\n",
         "Update the complete baseline using every event in the delta. Return "
         "a complete replacement object, not a patch. Retain still-supported "

@@ -38,6 +38,7 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "runtime/dpm/correction_digest.h"
 #include "runtime/dpm/dpm_projection_manifest.h"
 #include "runtime/dpm/dpm_projection_prompt.h"
 #include "runtime/dpm/dpm_receipt_validation.h"
@@ -738,6 +739,16 @@ absl::Status ValidateEvent(const DPMEvent& event,
         "DPM turn receipt projection manifest is not bound to its raw-log "
         "source and projected-memory bytes.");
   }
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 expected_projection_correction_digest,
+      ComputeDPMCorrectionDigestForPrefix(log_id, case_id, prior_events,
+                                          prior_events.size()));
+  if (projection.correction_digest !=
+      expected_projection_correction_digest) {
+    return absl::InvalidArgumentError(
+        "DPM projection correction lineage is not derived from its raw-log "
+        "source prefix.");
+  }
   if (projection.baseline_manifest_hash.has_value()) {
     if (projection.event_range_start >= prior_events.size()) {
       return absl::InvalidArgumentError(
@@ -752,10 +763,14 @@ absl::Status ValidateEvent(const DPMEvent& event,
     }
     const DPMProjectionManifest& baseline =
         baseline_response.turn_receipt->projection_manifest;
+    ABSL_ASSIGN_OR_RETURN(
+        const Hash256 expected_baseline_correction_digest,
+        ComputeDPMCorrectionDigestForPrefix(
+            log_id, case_id, prior_events, baseline.source_event_count));
     if (baseline.source_event_count != projection.event_range_start ||
         baseline.manifest_hash != *projection.baseline_manifest_hash ||
         baseline.output_hash != *projection.baseline_output_hash ||
-        baseline.correction_digest != projection.correction_digest ||
+        baseline.correction_digest != expected_baseline_correction_digest ||
         baseline.config_hash != projection.config_hash ||
         baseline.runtime_identity != projection.runtime_identity ||
         baseline.replay_mode != projection.replay_mode ||
@@ -1112,7 +1127,6 @@ absl::StatusOr<std::string> BuildRecord(absl::string_view canonical_event,
 
 struct ScanResult {
   DPMLogSnapshot snapshot;
-  std::vector<Hash256> prefixes;
   uint64_t file_size = 0;
 };
 
@@ -1138,7 +1152,7 @@ absl::StatusOr<ScanResult> ScanLog(int fd, absl::string_view log_id,
   result.snapshot.case_id.assign(case_id.data(), case_id.size());
   result.file_size = file_size;
   Hash256 prefix = ComputeGenesisHash(expected_header);
-  result.prefixes.push_back(prefix);
+  result.snapshot.prefix_hashes.push_back(prefix);
   uint64_t offset = expected_header.size();
   while (offset < file_size) {
     if (file_size - offset < kRecordHeaderSize) {
@@ -1202,7 +1216,7 @@ absl::StatusOr<ScanResult> ScanLog(int fd, absl::string_view log_id,
     }
     result.snapshot.events.push_back(std::move(event));
     prefix = expected_current;
-    result.prefixes.push_back(prefix);
+    result.snapshot.prefix_hashes.push_back(prefix);
     offset += kRecordHeaderSize + payload_size;
   }
   ABSL_ASSIGN_OR_RETURN(uint64_t final_file_size,
@@ -1385,7 +1399,7 @@ absl::StatusOr<Hash256> FilesystemDPMEventLog::PrefixHash(
         "DPM prefix event count ", event_count,
         " exceeds log generation ", scanned.snapshot.generation, "."));
   }
-  return scanned.prefixes[static_cast<size_t>(event_count)];
+  return scanned.snapshot.prefix_hashes[static_cast<size_t>(event_count)];
 }
 
 absl::StatusOr<DPMAppendResult>
@@ -1415,10 +1429,10 @@ FilesystemDPMEventLog::AppendIfGeneration(DPMEvent event,
   event.index = scanned.snapshot.generation;
   ABSL_RETURN_IF_ERROR(ValidateEvent(
       event, scanned.snapshot.events, log_id_, case_id_,
-      scanned.prefixes.back()));
+      scanned.snapshot.prefix_hashes.back()));
   ABSL_ASSIGN_OR_RETURN(std::string canonical_event,
                         EncodeEventCanonical(event));
-  const Hash256 previous = scanned.prefixes.back();
+  const Hash256 previous = scanned.snapshot.prefix_hashes.back();
   const Hash256 current =
       ComputeNextPrefixHash(previous, canonical_event);
   ABSL_ASSIGN_OR_RETURN(std::string record,
@@ -1431,6 +1445,7 @@ FilesystemDPMEventLog::AppendIfGeneration(DPMEvent event,
   scanned.snapshot.events.push_back(std::move(event));
   scanned.snapshot.generation = scanned.snapshot.events.size();
   scanned.snapshot.prefix_hash = current;
+  scanned.snapshot.prefix_hashes.push_back(current);
   result.snapshot = std::move(scanned.snapshot);
   return result;
 }
