@@ -15,9 +15,11 @@
 #include "runtime/core/session_advanced.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -37,12 +39,14 @@
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
+#include "absl/types/span.h"  // from @com_google_absl
 #include "runtime/core/session_handoff_codec.h"
 #include "runtime/core/session_utils.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
 #include "runtime/framework/resource_management/execution_manager.h"
+#include "runtime/platform/hash/sha256_hasher.h"
 #include "runtime/proto/sampler_params.pb.h"
 #include "runtime/util/status_macros.h"  // IWYU pragma: keep
 #include "support/tokenizer/tokenizer.h"
@@ -55,6 +59,208 @@ namespace litert::lm {
 namespace {
 
 using TaskController = SessionInterface::TaskController;
+
+constexpr std::array<char, 8> kDpmTokenBytesMagic = {
+    'D', 'P', 'M', 'T', 'O', 'K', '0', '1'};
+constexpr uint32_t kDpmTokenEncodingVersion = 1;
+constexpr uint32_t kMaximumWitnessTokenIds = 1'000'000;
+constexpr size_t kHandoffDigestChunkSize = 2 * 1024 * 1024;
+
+bool IsZeroHash(const Hash256& hash) { return hash == Hash256{}; }
+
+std::array<char, 4> EncodeU32(uint32_t value) {
+  return {
+      static_cast<char>((value >> 24) & 0xff),
+      static_cast<char>((value >> 16) & 0xff),
+      static_cast<char>((value >> 8) & 0xff),
+      static_cast<char>(value & 0xff),
+  };
+}
+
+// Hashes exactly the bytes successfully accepted by the downstream sink. A
+// null downstream is the import path's deliberately allocation-free,
+// digest-only re-export target.
+class HandoffWitnessByteSink final : public ByteSink {
+ public:
+  explicit HandoffWitnessByteSink(ByteSink* downstream)
+      : downstream_(downstream) {}
+
+  absl::Status Append(absl::string_view bytes) override {
+    if (finished_) {
+      return absl::FailedPreconditionError(
+          "Session handoff witness sink was already finalized.");
+    }
+    if (bytes.size() >
+        std::numeric_limits<uint64_t>::max() - emitted_size_) {
+      return absl::ResourceExhaustedError(
+          "Session handoff witness byte count overflows uint64.");
+    }
+    if (bytes.size() >
+        kMaximumSessionHandoffEnvelopeBytes - emitted_size_) {
+      return absl::ResourceExhaustedError(
+          "Session handoff envelope exceeds the supported transport limit.");
+    }
+    if (downstream_ != nullptr) {
+      ABSL_RETURN_IF_ERROR(downstream_->Append(bytes));
+    }
+    hasher_.Update(bytes);
+    emitted_size_ += bytes.size();
+    return absl::OkStatus();
+  }
+
+  absl::StatusOr<Hash256> Finish() {
+    if (finished_) {
+      return absl::FailedPreconditionError(
+          "Session handoff witness sink was finalized more than once.");
+    }
+    finished_ = true;
+    const Hash256 digest = hasher_.Finalize();
+    if (IsZeroHash(digest) || emitted_size_ == 0) {
+      return absl::InternalError(
+          "Session handoff witness sink produced empty evidence.");
+    }
+    return digest;
+  }
+
+  uint64_t emitted_size() const { return emitted_size_; }
+
+ private:
+  ByteSink* downstream_;
+  Sha256Hasher hasher_;
+  uint64_t emitted_size_ = 0;
+  bool finished_ = false;
+};
+
+absl::StatusOr<Hash256> HashByteSource(const ByteSource& source) {
+  const uint64_t source_size = source.Size();
+  if (source_size == 0) {
+    return absl::DataLossError(
+        "Session handoff byte source is empty.");
+  }
+  if (source_size > kMaximumSessionHandoffEnvelopeBytes) {
+    return absl::ResourceExhaustedError(
+        "Session handoff byte source exceeds the supported transport limit.");
+  }
+  Sha256Hasher hasher;
+  std::string buffer(
+      static_cast<size_t>(
+          std::min<uint64_t>(source_size, kHandoffDigestChunkSize)),
+      '\0');
+  uint64_t offset = 0;
+  while (offset < source_size) {
+    const size_t count = static_cast<size_t>(
+        std::min<uint64_t>(buffer.size(), source_size - offset));
+    ABSL_RETURN_IF_ERROR(source.ReadAt(
+        offset, absl::MakeSpan(buffer).subspan(0, count)));
+    hasher.Update(absl::string_view(buffer.data(), count));
+    offset += count;
+  }
+  if (source.Size() != source_size) {
+    return absl::AbortedError(
+        "Session handoff byte source changed while computing its digest.");
+  }
+  const Hash256 digest = hasher.Finalize();
+  if (IsZeroHash(digest)) {
+    return absl::DataLossError(
+        "Session handoff byte source has no canonical digestable envelope.");
+  }
+  return digest;
+}
+
+absl::StatusOr<Hash256> ComputeProcessedHistoryTokenBytesHash(
+    const ExecutorSessionSnapshot& snapshot) {
+  const auto& tokens = snapshot.processed_tokens;
+  if (tokens.processed_token_ids.size() != 1) {
+    return absl::UnimplementedError(
+        "Session continuation witness requires exactly one processed-token "
+        "history.");
+  }
+  if (!tokens.pending_token_ids.empty() &&
+      tokens.pending_token_ids.size() != 1) {
+    return absl::DataLossError(
+        "Session continuation witness has inconsistent pending-token "
+        "history.");
+  }
+  const size_t processed_count = tokens.processed_token_ids.front().size();
+  const size_t pending_count = tokens.pending_token_ids.empty() ? 0 : 1;
+  if (processed_count > kMaximumWitnessTokenIds - pending_count) {
+    return absl::ResourceExhaustedError(
+        "Session continuation witness exceeds the DPMTOK01 token limit.");
+  }
+  const size_t total_count = processed_count + pending_count;
+  if (snapshot.current_step < 0 ||
+      static_cast<size_t>(snapshot.current_step) != total_count) {
+    return absl::DataLossError(
+        "Session continuation witness step differs from its complete token "
+        "history.");
+  }
+  Sha256Hasher hasher;
+  hasher.Update(absl::string_view(kDpmTokenBytesMagic.data(),
+                                 kDpmTokenBytesMagic.size()));
+  const std::array<char, 4> version = EncodeU32(kDpmTokenEncodingVersion);
+  hasher.Update(absl::string_view(version.data(), version.size()));
+  const std::array<char, 4> count =
+      EncodeU32(static_cast<uint32_t>(total_count));
+  hasher.Update(absl::string_view(count.data(), count.size()));
+  // The live export boundary and transactional executor import separately
+  // validate every ID against the loaded logits vocabulary. This layer owns
+  // only the product-canonical nonnegative-int32 DPMTOK01 representation; it
+  // must not substitute a tokenizer vocabulary for the loaded executor shape.
+  const auto append_token = [&](int token_id) -> absl::Status {
+    if (token_id < 0 ||
+        static_cast<uint64_t>(token_id) >
+            static_cast<uint64_t>((std::numeric_limits<int32_t>::max)())) {
+      return absl::DataLossError(
+          "Session continuation witness contains a noncanonical token ID.");
+    }
+    const std::array<char, 4> encoded =
+        EncodeU32(static_cast<uint32_t>(token_id));
+    hasher.Update(absl::string_view(encoded.data(), encoded.size()));
+    return absl::OkStatus();
+  };
+  for (int token_id : tokens.processed_token_ids.front()) {
+    ABSL_RETURN_IF_ERROR(append_token(token_id));
+  }
+  if (!tokens.pending_token_ids.empty()) {
+    ABSL_RETURN_IF_ERROR(append_token(tokens.pending_token_ids.front()));
+  }
+  const Hash256 history_hash = hasher.Finalize();
+  if (IsZeroHash(history_hash)) {
+    return absl::InternalError(
+        "Canonical DPMTOK01 history produced a zero digest.");
+  }
+  return history_hash;
+}
+
+absl::StatusOr<SessionContinuationStateWitness> BuildContinuationWitness(
+    const SessionHandoffSnapshot& snapshot,
+    const SessionHandoffIdentity& identity, absl::string_view key_id,
+    const Hash256& processed_history_token_bytes_hash,
+    const Hash256& envelope_hash, uint64_t envelope_size) {
+  if (snapshot.executor.current_step < 0 ||
+      static_cast<uint64_t>(snapshot.executor.current_step) >
+          static_cast<uint64_t>(
+              (std::numeric_limits<int32_t>::max)())) {
+    return absl::DataLossError(
+        "Session continuation witness step is outside int32.");
+  }
+  SessionContinuationStateWitness witness;
+  witness.session_identity = identity;
+  witness.phase = snapshot.phase;
+  witness.current_step = static_cast<int32_t>(snapshot.executor.current_step);
+  witness.ran_decode = snapshot.executor.ran_decode;
+  witness.processed_history_token_bytes_hash =
+      processed_history_token_bytes_hash;
+  witness.envelope_hash = envelope_hash;
+  witness.envelope_size = envelope_size;
+  witness.key_id.assign(key_id.data(), key_id.size());
+  ABSL_ASSIGN_OR_RETURN(
+      witness.witness_id,
+      ComputeSessionContinuationStateWitnessId(witness));
+  ABSL_RETURN_IF_ERROR(
+      ValidateSessionContinuationStateWitness(witness));
+  return witness;
+}
 
 absl::Status ValidateSessionHandoffConfig(const SessionConfig& config) {
   if (config.UseExternalSampler()) {
@@ -835,11 +1041,22 @@ absl::StatusOr<std::string> SessionAdvanced::ExportHandoff(
     const SessionHandoffOptions& options) {
   std::string envelope;
   StringByteSink sink(&envelope);
-  ABSL_RETURN_IF_ERROR(ExportHandoffTo(options, &sink));
+  ABSL_ASSIGN_OR_RETURN(
+      SessionContinuationStateWitness witness,
+      ExportHandoffToWithWitness(options, &sink));
+  (void)witness;
   return envelope;
 }
 
 absl::Status SessionAdvanced::ExportHandoffTo(
+    const SessionHandoffOptions& options, ByteSink* sink) {
+  absl::StatusOr<SessionContinuationStateWitness> witness =
+      ExportHandoffToWithWitness(options, sink);
+  return witness.ok() ? absl::OkStatus() : witness.status();
+}
+
+absl::StatusOr<SessionContinuationStateWitness>
+SessionAdvanced::ExportHandoffToWithWitness(
     const SessionHandoffOptions& options, ByteSink* sink) {
   if (sink == nullptr) {
     return absl::InvalidArgumentError(
@@ -849,8 +1066,6 @@ absl::Status SessionAdvanced::ExportHandoffTo(
   if (execution_manager == nullptr) {
     return absl::FailedPreconditionError("Execution manager is not available.");
   }
-  ABSL_ASSIGN_OR_RETURN(SessionHandoffIdentity authoritative_identity,
-                        GetSessionHandoffIdentity());
   // Let already-running asynchronous work finish before taking the session
   // mutex. The manager guard then keeps the complete synchronous stream
   // quiescent; sinks must not re-enter this session.
@@ -864,47 +1079,130 @@ absl::Status SessionAdvanced::ExportHandoffTo(
     return absl::UnimplementedError(
         "Session handoff does not preserve rewind checkpoints.");
   }
-  SessionHandoffSnapshot snapshot;
+  SessionHandoffPhase phase;
   switch (session_state_) {
     case SessionState::kFresh:
-      snapshot.phase = SessionHandoffPhase::kFresh;
+      phase = SessionHandoffPhase::kFresh;
       break;
     case SessionState::kPrefilled:
-      snapshot.phase = SessionHandoffPhase::kPrefilled;
+      phase = SessionHandoffPhase::kPrefilled;
       break;
     case SessionState::kDecoded:
-      snapshot.phase = SessionHandoffPhase::kDecoded;
+      phase = SessionHandoffPhase::kDecoded;
       break;
+    default:
+      return absl::InternalError(
+          "Session handoff encountered an unknown live session phase.");
   }
-  return execution_manager->ExportSessionSnapshotTo(
+  return ExportHandoffToWithWitnessLocked(execution_manager, phase, options,
+                                          sink);
+}
+
+absl::StatusOr<SessionContinuationStateWitness>
+SessionAdvanced::ExportHandoffToWithWitnessLocked(
+    const std::shared_ptr<ExecutionManager>& execution_manager,
+    SessionHandoffPhase phase, const SessionHandoffOptions& options,
+    ByteSink* sink) {
+  if (execution_manager == nullptr) {
+    return absl::FailedPreconditionError("Execution manager is not available.");
+  }
+  ABSL_RETURN_IF_ERROR(
+      ValidateSessionHandoffConfig(session_info_->session_config));
+  if (!checkpoint_map_.empty()) {
+    return absl::UnimplementedError(
+        "Session handoff does not preserve rewind checkpoints.");
+  }
+  ABSL_ASSIGN_OR_RETURN(const SessionHandoffIdentity authoritative_identity,
+                        GetSessionHandoffIdentity());
+
+  HandoffWitnessByteSink witness_sink(sink);
+  SessionHandoffSnapshot snapshot;
+  snapshot.phase = phase;
+  std::optional<SessionContinuationStateWitness> witness;
+  bool consumer_invoked = false;
+  ABSL_RETURN_IF_ERROR(execution_manager->ExportSessionSnapshotTo(
       session_id_, last_task_ids_,
-      [&snapshot, &authoritative_identity, &options,
-       sink](const ExecutorSessionSnapshot& executor_snapshot,
-             const StateInterface& state) -> absl::Status {
+      [&](const ExecutorSessionSnapshot& executor_snapshot,
+          const StateInterface& state) -> absl::Status {
+        if (consumer_invoked) {
+          return absl::InternalError(
+              "Session handoff snapshot consumer was invoked more than once.");
+        }
+        consumer_invoked = true;
         snapshot.executor = executor_snapshot;
-        return EncodeSessionHandoffTo(snapshot, state, authoritative_identity,
-                                      options, sink);
-      });
+        ABSL_ASSIGN_OR_RETURN(
+            const Hash256 processed_history_token_bytes_hash,
+            ComputeProcessedHistoryTokenBytesHash(snapshot.executor));
+        ABSL_RETURN_IF_ERROR(EncodeSessionHandoffTo(
+            snapshot, state, authoritative_identity, options, &witness_sink));
+        ABSL_ASSIGN_OR_RETURN(const Hash256 envelope_hash,
+                              witness_sink.Finish());
+        ABSL_ASSIGN_OR_RETURN(
+            witness,
+            BuildContinuationWitness(snapshot, authoritative_identity,
+                                     options.key_id,
+                                     processed_history_token_bytes_hash,
+                                     envelope_hash,
+                                     witness_sink.emitted_size()));
+        return absl::OkStatus();
+      }));
+  if (!consumer_invoked || !witness.has_value()) {
+    return absl::InternalError(
+        "Session handoff export completed without live-state evidence.");
+  }
+  ABSL_RETURN_IF_ERROR(ValidateSessionContinuationStateWitness(*witness));
+  return *witness;
 }
 
 absl::Status SessionAdvanced::ImportHandoff(
     absl::string_view envelope, const SessionHandoffOptions& expected) {
   StringByteSource source(envelope);
-  return ImportHandoffFrom(source, expected);
+  absl::StatusOr<SessionContinuationStateWitness> witness =
+      ImportHandoffFromWithWitness(source, expected);
+  return witness.ok() ? absl::OkStatus() : witness.status();
 }
 
 absl::Status SessionAdvanced::ImportHandoffFrom(
     const ByteSource& envelope, const SessionHandoffOptions& expected) {
+  absl::StatusOr<SessionContinuationStateWitness> witness =
+      ImportHandoffFromWithWitness(envelope, expected);
+  return witness.ok() ? absl::OkStatus() : witness.status();
+}
+
+absl::StatusOr<SessionContinuationStateWitness>
+SessionAdvanced::ImportHandoffFromWithWitness(
+    const ByteSource& envelope, const SessionHandoffOptions& expected) {
   ABSL_ASSIGN_OR_RETURN(SessionHandoffIdentity authoritative_identity,
                         GetSessionHandoffIdentity());
+  const uint64_t incoming_envelope_size = envelope.Size();
+  ABSL_ASSIGN_OR_RETURN(const Hash256 incoming_envelope_hash,
+                        HashByteSource(envelope));
   // Authenticate and validate identity, structure, PRNG, and token semantics
   // before touching the target session.
   ABSL_ASSIGN_OR_RETURN(DecodedSessionHandoff decoded,
                         DecodeSessionHandoffFrom(
                             envelope, authoritative_identity, expected));
   SessionHandoffSnapshot& snapshot = decoded.snapshot;
+  if (envelope.Size() != incoming_envelope_size) {
+    return absl::AbortedError(
+        "Session handoff byte source changed while it was authenticated.");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 incoming_processed_history_token_bytes_hash,
+      ComputeProcessedHistoryTokenBytesHash(snapshot.executor));
+  ABSL_ASSIGN_OR_RETURN(
+      const SessionContinuationStateWitness incoming_witness,
+      BuildContinuationWitness(snapshot, authoritative_identity,
+                               expected.key_id,
+                               incoming_processed_history_token_bytes_hash,
+                               incoming_envelope_hash,
+                               incoming_envelope_size));
   ByteSourceView serialized_state(&envelope, decoded.serialized_state_offset,
                                   decoded.serialized_state_size);
+  if (serialized_state.Size() != decoded.serialized_state_size) {
+    return absl::DataLossError(
+        "Decoded session handoff state range is no longer readable.");
+  }
 
   auto execution_manager = execution_manager_.lock();
   if (execution_manager == nullptr) {
@@ -924,6 +1222,9 @@ absl::Status SessionAdvanced::ImportHandoffFrom(
   ABSL_RETURN_IF_ERROR(execution_manager->ImportSessionSnapshotFrom(
       session_id_, snapshot.executor, serialized_state));
 
+  // Executor import is the transactional commit point. Keep the public
+  // session phase coherent with that committed live state even if a later
+  // integrity postcondition detects a backend defect and returns an error.
   switch (snapshot.phase) {
     case SessionHandoffPhase::kFresh:
       session_state_ = SessionState::kFresh;
@@ -936,7 +1237,22 @@ absl::Status SessionAdvanced::ImportHandoffFrom(
       break;
   }
   last_task_ids_.clear();
-  return absl::OkStatus();
+
+  // The incoming digest is used only as an expected commitment. Re-export the
+  // committed target through the complete canonical encoder and an
+  // allocation-free digest-only sink, then require exact evidence equality.
+  // This proves the returned witness came from the live target rather than
+  // being copied from the source envelope.
+  ABSL_ASSIGN_OR_RETURN(
+      const SessionContinuationStateWitness committed_witness,
+      ExportHandoffToWithWitnessLocked(execution_manager, snapshot.phase,
+                                       expected, /*sink=*/nullptr));
+  if (committed_witness != incoming_witness) {
+    return absl::DataLossError(
+        "Committed session continuation state differs from the authenticated "
+        "handoff source.");
+  }
+  return committed_witness;
 }
 
 std::optional<SessionDebugInfo> SessionAdvanced::GetSessionDebugInfo() const {

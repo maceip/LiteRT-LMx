@@ -29,12 +29,6 @@
 
 namespace litert::lm {
 
-enum class SessionHandoffPhase : uint8_t {
-  kFresh = 0,
-  kPrefilled = 1,
-  kDecoded = 2,
-};
-
 struct SessionHandoffSnapshot {
   SessionHandoffPhase phase = SessionHandoffPhase::kFresh;
   ExecutorSessionSnapshot executor;

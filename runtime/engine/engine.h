@@ -355,40 +355,66 @@ class SessionInterface {
   // fresh session with the same model, runtime build, and inference profile.
   virtual absl::StatusOr<std::string> ExportHandoff(
       const SessionHandoffOptions& options) {
-    return absl::UnimplementedError("ExportHandoff not implemented.");
+    std::string envelope;
+    StringByteSink sink(&envelope);
+    absl::StatusOr<SessionContinuationStateWitness> witness =
+        ExportHandoffToWithWitness(options, &sink);
+    if (!witness.ok()) return witness.status();
+    return envelope;
   }
 
-  // Streams the envelope without a second full KV-state allocation.
+  // Streams the envelope without a second full KV-state allocation and
+  // returns runtime-derived evidence over the exact bytes actually accepted
+  // by the sink. Implementations that cannot expose a complete live-state
+  // witness fail closed rather than synthesizing one from caller metadata.
+  virtual absl::StatusOr<SessionContinuationStateWitness>
+  ExportHandoffToWithWitness(const SessionHandoffOptions& options,
+                             ByteSink* sink) {
+    (void)options;
+    (void)sink;
+    return absl::UnimplementedError(
+        "Session handoff export witness is not available.");
+  }
+
+  // Compatibility adapter that discards the independently validated witness.
   virtual absl::Status ExportHandoffTo(const SessionHandoffOptions& options,
                                        ByteSink* sink) {
-    if (sink == nullptr) {
-      return absl::InvalidArgumentError(
-          "Session handoff output sink must not be null.");
-    }
-    absl::StatusOr<std::string> envelope = ExportHandoff(options);
-    if (!envelope.ok()) return envelope.status();
-    return sink->Append(*envelope);
+    absl::StatusOr<SessionContinuationStateWitness> witness =
+        ExportHandoffToWithWitness(options, sink);
+    return witness.ok() ? absl::OkStatus() : witness.status();
   }
 
   // Imports into a fresh compatible session after authenticating and
   // validating the complete envelope.
   virtual absl::Status ImportHandoff(absl::string_view envelope,
                                      const SessionHandoffOptions& expected) {
-    return absl::UnimplementedError("ImportHandoff not implemented.");
+    StringByteSource source(envelope);
+    absl::StatusOr<SessionContinuationStateWitness> witness =
+        ImportHandoffFromWithWitness(source, expected);
+    return witness.ok() ? absl::OkStatus() : witness.status();
   }
 
-  // Compatibility adapter for alternate session implementations. The native
-  // implementation authenticates and loads directly from the ByteSource.
+  // Authenticates and transactionally imports the source, then independently
+  // re-exports the committed live target into a digest-only sink. The returned
+  // witness therefore cannot be copied from or supplied by incoming bytes.
+  // Authentication, decoding, and state-load failures leave the fresh target
+  // unchanged. A failure of the post-commit live-state re-export is an
+  // integrity failure; callers must discard that target session.
+  virtual absl::StatusOr<SessionContinuationStateWitness>
+  ImportHandoffFromWithWitness(
+      const ByteSource& envelope, const SessionHandoffOptions& expected) {
+    (void)envelope;
+    (void)expected;
+    return absl::UnimplementedError(
+        "Session handoff import witness is not available.");
+  }
+
+  // Compatibility adapter that discards the independently recomputed witness.
   virtual absl::Status ImportHandoffFrom(
       const ByteSource& envelope, const SessionHandoffOptions& expected) {
-    if (envelope.Size() > std::numeric_limits<size_t>::max()) {
-      return absl::ResourceExhaustedError(
-          "Session handoff envelope exceeds addressable memory.");
-    }
-    std::string bytes(static_cast<size_t>(envelope.Size()), '\0');
-    absl::Status read = envelope.ReadAt(0, absl::MakeSpan(bytes));
-    if (!read.ok()) return read;
-    return ImportHandoff(bytes, expected);
+    absl::StatusOr<SessionContinuationStateWitness> witness =
+        ImportHandoffFromWithWitness(envelope, expected);
+    return witness.ok() ? absl::OkStatus() : witness.status();
   }
 
   // Get the reference to the session config for the session.

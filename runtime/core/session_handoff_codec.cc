@@ -51,10 +51,109 @@ constexpr uint32_t kMaximumRandomEngineStateSize = 64 * 1024;
 constexpr uint32_t kSupportedCandidateCount = 1;
 constexpr uint32_t kMaximumTokensPerCandidate = 16 * 1024 * 1024;
 constexpr size_t kMaximumTotalTokenIds = 16 * 1024 * 1024;
+constexpr uint32_t kMaximumWitnessDpmTokenIds = 1'000'000;
 constexpr size_t kIoChunkSize = 2 * 1024 * 1024;
 constexpr size_t kTokenWriteChunkSize = 64 * 1024;
+constexpr absl::string_view kContinuationStateWitnessDomain =
+    "LITERT_LMX_SESSION_CONTINUATION_STATE_WITNESS_SHA256_V1";
 
 bool IsZeroHash(const Hash256& hash) { return hash == Hash256{}; }
+
+void AppendWitnessU32(uint32_t value, std::string* output) {
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    output->push_back(static_cast<char>((value >> shift) & 0xff));
+  }
+}
+
+void AppendWitnessI32(int32_t value, std::string* output) {
+  AppendWitnessU32(std::bit_cast<uint32_t>(value), output);
+}
+
+void AppendWitnessU64(uint64_t value, std::string* output) {
+  for (int shift = 56; shift >= 0; shift -= 8) {
+    output->push_back(static_cast<char>((value >> shift) & 0xff));
+  }
+}
+
+void AppendWitnessHash(const Hash256& hash, std::string* output) {
+  output->append(reinterpret_cast<const char*>(hash.bytes.data()),
+                 hash.bytes.size());
+}
+
+absl::Status ValidateContinuationStateWitnessFields(
+    const SessionContinuationStateWitness& witness,
+    bool require_witness_id) {
+  if (witness.format_version !=
+      SessionContinuationStateWitness::kFormatVersion) {
+    return absl::FailedPreconditionError(
+        "Unsupported session continuation-state witness version.");
+  }
+  if ((require_witness_id && IsZeroHash(witness.witness_id)) ||
+      IsZeroHash(witness.session_identity.model_artifact_hash) ||
+      IsZeroHash(witness.session_identity.runtime_artifact_hash) ||
+      IsZeroHash(witness.session_identity.inference_profile_hash) ||
+      witness.current_step < 0 ||
+      static_cast<uint32_t>(witness.current_step) >
+          kMaximumWitnessDpmTokenIds ||
+      IsZeroHash(witness.processed_history_token_bytes_hash) ||
+      IsZeroHash(witness.envelope_hash) || witness.envelope_size == 0 ||
+      witness.envelope_size > kMaximumSessionHandoffEnvelopeBytes ||
+      witness.key_id.empty() || witness.key_id.size() > kMaximumKeyIdSize) {
+    return absl::InvalidArgumentError(
+        "Session continuation-state witness is incomplete or outside its "
+        "canonical bounds.");
+  }
+  switch (witness.phase) {
+    case SessionHandoffPhase::kFresh:
+      if (witness.current_step != 0 || witness.ran_decode) {
+        return absl::InvalidArgumentError(
+            "Fresh session continuation-state witness contains non-fresh "
+            "state.");
+      }
+      break;
+    case SessionHandoffPhase::kPrefilled:
+      if (witness.current_step == 0 || witness.ran_decode) {
+        return absl::InvalidArgumentError(
+            "Prefilled session continuation-state witness has inconsistent "
+            "state.");
+      }
+      break;
+    case SessionHandoffPhase::kDecoded:
+      if (witness.current_step == 0 || !witness.ran_decode) {
+        return absl::InvalidArgumentError(
+            "Decoded session continuation-state witness has inconsistent "
+            "state.");
+      }
+      break;
+    default:
+      return absl::InvalidArgumentError(
+          "Session continuation-state witness has an unknown phase.");
+  }
+  return absl::OkStatus();
+}
+
+std::string EncodeContinuationStateWitnessFields(
+    const SessionContinuationStateWitness& witness) {
+  std::string canonical;
+  canonical.reserve(4 + 96 + 1 + 4 + 1 + 32 + 32 + 8 + 4 +
+                    witness.key_id.size());
+  AppendWitnessU32(witness.format_version, &canonical);
+  AppendWitnessHash(witness.session_identity.model_artifact_hash,
+                    &canonical);
+  AppendWitnessHash(witness.session_identity.runtime_artifact_hash,
+                    &canonical);
+  AppendWitnessHash(witness.session_identity.inference_profile_hash,
+                    &canonical);
+  canonical.push_back(static_cast<char>(witness.phase));
+  AppendWitnessI32(witness.current_step, &canonical);
+  canonical.push_back(witness.ran_decode ? '\1' : '\0');
+  AppendWitnessHash(witness.processed_history_token_bytes_hash, &canonical);
+  AppendWitnessHash(witness.envelope_hash, &canonical);
+  AppendWitnessU64(witness.envelope_size, &canonical);
+  AppendWitnessU32(static_cast<uint32_t>(witness.key_id.size()), &canonical);
+  canonical.append(witness.key_id);
+  return canonical;
+}
 
 absl::Status ValidateOptions(
     const SessionHandoffIdentity& authoritative_identity,
@@ -230,6 +329,73 @@ absl::StatusOr<std::string> SerializeRandomEngine(
         "Serialized session sampler random engine has an invalid size.");
   }
   return result;
+}
+
+absl::Status ValidateEncodedEnvelopeSize(
+    const SessionHandoffSnapshot& snapshot, uint64_t serialized_state_size,
+    size_t key_id_size, size_t random_engine_state_size) {
+  uint64_t total_size = 0;
+  const auto add = [&total_size](uint64_t byte_count) -> bool {
+    if (byte_count >
+        kMaximumSessionHandoffEnvelopeBytes - total_size) {
+      return false;
+    }
+    total_size += byte_count;
+    return true;
+  };
+
+  // Fixed body fields through runtime_config_flags, including the three
+  // identity hashes and key-id length, but excluding the key-id bytes.
+  if (!add(kSessionHandoffEnvelopeMagic.size() + sizeof(uint32_t) +
+           3 * Hash256{}.bytes.size() + sizeof(uint32_t) +
+           sizeof(uint8_t) + sizeof(uint8_t) + sizeof(uint16_t) +
+           sizeof(int32_t) + sizeof(int32_t) + sizeof(uint8_t)) ||
+      !add(key_id_size)) {
+    return absl::ResourceExhaustedError(
+        "Session handoff metadata exceeds the supported transport limit.");
+  }
+
+  const auto& runtime_config = snapshot.executor.runtime_config;
+  if (runtime_config.sampler_params.has_value()) {
+    // type, k, p, temperature, has_seed, optional seed, backend.
+    if (!add(4 + 4 + 4 + 4 + 1 +
+             (runtime_config.sampler_params->has_seed() ? 4 : 0) + 4)) {
+      return absl::ResourceExhaustedError(
+          "Session handoff sampler metadata exceeds the transport limit.");
+    }
+  }
+  if (runtime_config.output_heads.has_value() && !add(sizeof(int32_t))) {
+    return absl::ResourceExhaustedError(
+        "Session handoff runtime metadata exceeds the transport limit.");
+  }
+  if (runtime_config.tokens_per_decode.has_value() && !add(sizeof(int32_t))) {
+    return absl::ResourceExhaustedError(
+        "Session handoff runtime metadata exceeds the transport limit.");
+  }
+  if (!add(sizeof(uint32_t)) || !add(random_engine_state_size) ||
+      !add(sizeof(uint32_t) + sizeof(uint32_t))) {
+    return absl::ResourceExhaustedError(
+        "Session handoff runtime metadata exceeds the transport limit.");
+  }
+
+  const auto& tokens = snapshot.executor.processed_tokens;
+  const uint64_t candidate_count = tokens.processed_token_ids.size();
+  const uint64_t processed_count = tokens.processed_token_ids.front().size();
+  if (candidate_count != 0 &&
+      processed_count >
+          kMaximumSessionHandoffEnvelopeBytes / candidate_count / 4) {
+    return absl::ResourceExhaustedError(
+        "Session handoff token metadata exceeds the transport limit.");
+  }
+  if (!add(candidate_count * processed_count * 4) ||
+      !add(sizeof(uint8_t)) ||
+      (!tokens.pending_token_ids.empty() && !add(candidate_count * 4)) ||
+      !add(sizeof(uint64_t)) || !add(serialized_state_size) ||
+      !add(kMacSize)) {
+    return absl::ResourceExhaustedError(
+        "Session handoff envelope exceeds the supported transport limit.");
+  }
+  return absl::OkStatus();
 }
 
 absl::StatusOr<std::default_random_engine> ParseRandomEngine(
@@ -429,6 +595,9 @@ absl::Status EncodeSessionHandoffParts(
   ABSL_RETURN_IF_ERROR(ValidateSnapshot(snapshot, serialized_state_size));
   ABSL_ASSIGN_OR_RETURN(std::string random_engine_state,
                         SerializeRandomEngine(snapshot.executor.random_engine));
+  ABSL_RETURN_IF_ERROR(ValidateEncodedEnvelopeSize(
+      snapshot, serialized_state_size, options.key_id.size(),
+      random_engine_state.size()));
 
   HmacSha256State hmac(options.authentication_key);
   AuthenticatedByteSink body(sink, &hmac);
@@ -643,6 +812,35 @@ class SourceReader {
 
 }  // namespace
 
+absl::StatusOr<Hash256> ComputeSessionContinuationStateWitnessId(
+    const SessionContinuationStateWitness& witness) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateContinuationStateWitnessFields(witness, false));
+  Sha256Hasher hasher;
+  hasher.Update(kContinuationStateWitnessDomain);
+  hasher.Update(EncodeContinuationStateWitnessFields(witness));
+  const Hash256 witness_id = hasher.Finalize();
+  if (IsZeroHash(witness_id)) {
+    return absl::InternalError(
+        "Session continuation-state witness produced a zero ID.");
+  }
+  return witness_id;
+}
+
+absl::Status ValidateSessionContinuationStateWitness(
+    const SessionContinuationStateWitness& witness) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateContinuationStateWitnessFields(witness, true));
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 canonical_id,
+      ComputeSessionContinuationStateWitnessId(witness));
+  if (witness.witness_id != canonical_id) {
+    return absl::DataLossError(
+        "Session continuation-state witness ID is not canonical.");
+  }
+  return absl::OkStatus();
+}
+
 absl::Status EncodeSessionHandoffTo(
     const SessionHandoffSnapshot& snapshot, const StateInterface& state,
     const SessionHandoffIdentity& authoritative_identity,
@@ -696,8 +894,10 @@ absl::StatusOr<DecodedSessionHandoff> DecodeSessionHandoffFrom(
       ValidateOptions(authoritative_identity, options));
   constexpr uint64_t kMinimumEnvelopeSize =
       kSessionHandoffEnvelopeMagic.size() + sizeof(uint32_t) + kMacSize;
-  if (envelope.Size() < kMinimumEnvelopeSize) {
-    return absl::DataLossError("Session handoff envelope is truncated.");
+  if (envelope.Size() < kMinimumEnvelopeSize ||
+      envelope.Size() > kMaximumSessionHandoffEnvelopeBytes) {
+    return absl::DataLossError(
+        "Session handoff envelope size is outside the supported range.");
   }
   const uint64_t body_size = envelope.Size() - kMacSize;
   ABSL_ASSIGN_OR_RETURN(

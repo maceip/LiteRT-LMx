@@ -192,11 +192,22 @@ class SessionAdvanced : public SessionInterface {
                                ByteSink* sink) override
       ABSL_LOCKS_EXCLUDED(mutex_);
 
+  absl::StatusOr<SessionContinuationStateWitness>
+  ExportHandoffToWithWitness(const SessionHandoffOptions& options,
+                             ByteSink* sink) override
+      ABSL_LOCKS_EXCLUDED(mutex_);
+
   absl::Status ImportHandoff(absl::string_view envelope,
                              const SessionHandoffOptions& expected) override
       ABSL_LOCKS_EXCLUDED(mutex_);
 
   absl::Status ImportHandoffFrom(
+      const ByteSource& envelope,
+      const SessionHandoffOptions& expected) override
+      ABSL_LOCKS_EXCLUDED(mutex_);
+
+  absl::StatusOr<SessionContinuationStateWitness>
+  ImportHandoffFromWithWitness(
       const ByteSource& envelope,
       const SessionHandoffOptions& expected) override
       ABSL_LOCKS_EXCLUDED(mutex_);
@@ -336,6 +347,12 @@ class SessionAdvanced : public SessionInterface {
       const DecodeConfig& decode_config,
       std::shared_ptr<ExactLiteRtDecodeCapture> exact_litert_decode_capture)
       ABSL_LOCKS_EXCLUDED(mutex_);
+
+  absl::StatusOr<SessionContinuationStateWitness>
+  ExportHandoffToWithWitnessLocked(
+      const std::shared_ptr<ExecutionManager>& execution_manager,
+      SessionHandoffPhase phase, const SessionHandoffOptions& options,
+      ByteSink* sink) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   // The session ID used for the session.
   SessionId session_id_;
