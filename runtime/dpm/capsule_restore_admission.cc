@@ -1325,6 +1325,36 @@ CapsuleRestoreQualifier::Qualify(
       const std::string checkpoint_envelope,
       source->ExportHandoff(bound_checkpoint_authentication));
   ABSL_RETURN_IF_ERROR(ValidateLrtSess1Envelope(checkpoint_envelope));
+  ABSL_RETURN_IF_ERROR(ValidateSessionIdentity(*source, resolved.identity));
+  ABSL_ASSIGN_OR_RETURN(const auto source_after_export,
+                        InspectSingleHistory(*source));
+  if (source_after_export != checkpoint_observation) {
+    return absl::FailedPreconditionError(
+        "CapsuleRestore export changed the live source step or exact token "
+        "history.");
+  }
+  // LRTSESS1 is canonical. A second quiescent observation must therefore be
+  // byte-identical; this catches export implementations that mutate hidden
+  // state while taking a snapshot. State is observed once more after the
+  // second export, and the later live-vs-restored continuation comparison
+  // remains the final load-bearing-state check.
+  ABSL_ASSIGN_OR_RETURN(
+      const std::string repeated_checkpoint_envelope,
+      source->ExportHandoff(bound_checkpoint_authentication));
+  ABSL_RETURN_IF_ERROR(
+      ValidateLrtSess1Envelope(repeated_checkpoint_envelope));
+  if (repeated_checkpoint_envelope != checkpoint_envelope) {
+    return absl::FailedPreconditionError(
+        "CapsuleRestore export is not a stable canonical observation of the "
+        "same quiescent source state.");
+  }
+  ABSL_RETURN_IF_ERROR(ValidateSessionIdentity(*source, resolved.identity));
+  ABSL_ASSIGN_OR_RETURN(const auto source_after_repeated_export,
+                        InspectSingleHistory(*source));
+  if (source_after_repeated_export != checkpoint_observation) {
+    return absl::FailedPreconditionError(
+        "Repeated CapsuleRestore export changed the source step or history.");
+  }
 
   // Target creation count is intentionally exactly one. Freshness is proven
   // immediately before the transactional import API is invoked.

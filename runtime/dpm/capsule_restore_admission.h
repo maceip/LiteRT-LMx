@@ -102,10 +102,15 @@ struct CapsuleRestoreContinuationEvidence {
   }
 };
 
-// Durable evidence that this one complete Engine-derived capability restored
-// at its own position and produced the same continuation after identical
-// delta-prefill work. It is neither a checkpoint nor permission to restore a
-// different capsule/profile/specification.
+// Durable evidence that this one complete Engine-derived capability passed the
+// named concrete own-position restore qualification. Product policy may admit
+// operational capsules only for this same derived profile, capability, codec,
+// and qualification specification. The record is not an operational
+// checkpoint and does not authenticate arbitrary capsule bytes: every DPM
+// checkpoint still requires its own LRTSESS1 authentication, Engine identity,
+// raw-log provenance, own-position delta plan, and current record
+// reauthentication. A different profile, capability, codec, or qualification
+// specification requires a different admission record.
 struct CapsuleRestoreAdmissionRecord {
   static constexpr uint32_t kFormatVersion = 1;
 
