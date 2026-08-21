@@ -3813,6 +3813,11 @@ LlmLiteRtCompiledModelExecutorBase::GetSessionHandoffRuntimeProfile() const {
     ABSL_ASSIGN_OR_RETURN(
         const CpuConfig cpu,
         compiled_settings.GetBackendConfig<CpuConfig>());
+    if (!compiled_settings.GetLitertDispatchLibDir().empty()) {
+      return absl::UnimplementedError(
+          "Exact CPU identity does not admit an external LiteRT dispatch "
+          "library without selected plugin artifact evidence.");
+    }
     if (cpu.number_of_threads == 0) {
       return absl::FailedPreconditionError(
           "Loaded CPU executor has no positive compiled thread count.");
