@@ -172,8 +172,20 @@ struct DPMTurnResult {
   std::optional<Hash256> agent_exact_output_evidence_hash;
   uint32_t agent_exact_logit_frame_count = 0;
   bool agent_reused_canonical_winner = false;
+  // This remains exclusively a live-parent WinnerReplay statement. Exact
+  // worker capsules use the separate authenticated provenance below.
   bool agent_producing_session_matched_output = false;
+  bool agent_worker_capsule_matched_output = false;
   std::optional<Hash256> session_checkpoint_id;
+  std::optional<Hash256> restored_from_session_checkpoint_id;
+  DPMCheckpointCaptureOrigin checkpoint_capture_origin =
+      DPMCheckpointCaptureOrigin::kNone;
+  DPMCheckpointWorkerPrefillMode agent_worker_prefill_mode =
+      DPMCheckpointWorkerPrefillMode::kNone;
+  Hash256 agent_physical_execution_plan_hash;
+  std::optional<Hash256> agent_capsule_restore_admission_record_id;
+  std::optional<DPMExactWorkerCheckpointProvenance>
+      agent_exact_worker_checkpoint_provenance;
   bool restored_session_checkpoint = false;
   bool recovered_committed_turn = false;
 };
@@ -248,7 +260,9 @@ class DPMEngine {
       uint64_t response_event_index,
       const DPMProjectionOutcome& projection,
       const Hash256& agent_request_hash,
-      const Hash256& transcript_hash, int64_t created_unix_micros) const;
+      const Hash256& transcript_hash,
+      const std::optional<Hash256>& restored_from_checkpoint_id,
+      int64_t created_unix_micros) const;
 
   DPMEventLog* log_;
   DPMProjectionProvider* projection_provider_;
