@@ -20,6 +20,7 @@
 #include <string>
 
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/statusor.h"  // from @com_google_absl
 #include "runtime/engine/session_handoff.h"
 #include "runtime/platform/hash/hasher.h"
 
@@ -82,6 +83,46 @@ enum class ExactLiteRtEvidence : uint32_t {
 
 constexpr uint32_t ExactLiteRtEvidenceBit(ExactLiteRtEvidence evidence) {
   return static_cast<uint32_t>(evidence);
+}
+
+// Canonical evidence inventories. A resolved profile binds exactly the mask
+// for its concrete backend: missing bits are unsupported and extra/unknown
+// bits cannot be used to manufacture a stronger-looking profile.
+constexpr uint32_t ExactLiteRtCommonRequiredEvidenceMask() {
+  return ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kModelArtifact) |
+         ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kTokenizerContract) |
+         ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kLiteRtModelBytecode) |
+         ExactLiteRtEvidenceBit(
+             ExactLiteRtEvidence::kRuntimeAndDelegateBinary) |
+         ExactLiteRtEvidenceBit(
+             ExactLiteRtEvidence::kOperatingSystemAndDevice) |
+         ExactLiteRtEvidenceBit(
+             ExactLiteRtEvidence::kCompilationPrecisionAndQuantization) |
+         ExactLiteRtEvidenceBit(
+             ExactLiteRtEvidence::kExecutionShapeThreadingAndChunking) |
+         ExactLiteRtEvidenceBit(
+             ExactLiteRtEvidence::kStableCpuGreedySampler) |
+         ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kSessionIdentity);
+}
+
+constexpr uint32_t ExactLiteRtCpuRequiredEvidenceMask() {
+  return ExactLiteRtCommonRequiredEvidenceMask();
+}
+
+constexpr uint32_t ExactLiteRtMetalRequiredEvidenceMask() {
+  return ExactLiteRtCommonRequiredEvidenceMask() |
+         ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kMetalDeviceAndFamily) |
+         ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kSelectedMetalDelegate) |
+         ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kFixedPrefillSchedule) |
+         ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kFixedShapeDecode) |
+         ExactLiteRtEvidenceBit(
+             ExactLiteRtEvidence::kAdaptiveSplitKvDisabled) |
+         ExactLiteRtEvidenceBit(
+             ExactLiteRtEvidence::kQuiescentGpuExecution) |
+         ExactLiteRtEvidenceBit(
+             ExactLiteRtEvidence::kCompleteGpuSessionAndResetState) |
+         ExactLiteRtEvidenceBit(
+             ExactLiteRtEvidence::kSelectedMetalKernelPipeline);
 }
 
 // Engine-scoped discovery result. "Candidate" means only that this Engine can
@@ -248,6 +289,19 @@ struct ExactLiteRtProfileAssertion {
   std::optional<ExactLiteRtBackend> expected_backend;
   std::optional<SessionHandoffIdentity> expected_session_identity;
 };
+
+// Computes the sole canonical profile identifier. `profile_id` itself is not
+// an input; every other ExactLiteRtProfile field is encoded in a fixed order
+// under a versioned SHA-256 domain. This is intentionally separate from
+// validation so a builder can compute the identifier before assigning it.
+absl::StatusOr<Hash256> ComputeExactLiteRtProfileId(
+    const ExactLiteRtProfile& profile);
+
+// Validates the complete CPU or Metal profile contract and recomputes its
+// identifier. This must be called whenever a profile crosses a construction,
+// admission, repository, or runtime trust boundary; comparing a caller-
+// supplied profile_id alone is never sufficient.
+absl::Status ValidateExactLiteRtProfile(const ExactLiteRtProfile& profile);
 
 absl::Status ValidateExactLiteRtProfileAssertion(
     const ExactLiteRtProfile& derived,

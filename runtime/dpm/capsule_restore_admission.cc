@@ -213,63 +213,7 @@ absl::Status ValidatePublicKeyId(absl::string_view key_id,
 
 absl::Status ValidateDerivedProfile(
     const ExactLiteRtProfile& derived_profile) {
-  if (IsZeroHash(derived_profile.profile_id) ||
-      IsZeroHash(derived_profile.model_artifact_hash) ||
-      IsZeroHash(derived_profile.tokenizer_contract_hash) ||
-      IsZeroHash(derived_profile.litert_model_bytecode_hash) ||
-      IsZeroHash(derived_profile.runtime_delegate_platform_hash) ||
-      IsZeroHash(derived_profile.loaded_execution_profile_hash) ||
-      IsZeroHash(derived_profile.session_identity.model_artifact_hash) ||
-      IsZeroHash(derived_profile.session_identity.runtime_artifact_hash) ||
-      IsZeroHash(derived_profile.session_identity.inference_profile_hash) ||
-      derived_profile.qualification_requirement !=
-          ExactLiteRtQualificationRequirement::
-              kIndependentColdProcessesTokensAndLogits ||
-      derived_profile.sampler_identity !=
-          ExactLiteRtSamplerIdentity::kCpuGreedyArgmaxMinIndex ||
-      derived_profile.batch_size != 1 ||
-      derived_profile.logits_frame.batch_size != 1 ||
-      derived_profile.logits_frame.sequence_size != 1 ||
-      derived_profile.logits_frame.vocabulary_size == 0 ||
-      derived_profile.logits_frame.byte_count == 0) {
-    return absl::FailedPreconditionError(
-        "The loaded Engine did not derive a complete batch-one exact "
-        "profile for CapsuleRestore qualification.");
-  }
-  switch (derived_profile.backend) {
-    case ExactLiteRtBackend::kCpu:
-      break;
-    case ExactLiteRtBackend::kMetalGpu:
-      if (IsZeroHash(derived_profile.gpu_execution_policy_hash)) {
-        return absl::FailedPreconditionError(
-            "The Metal exact profile has no complete GPU execution policy.");
-      }
-      break;
-    default:
-      return absl::UnimplementedError(
-          "The resolved backend is not eligible for CapsuleRestore "
-          "qualification.");
-  }
-
-  uint64_t element_width = 0;
-  switch (derived_profile.logits_frame.element_type) {
-    case ExactLiteRtLogitsElementType::kFloat16:
-      element_width = 2;
-      break;
-    case ExactLiteRtLogitsElementType::kFloat32:
-      element_width = 4;
-      break;
-    default:
-      return absl::FailedPreconditionError(
-          "The exact profile has no supported full-logits element type.");
-  }
-  const uint64_t vocabulary = derived_profile.logits_frame.vocabulary_size;
-  if (vocabulary > (std::numeric_limits<uint64_t>::max)() / element_width ||
-      derived_profile.logits_frame.byte_count != vocabulary * element_width) {
-    return absl::FailedPreconditionError(
-        "The exact profile full-logits extent is inconsistent.");
-  }
-  return absl::OkStatus();
+  return ValidateExactLiteRtProfile(derived_profile);
 }
 
 absl::Status ValidateProfileCapabilityAgreement(

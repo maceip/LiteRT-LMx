@@ -87,6 +87,7 @@ CanonicalizeExactLiteRtDecodeEvidence(
     const ExactLiteRtDecodeResult& decoded,
     const ExactLiteRtProfile& derived_profile,
     uint32_t max_output_tokens) {
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(derived_profile));
   if (decoded.responses.GetTaskState() != TaskState::kDone &&
       decoded.responses.GetTaskState() != TaskState::kMaxNumTokensReached) {
     return absl::InternalError(

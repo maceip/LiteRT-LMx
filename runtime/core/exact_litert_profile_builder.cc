@@ -38,15 +38,7 @@
 namespace litert::lm {
 namespace {
 
-constexpr absl::string_view kStableGreedySamplerContract =
-    "LITERT_LM_CPU_GREEDY_ARGMAX_MIN_INDEX_V1";
-
 bool IsZeroHash(const Hash256& hash) { return hash == Hash256{}; }
-
-void HashU8(uint8_t value, Sha256Hasher* hasher) {
-  const char byte = static_cast<char>(value);
-  hasher->Update(absl::string_view(&byte, 1));
-}
 
 void HashU32(uint32_t value, Sha256Hasher* hasher) {
   std::array<char, 4> bytes;
@@ -76,39 +68,6 @@ void HashFrame(absl::string_view value, Sha256Hasher* hasher) {
 void HashDigest(const Hash256& value, Sha256Hasher* hasher) {
   hasher->Update(absl::string_view(
       reinterpret_cast<const char*>(value.bytes.data()), value.bytes.size()));
-}
-
-uint32_t CommonRequiredEvidence() {
-  return ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kModelArtifact) |
-         ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kTokenizerContract) |
-         ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kLiteRtModelBytecode) |
-         ExactLiteRtEvidenceBit(
-             ExactLiteRtEvidence::kRuntimeAndDelegateBinary) |
-         ExactLiteRtEvidenceBit(
-             ExactLiteRtEvidence::kOperatingSystemAndDevice) |
-         ExactLiteRtEvidenceBit(
-             ExactLiteRtEvidence::kCompilationPrecisionAndQuantization) |
-         ExactLiteRtEvidenceBit(
-             ExactLiteRtEvidence::kExecutionShapeThreadingAndChunking) |
-         ExactLiteRtEvidenceBit(
-             ExactLiteRtEvidence::kStableCpuGreedySampler) |
-         ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kSessionIdentity);
-}
-
-uint32_t MetalRequiredEvidence() {
-  return CommonRequiredEvidence() |
-         ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kMetalDeviceAndFamily) |
-         ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kSelectedMetalDelegate) |
-         ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kFixedPrefillSchedule) |
-         ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kFixedShapeDecode) |
-         ExactLiteRtEvidenceBit(
-             ExactLiteRtEvidence::kAdaptiveSplitKvDisabled) |
-         ExactLiteRtEvidenceBit(
-             ExactLiteRtEvidence::kQuiescentGpuExecution) |
-         ExactLiteRtEvidenceBit(
-             ExactLiteRtEvidence::kCompleteGpuSessionAndResetState) |
-         ExactLiteRtEvidenceBit(
-             ExactLiteRtEvidence::kSelectedMetalKernelPipeline);
 }
 
 absl::Status ValidateLogitsFrameContract(
@@ -386,7 +345,7 @@ ExactLiteRtProfileCapability DescribeExactLiteRtProfileCapability(
   switch (configured_backend) {
     case Backend::CPU: {
       capability.backend = ExactLiteRtBackend::kCpu;
-      capability.required_evidence = CommonRequiredEvidence();
+      capability.required_evidence = ExactLiteRtCpuRequiredEvidenceMask();
       const uint32_t session_scoped =
           ExactLiteRtEvidenceBit(
               ExactLiteRtEvidence::kStableCpuGreedySampler) |
@@ -405,7 +364,7 @@ ExactLiteRtProfileCapability DescribeExactLiteRtProfileCapability(
     }
     case Backend::GPU: {
       capability.backend = ExactLiteRtBackend::kUnclassifiedGpu;
-      capability.required_evidence = MetalRequiredEvidence();
+      capability.required_evidence = ExactLiteRtMetalRequiredEvidenceMask();
       capability.missing_evidence =
           capability.required_evidence & ~engine_derived_evidence;
       const uint32_t session_scoped =
@@ -436,7 +395,7 @@ ExactLiteRtProfileCapability DescribeExactLiteRtProfileCapability(
       // backend-specific evidence set remains unenumerated until a concrete
       // backend is owned; the sentinel can never be bound by a profile.
       capability.required_evidence =
-          CommonRequiredEvidence() |
+          ExactLiteRtCommonRequiredEvidenceMask() |
           ExactLiteRtEvidenceBit(
               ExactLiteRtEvidence::kBackendEvidenceUnenumerated);
       capability.availability =
@@ -490,7 +449,7 @@ absl::StatusOr<ExactLiteRtProfile> DeriveExactLiteRtCpuProfile(
       .loaded_execution_profile_hash = loaded_execution_profile_hash,
       .session_identity = session_identity,
       .backend = ExactLiteRtBackend::kCpu,
-      .bound_evidence = CommonRequiredEvidence(),
+      .bound_evidence = ExactLiteRtCpuRequiredEvidenceMask(),
       .qualification_requirement =
           ExactLiteRtQualificationRequirement::
               kIndependentColdProcessesTokensAndLogits,
@@ -502,37 +461,9 @@ absl::StatusOr<ExactLiteRtProfile> DeriveExactLiteRtCpuProfile(
       .prefill_chunk_size = prefill_chunk_size,
   };
 
-  Sha256Hasher profile_hasher;
-  HashFrame("LITERT_LM_EXACT_PROFILE_V3", &profile_hasher);
-  HashU8(static_cast<uint8_t>(profile.backend), &profile_hasher);
-  HashU32(profile.bound_evidence, &profile_hasher);
-  HashU8(static_cast<uint8_t>(profile.qualification_requirement),
-         &profile_hasher);
-  HashU8(static_cast<uint8_t>(profile.sampler_identity), &profile_hasher);
-  HashU8(static_cast<uint8_t>(profile.logits_frame.element_type),
-         &profile_hasher);
-  HashU32(profile.logits_frame.batch_size, &profile_hasher);
-  HashU32(profile.logits_frame.sequence_size, &profile_hasher);
-  HashU32(profile.logits_frame.vocabulary_size, &profile_hasher);
-  HashU64(profile.logits_frame.byte_count, &profile_hasher);
-  HashDigest(profile.model_artifact_hash, &profile_hasher);
-  HashDigest(profile.tokenizer_contract_hash, &profile_hasher);
-  HashDigest(profile.litert_model_bytecode_hash, &profile_hasher);
-  HashDigest(profile.runtime_delegate_platform_hash, &profile_hasher);
-  HashDigest(profile.loaded_execution_profile_hash, &profile_hasher);
-  HashDigest(profile.gpu_execution_policy_hash, &profile_hasher);
-  HashDigest(profile.session_identity.model_artifact_hash, &profile_hasher);
-  HashDigest(profile.session_identity.runtime_artifact_hash, &profile_hasher);
-  HashDigest(profile.session_identity.inference_profile_hash, &profile_hasher);
-  HashU32(profile.batch_size, &profile_hasher);
-  HashU32(profile.cpu_thread_count, &profile_hasher);
-  HashI32(profile.prefill_chunk_size, &profile_hasher);
-  HashFrame(kStableGreedySamplerContract, &profile_hasher);
-  profile.profile_id = profile_hasher.Finalize();
-  if (IsZeroHash(profile.profile_id)) {
-    return absl::FailedPreconditionError(
-        "Exact LiteRT profile produced a zero identifier.");
-  }
+  ABSL_ASSIGN_OR_RETURN(profile.profile_id,
+                        ComputeExactLiteRtProfileId(profile));
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(profile));
   return profile;
 }
 
@@ -585,7 +516,7 @@ absl::StatusOr<ExactLiteRtProfile> DeriveExactLiteRtMetalProfile(
       .gpu_execution_policy_hash = gpu_execution_policy_hash,
       .session_identity = session_identity,
       .backend = ExactLiteRtBackend::kMetalGpu,
-      .bound_evidence = MetalRequiredEvidence(),
+      .bound_evidence = ExactLiteRtMetalRequiredEvidenceMask(),
       .qualification_requirement =
           ExactLiteRtQualificationRequirement::
               kIndependentColdProcessesTokensAndLogits,
@@ -601,37 +532,9 @@ absl::StatusOr<ExactLiteRtProfile> DeriveExactLiteRtMetalProfile(
       .prefill_chunk_size = prefill_chunk_size,
   };
 
-  Sha256Hasher profile_hasher;
-  HashFrame("LITERT_LM_EXACT_PROFILE_V3", &profile_hasher);
-  HashU8(static_cast<uint8_t>(profile.backend), &profile_hasher);
-  HashU32(profile.bound_evidence, &profile_hasher);
-  HashU8(static_cast<uint8_t>(profile.qualification_requirement),
-         &profile_hasher);
-  HashU8(static_cast<uint8_t>(profile.sampler_identity), &profile_hasher);
-  HashU8(static_cast<uint8_t>(profile.logits_frame.element_type),
-         &profile_hasher);
-  HashU32(profile.logits_frame.batch_size, &profile_hasher);
-  HashU32(profile.logits_frame.sequence_size, &profile_hasher);
-  HashU32(profile.logits_frame.vocabulary_size, &profile_hasher);
-  HashU64(profile.logits_frame.byte_count, &profile_hasher);
-  HashDigest(profile.model_artifact_hash, &profile_hasher);
-  HashDigest(profile.tokenizer_contract_hash, &profile_hasher);
-  HashDigest(profile.litert_model_bytecode_hash, &profile_hasher);
-  HashDigest(profile.runtime_delegate_platform_hash, &profile_hasher);
-  HashDigest(profile.loaded_execution_profile_hash, &profile_hasher);
-  HashDigest(profile.gpu_execution_policy_hash, &profile_hasher);
-  HashDigest(profile.session_identity.model_artifact_hash, &profile_hasher);
-  HashDigest(profile.session_identity.runtime_artifact_hash, &profile_hasher);
-  HashDigest(profile.session_identity.inference_profile_hash, &profile_hasher);
-  HashU32(profile.batch_size, &profile_hasher);
-  HashU32(profile.cpu_thread_count, &profile_hasher);
-  HashI32(profile.prefill_chunk_size, &profile_hasher);
-  HashFrame(kStableGreedySamplerContract, &profile_hasher);
-  profile.profile_id = profile_hasher.Finalize();
-  if (IsZeroHash(profile.profile_id)) {
-    return absl::FailedPreconditionError(
-        "Exact LiteRT Metal profile produced a zero identifier.");
-  }
+  ABSL_ASSIGN_OR_RETURN(profile.profile_id,
+                        ComputeExactLiteRtProfileId(profile));
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(profile));
   return profile;
 }
 
