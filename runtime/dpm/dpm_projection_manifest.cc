@@ -29,7 +29,7 @@ namespace litert::lm {
 namespace {
 
 constexpr absl::string_view kManifestDomain =
-    "LITERT_LMX_DPM_PROJECTION_MANIFEST_SHA256_V2";
+    "LITERT_LMX_DPM_PROJECTION_MANIFEST_SHA256";
 
 bool IsZeroHash(const Hash256& hash) { return hash == Hash256{}; }
 
@@ -179,12 +179,11 @@ absl::Status ValidateManifestFields(const DPMProjectionManifest& manifest) {
           IsZeroHash(*manifest.exact_output_evidence_hash) ||
           manifest.exact_logit_frame_count == 0 ||
           manifest.exact_logit_frame_count >
-              kMaximumDPMProjectionExactLogitFrames ||
-          manifest.reused_canonical_winner) {
+              kMaximumDPMProjectionExactLogitFrames) {
         return absl::InvalidArgumentError(
             "ExactRegeneration projection manifest requires a non-empty "
             "derived profile, admission record, and ordered execution "
-            "evidence and cannot reuse a canonical winner.");
+            "evidence.");
       }
       break;
   }
@@ -235,7 +234,6 @@ absl::StatusOr<Hash256> ComputeDPMProjectionManifestHash(
     UpdateHash('V', *manifest.exact_output_evidence_hash, &hasher);
   }
   UpdateU32(manifest.exact_logit_frame_count, &hasher);
-  UpdateU8(manifest.reused_canonical_winner ? 1 : 0, &hasher);
   return hasher.Finalize();
 }
 

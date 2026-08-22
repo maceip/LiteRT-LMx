@@ -47,12 +47,12 @@
 namespace litert::lm {
 namespace {
 
-constexpr std::array<char, 8> kLogMagic = {'D', 'P', 'M', 'L', 'O', 'G',
-                                            '0', '4'};
-constexpr std::array<char, 8> kRecordMagic = {'D', 'P', 'M', 'E', 'V', 'T',
-                                               '0', '4'};
-constexpr uint32_t kLogFormatVersion = 4;
-constexpr uint32_t kEventFormatVersion = 4;
+constexpr std::array<char, 8> kLogMagic = {'D', 'P', 'M', 'L',
+                                           'O', 'G', '0', '1'};
+constexpr std::array<char, 8> kRecordMagic = {'D', 'P', 'M', 'E',
+                                              'V', 'T', '0', '1'};
+constexpr uint32_t kLogFormatVersion = 1;
+constexpr uint32_t kEventFormatVersion = 1;
 // A maximum model-turn record contains three payload-sized strings (the event
 // payload, projected memory, and the receipt's decision output), the canonical
 // agent input, all repeated operation/case/manifest identities, the complete
@@ -65,8 +65,8 @@ constexpr uint64_t kMaxRecordBytes =
     uint64_t{kMaximumDPMGenerationTokens} * sizeof(int32_t) + 4 * 1024;
 constexpr uint64_t kRecordHeaderSize =
     kRecordMagic.size() + sizeof(uint64_t) + 32 + 32;
-constexpr absl::string_view kGenesisDomain = "DPM_EVENT_LOG_GENESIS_SHA256_V4";
-constexpr absl::string_view kRecordDomain = "DPM_EVENT_LOG_PREFIX_SHA256_V4";
+constexpr absl::string_view kGenesisDomain = "DPM_EVENT_LOG_GENESIS_SHA256";
+constexpr absl::string_view kRecordDomain = "DPM_EVENT_LOG_PREFIX_SHA256";
 static_assert(sizeof(size_t) <= sizeof(uint64_t));
 static_assert(sizeof(int) >= sizeof(int32_t));
 
@@ -145,8 +145,7 @@ absl::StatusOr<ScopedFd> OpenRegularFile(const std::filesystem::path& path,
   } while (fd < 0 && errno == EINTR);
   if (fd < 0) {
     return absl::ErrnoToStatus(
-        errno, absl::StrCat("Unable to open DPM storage file ",
-                            path.string()));
+        errno, absl::StrCat("Unable to open DPM storage file ", path.string()));
   }
   struct stat stat_buffer;
   if (fstat(fd, &stat_buffer) != 0) {
@@ -158,9 +157,8 @@ absl::StatusOr<ScopedFd> OpenRegularFile(const std::filesystem::path& path,
   }
   if (!S_ISREG(stat_buffer.st_mode)) {
     close(fd);
-    return absl::FailedPreconditionError(
-        absl::StrCat("DPM storage path is not a regular file: ",
-                     path.string()));
+    return absl::FailedPreconditionError(absl::StrCat(
+        "DPM storage path is not a regular file: ", path.string()));
   }
   return ScopedFd(fd);
 }
@@ -178,8 +176,7 @@ absl::StatusOr<ScopedFileLock> AcquireFileLock(
   } while (result != 0 && errno == EINTR);
   if (result != 0) {
     return absl::ErrnoToStatus(
-        errno, absl::StrCat("Unable to lock DPM storage file ",
-                            path.string()));
+        errno, absl::StrCat("Unable to lock DPM storage file ", path.string()));
   }
   return ScopedFileLock(std::move(fd));
 }
@@ -190,8 +187,8 @@ absl::Status SyncFd(int fd, absl::string_view description) {
     result = fsync(fd);
   } while (result != 0 && errno == EINTR);
   if (result != 0) {
-    return absl::ErrnoToStatus(
-        errno, absl::StrCat("Unable to fsync ", description));
+    return absl::ErrnoToStatus(errno,
+                               absl::StrCat("Unable to fsync ", description));
   }
   return absl::OkStatus();
 }
@@ -223,8 +220,8 @@ absl::Status WriteAll(int fd, absl::string_view bytes,
       written = write(fd, bytes.data() + offset, bytes.size() - offset);
     } while (written < 0 && errno == EINTR);
     if (written < 0) {
-      return absl::ErrnoToStatus(
-          errno, absl::StrCat("Unable to write ", description));
+      return absl::ErrnoToStatus(errno,
+                                 absl::StrCat("Unable to write ", description));
     }
     if (written == 0) {
       return absl::DataLossError(
@@ -238,8 +235,8 @@ absl::Status WriteAll(int fd, absl::string_view bytes,
 absl::Status ReadExactAt(int fd, uint64_t offset, char* output, size_t size,
                          absl::string_view description) {
   if (offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) ||
-      size > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) -
-                 offset) {
+      size >
+          static_cast<uint64_t>(std::numeric_limits<off_t>::max()) - offset) {
     return absl::ResourceExhaustedError(
         absl::StrCat(description, " exceeds addressable file offsets."));
   }
@@ -251,12 +248,11 @@ absl::Status ReadExactAt(int fd, uint64_t offset, char* output, size_t size,
                          static_cast<off_t>(offset + consumed));
     } while (read_count < 0 && errno == EINTR);
     if (read_count < 0) {
-      return absl::ErrnoToStatus(
-          errno, absl::StrCat("Unable to read ", description));
+      return absl::ErrnoToStatus(errno,
+                                 absl::StrCat("Unable to read ", description));
     }
     if (read_count == 0) {
-      return absl::DataLossError(
-          absl::StrCat("Truncated ", description));
+      return absl::DataLossError(absl::StrCat("Truncated ", description));
     }
     consumed += static_cast<size_t>(read_count);
   }
@@ -266,8 +262,8 @@ absl::Status ReadExactAt(int fd, uint64_t offset, char* output, size_t size,
 absl::StatusOr<uint64_t> FileSize(int fd, absl::string_view description) {
   struct stat stat_buffer;
   if (fstat(fd, &stat_buffer) != 0) {
-    return absl::ErrnoToStatus(
-        errno, absl::StrCat("Unable to inspect ", description));
+    return absl::ErrnoToStatus(errno,
+                               absl::StrCat("Unable to inspect ", description));
   }
   if (!S_ISREG(stat_buffer.st_mode) || stat_buffer.st_size < 0) {
     return absl::FailedPreconditionError(
@@ -331,50 +327,6 @@ bool IsZeroHash(const Hash256& hash) {
   return true;
 }
 
-bool IsSupportedTurnReceiptVersion(uint32_t format_version) {
-  switch (format_version) {
-    case DPMTurnReceipt::kLegacyFormatVersion:
-    case DPMTurnReceipt::kPreviousFormatVersion:
-    case DPMTurnReceipt::kCoverageV1FormatVersion:
-    case DPMTurnReceipt::kCoverageV2FormatVersion:
-    case DPMTurnReceipt::kFormatVersion:
-      return true;
-    default:
-      return false;
-  }
-}
-
-bool HasVersionFourReceiptFields(uint32_t format_version) {
-  switch (format_version) {
-    case DPMTurnReceipt::kPreviousFormatVersion:
-    case DPMTurnReceipt::kCoverageV1FormatVersion:
-    case DPMTurnReceipt::kCoverageV2FormatVersion:
-    case DPMTurnReceipt::kFormatVersion:
-      return true;
-    case DPMTurnReceipt::kLegacyFormatVersion:
-    default:
-      return false;
-  }
-}
-
-bool HasVersionFiveReceiptFields(uint32_t format_version) {
-  switch (format_version) {
-    case DPMTurnReceipt::kCoverageV1FormatVersion:
-    case DPMTurnReceipt::kCoverageV2FormatVersion:
-    case DPMTurnReceipt::kFormatVersion:
-      return true;
-    case DPMTurnReceipt::kLegacyFormatVersion:
-    case DPMTurnReceipt::kPreviousFormatVersion:
-    default:
-      return false;
-  }
-}
-
-bool HasVersionSixReceiptFields(uint32_t format_version) {
-  return format_version == DPMTurnReceipt::kCoverageV2FormatVersion ||
-         format_version == DPMTurnReceipt::kFormatVersion;
-}
-
 bool ContainsControlByte(absl::string_view text) {
   for (unsigned char byte : text) {
     if (byte < 0x20 || byte == 0x7f) return true;
@@ -423,8 +375,7 @@ absl::StatusOr<std::string> BuildLogHeader(absl::string_view log_id,
     return absl::InvalidArgumentError("DPM filesystem log requires a log id.");
   }
   if (case_id.empty()) {
-    return absl::InvalidArgumentError(
-        "DPM filesystem log requires a case id.");
+    return absl::InvalidArgumentError("DPM filesystem log requires a case id.");
   }
   if (log_id.size() > kMaximumDPMProjectionIdentityBytes ||
       case_id.size() > kMaximumDPMProjectionIdentityBytes ||
@@ -458,8 +409,8 @@ Hash256 ComputeNextPrefixHash(const Hash256& previous,
                               absl::string_view canonical_event) {
   Sha256Hasher hasher;
   hasher.Update(kRecordDomain);
-  hasher.Update(absl::string_view(
-      reinterpret_cast<const char*>(previous.bytes.data()),
+  hasher.Update(
+      absl::string_view(reinterpret_cast<const char*>(previous.bytes.data()),
       previous.bytes.size()));
   std::string length;
   AppendU64(canonical_event.size(), &length);
@@ -483,8 +434,7 @@ class CanonicalReader {
     ABSL_RETURN_IF_ERROR(Require(4));
     uint32_t value = 0;
     for (int i = 0; i < 4; ++i) {
-      value = (value << 8) |
-              static_cast<unsigned char>(bytes_[offset_ + i]);
+      value = (value << 8) | static_cast<unsigned char>(bytes_[offset_ + i]);
     }
     offset_ += 4;
     return value;
@@ -507,12 +457,12 @@ class CanonicalReader {
     return static_cast<int32_t>(value);
   }
 
-  absl::StatusOr<std::string> ReadString(
-      size_t maximum_bytes, absl::string_view field_name) {
+  absl::StatusOr<std::string> ReadString(size_t maximum_bytes,
+                                         absl::string_view field_name) {
     ABSL_ASSIGN_OR_RETURN(uint64_t length, ReadU64());
     if (length > static_cast<uint64_t>(maximum_bytes)) {
-      return absl::DataLossError(absl::StrCat(
-          "Canonical DPM ", field_name, " exceeds its product limit."));
+      return absl::DataLossError(absl::StrCat("Canonical DPM ", field_name,
+                                              " exceeds its product limit."));
     }
     if (length > bytes_.size() - offset_) {
       return absl::DataLossError("Truncated canonical DPM event string.");
@@ -525,8 +475,7 @@ class CanonicalReader {
   absl::StatusOr<Hash256> ReadHash() {
     Hash256 hash;
     ABSL_RETURN_IF_ERROR(Require(hash.bytes.size()));
-    std::memcpy(hash.bytes.data(), bytes_.data() + offset_,
-                hash.bytes.size());
+    std::memcpy(hash.bytes.data(), bytes_.data() + offset_, hash.bytes.size());
     offset_ += hash.bytes.size();
     return hash;
   }
@@ -543,8 +492,8 @@ class CanonicalReader {
   size_t offset_ = 0;
 };
 
-absl::Status AppendProjectionManifest(
-    const DPMProjectionManifest& manifest, std::string* output) {
+absl::Status AppendProjectionManifest(const DPMProjectionManifest& manifest,
+                                      std::string* output) {
   ABSL_RETURN_IF_ERROR(ValidateDPMProjectionManifest(manifest));
   AppendU32(manifest.format_version, output);
   ABSL_RETURN_IF_ERROR(AppendString(manifest.log_id, output));
@@ -572,8 +521,8 @@ absl::Status AppendProjectionManifest(
   if (manifest.exact_profile_id.has_value()) {
     AppendHash(*manifest.exact_profile_id, output);
   }
-  output->push_back(
-      manifest.exact_profile_admission_record_id.has_value() ? 1 : 0);
+  output->push_back(manifest.exact_profile_admission_record_id.has_value() ? 1
+                                                                           : 0);
   if (manifest.exact_profile_admission_record_id.has_value()) {
     AppendHash(*manifest.exact_profile_admission_record_id, output);
   }
@@ -582,7 +531,6 @@ absl::Status AppendProjectionManifest(
     AppendHash(*manifest.exact_output_evidence_hash, output);
   }
   AppendU32(manifest.exact_logit_frame_count, output);
-  output->push_back(manifest.reused_canonical_winner ? 1 : 0);
   AppendHash(manifest.manifest_hash, output);
   return absl::OkStatus();
 }
@@ -599,12 +547,10 @@ absl::StatusOr<DPMProjectionManifest> ReadProjectionManifest(
     return absl::FailedPreconditionError(
         "Unsupported canonical DPM projection manifest version.");
   }
-  ABSL_ASSIGN_OR_RETURN(
-      manifest.log_id,
+  ABSL_ASSIGN_OR_RETURN(manifest.log_id,
       reader->ReadString(kMaximumDPMProjectionIdentityBytes,
                          "projection manifest log id"));
-  ABSL_ASSIGN_OR_RETURN(
-      manifest.case_id,
+  ABSL_ASSIGN_OR_RETURN(manifest.case_id,
       reader->ReadString(kMaximumDPMProjectionIdentityBytes,
                          "projection manifest case id"));
   ABSL_ASSIGN_OR_RETURN(manifest.source_event_count, reader->ReadU64());
@@ -664,12 +610,6 @@ absl::StatusOr<DPMProjectionManifest> ReadProjectionManifest(
     manifest.exact_output_evidence_hash = exact_output_evidence;
   }
   ABSL_ASSIGN_OR_RETURN(manifest.exact_logit_frame_count, reader->ReadU32());
-  ABSL_ASSIGN_OR_RETURN(uint8_t reused_winner, reader->ReadU8());
-  if (reused_winner > 1) {
-    return absl::DataLossError(
-        "Non-canonical DPM projection winner-reuse flag.");
-  }
-  manifest.reused_canonical_winner = reused_winner == 1;
   ABSL_ASSIGN_OR_RETURN(manifest.manifest_hash, reader->ReadHash());
   ABSL_RETURN_IF_ERROR(ValidateDPMProjectionManifest(manifest));
   return manifest;
@@ -677,8 +617,7 @@ absl::StatusOr<DPMProjectionManifest> ReadProjectionManifest(
 
 absl::Status ValidateEvent(const DPMEvent& event,
                            const std::vector<DPMEvent>& prior_events,
-                           absl::string_view log_id,
-                           absl::string_view case_id,
+                           absl::string_view log_id, absl::string_view case_id,
                            const Hash256& prior_prefix_hash) {
   switch (event.kind) {
     case DPMEvent::Kind::kUser:
@@ -705,8 +644,7 @@ absl::Status ValidateEvent(const DPMEvent& event,
   if (event.operation_id.size() > kMaximumDPMEventOperationIdBytes ||
       event.payload.size() > kMaximumDPMEventPayloadBytes ||
       !IsValidUtf8(event.operation_id) || !IsValidUtf8(event.case_id) ||
-      !IsValidUtf8(event.payload) ||
-      ContainsControlByte(event.operation_id) ||
+      !IsValidUtf8(event.payload) || ContainsControlByte(event.operation_id) ||
       ContainsControlByte(event.case_id)) {
     return absl::InvalidArgumentError(
         "DPM event identities or payload are invalid or exceed product "
@@ -743,7 +681,7 @@ absl::Status ValidateEvent(const DPMEvent& event,
         "DPM model event requires a turn receipt.");
   }
   const DPMTurnReceipt& receipt = *event.turn_receipt;
-  if (!IsSupportedTurnReceiptVersion(receipt.format_version)) {
+  if (receipt.format_version != DPMTurnReceipt::kFormatVersion) {
     return absl::FailedPreconditionError(
         "Unsupported DPM turn receipt format version.");
   }
@@ -762,8 +700,7 @@ absl::Status ValidateEvent(const DPMEvent& event,
   if ((input.kind != DPMEvent::Kind::kUser &&
        input.kind != DPMEvent::Kind::kTool &&
        input.kind != DPMEvent::Kind::kInternal) ||
-      input.turn_receipt ||
-      input.operation_id != receipt.operation_id ||
+      input.turn_receipt || input.operation_id != receipt.operation_id ||
       input.case_id != event.case_id ||
       receipt.response_event_index != receipt.input_event_index + 1 ||
       prior_events.size() != receipt.response_event_index ||
@@ -795,8 +732,7 @@ absl::Status ValidateEvent(const DPMEvent& event,
       const Hash256 expected_projection_correction_digest,
       ComputeDPMCorrectionDigestForPrefix(log_id, case_id, prior_events,
                                           prior_events.size()));
-  if (projection.correction_digest !=
-      expected_projection_correction_digest) {
+  if (projection.correction_digest != expected_projection_correction_digest) {
     return absl::InvalidArgumentError(
         "DPM projection correction lineage is not derived from its raw-log "
         "source prefix.");
@@ -817,8 +753,8 @@ absl::Status ValidateEvent(const DPMEvent& event,
         baseline_response.turn_receipt->projection_manifest;
     ABSL_ASSIGN_OR_RETURN(
         const Hash256 expected_baseline_correction_digest,
-        ComputeDPMCorrectionDigestForPrefix(
-            log_id, case_id, prior_events, baseline.source_event_count));
+        ComputeDPMCorrectionDigestForPrefix(log_id, case_id, prior_events,
+                                            baseline.source_event_count));
     if (baseline.source_event_count != projection.event_range_start ||
         baseline.manifest_hash != *projection.baseline_manifest_hash ||
         baseline.output_hash != *projection.baseline_output_hash ||
@@ -913,8 +849,7 @@ absl::StatusOr<std::string> EncodeEventCanonical(const DPMEvent& event) {
   if (receipt.agent_exact_profile_admission_record_id.has_value()) {
     AppendHash(*receipt.agent_exact_profile_admission_record_id, &bytes);
   }
-  bytes.push_back(
-      receipt.agent_exact_output_evidence_hash.has_value() ? 1 : 0);
+  bytes.push_back(receipt.agent_exact_output_evidence_hash.has_value() ? 1 : 0);
   if (receipt.agent_exact_output_evidence_hash.has_value()) {
     AppendHash(*receipt.agent_exact_output_evidence_hash, &bytes);
   }
@@ -933,76 +868,64 @@ absl::StatusOr<std::string> EncodeEventCanonical(const DPMEvent& event) {
   if (receipt.session_checkpoint_id.has_value()) {
     AppendHash(*receipt.session_checkpoint_id, &bytes);
   }
-  if (HasVersionFourReceiptFields(receipt.format_version)) {
-    bytes.push_back(
-        receipt.restored_from_session_checkpoint_id.has_value() ? 1 : 0);
-    if (receipt.restored_from_session_checkpoint_id.has_value()) {
-      AppendHash(*receipt.restored_from_session_checkpoint_id, &bytes);
-    }
-    bytes.push_back(static_cast<char>(receipt.checkpoint_capture_origin));
-    bytes.push_back(static_cast<char>(receipt.agent_worker_prefill_mode));
-    AppendHash(receipt.agent_physical_execution_plan_hash, &bytes);
-    bytes.push_back(
-        receipt.agent_capsule_restore_admission_record_id.has_value() ? 1
-                                                                      : 0);
-    if (receipt.agent_capsule_restore_admission_record_id.has_value()) {
-      AppendHash(*receipt.agent_capsule_restore_admission_record_id, &bytes);
-    }
-    bytes.push_back(
-        receipt.agent_exact_worker_checkpoint_provenance.has_value() ? 1 : 0);
-    if (receipt.agent_exact_worker_checkpoint_provenance.has_value()) {
-      const DPMExactWorkerCheckpointProvenance& provenance =
-          *receipt.agent_exact_worker_checkpoint_provenance;
-      AppendU32(provenance.run_index, &bytes);
-      AppendHash(provenance.execution_plan_hash, &bytes);
-      AppendHash(provenance.request_envelope_hash, &bytes);
-      AppendHash(provenance.result_envelope_hash, &bytes);
-      AppendU64(provenance.transient_envelope_size, &bytes);
-      AppendHash(provenance.transient_envelope_hash, &bytes);
-      AppendHash(provenance.output_evidence_hash, &bytes);
-    }
-    if (HasVersionFiveReceiptFields(receipt.format_version)) {
-      bytes.push_back(
-          receipt.agent_capsule_restore_capability_id.has_value() ? 1 : 0);
-      if (receipt.agent_capsule_restore_capability_id.has_value()) {
-        AppendHash(*receipt.agent_capsule_restore_capability_id, &bytes);
-      }
-      bytes.push_back(
-          receipt.agent_capsule_restore_coverage_id.has_value() ? 1 : 0);
-      if (receipt.agent_capsule_restore_coverage_id.has_value()) {
-        AppendHash(*receipt.agent_capsule_restore_coverage_id, &bytes);
-      }
-    }
-    if (HasVersionSixReceiptFields(receipt.format_version)) {
-      bytes.push_back(receipt.agent_prepared_prefill_work.has_value() ? 1 : 0);
-      if (receipt.agent_prepared_prefill_work.has_value()) {
-        AppendPreparedPrefillWorkBinding(
-            *receipt.agent_prepared_prefill_work, &bytes);
-      }
-      bytes.push_back(receipt.published_checkpoint_capture.has_value() ? 1
-                                                                      : 0);
-      if (receipt.published_checkpoint_capture.has_value()) {
-        AppendHash(receipt.published_checkpoint_capture->capture_plan_hash,
-                   &bytes);
-        AppendHash(receipt.published_checkpoint_capture->capture_evidence_id,
-                   &bytes);
-      }
-      bytes.push_back(
-          receipt.restored_checkpoint_capture_evidence_id.has_value() ? 1 : 0);
-      if (receipt.restored_checkpoint_capture_evidence_id.has_value()) {
-        AppendHash(*receipt.restored_checkpoint_capture_evidence_id, &bytes);
-      }
-      bytes.push_back(
-          receipt.agent_capsule_restore_evidence_id.has_value() ? 1 : 0);
-      if (receipt.agent_capsule_restore_evidence_id.has_value()) {
-        AppendHash(*receipt.agent_capsule_restore_evidence_id, &bytes);
-      }
-    }
-    if (receipt.format_version == DPMTurnReceipt::kFormatVersion) {
-      bytes.push_back(
-          receipt.agent_rematerialized_canonical_winner ? 1 : 0);
-    }
+  bytes.push_back(receipt.restored_from_session_checkpoint_id.has_value() ? 1
+                                                                          : 0);
+  if (receipt.restored_from_session_checkpoint_id.has_value()) {
+    AppendHash(*receipt.restored_from_session_checkpoint_id, &bytes);
   }
+  bytes.push_back(static_cast<char>(receipt.checkpoint_capture_origin));
+  bytes.push_back(static_cast<char>(receipt.agent_worker_prefill_mode));
+  AppendHash(receipt.agent_physical_execution_plan_hash, &bytes);
+  bytes.push_back(
+      receipt.agent_capsule_restore_admission_record_id.has_value() ? 1 : 0);
+  if (receipt.agent_capsule_restore_admission_record_id.has_value()) {
+    AppendHash(*receipt.agent_capsule_restore_admission_record_id, &bytes);
+  }
+  bytes.push_back(
+      receipt.agent_exact_worker_checkpoint_provenance.has_value() ? 1 : 0);
+  if (receipt.agent_exact_worker_checkpoint_provenance.has_value()) {
+    const DPMExactWorkerCheckpointProvenance& provenance =
+        *receipt.agent_exact_worker_checkpoint_provenance;
+    AppendU32(provenance.run_index, &bytes);
+    AppendHash(provenance.execution_plan_hash, &bytes);
+    AppendHash(provenance.request_envelope_hash, &bytes);
+    AppendHash(provenance.result_envelope_hash, &bytes);
+    AppendU64(provenance.transient_envelope_size, &bytes);
+    AppendHash(provenance.transient_envelope_hash, &bytes);
+    AppendHash(provenance.output_evidence_hash, &bytes);
+  }
+  bytes.push_back(receipt.agent_capsule_restore_capability_id.has_value() ? 1
+                                                                          : 0);
+  if (receipt.agent_capsule_restore_capability_id.has_value()) {
+    AppendHash(*receipt.agent_capsule_restore_capability_id, &bytes);
+  }
+  bytes.push_back(receipt.agent_capsule_restore_coverage_id.has_value() ? 1
+                                                                        : 0);
+  if (receipt.agent_capsule_restore_coverage_id.has_value()) {
+    AppendHash(*receipt.agent_capsule_restore_coverage_id, &bytes);
+  }
+  bytes.push_back(receipt.agent_prepared_prefill_work.has_value() ? 1 : 0);
+  if (receipt.agent_prepared_prefill_work.has_value()) {
+    AppendPreparedPrefillWorkBinding(*receipt.agent_prepared_prefill_work,
+                                     &bytes);
+  }
+  bytes.push_back(receipt.published_checkpoint_capture.has_value() ? 1 : 0);
+  if (receipt.published_checkpoint_capture.has_value()) {
+    AppendHash(receipt.published_checkpoint_capture->capture_plan_hash, &bytes);
+    AppendHash(receipt.published_checkpoint_capture->capture_evidence_id,
+               &bytes);
+  }
+  bytes.push_back(
+      receipt.restored_checkpoint_capture_evidence_id.has_value() ? 1 : 0);
+  if (receipt.restored_checkpoint_capture_evidence_id.has_value()) {
+    AppendHash(*receipt.restored_checkpoint_capture_evidence_id, &bytes);
+  }
+  bytes.push_back(receipt.agent_capsule_restore_evidence_id.has_value() ? 1
+                                                                        : 0);
+  if (receipt.agent_capsule_restore_evidence_id.has_value()) {
+    AppendHash(*receipt.agent_capsule_restore_evidence_id, &bytes);
+  }
+  bytes.push_back(receipt.agent_rematerialized_canonical_winner ? 1 : 0);
   return bytes;
 }
 
@@ -1018,10 +941,9 @@ absl::StatusOr<DPMEvent> DecodeEventCanonical(absl::string_view bytes) {
   ABSL_ASSIGN_OR_RETURN(uint8_t kind, reader.ReadU8());
   event.kind = static_cast<DPMEvent::Kind>(kind);
   ABSL_ASSIGN_OR_RETURN(event.timestamp_us, reader.ReadI64());
-  ABSL_ASSIGN_OR_RETURN(
-      event.operation_id,
-      reader.ReadString(kMaximumDPMEventOperationIdBytes,
-                        "event operation id"));
+  ABSL_ASSIGN_OR_RETURN(event.operation_id,
+                        reader.ReadString(kMaximumDPMEventOperationIdBytes,
+                                          "event operation id"));
   ABSL_ASSIGN_OR_RETURN(
       event.case_id,
       reader.ReadString(kMaximumDPMProjectionIdentityBytes, "event case id"));
@@ -1036,14 +958,13 @@ absl::StatusOr<DPMEvent> DecodeEventCanonical(absl::string_view bytes) {
   if (has_receipt == 1) {
     DPMTurnReceipt receipt;
     ABSL_ASSIGN_OR_RETURN(receipt.format_version, reader.ReadU32());
-    if (!IsSupportedTurnReceiptVersion(receipt.format_version)) {
+    if (receipt.format_version != DPMTurnReceipt::kFormatVersion) {
       return absl::FailedPreconditionError(
           "Unsupported canonical DPM turn receipt version.");
     }
-    ABSL_ASSIGN_OR_RETURN(
-        receipt.operation_id,
-        reader.ReadString(kMaximumDPMEventOperationIdBytes,
-                          "turn receipt operation id"));
+    ABSL_ASSIGN_OR_RETURN(receipt.operation_id,
+                          reader.ReadString(kMaximumDPMEventOperationIdBytes,
+                                            "turn receipt operation id"));
     ABSL_ASSIGN_OR_RETURN(receipt.input_event_index, reader.ReadU64());
     ABSL_ASSIGN_OR_RETURN(receipt.response_event_index, reader.ReadU64());
     ABSL_ASSIGN_OR_RETURN(receipt.projection_manifest,
@@ -1052,15 +973,13 @@ absl::StatusOr<DPMEvent> DecodeEventCanonical(absl::string_view bytes) {
                           reader.ReadHash());
     ABSL_ASSIGN_OR_RETURN(receipt.agent_session_identity.runtime_artifact_hash,
                           reader.ReadHash());
-    ABSL_ASSIGN_OR_RETURN(
-        receipt.agent_session_identity.inference_profile_hash,
-        reader.ReadHash());
+    ABSL_ASSIGN_OR_RETURN(receipt.agent_session_identity.inference_profile_hash,
+                          reader.ReadHash());
     ABSL_ASSIGN_OR_RETURN(receipt.max_decision_tokens, reader.ReadU32());
     ABSL_ASSIGN_OR_RETURN(receipt.agent_request_hash, reader.ReadHash());
     ABSL_ASSIGN_OR_RETURN(uint8_t agent_replay_mode, reader.ReadU8());
     receipt.agent_replay_mode = static_cast<DPMReplayMode>(agent_replay_mode);
-    ABSL_ASSIGN_OR_RETURN(receipt.agent_replay_request_hash,
-                          reader.ReadHash());
+    ABSL_ASSIGN_OR_RETURN(receipt.agent_replay_request_hash, reader.ReadHash());
     ABSL_ASSIGN_OR_RETURN(receipt.agent_execution_evidence_hash,
                           reader.ReadHash());
     ABSL_ASSIGN_OR_RETURN(uint8_t has_agent_exact_profile, reader.ReadU8());
@@ -1101,18 +1020,16 @@ absl::StatusOr<DPMEvent> DecodeEventCanonical(absl::string_view bytes) {
     receipt.agent_reused_canonical_winner = reused_agent_winner == 1;
     receipt.agent_producing_session_matched_output =
         producing_agent_session == 1;
-    ABSL_ASSIGN_OR_RETURN(
-        receipt.projected_memory,
-        reader.ReadString(kMaximumDPMEventPayloadBytes,
-                          "turn receipt projected memory"));
+    ABSL_ASSIGN_OR_RETURN(receipt.projected_memory,
+                          reader.ReadString(kMaximumDPMEventPayloadBytes,
+                                            "turn receipt projected memory"));
     ABSL_ASSIGN_OR_RETURN(
         receipt.canonical_agent_input,
         reader.ReadString(kMaximumDPMCanonicalAgentInputBytes,
                           "turn receipt canonical agent input"));
-    ABSL_ASSIGN_OR_RETURN(
-        receipt.decision_output,
-        reader.ReadString(kMaximumDPMEventPayloadBytes,
-                          "turn receipt decision output"));
+    ABSL_ASSIGN_OR_RETURN(receipt.decision_output,
+                          reader.ReadString(kMaximumDPMEventPayloadBytes,
+                                            "turn receipt decision output"));
     ABSL_ASSIGN_OR_RETURN(uint64_t token_count, reader.ReadU64());
     if (token_count > kMaximumDPMGenerationTokens ||
         token_count > bytes.size() / sizeof(int32_t)) {
@@ -1127,169 +1044,144 @@ absl::StatusOr<DPMEvent> DecodeEventCanonical(absl::string_view bytes) {
     ABSL_ASSIGN_OR_RETURN(receipt.agent_transcript_hash, reader.ReadHash());
     ABSL_ASSIGN_OR_RETURN(uint8_t has_checkpoint, reader.ReadU8());
     if (has_checkpoint > 1) {
-      return absl::DataLossError(
-          "Non-canonical DPM checkpoint-presence flag.");
+      return absl::DataLossError("Non-canonical DPM checkpoint-presence flag.");
     }
     if (has_checkpoint == 1) {
       ABSL_ASSIGN_OR_RETURN(Hash256 checkpoint_id, reader.ReadHash());
       receipt.session_checkpoint_id = checkpoint_id;
     }
-    if (HasVersionFourReceiptFields(receipt.format_version)) {
-      ABSL_ASSIGN_OR_RETURN(uint8_t has_restored_checkpoint, reader.ReadU8());
-      if (has_restored_checkpoint > 1) {
-        return absl::DataLossError(
-            "Non-canonical DPM restored-checkpoint-presence flag.");
-      }
-      if (has_restored_checkpoint == 1) {
-        ABSL_ASSIGN_OR_RETURN(Hash256 restored_checkpoint, reader.ReadHash());
-        receipt.restored_from_session_checkpoint_id = restored_checkpoint;
-      }
-      ABSL_ASSIGN_OR_RETURN(uint8_t checkpoint_capture_origin,
-                            reader.ReadU8());
-      receipt.checkpoint_capture_origin =
-          static_cast<DPMCheckpointCaptureOrigin>(checkpoint_capture_origin);
-      ABSL_ASSIGN_OR_RETURN(uint8_t agent_worker_prefill_mode,
-                            reader.ReadU8());
-      receipt.agent_worker_prefill_mode =
-          static_cast<DPMCheckpointWorkerPrefillMode>(
-              agent_worker_prefill_mode);
-      ABSL_ASSIGN_OR_RETURN(receipt.agent_physical_execution_plan_hash,
-                            reader.ReadHash());
-      ABSL_ASSIGN_OR_RETURN(uint8_t has_capsule_restore_admission,
-                            reader.ReadU8());
-      if (has_capsule_restore_admission > 1) {
-        return absl::DataLossError(
-            "Non-canonical DPM CapsuleRestore-admission-presence flag.");
-      }
-      if (has_capsule_restore_admission == 1) {
-        ABSL_ASSIGN_OR_RETURN(Hash256 capsule_restore_admission,
-                              reader.ReadHash());
-        receipt.agent_capsule_restore_admission_record_id =
-            capsule_restore_admission;
-      }
-      ABSL_ASSIGN_OR_RETURN(uint8_t has_worker_checkpoint_provenance,
-                            reader.ReadU8());
-      if (has_worker_checkpoint_provenance > 1) {
-        return absl::DataLossError(
-            "Non-canonical DPM worker-checkpoint-provenance-presence flag.");
-      }
-      if (has_worker_checkpoint_provenance == 1) {
-        DPMExactWorkerCheckpointProvenance provenance;
-        ABSL_ASSIGN_OR_RETURN(provenance.run_index, reader.ReadU32());
-        ABSL_ASSIGN_OR_RETURN(provenance.execution_plan_hash,
-                              reader.ReadHash());
-        ABSL_ASSIGN_OR_RETURN(provenance.request_envelope_hash,
-                              reader.ReadHash());
-        ABSL_ASSIGN_OR_RETURN(provenance.result_envelope_hash,
-                              reader.ReadHash());
-        ABSL_ASSIGN_OR_RETURN(provenance.transient_envelope_size,
-                              reader.ReadU64());
-        ABSL_ASSIGN_OR_RETURN(provenance.transient_envelope_hash,
-                              reader.ReadHash());
-        ABSL_ASSIGN_OR_RETURN(provenance.output_evidence_hash,
-                              reader.ReadHash());
-        receipt.agent_exact_worker_checkpoint_provenance = provenance;
-      }
-      if (HasVersionFiveReceiptFields(receipt.format_version)) {
-        ABSL_ASSIGN_OR_RETURN(uint8_t has_capsule_restore_capability,
-                              reader.ReadU8());
-        if (has_capsule_restore_capability > 1) {
-          return absl::DataLossError(
-              "Non-canonical DPM CapsuleRestore-capability-presence flag.");
-        }
-        if (has_capsule_restore_capability == 1) {
-          ABSL_ASSIGN_OR_RETURN(Hash256 capsule_restore_capability,
-                                reader.ReadHash());
-          receipt.agent_capsule_restore_capability_id =
-              capsule_restore_capability;
-        }
-        ABSL_ASSIGN_OR_RETURN(uint8_t has_capsule_restore_coverage,
-                              reader.ReadU8());
-        if (has_capsule_restore_coverage > 1) {
-          return absl::DataLossError(
-              "Non-canonical DPM CapsuleRestore-coverage-presence flag.");
-        }
-        if (has_capsule_restore_coverage == 1) {
-          ABSL_ASSIGN_OR_RETURN(Hash256 capsule_restore_coverage,
-                                reader.ReadHash());
-          receipt.agent_capsule_restore_coverage_id =
-              capsule_restore_coverage;
-        }
-      }
-      if (HasVersionSixReceiptFields(receipt.format_version)) {
-        ABSL_ASSIGN_OR_RETURN(uint8_t has_prepared_prefill_work,
-                              reader.ReadU8());
-        if (has_prepared_prefill_work > 1) {
-          return absl::DataLossError(
-              "Non-canonical DPM prepared-prefill-work-presence flag.");
-        }
-        if (has_prepared_prefill_work == 1) {
-          DPMPreparedPrefillWorkBinding binding;
-          ABSL_ASSIGN_OR_RETURN(uint32_t start_kind, reader.ReadU32());
-          binding.start_kind =
-              static_cast<DPMPreparedPrefillStartKind>(start_kind);
-          ABSL_ASSIGN_OR_RETURN(binding.plan_id, reader.ReadHash());
-          ABSL_ASSIGN_OR_RETURN(binding.canonical_source_chunks_hash,
-                                reader.ReadHash());
-          ABSL_ASSIGN_OR_RETURN(binding.resolved_token_plan_hash,
-                                reader.ReadHash());
-          ABSL_ASSIGN_OR_RETURN(binding.shape_schedule_hash,
-                                reader.ReadHash());
-          receipt.agent_prepared_prefill_work = binding;
-        }
-
-        ABSL_ASSIGN_OR_RETURN(uint8_t has_published_checkpoint_capture,
-                              reader.ReadU8());
-        if (has_published_checkpoint_capture > 1) {
-          return absl::DataLossError(
-              "Non-canonical DPM checkpoint-capture-evidence-presence flag.");
-        }
-        if (has_published_checkpoint_capture == 1) {
-          DPMCheckpointCaptureEvidenceBinding binding;
-          ABSL_ASSIGN_OR_RETURN(binding.capture_plan_hash, reader.ReadHash());
-          ABSL_ASSIGN_OR_RETURN(binding.capture_evidence_id,
-                                reader.ReadHash());
-          receipt.published_checkpoint_capture = binding;
-        }
-
-        ABSL_ASSIGN_OR_RETURN(
-            uint8_t has_restored_checkpoint_capture_evidence,
-            reader.ReadU8());
-        if (has_restored_checkpoint_capture_evidence > 1) {
-          return absl::DataLossError(
-              "Non-canonical DPM restored-checkpoint-capture-evidence-presence "
-              "flag.");
-        }
-        if (has_restored_checkpoint_capture_evidence == 1) {
-          ABSL_ASSIGN_OR_RETURN(Hash256 capture_evidence_id,
-                                reader.ReadHash());
-          receipt.restored_checkpoint_capture_evidence_id =
-              capture_evidence_id;
-        }
-
-        ABSL_ASSIGN_OR_RETURN(uint8_t has_capsule_restore_evidence,
-                              reader.ReadU8());
-        if (has_capsule_restore_evidence > 1) {
-          return absl::DataLossError(
-              "Non-canonical DPM capsule-restore-evidence-presence flag.");
-        }
-        if (has_capsule_restore_evidence == 1) {
-          ABSL_ASSIGN_OR_RETURN(Hash256 restore_evidence_id,
-                                reader.ReadHash());
-          receipt.agent_capsule_restore_evidence_id = restore_evidence_id;
-        }
-      }
-      if (receipt.format_version == DPMTurnReceipt::kFormatVersion) {
-        ABSL_ASSIGN_OR_RETURN(uint8_t rematerialized_canonical_winner,
-                              reader.ReadU8());
-        if (rematerialized_canonical_winner > 1) {
-          return absl::DataLossError(
-              "Non-canonical DPM WinnerReplay rematerialization flag.");
-        }
-        receipt.agent_rematerialized_canonical_winner =
-            rematerialized_canonical_winner == 1;
-      }
+    ABSL_ASSIGN_OR_RETURN(uint8_t has_restored_checkpoint, reader.ReadU8());
+    if (has_restored_checkpoint > 1) {
+      return absl::DataLossError(
+          "Non-canonical DPM restored-checkpoint-presence flag.");
     }
+    if (has_restored_checkpoint == 1) {
+      ABSL_ASSIGN_OR_RETURN(Hash256 restored_checkpoint, reader.ReadHash());
+      receipt.restored_from_session_checkpoint_id = restored_checkpoint;
+    }
+    ABSL_ASSIGN_OR_RETURN(uint8_t checkpoint_capture_origin, reader.ReadU8());
+    receipt.checkpoint_capture_origin =
+        static_cast<DPMCheckpointCaptureOrigin>(checkpoint_capture_origin);
+    ABSL_ASSIGN_OR_RETURN(uint8_t agent_worker_prefill_mode, reader.ReadU8());
+    receipt.agent_worker_prefill_mode =
+        static_cast<DPMCheckpointWorkerPrefillMode>(agent_worker_prefill_mode);
+    ABSL_ASSIGN_OR_RETURN(receipt.agent_physical_execution_plan_hash,
+                          reader.ReadHash());
+    ABSL_ASSIGN_OR_RETURN(uint8_t has_capsule_restore_admission,
+                          reader.ReadU8());
+    if (has_capsule_restore_admission > 1) {
+      return absl::DataLossError(
+          "Non-canonical DPM CapsuleRestore-admission-presence flag.");
+    }
+    if (has_capsule_restore_admission == 1) {
+      ABSL_ASSIGN_OR_RETURN(Hash256 capsule_restore_admission,
+                            reader.ReadHash());
+      receipt.agent_capsule_restore_admission_record_id =
+          capsule_restore_admission;
+    }
+    ABSL_ASSIGN_OR_RETURN(uint8_t has_worker_checkpoint_provenance,
+                          reader.ReadU8());
+    if (has_worker_checkpoint_provenance > 1) {
+      return absl::DataLossError(
+          "Non-canonical DPM worker-checkpoint-provenance-presence flag.");
+    }
+    if (has_worker_checkpoint_provenance == 1) {
+      DPMExactWorkerCheckpointProvenance provenance;
+      ABSL_ASSIGN_OR_RETURN(provenance.run_index, reader.ReadU32());
+      ABSL_ASSIGN_OR_RETURN(provenance.execution_plan_hash, reader.ReadHash());
+      ABSL_ASSIGN_OR_RETURN(provenance.request_envelope_hash,
+                            reader.ReadHash());
+      ABSL_ASSIGN_OR_RETURN(provenance.result_envelope_hash, reader.ReadHash());
+      ABSL_ASSIGN_OR_RETURN(provenance.transient_envelope_size,
+                            reader.ReadU64());
+      ABSL_ASSIGN_OR_RETURN(provenance.transient_envelope_hash,
+                            reader.ReadHash());
+      ABSL_ASSIGN_OR_RETURN(provenance.output_evidence_hash, reader.ReadHash());
+      receipt.agent_exact_worker_checkpoint_provenance = provenance;
+    }
+    ABSL_ASSIGN_OR_RETURN(uint8_t has_capsule_restore_capability,
+                          reader.ReadU8());
+    if (has_capsule_restore_capability > 1) {
+      return absl::DataLossError(
+          "Non-canonical DPM CapsuleRestore-capability-presence flag.");
+    }
+    if (has_capsule_restore_capability == 1) {
+      ABSL_ASSIGN_OR_RETURN(Hash256 capsule_restore_capability,
+                            reader.ReadHash());
+      receipt.agent_capsule_restore_capability_id = capsule_restore_capability;
+    }
+    ABSL_ASSIGN_OR_RETURN(uint8_t has_capsule_restore_coverage,
+                          reader.ReadU8());
+    if (has_capsule_restore_coverage > 1) {
+      return absl::DataLossError(
+          "Non-canonical DPM CapsuleRestore-coverage-presence flag.");
+    }
+    if (has_capsule_restore_coverage == 1) {
+      ABSL_ASSIGN_OR_RETURN(Hash256 capsule_restore_coverage,
+                            reader.ReadHash());
+      receipt.agent_capsule_restore_coverage_id = capsule_restore_coverage;
+    }
+    ABSL_ASSIGN_OR_RETURN(uint8_t has_prepared_prefill_work, reader.ReadU8());
+    if (has_prepared_prefill_work > 1) {
+      return absl::DataLossError(
+          "Non-canonical DPM prepared-prefill-work-presence flag.");
+    }
+    if (has_prepared_prefill_work == 1) {
+      DPMPreparedPrefillWorkBinding binding;
+      ABSL_ASSIGN_OR_RETURN(uint32_t start_kind, reader.ReadU32());
+      binding.start_kind = static_cast<DPMPreparedPrefillStartKind>(start_kind);
+      ABSL_ASSIGN_OR_RETURN(binding.plan_id, reader.ReadHash());
+      ABSL_ASSIGN_OR_RETURN(binding.canonical_source_chunks_hash,
+                            reader.ReadHash());
+      ABSL_ASSIGN_OR_RETURN(binding.resolved_token_plan_hash,
+                            reader.ReadHash());
+      ABSL_ASSIGN_OR_RETURN(binding.shape_schedule_hash, reader.ReadHash());
+      receipt.agent_prepared_prefill_work = binding;
+    }
+
+    ABSL_ASSIGN_OR_RETURN(uint8_t has_published_checkpoint_capture,
+                          reader.ReadU8());
+    if (has_published_checkpoint_capture > 1) {
+      return absl::DataLossError(
+          "Non-canonical DPM checkpoint-capture-evidence-presence flag.");
+    }
+    if (has_published_checkpoint_capture == 1) {
+      DPMCheckpointCaptureEvidenceBinding binding;
+      ABSL_ASSIGN_OR_RETURN(binding.capture_plan_hash, reader.ReadHash());
+      ABSL_ASSIGN_OR_RETURN(binding.capture_evidence_id, reader.ReadHash());
+      receipt.published_checkpoint_capture = binding;
+    }
+
+    ABSL_ASSIGN_OR_RETURN(uint8_t has_restored_checkpoint_capture_evidence,
+                          reader.ReadU8());
+    if (has_restored_checkpoint_capture_evidence > 1) {
+      return absl::DataLossError(
+          "Non-canonical DPM restored-checkpoint-capture-evidence-presence "
+          "flag.");
+    }
+    if (has_restored_checkpoint_capture_evidence == 1) {
+      ABSL_ASSIGN_OR_RETURN(Hash256 capture_evidence_id, reader.ReadHash());
+      receipt.restored_checkpoint_capture_evidence_id = capture_evidence_id;
+    }
+
+    ABSL_ASSIGN_OR_RETURN(uint8_t has_capsule_restore_evidence,
+                          reader.ReadU8());
+    if (has_capsule_restore_evidence > 1) {
+      return absl::DataLossError(
+          "Non-canonical DPM capsule-restore-evidence-presence flag.");
+    }
+    if (has_capsule_restore_evidence == 1) {
+      ABSL_ASSIGN_OR_RETURN(Hash256 restore_evidence_id, reader.ReadHash());
+      receipt.agent_capsule_restore_evidence_id = restore_evidence_id;
+    }
+    ABSL_ASSIGN_OR_RETURN(uint8_t rematerialized_canonical_winner,
+                          reader.ReadU8());
+    if (rematerialized_canonical_winner > 1) {
+      return absl::DataLossError(
+          "Non-canonical DPM WinnerReplay rematerialization flag.");
+    }
+    receipt.agent_rematerialized_canonical_winner =
+        rematerialized_canonical_winner == 1;
     ABSL_RETURN_IF_ERROR(ValidateDPMTurnReceiptReplayEvidence(receipt));
     event.turn_receipt = std::move(receipt);
   }
@@ -1372,16 +1264,16 @@ absl::StatusOr<ScanResult> ScanLog(int fd, absl::string_view log_id,
     std::memcpy(stored_previous.bytes.data(),
                 record_header.data() + previous_offset,
                 stored_previous.bytes.size());
-    std::memcpy(stored_current.bytes.data(),
-                record_header.data() + previous_offset +
-                    stored_previous.bytes.size(),
+    std::memcpy(
+        stored_current.bytes.data(),
+        record_header.data() + previous_offset + stored_previous.bytes.size(),
                 stored_current.bytes.size());
     if (stored_previous != prefix) {
       return absl::DataLossError("Broken DPM event prefix-hash link.");
     }
     std::string canonical_event(static_cast<size_t>(payload_size), '\0');
-    ABSL_RETURN_IF_ERROR(ReadExactAt(
-        fd, offset + kRecordHeaderSize, canonical_event.data(),
+    ABSL_RETURN_IF_ERROR(
+        ReadExactAt(fd, offset + kRecordHeaderSize, canonical_event.data(),
         canonical_event.size(), "DPM canonical event payload"));
     const Hash256 expected_current =
         ComputeNextPrefixHash(prefix, canonical_event);
@@ -1394,14 +1286,13 @@ absl::StatusOr<ScanResult> ScanLog(int fd, absl::string_view log_id,
       return absl::DataLossError(
           "DPM event log contains non-contiguous indices.");
     }
-    absl::Status validation = ValidateEvent(
-        event, result.snapshot.events, log_id, case_id, prefix);
+    absl::Status validation =
+        ValidateEvent(event, result.snapshot.events, log_id, case_id, prefix);
     if (!validation.ok()) {
       return absl::DataLossError(absl::StrCat(
           "Invalid authoritative DPM event: ", validation.message()));
     }
-    ABSL_ASSIGN_OR_RETURN(std::string reencoded,
-                          EncodeEventCanonical(event));
+    ABSL_ASSIGN_OR_RETURN(std::string reencoded, EncodeEventCanonical(event));
     if (reencoded != canonical_event) {
       return absl::DataLossError("Non-canonical DPM event encoding.");
     }
@@ -1454,15 +1345,13 @@ absl::StatusOr<std::pair<ScopedFd, std::filesystem::path>> CreateTempFile(
         saved_errno, "Unable to mark DPM temporary file close-on-exec");
   }
 #endif
-  return std::make_pair(ScopedFd(fd),
-                        std::filesystem::path(writable.data()));
+  return std::make_pair(ScopedFd(fd), std::filesystem::path(writable.data()));
 }
 
 absl::Status PublishInitialLog(const std::filesystem::path& directory,
                                const std::filesystem::path& log_path,
                                absl::string_view header) {
-  ABSL_ASSIGN_OR_RETURN(auto temporary,
-                        CreateTempFile(directory, "events"));
+  ABSL_ASSIGN_OR_RETURN(auto temporary, CreateTempFile(directory, "events"));
   ScopedFd fd = std::move(temporary.first);
   const std::filesystem::path temporary_path = std::move(temporary.second);
   absl::Status status = WriteAll(fd.get(), header, "DPM event log header");
@@ -1473,8 +1362,8 @@ absl::Status PublishInitialLog(const std::filesystem::path& directory,
       result = link(temporary_path.c_str(), log_path.c_str());
     } while (result != 0 && errno == EINTR);
     if (result != 0 && errno != EEXIST) {
-      status = absl::ErrnoToStatus(
-          errno, "Unable to publish initial DPM event log");
+      status =
+          absl::ErrnoToStatus(errno, "Unable to publish initial DPM event log");
     }
   }
   if (status.ok()) status = SyncDirectory(directory);
@@ -1489,8 +1378,8 @@ absl::Status PublishInitialLog(const std::filesystem::path& directory,
 
 }  // namespace
 
-FilesystemDPMEventLog::FilesystemDPMEventLog(
-    std::filesystem::path directory, std::string log_id,
+FilesystemDPMEventLog::FilesystemDPMEventLog(std::filesystem::path directory,
+                                             std::string log_id,
     std::string case_id)
     : directory_(std::move(directory)),
       log_path_(directory_ / "events.dpm"),
@@ -1511,18 +1400,15 @@ FilesystemDPMEventLog::Create(std::filesystem::path directory,
   directory = std::filesystem::absolute(directory, path_error);
   if (path_error) {
     return absl::InvalidArgumentError(absl::StrCat(
-        "Unable to resolve DPM event-log directory: ",
-        path_error.message()));
+        "Unable to resolve DPM event-log directory: ", path_error.message()));
   }
   directory = std::filesystem::weakly_canonical(directory, path_error);
   if (path_error) {
     return absl::InvalidArgumentError(absl::StrCat(
-        "Unable to normalize DPM event-log directory: ",
-        path_error.message()));
+        "Unable to normalize DPM event-log directory: ", path_error.message()));
   }
-  auto log = std::unique_ptr<FilesystemDPMEventLog>(
-      new FilesystemDPMEventLog(std::move(directory), std::move(log_id),
-                                std::move(case_id)));
+  auto log = std::unique_ptr<FilesystemDPMEventLog>(new FilesystemDPMEventLog(
+      std::move(directory), std::move(log_id), std::move(case_id)));
   ABSL_RETURN_IF_ERROR(log->Initialize());
   return log;
 }
@@ -1540,12 +1426,10 @@ absl::Status FilesystemDPMEventLog::Initialize() {
   // The operation lock has no payload. Creating it while the append lock is
   // held establishes its durable name without taking locks in the inverse of
   // the runtime order (operation lease, then individual append lock).
-  ABSL_ASSIGN_OR_RETURN(
-      ScopedFd operation_lock_fd,
+  ABSL_ASSIGN_OR_RETURN(ScopedFd operation_lock_fd,
       OpenRegularFile(operation_lock_path_, O_RDWR | O_CREAT,
                       S_IRUSR | S_IWUSR));
-  absl::StatusOr<ScopedFd> existing =
-      OpenRegularFile(log_path_, O_RDWR);
+  absl::StatusOr<ScopedFd> existing = OpenRegularFile(log_path_, O_RDWR);
   if (!existing.ok()) {
     if (!absl::IsNotFound(existing.status())) return existing.status();
     ABSL_ASSIGN_OR_RETURN(std::string header,
@@ -1571,8 +1455,7 @@ absl::StatusOr<DPMLogSnapshot> FilesystemDPMEventLog::Snapshot() const {
 
 absl::StatusOr<std::unique_ptr<DPMEventLogOperationLease>>
 FilesystemDPMEventLog::AcquireOperationLease() {
-  ABSL_ASSIGN_OR_RETURN(
-      ScopedFileLock lock,
+  ABSL_ASSIGN_OR_RETURN(ScopedFileLock lock,
       AcquireFileLock(operation_lock_path_, true, false));
   return std::unique_ptr<DPMEventLogOperationLease>(
       new FilesystemOperationLease(std::move(lock)));
@@ -1587,23 +1470,21 @@ absl::StatusOr<Hash256> FilesystemDPMEventLog::PrefixHash(
                         DurablyScanLog(fd.get(), log_id_, case_id_));
   if (event_count > scanned.snapshot.generation) {
     return absl::OutOfRangeError(absl::StrCat(
-        "DPM prefix event count ", event_count,
-        " exceeds log generation ", scanned.snapshot.generation, "."));
+        "DPM prefix event count ", event_count, " exceeds log generation ",
+        scanned.snapshot.generation, "."));
   }
   return scanned.snapshot.prefix_hashes[static_cast<size_t>(event_count)];
 }
 
-absl::StatusOr<DPMAppendResult>
-FilesystemDPMEventLog::AppendIfGeneration(DPMEvent event,
-                                          uint64_t expected_generation) {
+absl::StatusOr<DPMAppendResult> FilesystemDPMEventLog::AppendIfGeneration(
+    DPMEvent event, uint64_t expected_generation) {
   if (event.index != 0) {
     return absl::InvalidArgumentError(
         "Caller must leave a new DPM event index at zero.");
   }
   ABSL_ASSIGN_OR_RETURN(ScopedFileLock lock,
                         AcquireFileLock(lock_path_, true, false));
-  ABSL_ASSIGN_OR_RETURN(
-      ScopedFd fd,
+  ABSL_ASSIGN_OR_RETURN(ScopedFd fd,
       OpenRegularFile(log_path_, O_RDWR | O_APPEND));
   ABSL_ASSIGN_OR_RETURN(ScanResult scanned,
                         DurablyScanLog(fd.get(), log_id_, case_id_));
@@ -1612,20 +1493,18 @@ FilesystemDPMEventLog::AppendIfGeneration(DPMEvent event,
         "DPM append generation changed: expected ", expected_generation,
         ", authoritative generation is ", scanned.snapshot.generation, "."));
   }
-  if (scanned.snapshot.generation ==
-      std::numeric_limits<uint64_t>::max()) {
+  if (scanned.snapshot.generation == std::numeric_limits<uint64_t>::max()) {
     return absl::ResourceExhaustedError(
         "DPM event log cannot address another event.");
   }
   event.index = scanned.snapshot.generation;
-  ABSL_RETURN_IF_ERROR(ValidateEvent(
-      event, scanned.snapshot.events, log_id_, case_id_,
+  ABSL_RETURN_IF_ERROR(ValidateEvent(event, scanned.snapshot.events, log_id_,
+                                     case_id_,
       scanned.snapshot.prefix_hashes.back()));
   ABSL_ASSIGN_OR_RETURN(std::string canonical_event,
                         EncodeEventCanonical(event));
   const Hash256 previous = scanned.snapshot.prefix_hashes.back();
-  const Hash256 current =
-      ComputeNextPrefixHash(previous, canonical_event);
+  const Hash256 current = ComputeNextPrefixHash(previous, canonical_event);
   ABSL_ASSIGN_OR_RETURN(std::string record,
                         BuildRecord(canonical_event, previous, current));
   ABSL_RETURN_IF_ERROR(WriteAll(fd.get(), record, "DPM event record"));

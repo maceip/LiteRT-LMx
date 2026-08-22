@@ -45,8 +45,8 @@
 namespace litert::lm {
 namespace {
 
-constexpr std::array<char, 8> kStoredDescriptorMagic = {
-    'D', 'P', 'M', 'D', 'S', 'C', '0', '1'};
+constexpr std::array<char, 8> kStoredDescriptorMagic = {'D', 'P', 'M', 'D',
+                                                        'S', 'C', '0', '1'};
 constexpr uint32_t kStoredDescriptorFormatVersion = 1;
 constexpr uint64_t kMaxStoredDescriptorBytes = uint64_t{1024} * 1024;
 constexpr uint64_t kMaxStoredEnvelopeBytes = uint64_t{8} * 1024 * 1024 * 1024;
@@ -118,8 +118,8 @@ absl::StatusOr<ScopedFd> OpenRegularFile(const std::filesystem::path& path,
   } while (fd < 0 && errno == EINTR);
   if (fd < 0) {
     return absl::ErrnoToStatus(
-        errno, absl::StrCat("Unable to open DPM checkpoint file ",
-                            path.string()));
+        errno,
+        absl::StrCat("Unable to open DPM checkpoint file ", path.string()));
   }
   struct stat stat_buffer;
   if (fstat(fd, &stat_buffer) != 0) {
@@ -127,8 +127,7 @@ absl::StatusOr<ScopedFd> OpenRegularFile(const std::filesystem::path& path,
     close(fd);
     return absl::ErrnoToStatus(
         saved_errno,
-        absl::StrCat("Unable to inspect DPM checkpoint file ",
-                     path.string()));
+        absl::StrCat("Unable to inspect DPM checkpoint file ", path.string()));
   }
   if (!S_ISREG(stat_buffer.st_mode)) {
     close(fd);
@@ -163,8 +162,8 @@ absl::Status SyncFd(int fd, absl::string_view description) {
     result = fsync(fd);
   } while (result != 0 && errno == EINTR);
   if (result != 0) {
-    return absl::ErrnoToStatus(
-        errno, absl::StrCat("Unable to fsync ", description));
+    return absl::ErrnoToStatus(errno,
+                               absl::StrCat("Unable to fsync ", description));
   }
   return absl::OkStatus();
 }
@@ -196,8 +195,8 @@ absl::Status WriteAll(int fd, absl::string_view bytes,
       written = write(fd, bytes.data() + offset, bytes.size() - offset);
     } while (written < 0 && errno == EINTR);
     if (written < 0) {
-      return absl::ErrnoToStatus(
-          errno, absl::StrCat("Unable to write ", description));
+      return absl::ErrnoToStatus(errno,
+                                 absl::StrCat("Unable to write ", description));
     }
     if (written == 0) {
       return absl::DataLossError(
@@ -211,8 +210,8 @@ absl::Status WriteAll(int fd, absl::string_view bytes,
 absl::Status ReadExactAt(int fd, uint64_t offset, char* output, size_t size,
                          absl::string_view description) {
   if (offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) ||
-      size > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) -
-                 offset) {
+      size >
+          static_cast<uint64_t>(std::numeric_limits<off_t>::max()) - offset) {
     return absl::ResourceExhaustedError(
         absl::StrCat(description, " exceeds addressable file offsets."));
   }
@@ -224,8 +223,8 @@ absl::Status ReadExactAt(int fd, uint64_t offset, char* output, size_t size,
                          static_cast<off_t>(offset + consumed));
     } while (read_count < 0 && errno == EINTR);
     if (read_count < 0) {
-      return absl::ErrnoToStatus(
-          errno, absl::StrCat("Unable to read ", description));
+      return absl::ErrnoToStatus(errno,
+                                 absl::StrCat("Unable to read ", description));
     }
     if (read_count == 0) {
       return absl::DataLossError(absl::StrCat("Truncated ", description));
@@ -235,12 +234,12 @@ absl::Status ReadExactAt(int fd, uint64_t offset, char* output, size_t size,
   return absl::OkStatus();
 }
 
-absl::StatusOr<std::string> AllocateFileBytes(
-    uint64_t size, absl::string_view description) {
+absl::StatusOr<std::string> AllocateFileBytes(uint64_t size,
+                                              absl::string_view description) {
   if constexpr (sizeof(size_t) < sizeof(uint64_t)) {
     if (size > std::numeric_limits<size_t>::max()) {
-      return absl::ResourceExhaustedError(absl::StrCat(
-          description, " exceeds addressable process memory."));
+      return absl::ResourceExhaustedError(
+          absl::StrCat(description, " exceeds addressable process memory."));
     }
   }
   const size_t allocation_size = static_cast<size_t>(size);
@@ -274,8 +273,8 @@ absl::StatusOr<std::string> ReadWholeFile(
   ABSL_ASSIGN_OR_RETURN(ScopedFd fd, OpenRegularFile(path, O_RDONLY));
   struct stat stat_buffer;
   if (fstat(fd.get(), &stat_buffer) != 0) {
-    return absl::ErrnoToStatus(
-        errno, absl::StrCat("Unable to inspect ", description));
+    return absl::ErrnoToStatus(errno,
+                               absl::StrCat("Unable to inspect ", description));
   }
   if (stat_buffer.st_size < 0 ||
       static_cast<uint64_t>(stat_buffer.st_size) > size_limit) {
@@ -308,24 +307,24 @@ absl::Status EnsureNonSymlinkDirectory(const std::filesystem::path& directory,
   std::error_code error;
   std::filesystem::create_directories(directory, error);
   if (error) {
-    return absl::FailedPreconditionError(absl::StrCat(
-        "Unable to create ", description, " ", directory.string(), ": ",
-        error.message()));
+    return absl::FailedPreconditionError(
+        absl::StrCat("Unable to create ", description, " ", directory.string(),
+                     ": ", error.message()));
   }
   const std::filesystem::file_status status =
       std::filesystem::symlink_status(directory, error);
   if (error) {
-    return absl::FailedPreconditionError(absl::StrCat(
-        "Unable to inspect ", description, " ", directory.string(), ": ",
-        error.message()));
+    return absl::FailedPreconditionError(
+        absl::StrCat("Unable to inspect ", description, " ", directory.string(),
+                     ": ", error.message()));
   }
   if (std::filesystem::is_symlink(status)) {
     return absl::FailedPreconditionError(absl::StrCat(
         description, " must not be a symbolic link: ", directory.string()));
   }
   if (!std::filesystem::is_directory(status)) {
-    return absl::FailedPreconditionError(absl::StrCat(
-        description, " is not a directory: ", directory.string()));
+    return absl::FailedPreconditionError(
+        absl::StrCat(description, " is not a directory: ", directory.string()));
   }
   return absl::OkStatus();
 }
@@ -351,8 +350,7 @@ absl::StatusOr<std::pair<ScopedFd, std::filesystem::path>> CreateTempFile(
         saved_errno, "Unable to mark checkpoint temporary file close-on-exec");
   }
 #endif
-  return std::make_pair(ScopedFd(fd),
-                        std::filesystem::path(writable.data()));
+  return std::make_pair(ScopedFd(fd), std::filesystem::path(writable.data()));
 }
 
 absl::Status PublishCreateOnce(const std::filesystem::path& directory,
@@ -364,8 +362,8 @@ absl::Status PublishCreateOnce(const std::filesystem::path& directory,
       ReadWholeFile(final_path, existing_size_limit, description);
   if (existing.ok()) {
     if (*existing == bytes) return SyncDirectory(directory);
-    return absl::DataLossError(absl::StrCat(
-        "Conflicting bytes already exist for content-addressed ",
+    return absl::DataLossError(
+        absl::StrCat("Conflicting bytes already exist for content-addressed ",
         description, "."));
   }
   if (!absl::IsNotFound(existing.status())) return existing.status();
@@ -390,8 +388,8 @@ absl::Status PublishCreateOnce(const std::filesystem::path& directory,
       if (!raced.ok()) {
         status = raced.status();
       } else if (*raced != bytes) {
-        status = absl::DataLossError(absl::StrCat(
-            "Conflicting bytes won create-once publication for ",
+        status = absl::DataLossError(
+            absl::StrCat("Conflicting bytes won create-once publication for ",
             description, "."));
       }
     } else {
@@ -470,8 +468,7 @@ class CanonicalReader {
     ABSL_RETURN_IF_ERROR(Require(4));
     uint32_t value = 0;
     for (int i = 0; i < 4; ++i) {
-      value = (value << 8) |
-              static_cast<unsigned char>(bytes_[offset_ + i]);
+      value = (value << 8) | static_cast<unsigned char>(bytes_[offset_ + i]);
     }
     offset_ += 4;
     return value;
@@ -481,8 +478,7 @@ class CanonicalReader {
     ABSL_RETURN_IF_ERROR(Require(8));
     uint64_t value = 0;
     for (int i = 0; i < 8; ++i) {
-      value = (value << 8) |
-              static_cast<unsigned char>(bytes_[offset_ + i]);
+      value = (value << 8) | static_cast<unsigned char>(bytes_[offset_ + i]);
     }
     offset_ += 8;
     return value;
@@ -496,8 +492,7 @@ class CanonicalReader {
   absl::StatusOr<std::string> ReadString() {
     ABSL_ASSIGN_OR_RETURN(uint32_t length, ReadU32());
     if (length > bytes_.size() - offset_) {
-      return absl::DataLossError(
-          "Truncated stored DPM descriptor string.");
+      return absl::DataLossError("Truncated stored DPM descriptor string.");
     }
     std::string value(bytes_.data() + offset_, length);
     offset_ += length;
@@ -507,8 +502,7 @@ class CanonicalReader {
   absl::StatusOr<Hash256> ReadHash() {
     Hash256 hash;
     ABSL_RETURN_IF_ERROR(Require(hash.bytes.size()));
-    std::memcpy(hash.bytes.data(), bytes_.data() + offset_,
-                hash.bytes.size());
+    std::memcpy(hash.bytes.data(), bytes_.data() + offset_, hash.bytes.size());
     offset_ += hash.bytes.size();
     return hash;
   }
@@ -566,55 +560,32 @@ absl::StatusOr<std::string> EncodeStoredDescriptor(
   AppendHash(descriptor.envelope_hash, &bytes);
   AppendU64(descriptor.envelope_size, &bytes);
   AppendI64(descriptor.created_unix_micros, &bytes);
-  if (descriptor.format_version ==
-          DPMSessionCheckpointDescriptor::kPreviousFormatVersion ||
-      descriptor.format_version ==
-          DPMSessionCheckpointDescriptor::kCoverageV1FormatVersion ||
-      descriptor.format_version ==
-          DPMSessionCheckpointDescriptor::kFormatVersion) {
-    bytes.push_back(static_cast<char>(descriptor.replay_mode));
-    bytes.push_back(static_cast<char>(descriptor.capture_origin));
-    AppendOptionalHash(descriptor.restored_from_checkpoint_id, &bytes);
-    AppendOptionalHash(descriptor.exact_profile_id, &bytes);
-    AppendHash(descriptor.exact_profile_admission_record_id, &bytes);
-    if (descriptor.format_version ==
-            DPMSessionCheckpointDescriptor::kCoverageV1FormatVersion ||
-        descriptor.format_version ==
-            DPMSessionCheckpointDescriptor::kFormatVersion) {
-      AppendHash(descriptor.capsule_restore_capability_id, &bytes);
-    }
-    AppendHash(descriptor.capsule_restore_admission_record_id, &bytes);
-    if (descriptor.format_version ==
-            DPMSessionCheckpointDescriptor::kCoverageV1FormatVersion ||
-        descriptor.format_version ==
-            DPMSessionCheckpointDescriptor::kFormatVersion) {
-      AppendHash(descriptor.capsule_restore_coverage_id, &bytes);
-    }
-    AppendHash(descriptor.exact_request_execution_evidence_id, &bytes);
-    bytes.push_back(static_cast<char>(descriptor.worker_prefill_mode));
-    AppendHash(descriptor.execution_plan_hash, &bytes);
-    AppendHash(descriptor.exact_output_evidence_hash, &bytes);
-    bytes.push_back(descriptor.worker_provenance.has_value() ? '\1' : '\0');
-    if (descriptor.worker_provenance.has_value()) {
-      const DPMExactWorkerCheckpointProvenance& provenance =
-          *descriptor.worker_provenance;
-      AppendU32(provenance.run_index, &bytes);
-      AppendHash(provenance.execution_plan_hash, &bytes);
-      AppendHash(provenance.request_envelope_hash, &bytes);
-      AppendHash(provenance.result_envelope_hash, &bytes);
-      AppendU64(provenance.transient_envelope_size, &bytes);
-      AppendHash(provenance.transient_envelope_hash, &bytes);
-      AppendHash(provenance.output_evidence_hash, &bytes);
-    }
-    if (descriptor.format_version ==
-        DPMSessionCheckpointDescriptor::kFormatVersion) {
-      // Version 4 retains the complete stored version 3 sequence above and
-      // appends only its Coverage V2 tail.
-      AppendHash(descriptor.capsule_capture_plan_hash, &bytes);
-      AppendPreparedPrefillWorkBinding(descriptor.prepared_prefill_work,
-                                       &bytes);
-    }
+  bytes.push_back(static_cast<char>(descriptor.replay_mode));
+  bytes.push_back(static_cast<char>(descriptor.capture_origin));
+  AppendOptionalHash(descriptor.restored_from_checkpoint_id, &bytes);
+  AppendOptionalHash(descriptor.exact_profile_id, &bytes);
+  AppendHash(descriptor.exact_profile_admission_record_id, &bytes);
+  AppendHash(descriptor.capsule_restore_capability_id, &bytes);
+  AppendHash(descriptor.capsule_restore_admission_record_id, &bytes);
+  AppendHash(descriptor.capsule_restore_coverage_id, &bytes);
+  AppendHash(descriptor.exact_request_execution_evidence_id, &bytes);
+  bytes.push_back(static_cast<char>(descriptor.worker_prefill_mode));
+  AppendHash(descriptor.execution_plan_hash, &bytes);
+  AppendHash(descriptor.exact_output_evidence_hash, &bytes);
+  bytes.push_back(descriptor.worker_provenance.has_value() ? '\1' : '\0');
+  if (descriptor.worker_provenance.has_value()) {
+    const DPMExactWorkerCheckpointProvenance& provenance =
+        *descriptor.worker_provenance;
+    AppendU32(provenance.run_index, &bytes);
+    AppendHash(provenance.execution_plan_hash, &bytes);
+    AppendHash(provenance.request_envelope_hash, &bytes);
+    AppendHash(provenance.result_envelope_hash, &bytes);
+    AppendU64(provenance.transient_envelope_size, &bytes);
+    AppendHash(provenance.transient_envelope_hash, &bytes);
+    AppendHash(provenance.output_evidence_hash, &bytes);
   }
+  AppendHash(descriptor.capsule_capture_plan_hash, &bytes);
+  AppendPreparedPrefillWorkBinding(descriptor.prepared_prefill_work, &bytes);
   if (bytes.size() > kMaxStoredDescriptorBytes) {
     return absl::ResourceExhaustedError(
         "DPM checkpoint descriptor exceeds its durable size limit.");
@@ -648,10 +619,8 @@ absl::StatusOr<DPMSessionCheckpointDescriptor> DecodeStoredDescriptor(
   ABSL_ASSIGN_OR_RETURN(descriptor.source_event_count, reader.ReadU64());
   ABSL_ASSIGN_OR_RETURN(descriptor.source_prefix_hash, reader.ReadHash());
   ABSL_ASSIGN_OR_RETURN(descriptor.response_event_index, reader.ReadU64());
-  ABSL_ASSIGN_OR_RETURN(descriptor.projection_request_hash,
-                        reader.ReadHash());
-  ABSL_ASSIGN_OR_RETURN(descriptor.projection_manifest_hash,
-                        reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(descriptor.projection_request_hash, reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(descriptor.projection_manifest_hash, reader.ReadHash());
   ABSL_ASSIGN_OR_RETURN(descriptor.correction_digest, reader.ReadHash());
   ABSL_ASSIGN_OR_RETURN(descriptor.agent_request_hash, reader.ReadHash());
   ABSL_ASSIGN_OR_RETURN(descriptor.agent_transcript_hash, reader.ReadHash());
@@ -666,107 +635,73 @@ absl::StatusOr<DPMSessionCheckpointDescriptor> DecodeStoredDescriptor(
   ABSL_ASSIGN_OR_RETURN(descriptor.envelope_size, reader.ReadU64());
   ABSL_ASSIGN_OR_RETURN(descriptor.created_unix_micros, reader.ReadI64());
 
-  switch (descriptor.format_version) {
-    case DPMSessionCheckpointDescriptor::kLegacyFormatVersion:
-      // These values are inferred rather than serialized in DPMDSC01 v1.
-      descriptor.replay_mode = DPMReplayMode::kCanonicalWinnerReplay;
-      descriptor.capture_origin =
-          DPMCheckpointCaptureOrigin::kLiveParentSession;
-      break;
-
-    case DPMSessionCheckpointDescriptor::kPreviousFormatVersion:
-    case DPMSessionCheckpointDescriptor::kCoverageV1FormatVersion:
-    case DPMSessionCheckpointDescriptor::kFormatVersion: {
-      uint8_t replay_mode;
-      ABSL_ASSIGN_OR_RETURN(replay_mode, reader.ReadU8());
-      descriptor.replay_mode = static_cast<DPMReplayMode>(replay_mode);
-      uint8_t capture_origin;
-      ABSL_ASSIGN_OR_RETURN(capture_origin, reader.ReadU8());
-      descriptor.capture_origin =
-          static_cast<DPMCheckpointCaptureOrigin>(capture_origin);
-      ABSL_ASSIGN_OR_RETURN(descriptor.restored_from_checkpoint_id,
-                            reader.ReadOptionalHash());
-      ABSL_ASSIGN_OR_RETURN(descriptor.exact_profile_id,
-                            reader.ReadOptionalHash());
-      ABSL_ASSIGN_OR_RETURN(descriptor.exact_profile_admission_record_id,
-                            reader.ReadHash());
-      if (descriptor.format_version ==
-              DPMSessionCheckpointDescriptor::kCoverageV1FormatVersion ||
-          descriptor.format_version ==
-              DPMSessionCheckpointDescriptor::kFormatVersion) {
-        ABSL_ASSIGN_OR_RETURN(descriptor.capsule_restore_capability_id,
-                              reader.ReadHash());
-      }
-      ABSL_ASSIGN_OR_RETURN(descriptor.capsule_restore_admission_record_id,
-                            reader.ReadHash());
-      if (descriptor.format_version ==
-              DPMSessionCheckpointDescriptor::kCoverageV1FormatVersion ||
-          descriptor.format_version ==
-              DPMSessionCheckpointDescriptor::kFormatVersion) {
-        ABSL_ASSIGN_OR_RETURN(descriptor.capsule_restore_coverage_id,
-                              reader.ReadHash());
-      }
-      ABSL_ASSIGN_OR_RETURN(descriptor.exact_request_execution_evidence_id,
-                            reader.ReadHash());
-      uint8_t worker_prefill_mode;
-      ABSL_ASSIGN_OR_RETURN(worker_prefill_mode, reader.ReadU8());
-      descriptor.worker_prefill_mode =
-          static_cast<DPMCheckpointWorkerPrefillMode>(worker_prefill_mode);
-      ABSL_ASSIGN_OR_RETURN(descriptor.execution_plan_hash,
-                            reader.ReadHash());
-      ABSL_ASSIGN_OR_RETURN(descriptor.exact_output_evidence_hash,
-                            reader.ReadHash());
-      uint8_t has_worker_provenance;
-      ABSL_ASSIGN_OR_RETURN(has_worker_provenance, reader.ReadU8());
-      if (has_worker_provenance > 1) {
-        return absl::DataLossError(
-            "Stored DPM descriptor has a non-canonical worker-provenance "
-            "marker.");
-      }
-      if (has_worker_provenance != 0) {
-        DPMExactWorkerCheckpointProvenance provenance;
-        ABSL_ASSIGN_OR_RETURN(provenance.run_index, reader.ReadU32());
-        ABSL_ASSIGN_OR_RETURN(provenance.execution_plan_hash,
-                              reader.ReadHash());
-        ABSL_ASSIGN_OR_RETURN(provenance.request_envelope_hash,
-                              reader.ReadHash());
-        ABSL_ASSIGN_OR_RETURN(provenance.result_envelope_hash,
-                              reader.ReadHash());
-        ABSL_ASSIGN_OR_RETURN(provenance.transient_envelope_size,
-                              reader.ReadU64());
-        ABSL_ASSIGN_OR_RETURN(provenance.transient_envelope_hash,
-                              reader.ReadHash());
-        ABSL_ASSIGN_OR_RETURN(provenance.output_evidence_hash,
-                              reader.ReadHash());
-        descriptor.worker_provenance = std::move(provenance);
-      }
-      if (descriptor.format_version ==
-          DPMSessionCheckpointDescriptor::kFormatVersion) {
-        ABSL_ASSIGN_OR_RETURN(descriptor.capsule_capture_plan_hash,
-                              reader.ReadHash());
-        uint32_t prepared_start_kind;
-        ABSL_ASSIGN_OR_RETURN(prepared_start_kind, reader.ReadU32());
-        descriptor.prepared_prefill_work.start_kind =
-            static_cast<DPMPreparedPrefillStartKind>(prepared_start_kind);
-        ABSL_ASSIGN_OR_RETURN(descriptor.prepared_prefill_work.plan_id,
-                              reader.ReadHash());
-        ABSL_ASSIGN_OR_RETURN(
-            descriptor.prepared_prefill_work.canonical_source_chunks_hash,
-            reader.ReadHash());
-        ABSL_ASSIGN_OR_RETURN(
-            descriptor.prepared_prefill_work.resolved_token_plan_hash,
-            reader.ReadHash());
-        ABSL_ASSIGN_OR_RETURN(
-            descriptor.prepared_prefill_work.shape_schedule_hash,
-            reader.ReadHash());
-      }
-      break;
-    }
-
-    default:
-      return absl::FailedPreconditionError(
-          "Unsupported DPM session checkpoint descriptor version.");
+  if (descriptor.format_version !=
+      DPMSessionCheckpointDescriptor::kFormatVersion) {
+    return absl::FailedPreconditionError(
+        "Unsupported DPM session checkpoint descriptor format.");
   }
+  uint8_t replay_mode;
+  ABSL_ASSIGN_OR_RETURN(replay_mode, reader.ReadU8());
+  descriptor.replay_mode = static_cast<DPMReplayMode>(replay_mode);
+  uint8_t capture_origin;
+  ABSL_ASSIGN_OR_RETURN(capture_origin, reader.ReadU8());
+  descriptor.capture_origin =
+      static_cast<DPMCheckpointCaptureOrigin>(capture_origin);
+  ABSL_ASSIGN_OR_RETURN(descriptor.restored_from_checkpoint_id,
+                        reader.ReadOptionalHash());
+  ABSL_ASSIGN_OR_RETURN(descriptor.exact_profile_id, reader.ReadOptionalHash());
+  ABSL_ASSIGN_OR_RETURN(descriptor.exact_profile_admission_record_id,
+                        reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(descriptor.capsule_restore_capability_id,
+                        reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(descriptor.capsule_restore_admission_record_id,
+                        reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(descriptor.capsule_restore_coverage_id,
+                        reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(descriptor.exact_request_execution_evidence_id,
+                        reader.ReadHash());
+  uint8_t worker_prefill_mode;
+  ABSL_ASSIGN_OR_RETURN(worker_prefill_mode, reader.ReadU8());
+  descriptor.worker_prefill_mode =
+      static_cast<DPMCheckpointWorkerPrefillMode>(worker_prefill_mode);
+  ABSL_ASSIGN_OR_RETURN(descriptor.execution_plan_hash, reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(descriptor.exact_output_evidence_hash,
+                        reader.ReadHash());
+  uint8_t has_worker_provenance;
+  ABSL_ASSIGN_OR_RETURN(has_worker_provenance, reader.ReadU8());
+  if (has_worker_provenance > 1) {
+    return absl::DataLossError(
+        "Stored DPM descriptor has a non-canonical worker-provenance "
+        "marker.");
+  }
+  if (has_worker_provenance != 0) {
+    DPMExactWorkerCheckpointProvenance provenance;
+    ABSL_ASSIGN_OR_RETURN(provenance.run_index, reader.ReadU32());
+    ABSL_ASSIGN_OR_RETURN(provenance.execution_plan_hash, reader.ReadHash());
+    ABSL_ASSIGN_OR_RETURN(provenance.request_envelope_hash, reader.ReadHash());
+    ABSL_ASSIGN_OR_RETURN(provenance.result_envelope_hash, reader.ReadHash());
+    ABSL_ASSIGN_OR_RETURN(provenance.transient_envelope_size, reader.ReadU64());
+    ABSL_ASSIGN_OR_RETURN(provenance.transient_envelope_hash,
+                          reader.ReadHash());
+    ABSL_ASSIGN_OR_RETURN(provenance.output_evidence_hash, reader.ReadHash());
+    descriptor.worker_provenance = std::move(provenance);
+  }
+  ABSL_ASSIGN_OR_RETURN(descriptor.capsule_capture_plan_hash,
+                        reader.ReadHash());
+  uint32_t prepared_start_kind;
+  ABSL_ASSIGN_OR_RETURN(prepared_start_kind, reader.ReadU32());
+  descriptor.prepared_prefill_work.start_kind =
+      static_cast<DPMPreparedPrefillStartKind>(prepared_start_kind);
+  ABSL_ASSIGN_OR_RETURN(descriptor.prepared_prefill_work.plan_id,
+                        reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(
+      descriptor.prepared_prefill_work.canonical_source_chunks_hash,
+      reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(
+      descriptor.prepared_prefill_work.resolved_token_plan_hash,
+      reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(descriptor.prepared_prefill_work.shape_schedule_hash,
+                        reader.ReadHash());
   if (!reader.empty()) {
     return absl::DataLossError("Trailing bytes in stored DPM descriptor.");
   }
@@ -800,8 +735,7 @@ FilesystemDPMSessionCheckpointRepository::
       descriptor_directory_(directory_ / "descriptors"),
       lock_path_(directory_ / ".repository.lock") {}
 
-absl::StatusOr<
-    std::unique_ptr<FilesystemDPMSessionCheckpointRepository>>
+absl::StatusOr<std::unique_ptr<FilesystemDPMSessionCheckpointRepository>>
 FilesystemDPMSessionCheckpointRepository::Create(
     std::filesystem::path directory) {
   if (directory.empty()) {
@@ -812,27 +746,25 @@ FilesystemDPMSessionCheckpointRepository::Create(
   directory = std::filesystem::absolute(directory, path_error);
   if (path_error) {
     return absl::InvalidArgumentError(absl::StrCat(
-        "Unable to resolve DPM checkpoint directory: ",
-        path_error.message()));
+        "Unable to resolve DPM checkpoint directory: ", path_error.message()));
   }
   directory = std::filesystem::weakly_canonical(directory, path_error);
   if (path_error) {
-    return absl::InvalidArgumentError(absl::StrCat(
-        "Unable to normalize DPM checkpoint directory: ",
+    return absl::InvalidArgumentError(
+        absl::StrCat("Unable to normalize DPM checkpoint directory: ",
         path_error.message()));
   }
-  auto repository =
-      std::unique_ptr<FilesystemDPMSessionCheckpointRepository>(
+  auto repository = std::unique_ptr<FilesystemDPMSessionCheckpointRepository>(
           new FilesystemDPMSessionCheckpointRepository(std::move(directory)));
   ABSL_RETURN_IF_ERROR(repository->Initialize());
   return repository;
 }
 
 absl::Status FilesystemDPMSessionCheckpointRepository::Initialize() {
-  ABSL_RETURN_IF_ERROR(EnsureNonSymlinkDirectory(
-      envelope_directory_, "DPM envelope directory"));
-  ABSL_RETURN_IF_ERROR(EnsureNonSymlinkDirectory(
-      descriptor_directory_, "DPM descriptor directory"));
+  ABSL_RETURN_IF_ERROR(
+      EnsureNonSymlinkDirectory(envelope_directory_, "DPM envelope directory"));
+  ABSL_RETURN_IF_ERROR(EnsureNonSymlinkDirectory(descriptor_directory_,
+                                                 "DPM descriptor directory"));
   ABSL_ASSIGN_OR_RETURN(ScopedFileLock lock,
                         AcquireFileLock(lock_path_, true, true));
   ABSL_RETURN_IF_ERROR(SyncDirectory(envelope_directory_));
@@ -848,8 +780,7 @@ absl::Status FilesystemDPMSessionCheckpointRepository::Put(
     return absl::ResourceExhaustedError(
         "DPM session checkpoint envelope exceeds the repository limit.");
   }
-  ABSL_ASSIGN_OR_RETURN(
-      std::string descriptor_bytes,
+  ABSL_ASSIGN_OR_RETURN(std::string descriptor_bytes,
       EncodeStoredDescriptor(artifact.descriptor));
   ABSL_ASSIGN_OR_RETURN(ScopedFileLock lock,
                         AcquireFileLock(lock_path_, true, false));

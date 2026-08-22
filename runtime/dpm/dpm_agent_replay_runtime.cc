@@ -44,8 +44,8 @@ namespace {
 
 constexpr std::array<char, 8> kAgentExecutionMagic = {'D', 'P', 'M', 'A',
                                                        'G', 'N', '0', '1'};
-constexpr std::array<char, 8> kAgentDeltaExecutionMagic = {
-    'D', 'P', 'M', 'D', 'L', 'T', '0', '1'};
+constexpr std::array<char, 8> kAgentDeltaExecutionMagic = {'D', 'P', 'M', 'D',
+                                                           'L', 'T', '0', '1'};
 constexpr std::array<char, 8> kAgentDecisionMagic = {'D', 'P', 'M', 'D',
                                                       'E', 'C', '0', '1'};
 constexpr uint64_t kAgentExecutionFixedBytes = 8 + 4 + 32 + 32 + 4 + 4;
@@ -54,7 +54,7 @@ constexpr uint64_t kAgentDeltaExecutionFixedBytes =
 constexpr uint64_t kAgentChunkFramingBytes = 1 + 8;
 constexpr uint64_t kCanonicalTokenFramingBytes = 8 + 4 + 4;
 constexpr absl::string_view kWinnerAgentEvidenceDomain =
-    "LITERT_LMX_DPM_WINNER_AGENT_EVIDENCE_SHA256_V1";
+    "LITERT_LMX_DPM_WINNER_AGENT_EVIDENCE_SHA256";
 
 bool IsZeroHash(const Hash256& hash) { return hash == Hash256{}; }
 
@@ -64,8 +64,7 @@ Hash256 Sha256(absl::string_view bytes) {
   return hasher.Finalize();
 }
 
-absl::Status ValidateRuntimeIdentity(
-    const SessionHandoffIdentity& identity) {
+absl::Status ValidateRuntimeIdentity(const SessionHandoffIdentity& identity) {
   if (IsZeroHash(identity.model_artifact_hash) ||
       IsZeroHash(identity.runtime_artifact_hash) ||
       IsZeroHash(identity.inference_profile_hash)) {
@@ -139,8 +138,7 @@ class Reader {
     if (remaining() < 4) return Truncated();
     uint32_t value = 0;
     for (int index = 0; index < 4; ++index) {
-      value = (value << 8) |
-              static_cast<uint8_t>(bytes_[offset_ + index]);
+      value = (value << 8) | static_cast<uint8_t>(bytes_[offset_ + index]);
     }
     offset_ += 4;
     return value;
@@ -150,8 +148,7 @@ class Reader {
     if (remaining() < 8) return Truncated();
     uint64_t value = 0;
     for (int index = 0; index < 8; ++index) {
-      value = (value << 8) |
-              static_cast<uint8_t>(bytes_[offset_ + index]);
+      value = (value << 8) | static_cast<uint8_t>(bytes_[offset_ + index]);
     }
     offset_ += 8;
     return value;
@@ -166,8 +163,7 @@ class Reader {
   }
 
   absl::StatusOr<absl::string_view> ReadBytes(uint64_t size) {
-    if (size > remaining() ||
-        size > (std::numeric_limits<size_t>::max)()) {
+    if (size > remaining() || size > (std::numeric_limits<size_t>::max)()) {
       return Truncated();
     }
     absl::string_view result =
@@ -197,11 +193,13 @@ absl::StatusOr<Hash256> ComputeWinnerEvidenceHash(
   hasher.Update(absl::string_view(
       reinterpret_cast<const char*>(identity.model_artifact_hash.bytes.data()),
       identity.model_artifact_hash.bytes.size()));
-  hasher.Update(absl::string_view(
-      reinterpret_cast<const char*>(identity.runtime_artifact_hash.bytes.data()),
+  hasher.Update(
+      absl::string_view(reinterpret_cast<const char*>(
+                            identity.runtime_artifact_hash.bytes.data()),
       identity.runtime_artifact_hash.bytes.size()));
-  hasher.Update(absl::string_view(
-      reinterpret_cast<const char*>(identity.inference_profile_hash.bytes.data()),
+  hasher.Update(
+      absl::string_view(reinterpret_cast<const char*>(
+                            identity.inference_profile_hash.bytes.data()),
       identity.inference_profile_hash.bytes.size()));
   ABSL_ASSIGN_OR_RETURN(const Hash256 request_hash,
                         ComputeDPMCanonicalReplayRequestHash(request));
@@ -234,8 +232,7 @@ absl::Status ValidateChunk(
             "with text.");
       }
       for (int token_id : chunk.token_ids) {
-        if (token_id < 0 ||
-            static_cast<int64_t>(token_id) >
+        if (token_id < 0 || static_cast<int64_t>(token_id) >
                 std::numeric_limits<int32_t>::max()) {
           return absl::InvalidArgumentError(
               "Canonical DPM agent chunk contains a non-int32 token ID.");
@@ -285,8 +282,7 @@ absl::Status ValidatePreparedPlanSourceBindings(
         break;
       }
       case DPMAgentGenerationRequest::PrefillChunk::Encoding::kTokenIds: {
-        expected_encoding =
-            DPMPreparedPrefillSourceEncoding::kExactTokenIds;
+        expected_encoding = DPMPreparedPrefillSourceEncoding::kExactTokenIds;
         std::vector<int32_t> exact_ids;
         exact_ids.reserve(chunk.token_ids.size());
         for (int token_id : chunk.token_ids) {
@@ -310,38 +306,6 @@ absl::Status ValidatePreparedPlanSourceBindings(
   return absl::OkStatus();
 }
 
-absl::StatusOr<std::vector<CapsuleRestorePrefillChunk>>
-ToCapsuleRestoreChunks(
-    const std::vector<DPMAgentGenerationRequest::PrefillChunk>& chunks) {
-  std::vector<CapsuleRestorePrefillChunk> converted;
-  converted.reserve(chunks.size());
-  for (const DPMAgentGenerationRequest::PrefillChunk& chunk : chunks) {
-    ABSL_RETURN_IF_ERROR(ValidateChunk(chunk));
-    CapsuleRestorePrefillChunk converted_chunk;
-    switch (chunk.encoding) {
-      case DPMAgentGenerationRequest::PrefillChunk::Encoding::kUtf8Text:
-        converted_chunk.encoding =
-            CapsuleRestorePrefillChunk::Encoding::kUtf8Text;
-        converted_chunk.utf8_text = chunk.text;
-        break;
-      case DPMAgentGenerationRequest::PrefillChunk::Encoding::kTokenIds:
-        converted_chunk.encoding =
-            CapsuleRestorePrefillChunk::Encoding::kExactTokenIds;
-        converted_chunk.token_ids.reserve(chunk.token_ids.size());
-        for (int token_id : chunk.token_ids) {
-          converted_chunk.token_ids.push_back(
-              static_cast<int32_t>(token_id));
-        }
-        break;
-      default:
-        return absl::InvalidArgumentError(
-            "CapsuleRestore operation has an unknown chunk encoding.");
-    }
-    converted.push_back(std::move(converted_chunk));
-  }
-  return converted;
-}
-
 bool ExecutionRequestsEqual(const DPMAgentExecutionRequest& left,
                             const DPMAgentExecutionRequest& right) {
   return left.format_version == right.format_version &&
@@ -353,8 +317,8 @@ bool ExecutionRequestsEqual(const DPMAgentExecutionRequest& left,
 }
 
 bool HasSameStateWitnessAdmissionAuthority(
-    const AuthenticatedCapsuleRestoreStateWitnessAdmission& lhs,
-    const AuthenticatedCapsuleRestoreStateWitnessAdmission& rhs) {
+    const AuthenticatedCapsuleRestoreAdmission& lhs,
+    const AuthenticatedCapsuleRestoreAdmission& rhs) {
   return lhs.record.record_id == rhs.record.record_id &&
          lhs.profile == rhs.profile && lhs.capability == rhs.capability &&
          lhs.operational_coverage == rhs.operational_coverage &&
@@ -363,31 +327,25 @@ bool HasSameStateWitnessAdmissionAuthority(
 }
 
 absl::Status ValidateStateWitnessAdmissionForAgentRuntime(
-    const AuthenticatedCapsuleRestoreStateWitnessAdmission& admission,
+    const AuthenticatedCapsuleRestoreAdmission& admission,
     const SessionHandoffIdentity& expected_identity,
     const std::optional<ExactLiteRtProfile>& expected_exact_profile) {
   ABSL_RETURN_IF_ERROR(ValidateRuntimeIdentity(expected_identity));
   ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(admission.profile));
-  ABSL_RETURN_IF_ERROR(
-      ValidateSessionHandoffCapability(admission.capability));
-  ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleRestoreStateWitnessAdmissionRecord(admission.record));
-  ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleRestoreStateWitnessOperationalCoverage(
+  ABSL_RETURN_IF_ERROR(ValidateSessionHandoffCapability(admission.capability));
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreAdmissionRecord(admission.record));
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreOperationalCoverage(
           admission.operational_coverage));
-  ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleRestoreStateWitnessOperationalContracts(
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreOperationalContracts(
           admission.operational_coverage));
-  ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleRestoreStateWitnessAdmissionRecordForRuntime(
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreAdmissionRecordForRuntime(
           admission.record, admission.profile, admission.capability,
           admission.operational_coverage.coverage_id));
-  ABSL_ASSIGN_OR_RETURN(
-      const CapsuleRestoreAuthorityV2 authority,
-      BuildCapsuleRestoreAuthorityV2(admission));
+  ABSL_ASSIGN_OR_RETURN(const CapsuleRestoreAuthority authority,
+                        BuildCapsuleRestoreAuthority(admission));
   ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleRestoreAuthorityV2ForAdmission(authority, admission));
-  const CapsuleRestoreStateWitnessOperationalCoverage& coverage =
+      ValidateCapsuleRestoreAuthorityForAdmission(authority, admission));
+  const CapsuleRestoreOperationalCoverage& coverage =
       admission.operational_coverage;
   const CapsuleRestoreStateWitnessOperationalDomain& domain =
       coverage.operational_domain;
@@ -405,7 +363,7 @@ absl::Status ValidateStateWitnessAdmissionForAgentRuntime(
       (expected_exact_profile.has_value() &&
        admission.profile != *expected_exact_profile)) {
     return absl::FailedPreconditionError(
-        "CapsuleRestore Coverage V2 admission is detached from the loaded "
+        "CapsuleRestore admission is detached from the loaded "
         "agent runtime's profile, capability, or operational domain.");
   }
   return absl::OkStatus();
@@ -420,7 +378,7 @@ absl::Status ValidateStateWitnessSourceDomain(
       maximum_output_tokens == 0 ||
       maximum_output_tokens > domain.maximum_output_tokens) {
     return absl::FailedPreconditionError(
-        "Exact agent request is outside the CapsuleRestore Coverage V2 "
+        "Exact agent request is outside the CapsuleRestore "
         "prefill-count or output-token domain.");
   }
   uint64_t text_bytes = 0;
@@ -435,7 +393,7 @@ absl::Status ValidateStateWitnessSourceDomain(
                 domain.maximum_prefill_text_bytes - text_bytes) {
           return absl::FailedPreconditionError(
               "Exact agent text prefill exceeds the CapsuleRestore Coverage "
-              "V2 domain.");
+              "authenticated domain.");
         }
         text_bytes += chunk.text.size();
         encoding_mask |= CapsuleRestoreStateWitnessEncodingBit(
@@ -447,7 +405,7 @@ absl::Status ValidateStateWitnessSourceDomain(
                 domain.maximum_prefill_token_ids - token_ids) {
           return absl::FailedPreconditionError(
               "Exact agent token prefill exceeds the CapsuleRestore Coverage "
-              "V2 domain.");
+              "authenticated domain.");
         }
         token_ids += chunk.token_ids.size();
         encoding_mask |= CapsuleRestoreStateWitnessEncodingBit(
@@ -462,47 +420,45 @@ absl::Status ValidateStateWitnessSourceDomain(
       (encoding_mask & ~domain.admitted_encoding_mask) != 0) {
     return absl::FailedPreconditionError(
         "Exact agent prefill encoding is outside the CapsuleRestore Coverage "
-        "V2 domain.");
+        "authenticated domain.");
   }
   return absl::OkStatus();
 }
 
 absl::Status ValidateStateWitnessPreparedPlanDomain(
     const DPMPreparedPrefillPlan& plan, uint32_t maximum_output_tokens,
-    bool restored,
-    const CapsuleRestoreStateWitnessOperationalDomain& domain) {
+    bool restored, const CapsuleRestoreStateWitnessOperationalDomain& domain) {
   ABSL_RETURN_IF_ERROR(ValidateDPMPreparedPrefillPlan(plan));
   if (plan.end_step > domain.maximum_context_positions ||
       maximum_output_tokens > domain.maximum_context_positions ||
       plan.end_step >
           domain.maximum_context_positions - maximum_output_tokens) {
     return absl::FailedPreconditionError(
-        "Exact agent prefill or decode exceeds the CapsuleRestore Coverage V2 "
+        "Exact agent prefill or decode exceeds the CapsuleRestore "
         "context domain.");
   }
   if (!restored) {
     if (plan.start_kind != DPMPreparedPrefillStartKind::kFreshSession ||
         plan.start_step != 0) {
       return absl::FailedPreconditionError(
-          "Coverage V2 root capture did not begin from a fresh session.");
+          "CapsuleRestore root capture did not begin from a fresh session.");
     }
     return absl::OkStatus();
   }
-  if (plan.start_kind !=
-          DPMPreparedPrefillStartKind::kOwnPositionRestore ||
+  if (plan.start_kind != DPMPreparedPrefillStartKind::kOwnPositionRestore ||
       plan.start_step < domain.minimum_checkpoint_step ||
       plan.start_step > domain.maximum_checkpoint_step ||
       plan.end_step <= plan.start_step) {
     return absl::FailedPreconditionError(
         "Exact agent restored prefill is outside the CapsuleRestore Coverage "
-        "V2 checkpoint domain.");
+        "authenticated checkpoint domain.");
   }
   const uint64_t delta_positions = plan.end_step - plan.start_step;
   if (delta_positions < domain.minimum_delta_positions ||
       delta_positions > domain.maximum_delta_positions) {
     return absl::FailedPreconditionError(
         "Exact agent restored prefill is outside the CapsuleRestore Coverage "
-        "V2 delta-position domain.");
+        "authenticated delta-position domain.");
   }
   return absl::OkStatus();
 }
@@ -510,32 +466,30 @@ absl::Status ValidateStateWitnessPreparedPlanDomain(
 absl::Status ValidateWinnerRestoreOperationAuthority(
     const DPMAgentGenerationRequest& execution_request,
     const DPMAgentExecutionRequest& logical_request,
-    const AuthenticatedCapsuleRestoreStateWitnessAdmission& admission) {
-  if (!execution_request.capsule_restore_operation_v3.has_value() ||
+    const AuthenticatedCapsuleRestoreAdmission& admission) {
+  if (!execution_request.capsule_restore_operation.has_value() ||
       !execution_request.restore_checkpoint_id.has_value() ||
       !execution_request.restored_state_witness.has_value()) {
     return absl::InvalidArgumentError(
-        "WinnerReplay Coverage V2 restore requires its complete operation, "
+        "WinnerReplay CapsuleRestore restore requires its complete operation, "
         "checkpoint, and live witness.");
   }
-  const DPMAgentCapsuleRestoreOperationV3& operation =
-      *execution_request.capsule_restore_operation_v3;
+  const DPMAgentCapsuleRestoreOperation& operation =
+      *execution_request.capsule_restore_operation;
   if (operation.format_version !=
-      DPMAgentCapsuleRestoreOperationV3::kFormatVersion) {
+      DPMAgentCapsuleRestoreOperation::kFormatVersion) {
     return absl::FailedPreconditionError(
         "WinnerReplay CapsuleRestore operation version is unsupported.");
   }
   ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleCaptureEvidenceV3(operation.source_capture_evidence));
+      ValidateCapsuleCaptureEvidence(operation.source_capture_evidence));
   ABSL_RETURN_IF_ERROR(ValidateSessionContinuationStateWitness(
       *execution_request.restored_state_witness));
   ABSL_RETURN_IF_ERROR(ValidateSessionHandoffReauthenticationEvidence(
       operation.durable_to_transient_reauthentication));
-  ABSL_ASSIGN_OR_RETURN(
-      const CapsuleRestoreAuthorityV2 expected_authority,
-      BuildCapsuleRestoreAuthorityV2(admission));
-  const CapsuleCaptureEvidenceV3& source =
-      operation.source_capture_evidence;
+  ABSL_ASSIGN_OR_RETURN(const CapsuleRestoreAuthority expected_authority,
+                        BuildCapsuleRestoreAuthority(admission));
+  const CapsuleCaptureEvidence& source = operation.source_capture_evidence;
   const SessionContinuationStateWitness& witness =
       *execution_request.restored_state_witness;
   const SessionHandoffReauthenticationEvidence& reauthentication =
@@ -597,8 +551,7 @@ absl::Status ValidateGenerationRequest(
           static_cast<int>(kMaximumDPMGenerationTokens) ||
       IsZeroHash(request.logical_agent_request_hash) ||
       request.canonical_prefill_chunks.empty() ||
-      request.canonical_prefill_chunks.size() >
-          kMaximumFreshWorkerTokenIds) {
+      request.canonical_prefill_chunks.size() > kMaximumFreshWorkerTokenIds) {
     return absl::InvalidArgumentError(
         "DPM agent generation request is incomplete or oversized.");
   }
@@ -683,8 +636,7 @@ class WinnerAgentInvocation final : public CanonicalWinnerReplayGenerator {
     }
     ABSL_RETURN_IF_ERROR(ValidateRuntimeIdentity(runtime_identity_));
     ABSL_RETURN_IF_ERROR(ValidateGenerationRequest(*execution_request_));
-    ABSL_RETURN_IF_ERROR(
-        ValidateDPMAgentExecutionRequest(*logical_request_));
+    ABSL_RETURN_IF_ERROR(ValidateDPMAgentExecutionRequest(*logical_request_));
     if (static_cast<uint32_t>(execution_request_->max_output_tokens) !=
             logical_request_->max_output_tokens ||
         execution_request_->logical_agent_request_hash !=
@@ -709,17 +661,15 @@ class WinnerAgentInvocation final : public CanonicalWinnerReplayGenerator {
           "WinnerReplay agent session has another runtime identity.");
     }
     ABSL_ASSIGN_OR_RETURN(
-        const std::optional<
-            AuthenticatedCapsuleRestoreStateWitnessAdmission>
+        const std::optional<AuthenticatedCapsuleRestoreAdmission>
             state_witness_admission,
-        inference_runtime_
-            ->GetAuthenticatedCapsuleRestoreStateWitnessAdmission());
+        inference_runtime_->GetAuthenticatedCapsuleRestoreAdmission());
     const bool is_restore =
         execution_request_->restore_checkpoint_id.has_value();
-    if (execution_request_->capsule_restore_operation_v3.has_value() !=
+    if (execution_request_->capsule_restore_operation.has_value() !=
         (state_witness_admission.has_value() && is_restore)) {
       return absl::FailedPreconditionError(
-          "WinnerReplay invocation requires Coverage V2 operation evidence "
+          "WinnerReplay invocation requires CapsuleRestore operation evidence "
           "exactly for a restore on its current loaded-Engine authority.");
     }
     if (state_witness_admission.has_value()) {
@@ -728,11 +678,9 @@ class WinnerAgentInvocation final : public CanonicalWinnerReplayGenerator {
     }
     if (state_witness_admission.has_value() && is_restore) {
       ABSL_RETURN_IF_ERROR(ValidateWinnerRestoreOperationAuthority(
-          *execution_request_, *logical_request_,
-          *state_witness_admission));
+          *execution_request_, *logical_request_, *state_witness_admission));
     } else if (is_restore) {
-      ABSL_RETURN_IF_ERROR(
-          inference_runtime_->ValidateSessionHandoffSupport());
+      ABSL_RETURN_IF_ERROR(inference_runtime_->ValidateSessionHandoffSupport());
     }
     return absl::OkStatus();
   }
@@ -748,7 +696,7 @@ class WinnerAgentInvocation final : public CanonicalWinnerReplayGenerator {
     generate_called_ = true;
     if (request.stage != DPMReplayStage::kAgentDecision ||
         request.max_output_tokens != logical_request_->max_output_tokens ||
-        request.request_contract_version != kDPMAgentReplayContractVersion) {
+        request.request_contract != kDPMAgentReplayContract) {
       return absl::InvalidArgumentError(
           "WinnerReplay agent invocation received another request contract.");
     }
@@ -766,8 +714,8 @@ class WinnerAgentInvocation final : public CanonicalWinnerReplayGenerator {
       return absl::DataLossError(
           "WinnerReplay live generation omitted its prepared prefill plan.");
     }
-    ABSL_RETURN_IF_ERROR(ValidateDPMPreparedPrefillPlan(
-        *generated.prepared_prefill_plan));
+    ABSL_RETURN_IF_ERROR(
+        ValidateDPMPreparedPrefillPlan(*generated.prepared_prefill_plan));
     ABSL_RETURN_IF_ERROR(ValidatePreparedPlanSourceBindings(
         *generated.prepared_prefill_plan,
         execution_request_->canonical_prefill_chunks));
@@ -786,26 +734,25 @@ class WinnerAgentInvocation final : public CanonicalWinnerReplayGenerator {
           "logical request, or restore start.");
     }
     const bool expects_restore_evidence =
-        execution_request_->capsule_restore_operation_v3.has_value();
-    if (generated.capsule_restore_evidence_v3.has_value() !=
+        execution_request_->capsule_restore_operation.has_value();
+    if (generated.capsule_restore_evidence.has_value() !=
         expects_restore_evidence) {
       return absl::DataLossError(
-          "WinnerReplay live generation omitted or invented Coverage V2 "
+          "WinnerReplay live generation omitted or invented CapsuleRestore "
           "restore evidence.");
     }
-    if (generated.capsule_restore_evidence_v3.has_value()) {
+    if (generated.capsule_restore_evidence.has_value()) {
       if (!execution_request_->restore_checkpoint_id.has_value() ||
           !execution_request_->restored_state_witness.has_value()) {
         return absl::DataLossError(
             "WinnerReplay returned restore evidence for a fresh generation.");
       }
-      const DPMAgentCapsuleRestoreOperationV3& operation =
-          *execution_request_->capsule_restore_operation_v3;
-      const CapsuleRestoreEvidenceV3& restore_evidence =
-          *generated.capsule_restore_evidence_v3;
-      ABSL_RETURN_IF_ERROR(
-          ValidateCapsuleRestoreEvidenceV3(restore_evidence));
-      ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreEvidenceV3ForSourceCapture(
+      const DPMAgentCapsuleRestoreOperation& operation =
+          *execution_request_->capsule_restore_operation;
+      const CapsuleRestoreEvidence& restore_evidence =
+          *generated.capsule_restore_evidence;
+      ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreEvidence(restore_evidence));
+      ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreEvidenceForSourceCapture(
           restore_evidence, operation.source_capture_evidence));
       if (restore_evidence.plan.authority != operation.current_authority ||
           restore_evidence.plan.target_state != operation.target_state ||
@@ -827,8 +774,7 @@ class WinnerAgentInvocation final : public CanonicalWinnerReplayGenerator {
     std::vector<int32_t> token_ids;
     token_ids.reserve(generated.decision_token_ids.size());
     for (int token_id : generated.decision_token_ids) {
-      if (token_id < 0 ||
-          static_cast<int64_t>(token_id) >
+      if (token_id < 0 || static_cast<int64_t>(token_id) >
               std::numeric_limits<int32_t>::max()) {
         return absl::DataLossError(
             "WinnerReplay agent generated a non-int32 token ID.");
@@ -846,8 +792,7 @@ class WinnerAgentInvocation final : public CanonicalWinnerReplayGenerator {
     };
     ABSL_ASSIGN_OR_RETURN(std::string canonical_output,
                           EncodeDPMAgentDecisionEnvelope(envelope));
-    ABSL_ASSIGN_OR_RETURN(
-        const Hash256 evidence,
+    ABSL_ASSIGN_OR_RETURN(const Hash256 evidence,
         ComputeWinnerEvidenceHash(runtime_identity_, request,
                                   canonical_output));
     if (IsZeroHash(evidence)) {
@@ -856,10 +801,8 @@ class WinnerAgentInvocation final : public CanonicalWinnerReplayGenerator {
     }
     generated_output_hash_ = Sha256(canonical_output);
     generated_evidence_hash_ = evidence;
-    prepared_prefill_plan_ =
-        std::move(*generated.prepared_prefill_plan);
-    capsule_restore_evidence_v3_ =
-        std::move(generated.capsule_restore_evidence_v3);
+    prepared_prefill_plan_ = std::move(*generated.prepared_prefill_plan);
+    capsule_restore_evidence_ = std::move(generated.capsule_restore_evidence);
     generation_succeeded_ = true;
     return CanonicalWinnerGeneratedCandidate{
         .canonical_output = std::move(canonical_output),
@@ -872,9 +815,9 @@ class WinnerAgentInvocation final : public CanonicalWinnerReplayGenerator {
   const std::optional<DPMPreparedPrefillPlan>& prepared_prefill_plan() const {
     return prepared_prefill_plan_;
   }
-  const std::optional<CapsuleRestoreEvidenceV3>&
-  capsule_restore_evidence_v3() const {
-    return capsule_restore_evidence_v3_;
+  const std::optional<CapsuleRestoreEvidence>& capsule_restore_evidence()
+      const {
+    return capsule_restore_evidence_;
   }
   bool GeneratedSelectedCandidate(
       const CanonicalWinnerReplayExecution& replay) const {
@@ -894,7 +837,7 @@ class WinnerAgentInvocation final : public CanonicalWinnerReplayGenerator {
   Hash256 generated_output_hash_;
   Hash256 generated_evidence_hash_;
   std::optional<DPMPreparedPrefillPlan> prepared_prefill_plan_;
-  std::optional<CapsuleRestoreEvidenceV3> capsule_restore_evidence_v3_;
+  std::optional<CapsuleRestoreEvidence> capsule_restore_evidence_;
 };
 
 DPMCanonicalReplayRequest MakeReplayRequest(std::string encoded,
@@ -902,7 +845,7 @@ DPMCanonicalReplayRequest MakeReplayRequest(std::string encoded,
   return DPMCanonicalReplayRequest{
       .stage = DPMReplayStage::kAgentDecision,
       .max_output_tokens = max_output_tokens,
-      .request_contract_version = std::string(kDPMAgentReplayContractVersion),
+      .request_contract = std::string(kDPMAgentReplayContract),
       .canonical_payload = std::move(encoded),
   };
 }
@@ -915,8 +858,7 @@ bool DurableCapsuleEvidenceEqual(
          left.envelope_size == right.envelope_size &&
          left.envelope_hash == right.envelope_hash &&
          left.output_evidence_hash == right.output_evidence_hash &&
-         left.reauthentication_evidence ==
-             right.reauthentication_evidence;
+         left.reauthentication_evidence == right.reauthentication_evidence;
 }
 
 absl::StatusOr<DPMAgentReplayExecution> BuildExactAgentReplayExecution(
@@ -947,8 +889,7 @@ absl::StatusOr<DPMAgentReplayExecution> BuildExactAgentReplayExecution(
     return absl::DataLossError(
         "Exact agent result lacks its cold-run prepared-prefill consensus.");
   }
-  const DPMPreparedPrefillPlan& prepared_plan =
-      *exact.prepared_prefill_plan;
+  const DPMPreparedPrefillPlan& prepared_plan = *exact.prepared_prefill_plan;
   ABSL_RETURN_IF_ERROR(ValidateDPMPreparedPrefillPlan(prepared_plan));
   ABSL_RETURN_IF_ERROR(ValidatePreparedPlanSourceBindings(
       prepared_plan, expected_executed_source_chunks));
@@ -994,15 +935,13 @@ absl::StatusOr<DPMAgentReplayExecution> BuildExactAgentReplayExecution(
         "capsule evidence.");
   }
   if (exact.durable_producing_capsule_evidence.has_value() &&
-      !DurableCapsuleEvidenceEqual(
-          *run_zero.durable_producing_capsule_evidence,
+      !DurableCapsuleEvidenceEqual(*run_zero.durable_producing_capsule_evidence,
           *exact.durable_producing_capsule_evidence)) {
     return absl::DataLossError(
         "Exact agent run-zero and returned durable capsule evidence "
         "disagree.");
   }
-  ABSL_ASSIGN_OR_RETURN(
-      const DPMAgentDecisionEnvelope envelope,
+  ABSL_ASSIGN_OR_RETURN(const DPMAgentDecisionEnvelope envelope,
       DecodeDPMAgentDecisionEnvelope(exact.canonical_output));
   if (envelope.canonical_token_bytes != exact.token_bytes) {
     return absl::DataLossError(
@@ -1020,8 +959,7 @@ absl::StatusOr<DPMAgentReplayExecution> BuildExactAgentReplayExecution(
       .replay_request_hash = exact.canonical_request_hash,
       .execution_evidence_hash = exact.request_evidence.evidence_id,
       .exact_profile_id = exact.derived_profile.profile_id,
-      .exact_profile_admission_record_id =
-          exact.profile_admission_record_id,
+      .exact_profile_admission_record_id = exact.profile_admission_record_id,
       .decision_output = envelope.decision_output,
       .decision_token_ids = std::move(decision_ids),
       .exact_token_bytes = exact.token_bytes,
@@ -1051,8 +989,7 @@ absl::Status ValidateDPMAgentExecutionRequest(
         "Canonical DPM agent execution request is incomplete or oversized.");
   }
   const uint64_t outer_overhead =
-      kDPMCanonicalReplayRequestFramingBytes +
-      kDPMAgentReplayContractVersion.size();
+      kDPMCanonicalReplayRequestFramingBytes + kDPMAgentReplayContract.size();
   if (outer_overhead > kMaximumFreshWorkerRequestPayloadBytes) {
     return absl::InternalError(
         "DPM agent replay framing exceeds its worker protocol.");
@@ -1074,13 +1011,13 @@ absl::Status ValidateDPMAgentExecutionRequest(
             "Canonical DPM agent execution exceeds the token-input limit.");
       }
       total_token_ids += chunk.token_ids.size();
-      payload_size = kCanonicalTokenFramingBytes +
-                     uint64_t{4} * chunk.token_ids.size();
+      payload_size =
+          kCanonicalTokenFramingBytes + uint64_t{4} * chunk.token_ids.size();
     }
     if (encoded_size > maximum_inner_size ||
         kAgentChunkFramingBytes > maximum_inner_size - encoded_size ||
-        payload_size > maximum_inner_size - encoded_size -
-                           kAgentChunkFramingBytes) {
+        payload_size >
+            maximum_inner_size - encoded_size - kAgentChunkFramingBytes) {
       return absl::ResourceExhaustedError(
           "Canonical DPM agent request cannot fit one worker envelope.");
     }
@@ -1099,11 +1036,10 @@ absl::StatusOr<std::string> EncodeDPMAgentExecutionRequest(
   AppendHash(request.logical_agent_request_hash, &encoded);
   AppendHash(request.correction_digest, &encoded);
   AppendU32(request.max_output_tokens, &encoded);
-  AppendU32(static_cast<uint32_t>(
-      request.full_canonical_prefill_chunks.size()), &encoded);
+  AppendU32(static_cast<uint32_t>(request.full_canonical_prefill_chunks.size()),
+            &encoded);
   const uint64_t outer_overhead =
-      kDPMCanonicalReplayRequestFramingBytes +
-      kDPMAgentReplayContractVersion.size();
+      kDPMCanonicalReplayRequestFramingBytes + kDPMAgentReplayContract.size();
   const uint64_t maximum_inner_size =
       kMaximumFreshWorkerRequestPayloadBytes - outer_overhead;
   for (const auto& chunk : request.full_canonical_prefill_chunks) {
@@ -1124,8 +1060,8 @@ absl::StatusOr<std::string> EncodeDPMAgentExecutionRequest(
     }
     if (encoded.size() > maximum_inner_size ||
         kAgentChunkFramingBytes > maximum_inner_size - encoded.size() ||
-        payload.size() > maximum_inner_size - encoded.size() -
-                             kAgentChunkFramingBytes) {
+        payload.size() >
+            maximum_inner_size - encoded.size() - kAgentChunkFramingBytes) {
       return absl::ResourceExhaustedError(
           "Canonical DPM agent execution request exceeds the worker limit.");
     }
@@ -1143,8 +1079,7 @@ absl::StatusOr<std::string> EncodeDPMAgentExecutionRequest(
 absl::StatusOr<DPMAgentExecutionRequest> DecodeDPMAgentExecutionRequest(
     absl::string_view bytes) {
   const uint64_t outer_overhead =
-      kDPMCanonicalReplayRequestFramingBytes +
-      kDPMAgentReplayContractVersion.size();
+      kDPMCanonicalReplayRequestFramingBytes + kDPMAgentReplayContract.size();
   if (outer_overhead > kMaximumFreshWorkerRequestPayloadBytes) {
     return absl::InternalError(
         "DPM agent replay framing exceeds its worker protocol.");
@@ -1182,8 +1117,9 @@ absl::StatusOr<DPMAgentExecutionRequest> DecodeDPMAgentExecutionRequest(
     absl::string_view payload;
     ABSL_ASSIGN_OR_RETURN(payload, reader.ReadBytes(payload_size));
     DPMAgentGenerationRequest::PrefillChunk chunk;
-    chunk.encoding = static_cast<
-        DPMAgentGenerationRequest::PrefillChunk::Encoding>(encoding);
+    chunk.encoding =
+        static_cast<DPMAgentGenerationRequest::PrefillChunk::Encoding>(
+            encoding);
     switch (chunk.encoding) {
       case DPMAgentGenerationRequest::PrefillChunk::Encoding::kUtf8Text:
         chunk.text.assign(payload.data(), payload.size());
@@ -1191,8 +1127,7 @@ absl::StatusOr<DPMAgentExecutionRequest> DecodeDPMAgentExecutionRequest(
       case DPMAgentGenerationRequest::PrefillChunk::Encoding::kTokenIds: {
         ABSL_ASSIGN_OR_RETURN(const std::vector<int32_t> token_ids,
                               DecodeFreshWorkerTokenIds(payload));
-        if (token_ids.size() >
-            kMaximumFreshWorkerTokenIds - total_token_ids) {
+        if (token_ids.size() > kMaximumFreshWorkerTokenIds - total_token_ids) {
           return absl::ResourceExhaustedError(
               "Canonical DPM agent execution exceeds the token-input limit.");
         }
@@ -1223,8 +1158,7 @@ absl::StatusOr<DPMAgentExecutionRequest> DecodeDPMAgentExecutionRequest(
 
 absl::Status ValidateDPMAgentDeltaExecutionRequest(
     const DPMAgentDeltaExecutionRequest& request) {
-  if (request.format_version !=
-          kDPMAgentDeltaExecutionRequestFormatVersion ||
+  if (request.format_version != kDPMAgentDeltaExecutionRequestFormatVersion ||
       IsZeroHash(request.logical_agent_request_hash) ||
       IsZeroHash(request.correction_digest) ||
       IsZeroHash(request.restore_checkpoint_id) ||
@@ -1254,14 +1188,14 @@ absl::Status ValidateDPMAgentDeltaExecutionRequest(
             "Canonical DPM agent delta exceeds the token-input limit.");
       }
       total_token_ids += chunk.token_ids.size();
-      payload_size = kCanonicalTokenFramingBytes +
-                     uint64_t{4} * chunk.token_ids.size();
+      payload_size =
+          kCanonicalTokenFramingBytes + uint64_t{4} * chunk.token_ids.size();
     }
     if (encoded_size > kMaximumFreshWorkerRequestPayloadBytes ||
         kAgentChunkFramingBytes >
             kMaximumFreshWorkerRequestPayloadBytes - encoded_size ||
-        payload_size > kMaximumFreshWorkerRequestPayloadBytes -
-                           encoded_size - kAgentChunkFramingBytes) {
+        payload_size > kMaximumFreshWorkerRequestPayloadBytes - encoded_size -
+                           kAgentChunkFramingBytes) {
       return absl::ResourceExhaustedError(
           "Canonical DPM agent delta cannot fit its execution-plan "
           "payload.");
@@ -1326,14 +1260,12 @@ DecodeDPMAgentDeltaExecutionRequest(absl::string_view bytes) {
       bytes.size() > kMaximumFreshWorkerRequestPayloadBytes ||
       std::memcmp(bytes.data(), kAgentDeltaExecutionMagic.data(),
                   kAgentDeltaExecutionMagic.size()) != 0) {
-    return absl::DataLossError(
-        "Canonical DPM agent delta framing is invalid.");
+    return absl::DataLossError("Canonical DPM agent delta framing is invalid.");
   }
   Reader reader(bytes.substr(kAgentDeltaExecutionMagic.size()));
   DPMAgentDeltaExecutionRequest request;
   ABSL_ASSIGN_OR_RETURN(request.format_version, reader.ReadU32());
-  ABSL_ASSIGN_OR_RETURN(request.logical_agent_request_hash,
-                        reader.ReadHash());
+  ABSL_ASSIGN_OR_RETURN(request.logical_agent_request_hash, reader.ReadHash());
   ABSL_ASSIGN_OR_RETURN(request.correction_digest, reader.ReadHash());
   ABSL_ASSIGN_OR_RETURN(request.restore_checkpoint_id, reader.ReadHash());
   ABSL_ASSIGN_OR_RETURN(request.restored_response_event_index,
@@ -1359,8 +1291,9 @@ DecodeDPMAgentDeltaExecutionRequest(absl::string_view bytes) {
     absl::string_view payload;
     ABSL_ASSIGN_OR_RETURN(payload, reader.ReadBytes(payload_size));
     DPMAgentGenerationRequest::PrefillChunk chunk;
-    chunk.encoding = static_cast<
-        DPMAgentGenerationRequest::PrefillChunk::Encoding>(encoding);
+    chunk.encoding =
+        static_cast<DPMAgentGenerationRequest::PrefillChunk::Encoding>(
+            encoding);
     switch (chunk.encoding) {
       case DPMAgentGenerationRequest::PrefillChunk::Encoding::kUtf8Text:
         chunk.text.assign(payload.data(), payload.size());
@@ -1368,8 +1301,7 @@ DecodeDPMAgentDeltaExecutionRequest(absl::string_view bytes) {
       case DPMAgentGenerationRequest::PrefillChunk::Encoding::kTokenIds: {
         ABSL_ASSIGN_OR_RETURN(const std::vector<int32_t> token_ids,
                               DecodeFreshWorkerTokenIds(payload));
-        if (token_ids.size() >
-            kMaximumFreshWorkerTokenIds - total_token_ids) {
+        if (token_ids.size() > kMaximumFreshWorkerTokenIds - total_token_ids) {
           return absl::ResourceExhaustedError(
               "Canonical DPM agent delta exceeds the token-input limit.");
         }
@@ -1385,8 +1317,7 @@ DecodeDPMAgentDeltaExecutionRequest(absl::string_view bytes) {
     request.canonical_delta_prefill_chunks.push_back(std::move(chunk));
   }
   if (reader.remaining() != 0) {
-    return absl::DataLossError(
-        "Canonical DPM agent delta has trailing bytes.");
+    return absl::DataLossError("Canonical DPM agent delta has trailing bytes.");
   }
   ABSL_RETURN_IF_ERROR(ValidateDPMAgentDeltaExecutionRequest(request));
   ABSL_ASSIGN_OR_RETURN(const std::string canonical,
@@ -1402,12 +1333,9 @@ absl::Status ValidateDPMAgentDeltaExecutionBinding(
     const DPMAgentExecutionRequest& logical_request,
     const FreshWorkerExecutionPlan& execution_plan,
     const DPMAgentDeltaExecutionRequest& delta_request) {
-  ABSL_RETURN_IF_ERROR(
-      ValidateDPMAgentExecutionRequest(logical_request));
-  ABSL_RETURN_IF_ERROR(
-      ValidateFreshWorkerExecutionPlan(execution_plan));
-  ABSL_RETURN_IF_ERROR(
-      ValidateDPMAgentDeltaExecutionRequest(delta_request));
+  ABSL_RETURN_IF_ERROR(ValidateDPMAgentExecutionRequest(logical_request));
+  ABSL_RETURN_IF_ERROR(ValidateFreshWorkerExecutionPlan(execution_plan));
+  ABSL_RETURN_IF_ERROR(ValidateDPMAgentDeltaExecutionRequest(delta_request));
   if (execution_plan.prefill_mode !=
           FreshWorkerPrefillMode::kOwnPositionCapsuleDelta ||
       !execution_plan.restore_checkpoint_id.has_value() ||
@@ -1421,8 +1349,7 @@ absl::Status ValidateDPMAgentDeltaExecutionBinding(
         "DPM agent delta does not match its complete logical request and "
         "authenticated restore plan.");
   }
-  ABSL_ASSIGN_OR_RETURN(
-      const std::string canonical_delta,
+  ABSL_ASSIGN_OR_RETURN(const std::string canonical_delta,
       EncodeDPMAgentDeltaExecutionRequest(delta_request));
   if (canonical_delta != execution_plan.canonical_execution_payload) {
     return absl::DataLossError(
@@ -1438,12 +1365,10 @@ absl::Status ValidateDPMAgentDeltaExecutionBinding(
       logical_request.full_canonical_prefill_chunks.size() -
       delta_request.canonical_delta_prefill_chunks.size();
   for (size_t index = 0;
-       index < delta_request.canonical_delta_prefill_chunks.size();
-       ++index) {
+       index < delta_request.canonical_delta_prefill_chunks.size(); ++index) {
     const auto& full =
         logical_request.full_canonical_prefill_chunks[suffix_start + index];
-    const auto& delta =
-        delta_request.canonical_delta_prefill_chunks[index];
+    const auto& delta = delta_request.canonical_delta_prefill_chunks[index];
     if (full.encoding != delta.encoding || full.text != delta.text ||
         full.token_ids != delta.token_ids) {
       return absl::FailedPreconditionError(
@@ -1464,9 +1389,9 @@ absl::Status ValidateDPMAgentDecisionEnvelope(
     return absl::InvalidArgumentError(
         "Canonical DPM agent decision envelope is invalid or oversized.");
   }
-  ABSL_ASSIGN_OR_RETURN(const std::vector<int32_t> token_ids,
-                        DecodeFreshWorkerTokenIds(
-                            envelope.canonical_token_bytes));
+  ABSL_ASSIGN_OR_RETURN(
+      const std::vector<int32_t> token_ids,
+      DecodeFreshWorkerTokenIds(envelope.canonical_token_bytes));
   if (token_ids.empty()) {
     return absl::InvalidArgumentError(
         "Canonical DPM agent decision has no exact token IDs.");
@@ -1477,9 +1402,9 @@ absl::Status ValidateDPMAgentDecisionEnvelope(
 absl::StatusOr<std::string> EncodeDPMAgentDecisionEnvelope(
     const DPMAgentDecisionEnvelope& envelope) {
   ABSL_RETURN_IF_ERROR(ValidateDPMAgentDecisionEnvelope(envelope));
-  const uint64_t encoded_size =
-      kAgentDecisionMagic.size() + 4 + 8 + envelope.decision_output.size() +
-      8 + envelope.canonical_token_bytes.size();
+  const uint64_t encoded_size = kAgentDecisionMagic.size() + 4 + 8 +
+                                envelope.decision_output.size() + 8 +
+                                envelope.canonical_token_bytes.size();
   if (encoded_size > kMaximumFreshWorkerCanonicalOutputBytes ||
       encoded_size > (std::numeric_limits<size_t>::max)()) {
     return absl::ResourceExhaustedError(
@@ -1527,8 +1452,7 @@ absl::StatusOr<DPMAgentDecisionEnvelope> DecodeDPMAgentDecisionEnvelope(
   }
   absl::string_view token_bytes;
   ABSL_ASSIGN_OR_RETURN(token_bytes, reader.ReadBytes(token_size));
-  envelope.canonical_token_bytes.assign(token_bytes.data(),
-                                        token_bytes.size());
+  envelope.canonical_token_bytes.assign(token_bytes.data(), token_bytes.size());
   if (reader.remaining() != 0) {
     return absl::DataLossError(
         "Canonical DPM agent decision has trailing bytes.");
@@ -1557,22 +1481,21 @@ absl::Status ValidateDPMAgentReplayExecution(
   token_ids.reserve(execution.decision_token_ids.size());
   for (int token_id : execution.decision_token_ids) {
     if (token_id < 0 ||
-        static_cast<int64_t>(token_id) >
-            std::numeric_limits<int32_t>::max()) {
+        static_cast<int64_t>(token_id) > std::numeric_limits<int32_t>::max()) {
       return absl::DataLossError(
           "DPM agent replay returned a non-int32 token ID.");
     }
     token_ids.push_back(static_cast<int32_t>(token_id));
   }
-  ABSL_RETURN_IF_ERROR(ValidateDecisionFields(
-      execution.decision_output, token_ids, max_output_tokens));
+  ABSL_RETURN_IF_ERROR(ValidateDecisionFields(execution.decision_output,
+                                              token_ids, max_output_tokens));
   if (execution.prepared_prefill_plan.has_value()) {
-    ABSL_RETURN_IF_ERROR(ValidateDPMPreparedPrefillPlan(
-        *execution.prepared_prefill_plan));
+    ABSL_RETURN_IF_ERROR(
+        ValidateDPMPreparedPrefillPlan(*execution.prepared_prefill_plan));
   }
-  if (execution.capsule_restore_evidence_v3.has_value()) {
-    ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreEvidenceV3(
-        *execution.capsule_restore_evidence_v3));
+  if (execution.capsule_restore_evidence.has_value()) {
+    ABSL_RETURN_IF_ERROR(
+        ValidateCapsuleRestoreEvidence(*execution.capsule_restore_evidence));
   }
   switch (execution.mode) {
     case DPMReplayMode::kCanonicalWinnerReplay: {
@@ -1597,11 +1520,11 @@ absl::Status ValidateDPMAgentReplayExecution(
            !is_rematerialized_catalog_winner) ||
           execution.prepared_prefill_plan.has_value() !=
               execution.producing_session_matches_output ||
-          (execution.capsule_restore_evidence_v3.has_value() &&
+          (execution.capsule_restore_evidence.has_value() &&
            (!execution.producing_session_matches_output ||
             !execution.prepared_prefill_plan.has_value() ||
-            !(execution.capsule_restore_evidence_v3->plan.prefill
-                  .prepared_plan == *execution.prepared_prefill_plan)))) {
+            !(execution.capsule_restore_evidence->plan.prefill.prepared_plan ==
+              *execution.prepared_prefill_plan)))) {
         return absl::DataLossError(
             "WinnerReplay agent execution carries exact evidence or invalid "
             "producing-session provenance.");
@@ -1618,7 +1541,7 @@ absl::Status ValidateDPMAgentReplayExecution(
           execution.exact_token_bytes.empty() ||
           execution.exact_logit_frames.empty() ||
           !execution.prepared_prefill_plan.has_value() ||
-          execution.capsule_restore_evidence_v3.has_value() ||
+          execution.capsule_restore_evidence.has_value() ||
           execution.reused_canonical_winner ||
           execution.rematerialized_canonical_winner ||
           execution.producing_session_matches_output) {
@@ -1626,9 +1549,9 @@ absl::Status ValidateDPMAgentReplayExecution(
             "Exact agent execution is missing non-catalog evidence or "
             "claims a parent producing session.");
       }
-      ABSL_ASSIGN_OR_RETURN(const std::vector<int32_t> exact_ids,
-                            DecodeFreshWorkerTokenIds(
-                                execution.exact_token_bytes));
+      ABSL_ASSIGN_OR_RETURN(
+          const std::vector<int32_t> exact_ids,
+          DecodeFreshWorkerTokenIds(execution.exact_token_bytes));
       if (exact_ids != token_ids ||
           exact_ids.size() != execution.exact_logit_frames.size()) {
         return absl::DataLossError(
@@ -1639,8 +1562,7 @@ absl::Status ValidateDPMAgentReplayExecution(
           .decision_output = execution.decision_output,
           .canonical_token_bytes = execution.exact_token_bytes,
       };
-      ABSL_ASSIGN_OR_RETURN(
-          std::string canonical_output,
+      ABSL_ASSIGN_OR_RETURN(std::string canonical_output,
           EncodeDPMAgentDecisionEnvelope(canonical_envelope));
       FreshWorkerExecutionOutput exact_output{
           .canonical_output = canonical_output,
@@ -1648,8 +1570,8 @@ absl::Status ValidateDPMAgentReplayExecution(
           .logit_frames = execution.exact_logit_frames,
       };
       ABSL_RETURN_IF_ERROR(ValidateFreshWorkerExecutionOutput(exact_output));
-      if (ComputeFreshWorkerOutputEvidenceHash(
-              canonical_output, execution.exact_token_bytes,
+      if (ComputeFreshWorkerOutputEvidenceHash(canonical_output,
+                                               execution.exact_token_bytes,
               execution.exact_logit_frames) !=
           *execution.exact_output_evidence_hash) {
         return absl::DataLossError(
@@ -1669,10 +1591,8 @@ absl::Status ValidateExactRegenerationDPMAgentPhysicalExecution(
       execution.replay_execution, max_output_tokens));
   ABSL_RETURN_IF_ERROR(
       ValidateExactRegenerationRequestEvidence(execution.request_evidence));
-  if (execution.replay_execution.mode !=
-          DPMReplayMode::kExactRegeneration ||
-      execution.request_evidence.stage !=
-          DPMReplayStage::kAgentDecision ||
+  if (execution.replay_execution.mode != DPMReplayMode::kExactRegeneration ||
+      execution.request_evidence.stage != DPMReplayStage::kAgentDecision ||
       !execution.replay_execution.exact_profile_id.has_value() ||
       !execution.replay_execution.exact_profile_admission_record_id
            .has_value() ||
@@ -1738,8 +1658,7 @@ absl::Status ValidateExactRegenerationDPMAgentPhysicalExecution(
         "Exact agent physical execution changed run-zero's independently "
         "recomputed restored-state witness.");
   }
-  const bool restored =
-      execution.prefill_mode ==
+  const bool restored = execution.prefill_mode ==
       FreshWorkerPrefillMode::kOwnPositionCapsuleDelta;
   if (execution.run_zero_restore_reauthentication_evidence.has_value() !=
           restored ||
@@ -1770,8 +1689,7 @@ absl::Status ValidateExactRegenerationDPMAgentPhysicalExecution(
     return absl::DataLossError(
         "Exact agent physical execution changed durable capsule evidence.");
   }
-  const bool captured =
-      execution.capture_run_policy ==
+  const bool captured = execution.capture_run_policy ==
       ExactRegenerationCaptureRunPolicy::kRunZeroOnly;
   if (execution.run_zero_transient_producing_capsule_evidence.has_value() !=
           captured ||
@@ -1783,8 +1701,7 @@ absl::Status ValidateExactRegenerationDPMAgentPhysicalExecution(
 }
 
 absl::StatusOr<std::unique_ptr<CanonicalWinnerDPMAgentRuntime>>
-CanonicalWinnerDPMAgentRuntime::Create(
-    DPMAgentRuntime* inference_runtime,
+CanonicalWinnerDPMAgentRuntime::Create(DPMAgentRuntime* inference_runtime,
     CanonicalWinnerReplayCatalog* catalog) {
   if (inference_runtime == nullptr || catalog == nullptr) {
     return absl::InvalidArgumentError(
@@ -1812,34 +1729,6 @@ CanonicalWinnerDPMAgentRuntime::GetExactProfileAdmissionRecordId() const {
   return std::optional<Hash256>();
 }
 
-absl::StatusOr<std::optional<Hash256>>
-CanonicalWinnerDPMAgentRuntime::GetCapsuleRestoreAdmissionRecordId() const {
-  ABSL_RETURN_IF_ERROR(ValidateSupport());
-  ABSL_ASSIGN_OR_RETURN(
-      std::optional<Hash256> record_id,
-      inference_runtime_->GetCapsuleRestoreAdmissionRecordId());
-  if (record_id.has_value() && IsZeroHash(*record_id)) {
-    return absl::DataLossError(
-        "WinnerReplay inference runtime returned a zero CapsuleRestore "
-        "admission record ID.");
-  }
-  return record_id;
-}
-
-absl::StatusOr<std::optional<Hash256>>
-CanonicalWinnerDPMAgentRuntime::GetSessionHandoffCapabilityId() const {
-  ABSL_RETURN_IF_ERROR(ValidateSupport());
-  ABSL_ASSIGN_OR_RETURN(
-      std::optional<Hash256> capability_id,
-      inference_runtime_->GetSessionHandoffCapabilityId());
-  if (capability_id.has_value() && IsZeroHash(*capability_id)) {
-    return absl::DataLossError(
-        "WinnerReplay inference runtime returned a zero session-handoff "
-        "capability ID.");
-  }
-  return capability_id;
-}
-
 absl::StatusOr<DPMStageCapabilities>
 CanonicalWinnerDPMAgentRuntime::GetCapabilities() const {
   ABSL_RETURN_IF_ERROR(ValidateSupport());
@@ -1853,47 +1742,13 @@ CanonicalWinnerDPMAgentRuntime::GetCapabilities() const {
   return capabilities;
 }
 
-absl::StatusOr<std::optional<SessionHandoffCapability>>
-CanonicalWinnerDPMAgentRuntime::GetSessionHandoffCapability() const {
-  ABSL_RETURN_IF_ERROR(ValidateSupport());
-  ABSL_ASSIGN_OR_RETURN(
-      std::optional<SessionHandoffCapability> capability,
-      inference_runtime_->GetSessionHandoffCapability());
-  if (capability.has_value()) {
-    ABSL_RETURN_IF_ERROR(ValidateSessionHandoffCapability(*capability));
-    if (capability->session_identity != runtime_identity_) {
-      return absl::FailedPreconditionError(
-          "WinnerReplay CapsuleRestore capability belongs to another "
-          "runtime identity.");
-    }
-  }
-  return capability;
-}
-
-absl::StatusOr<std::optional<CapsuleRestoreOperationalCoverage>>
-CanonicalWinnerDPMAgentRuntime::GetCapsuleRestoreOperationalCoverage()
+absl::StatusOr<std::optional<AuthenticatedCapsuleRestoreAdmission>>
+CanonicalWinnerDPMAgentRuntime::GetAuthenticatedCapsuleRestoreAdmission()
     const {
   ABSL_RETURN_IF_ERROR(ValidateSupport());
   ABSL_ASSIGN_OR_RETURN(
-      std::optional<CapsuleRestoreOperationalCoverage> coverage,
-      inference_runtime_->GetCapsuleRestoreOperationalCoverage());
-  if (coverage.has_value()) {
-    ABSL_RETURN_IF_ERROR(
-        ValidateCapsuleRestoreOperationalCoverage(*coverage));
-  }
-  return coverage;
-}
-
-absl::StatusOr<std::optional<
-    AuthenticatedCapsuleRestoreStateWitnessAdmission>>
-CanonicalWinnerDPMAgentRuntime::
-    GetAuthenticatedCapsuleRestoreStateWitnessAdmission() const {
-  ABSL_RETURN_IF_ERROR(ValidateSupport());
-  ABSL_ASSIGN_OR_RETURN(
-      std::optional<AuthenticatedCapsuleRestoreStateWitnessAdmission>
-          admission,
-      inference_runtime_
-          ->GetAuthenticatedCapsuleRestoreStateWitnessAdmission());
+      std::optional<AuthenticatedCapsuleRestoreAdmission> admission,
+      inference_runtime_->GetAuthenticatedCapsuleRestoreAdmission());
   if (admission.has_value()) {
     ABSL_RETURN_IF_ERROR(ValidateStateWitnessAdmissionForAgentRuntime(
         *admission, runtime_identity_, std::nullopt));
@@ -1901,7 +1756,7 @@ CanonicalWinnerDPMAgentRuntime::
   if (inference_runtime_->GetSessionHandoffIdentity() != runtime_identity_) {
     return absl::AbortedError(
         "WinnerReplay agent runtime identity changed while resolving "
-        "CapsuleRestore Coverage V2 authority.");
+        "CapsuleRestore authority.");
   }
   return admission;
 }
@@ -1935,82 +1790,25 @@ absl::Status CanonicalWinnerDPMAgentRuntime::ValidateGenerationLimit(
   return absl::OkStatus();
 }
 
-absl::Status
-CanonicalWinnerDPMAgentRuntime::ValidateSessionHandoffSupport() const {
+absl::Status CanonicalWinnerDPMAgentRuntime::ValidateSessionHandoffSupport()
+    const {
   ABSL_RETURN_IF_ERROR(ValidateSupport());
-  ABSL_RETURN_IF_ERROR(inference_runtime_->ValidateSessionHandoffSupport());
   ABSL_ASSIGN_OR_RETURN(
-      const std::optional<AuthenticatedCapsuleRestoreStateWitnessAdmission>
-          state_witness_admission,
-      GetAuthenticatedCapsuleRestoreStateWitnessAdmission());
-  ABSL_ASSIGN_OR_RETURN(
-      const std::optional<Hash256> admission_id,
-      inference_runtime_->GetCapsuleRestoreAdmissionRecordId());
-  ABSL_ASSIGN_OR_RETURN(
-      const std::optional<Hash256> capability_id,
-      inference_runtime_->GetSessionHandoffCapabilityId());
-  ABSL_ASSIGN_OR_RETURN(
-      const std::optional<SessionHandoffCapability> capability,
-      inference_runtime_->GetSessionHandoffCapability());
-  ABSL_ASSIGN_OR_RETURN(
-      const std::optional<CapsuleRestoreOperationalCoverage> coverage,
-      inference_runtime_->GetCapsuleRestoreOperationalCoverage());
-  const bool has_any_v1 = admission_id.has_value() ||
-                          capability_id.has_value() || capability.has_value() ||
-                          coverage.has_value();
-  const bool has_complete_v1 = admission_id.has_value() &&
-                               capability_id.has_value() &&
-                               capability.has_value() && coverage.has_value();
-  if (state_witness_admission.has_value() && has_any_v1) {
-    return absl::FailedPreconditionError(
-        "WinnerReplay runtime cannot combine CapsuleRestore Coverage V1 and "
-        "V2 authority.");
-  }
-  if (!state_witness_admission.has_value() && !has_complete_v1) {
-    return absl::FailedPreconditionError(
-        "WinnerReplay CapsuleRestore support requires a current admission "
-        "record and complete Engine-derived capability.");
-  }
-  if (has_complete_v1) {
-    if (IsZeroHash(*admission_id) || IsZeroHash(*capability_id)) {
+      const std::optional<AuthenticatedCapsuleRestoreAdmission> before,
+      GetAuthenticatedCapsuleRestoreAdmission());
+  if (!before.has_value()) {
       return absl::FailedPreconditionError(
-          "WinnerReplay CapsuleRestore V1 authority has an empty identity.");
-    }
-    ABSL_RETURN_IF_ERROR(ValidateSessionHandoffCapability(*capability));
-    ABSL_RETURN_IF_ERROR(
-        ValidateCapsuleRestoreOperationalCoverage(*coverage));
-    if (capability->capability_id != *capability_id ||
-        capability->session_identity != runtime_identity_ ||
-        coverage->capsule_restore_capability_id != *capability_id ||
-        coverage->capsule_restore_admission_record_id != *admission_id) {
-      return absl::FailedPreconditionError(
-          "WinnerReplay CapsuleRestore capability IDs or runtime identity do "
-          "not agree.");
-    }
+        "WinnerReplay CapsuleRestore support requires one authenticated "
+        "admission authority.");
   }
   ABSL_RETURN_IF_ERROR(inference_runtime_->ValidateSessionHandoffSupport());
   ABSL_ASSIGN_OR_RETURN(
-      const std::optional<AuthenticatedCapsuleRestoreStateWitnessAdmission>
-          state_witness_admission_after,
-      GetAuthenticatedCapsuleRestoreStateWitnessAdmission());
-  ABSL_ASSIGN_OR_RETURN(
-      const std::optional<Hash256> admission_after,
-      inference_runtime_->GetCapsuleRestoreAdmissionRecordId());
-  ABSL_ASSIGN_OR_RETURN(
-      const std::optional<SessionHandoffCapability> capability_after,
-      inference_runtime_->GetSessionHandoffCapability());
-  ABSL_ASSIGN_OR_RETURN(
-      const std::optional<CapsuleRestoreOperationalCoverage> coverage_after,
-      inference_runtime_->GetCapsuleRestoreOperationalCoverage());
-  if (admission_after != admission_id || capability_after != capability ||
-      coverage_after != coverage ||
-      state_witness_admission_after.has_value() !=
-          state_witness_admission.has_value() ||
-      (state_witness_admission.has_value() &&
-       !HasSameStateWitnessAdmissionAuthority(
-           *state_witness_admission_after, *state_witness_admission))) {
+      const std::optional<AuthenticatedCapsuleRestoreAdmission> after,
+      GetAuthenticatedCapsuleRestoreAdmission());
+  if (!after.has_value() ||
+      !HasSameStateWitnessAdmissionAuthority(*before, *after)) {
     return absl::AbortedError(
-        "WinnerReplay CapsuleRestore admission changed during support "
+        "WinnerReplay CapsuleRestore authority changed during support "
         "validation.");
   }
   return absl::OkStatus();
@@ -2050,41 +1848,37 @@ CanonicalWinnerDPMAgentRuntime::Generate(
         "WinnerReplay agent requires a live session and a matching execution "
         "request.");
   }
-  std::optional<AuthenticatedCapsuleRestoreStateWitnessAdmission>
+  std::optional<AuthenticatedCapsuleRestoreAdmission>
       state_witness_admission_before;
   ABSL_ASSIGN_OR_RETURN(
-      const std::optional<AuthenticatedCapsuleRestoreStateWitnessAdmission>
+      const std::optional<AuthenticatedCapsuleRestoreAdmission>
           current_state_witness_admission,
-      GetAuthenticatedCapsuleRestoreStateWitnessAdmission());
+      GetAuthenticatedCapsuleRestoreAdmission());
   const bool is_restore = execution_request.restore_checkpoint_id.has_value();
-  if (execution_request.capsule_restore_operation_v3.has_value() !=
+  if (execution_request.capsule_restore_operation.has_value() !=
       (current_state_witness_admission.has_value() && is_restore)) {
     return absl::FailedPreconditionError(
-        "WinnerReplay Coverage V2 restore operation is required exactly for "
-        "a restore on a Coverage V2-bound runtime.");
+        "WinnerReplay CapsuleRestore restore operation is required exactly for "
+        "a restore on a CapsuleRestore-bound runtime.");
   }
   if (is_restore && !current_state_witness_admission.has_value()) {
     ABSL_RETURN_IF_ERROR(ValidateSessionHandoffSupport());
   }
   if (current_state_witness_admission.has_value() && is_restore) {
     ABSL_RETURN_IF_ERROR(ValidateWinnerRestoreOperationAuthority(
-        execution_request, logical_request,
-        *current_state_witness_admission));
+        execution_request, logical_request, *current_state_witness_admission));
     state_witness_admission_before = *current_state_witness_admission;
   }
   ABSL_ASSIGN_OR_RETURN(std::string encoded,
                         EncodeDPMAgentExecutionRequest(logical_request));
   const DPMCanonicalReplayRequest replay_request =
-      MakeReplayRequest(std::move(encoded),
-                        logical_request.max_output_tokens);
-  ABSL_ASSIGN_OR_RETURN(
-      const Hash256 expected_request_hash,
+      MakeReplayRequest(std::move(encoded), logical_request.max_output_tokens);
+  ABSL_ASSIGN_OR_RETURN(const Hash256 expected_request_hash,
       ComputeDPMCanonicalReplayRequestHash(replay_request));
   WinnerAgentInvocation invocation(inference_runtime_, producing_session,
                                    &execution_request, &logical_request,
                                    runtime_identity_);
-  ABSL_ASSIGN_OR_RETURN(
-      CanonicalWinnerReplayExecution replay,
+  ABSL_ASSIGN_OR_RETURN(CanonicalWinnerReplayExecution replay,
       replay_executor_.Run(replay_request, &invocation));
   ABSL_ASSIGN_OR_RETURN(
       const Hash256 expected_evidence_hash,
@@ -2126,15 +1920,13 @@ CanonicalWinnerDPMAgentRuntime::Generate(
   }
   if (state_witness_admission_before.has_value()) {
     ABSL_ASSIGN_OR_RETURN(
-        const std::optional<
-            AuthenticatedCapsuleRestoreStateWitnessAdmission>
-            current_after,
-        GetAuthenticatedCapsuleRestoreStateWitnessAdmission());
+        const std::optional<AuthenticatedCapsuleRestoreAdmission> current_after,
+        GetAuthenticatedCapsuleRestoreAdmission());
     if (!current_after.has_value() ||
         !HasSameStateWitnessAdmissionAuthority(
             *current_after, *state_witness_admission_before)) {
       return absl::AbortedError(
-          "WinnerReplay CapsuleRestore Coverage V2 authority changed during "
+          "WinnerReplay CapsuleRestore authority changed during "
           "catalog resolution or physical generation.");
     }
   } else if (is_restore) {
@@ -2143,9 +1935,9 @@ CanonicalWinnerDPMAgentRuntime::Generate(
   ABSL_ASSIGN_OR_RETURN(
       const DPMAgentDecisionEnvelope envelope,
       DecodeDPMAgentDecisionEnvelope(replay.canonical_output));
-  ABSL_ASSIGN_OR_RETURN(const std::vector<int32_t> exact_ids,
-                        DecodeFreshWorkerTokenIds(
-                            envelope.canonical_token_bytes));
+  ABSL_ASSIGN_OR_RETURN(
+      const std::vector<int32_t> exact_ids,
+      DecodeFreshWorkerTokenIds(envelope.canonical_token_bytes));
   std::vector<int> decision_ids(exact_ids.begin(), exact_ids.end());
   DPMAgentReplayExecution execution{
       .mode = DPMReplayMode::kCanonicalWinnerReplay,
@@ -2154,16 +1946,13 @@ CanonicalWinnerDPMAgentRuntime::Generate(
       .decision_output = envelope.decision_output,
       .decision_token_ids = std::move(decision_ids),
       .reused_canonical_winner = expected_reuse,
-      .producing_session_matches_output =
-          expected_producing_session_match,
-      .prepared_prefill_plan =
-          expected_producing_session_match
+      .producing_session_matches_output = expected_producing_session_match,
+      .prepared_prefill_plan = expected_producing_session_match
               ? invocation.prepared_prefill_plan()
               : std::optional<DPMPreparedPrefillPlan>(),
-      .capsule_restore_evidence_v3 =
-          expected_producing_session_match
-              ? invocation.capsule_restore_evidence_v3()
-              : std::optional<CapsuleRestoreEvidenceV3>(),
+      .capsule_restore_evidence = expected_producing_session_match
+                                      ? invocation.capsule_restore_evidence()
+                                      : std::optional<CapsuleRestoreEvidence>(),
   };
   ABSL_RETURN_IF_ERROR(ValidateDPMAgentReplayExecution(
       execution, logical_request.max_output_tokens));
@@ -2196,26 +1985,25 @@ CanonicalWinnerDPMAgentRuntime::RematerializeCanonicalWinner(
         "WinnerReplay rematerialization requires an already selected catalog "
         "winner without a live producing session.");
   }
-  std::optional<AuthenticatedCapsuleRestoreStateWitnessAdmission>
+  std::optional<AuthenticatedCapsuleRestoreAdmission>
       state_witness_admission_before;
   ABSL_ASSIGN_OR_RETURN(
-      const std::optional<AuthenticatedCapsuleRestoreStateWitnessAdmission>
+      const std::optional<AuthenticatedCapsuleRestoreAdmission>
           current_state_witness_admission,
-      GetAuthenticatedCapsuleRestoreStateWitnessAdmission());
+      GetAuthenticatedCapsuleRestoreAdmission());
   const bool is_restore = execution_request.restore_checkpoint_id.has_value();
-  if (execution_request.capsule_restore_operation_v3.has_value() !=
+  if (execution_request.capsule_restore_operation.has_value() !=
       (current_state_witness_admission.has_value() && is_restore)) {
     return absl::FailedPreconditionError(
-        "WinnerReplay rematerialization requires Coverage V2 operation "
-        "evidence exactly for a restore on a Coverage V2-bound runtime.");
+        "WinnerReplay rematerialization requires CapsuleRestore operation "
+        "evidence exactly for a restore on a CapsuleRestore-bound runtime.");
   }
   if (is_restore && !current_state_witness_admission.has_value()) {
     ABSL_RETURN_IF_ERROR(ValidateSessionHandoffSupport());
   }
   if (current_state_witness_admission.has_value() && is_restore) {
     ABSL_RETURN_IF_ERROR(ValidateWinnerRestoreOperationAuthority(
-        execution_request, logical_request,
-        *current_state_witness_admission));
+        execution_request, logical_request, *current_state_witness_admission));
     state_witness_admission_before = *current_state_witness_admission;
   }
 
@@ -2223,8 +2011,7 @@ CanonicalWinnerDPMAgentRuntime::RematerializeCanonicalWinner(
                         EncodeDPMAgentExecutionRequest(logical_request));
   const DPMCanonicalReplayRequest replay_request =
       MakeReplayRequest(std::move(encoded), logical_request.max_output_tokens);
-  ABSL_ASSIGN_OR_RETURN(
-      const Hash256 expected_request_hash,
+  ABSL_ASSIGN_OR_RETURN(const Hash256 expected_request_hash,
       ComputeDPMCanonicalReplayRequestHash(replay_request));
   if (selected_winner.replay_request_hash != expected_request_hash) {
     return absl::FailedPreconditionError(
@@ -2235,22 +2022,19 @@ CanonicalWinnerDPMAgentRuntime::RematerializeCanonicalWinner(
   selected_token_ids.reserve(selected_winner.decision_token_ids.size());
   for (int token_id : selected_winner.decision_token_ids) {
     if (token_id < 0 ||
-        static_cast<int64_t>(token_id) >
-            std::numeric_limits<int32_t>::max()) {
+        static_cast<int64_t>(token_id) > std::numeric_limits<int32_t>::max()) {
       return absl::DataLossError(
           "Selected WinnerReplay result contains a non-int32 token ID.");
     }
     selected_token_ids.push_back(static_cast<int32_t>(token_id));
   }
-  ABSL_ASSIGN_OR_RETURN(
-      std::string selected_token_bytes,
+  ABSL_ASSIGN_OR_RETURN(std::string selected_token_bytes,
       EncodeFreshWorkerTokenIds(selected_token_ids));
   DPMAgentDecisionEnvelope selected_envelope{
       .decision_output = selected_winner.decision_output,
       .canonical_token_bytes = std::move(selected_token_bytes),
   };
-  ABSL_ASSIGN_OR_RETURN(
-      const std::string selected_canonical_output,
+  ABSL_ASSIGN_OR_RETURN(const std::string selected_canonical_output,
       EncodeDPMAgentDecisionEnvelope(selected_envelope));
   ABSL_ASSIGN_OR_RETURN(
       const Hash256 selected_expected_evidence,
@@ -2268,8 +2052,7 @@ CanonicalWinnerDPMAgentRuntime::RematerializeCanonicalWinner(
   WinnerAgentInvocation invocation(inference_runtime_, producing_session,
                                    &execution_request, &logical_request,
                                    runtime_identity_);
-  ABSL_ASSIGN_OR_RETURN(
-      CanonicalWinnerGeneratedCandidate rematerialized,
+  ABSL_ASSIGN_OR_RETURN(CanonicalWinnerGeneratedCandidate rematerialized,
       invocation.Generate(replay_request));
   ABSL_RETURN_IF_ERROR(
       invocation.ValidateSupport(DPMReplayStage::kAgentDecision));
@@ -2287,15 +2070,13 @@ CanonicalWinnerDPMAgentRuntime::RematerializeCanonicalWinner(
   }
   if (state_witness_admission_before.has_value()) {
     ABSL_ASSIGN_OR_RETURN(
-        const std::optional<
-            AuthenticatedCapsuleRestoreStateWitnessAdmission>
-            current_after,
-        GetAuthenticatedCapsuleRestoreStateWitnessAdmission());
+        const std::optional<AuthenticatedCapsuleRestoreAdmission> current_after,
+        GetAuthenticatedCapsuleRestoreAdmission());
     if (!current_after.has_value() ||
         !HasSameStateWitnessAdmissionAuthority(
             *current_after, *state_witness_admission_before)) {
       return absl::AbortedError(
-          "WinnerReplay CapsuleRestore Coverage V2 authority changed during "
+          "WinnerReplay CapsuleRestore authority changed during "
           "live rematerialization.");
     }
   } else if (is_restore) {
@@ -2307,8 +2088,8 @@ CanonicalWinnerDPMAgentRuntime::RematerializeCanonicalWinner(
   live_execution.rematerialized_canonical_winner = true;
   live_execution.producing_session_matches_output = true;
   live_execution.prepared_prefill_plan = invocation.prepared_prefill_plan();
-  live_execution.capsule_restore_evidence_v3 =
-      invocation.capsule_restore_evidence_v3();
+  live_execution.capsule_restore_evidence =
+      invocation.capsule_restore_evidence();
   ABSL_RETURN_IF_ERROR(ValidateDPMAgentReplayExecution(
       live_execution, logical_request.max_output_tokens));
   return live_execution;
@@ -2321,8 +2102,7 @@ ExactRegenerationDPMAgentRuntime::Create(
     return absl::InvalidArgumentError(
         "Exact agent requires an ExactRegeneration executor.");
   }
-  if (exact_executor->GetReplayStage() !=
-      DPMReplayStage::kAgentDecision) {
+  if (exact_executor->GetReplayStage() != DPMReplayStage::kAgentDecision) {
     return absl::FailedPreconditionError(
         "Exact agent executor is bound to another replay stage.");
   }
@@ -2335,11 +2115,8 @@ ExactRegenerationDPMAgentRuntime::Create(
         "Exact agent Engine returned an empty derived profile ID.");
   }
   auto runtime = std::unique_ptr<ExactRegenerationDPMAgentRuntime>(
-      new ExactRegenerationDPMAgentRuntime(exact_executor,
-                                           std::move(profile), std::nullopt,
-                                           std::nullopt, std::nullopt,
-                                           std::nullopt, std::nullopt,
-                                           std::nullopt));
+      new ExactRegenerationDPMAgentRuntime(exact_executor, std::move(profile),
+                                           std::nullopt, std::nullopt));
   ABSL_RETURN_IF_ERROR(runtime->ValidateSupport());
   return runtime;
 }
@@ -2352,8 +2129,7 @@ ExactRegenerationDPMAgentRuntime::Create(
     return absl::InvalidArgumentError(
         "Exact agent requires an ExactRegeneration executor.");
   }
-  if (exact_executor->GetReplayStage() !=
-      DPMReplayStage::kAgentDecision) {
+  if (exact_executor->GetReplayStage() != DPMReplayStage::kAgentDecision) {
     return absl::FailedPreconditionError(
         "Exact agent executor is bound to another replay stage.");
   }
@@ -2365,80 +2141,18 @@ ExactRegenerationDPMAgentRuntime::Create(
     return absl::FailedPreconditionError(
         "Exact agent Engine returned an empty derived profile ID.");
   }
-  ABSL_ASSIGN_OR_RETURN(
-      AuthenticatedCapsuleRestoreAdmission admission,
+  ABSL_ASSIGN_OR_RETURN(AuthenticatedCapsuleRestoreAdmission admission,
       exact_executor->GetAuthenticatedCapsuleRestoreAdmission(
           capsule_restore_admission));
-  if (admission.profile != profile ||
-      admission.capability.exact_profile_id != profile.profile_id ||
-      admission.capability.session_identity != profile.session_identity ||
-      admission.capability.backend != profile.backend ||
-      admission.record.capability != admission.capability ||
-      admission.operational_coverage.capsule_restore_capability_id !=
-          admission.capability.capability_id ||
-      admission.operational_coverage
-              .capsule_restore_admission_record_id !=
-          admission.record.record_id ||
-      IsZeroHash(admission.record.record_id)) {
-    return absl::FailedPreconditionError(
-        "Exact agent CapsuleRestore admission is not bound to its immutable "
-        "Engine profile.");
-  }
-  const Hash256 admission_record_id = admission.record.record_id;
-  SessionHandoffCapability capability = admission.capability;
-  CapsuleRestoreOperationalCoverage operational_coverage =
-      admission.operational_coverage;
-  auto runtime = std::unique_ptr<ExactRegenerationDPMAgentRuntime>(
-      new ExactRegenerationDPMAgentRuntime(
-          exact_executor, std::move(profile),
-          std::optional<CapsuleRestoreAdmissionBinding>(
-              std::move(capsule_restore_admission)),
-          std::optional<Hash256>(admission_record_id),
-          std::optional<SessionHandoffCapability>(std::move(capability)),
-          std::optional<CapsuleRestoreOperationalCoverage>(
-              std::move(operational_coverage)),
-          std::nullopt, std::nullopt));
-  ABSL_RETURN_IF_ERROR(runtime->ValidateSupport());
-  ABSL_RETURN_IF_ERROR(runtime->ValidateSessionHandoffSupport());
-  return runtime;
-}
-
-absl::StatusOr<std::unique_ptr<ExactRegenerationDPMAgentRuntime>>
-ExactRegenerationDPMAgentRuntime::Create(
-    ExactRegenerationExecutor* exact_executor,
-    CapsuleRestoreStateWitnessAdmissionBinding
-        capsule_restore_state_witness_admission) {
-  if (exact_executor == nullptr) {
-    return absl::InvalidArgumentError(
-        "Exact agent requires an ExactRegeneration executor.");
-  }
-  if (exact_executor->GetReplayStage() !=
-      DPMReplayStage::kAgentDecision) {
-    return absl::FailedPreconditionError(
-        "Exact agent executor is bound to another replay stage.");
-  }
-  ABSL_ASSIGN_OR_RETURN(ExactLiteRtProfile profile,
-                        exact_executor->GetDerivedProfile());
-  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(profile));
-  ABSL_RETURN_IF_ERROR(ValidateRuntimeIdentity(profile.session_identity));
-  if (IsZeroHash(profile.profile_id)) {
-    return absl::FailedPreconditionError(
-        "Exact agent Engine returned an empty derived profile ID.");
-  }
-  ABSL_ASSIGN_OR_RETURN(
-      AuthenticatedCapsuleRestoreStateWitnessAdmission admission,
-      exact_executor->GetAuthenticatedCapsuleRestoreStateWitnessAdmission(
-          capsule_restore_state_witness_admission));
   ABSL_RETURN_IF_ERROR(ValidateStateWitnessAdmissionForAgentRuntime(
       admission, profile.session_identity,
       std::optional<ExactLiteRtProfile>(profile)));
   auto runtime = std::unique_ptr<ExactRegenerationDPMAgentRuntime>(
       new ExactRegenerationDPMAgentRuntime(
-          exact_executor, std::move(profile), std::nullopt, std::nullopt,
-          std::nullopt, std::nullopt,
-          std::optional<CapsuleRestoreStateWitnessAdmissionBinding>(
-              std::move(capsule_restore_state_witness_admission)),
-          std::optional<AuthenticatedCapsuleRestoreStateWitnessAdmission>(
+          exact_executor, std::move(profile),
+          std::optional<CapsuleRestoreAdmissionBinding>(
+              std::move(capsule_restore_admission)),
+          std::optional<AuthenticatedCapsuleRestoreAdmission>(
               std::move(admission))));
   ABSL_RETURN_IF_ERROR(runtime->ValidateSupport());
   ABSL_RETURN_IF_ERROR(runtime->ValidateSessionHandoffSupport());
@@ -2454,8 +2168,7 @@ ExactRegenerationDPMAgentRuntime::GetExactProfileId() const {
 absl::StatusOr<std::optional<Hash256>>
 ExactRegenerationDPMAgentRuntime::GetExactProfileAdmissionRecordId() const {
   ABSL_RETURN_IF_ERROR(ValidateSupport());
-  ABSL_ASSIGN_OR_RETURN(
-      const Hash256 admission_id,
+  ABSL_ASSIGN_OR_RETURN(const Hash256 admission_id,
       exact_executor_->GetProfileAdmissionRecordId());
   if (IsZeroHash(admission_id)) {
     return absl::DataLossError(
@@ -2467,14 +2180,12 @@ ExactRegenerationDPMAgentRuntime::GetExactProfileAdmissionRecordId() const {
 absl::StatusOr<AuthenticatedCapsuleRestoreAdmission>
 ExactRegenerationDPMAgentRuntime::ResolveCurrentCapsuleRestoreAdmission()
     const {
-  const bool has_binding = capsule_restore_admission_.has_value();
-  if (has_binding != capsule_restore_admission_record_id_.has_value() ||
-      has_binding != session_handoff_capability_.has_value() ||
-      has_binding != capsule_restore_operational_coverage_.has_value()) {
+  if (capsule_restore_admission_.has_value() !=
+      initial_capsule_restore_admission_.has_value()) {
     return absl::InternalError(
-        "Exact agent CapsuleRestore binding is internally inconsistent.");
+        "Exact agent CapsuleRestore authority is internally inconsistent.");
   }
-  if (!has_binding) {
+  if (!capsule_restore_admission_.has_value()) {
     return absl::FailedPreconditionError(
         "Exact agent was constructed without CapsuleRestore admission.");
   }
@@ -2482,86 +2193,22 @@ ExactRegenerationDPMAgentRuntime::ResolveCurrentCapsuleRestoreAdmission()
       AuthenticatedCapsuleRestoreAdmission current,
       exact_executor_->GetAuthenticatedCapsuleRestoreAdmission(
           *capsule_restore_admission_));
-  if (current.record.record_id !=
-          *capsule_restore_admission_record_id_ ||
-      current.profile != derived_profile_ ||
-      current.capability != *session_handoff_capability_ ||
-      current.operational_coverage !=
-          *capsule_restore_operational_coverage_ ||
-      current.record.capability != current.capability) {
-    return absl::AbortedError(
-        "Authenticated CapsuleRestore admission or Engine-derived "
-        "capability changed after exact-runtime construction.");
-  }
-  return current;
-}
-
-absl::StatusOr<AuthenticatedCapsuleRestoreStateWitnessAdmission>
-ExactRegenerationDPMAgentRuntime::
-    ResolveCurrentCapsuleRestoreStateWitnessAdmission() const {
-  const bool has_binding =
-      capsule_restore_state_witness_admission_.has_value();
-  const bool has_initial =
-      initial_capsule_restore_state_witness_admission_.has_value();
-  const bool has_any_v1 = capsule_restore_admission_.has_value() ||
-                          capsule_restore_admission_record_id_.has_value() ||
-                          session_handoff_capability_.has_value() ||
-                          capsule_restore_operational_coverage_.has_value();
-  if (has_binding != has_initial || has_any_v1) {
-    return absl::InternalError(
-        "Exact agent CapsuleRestore Coverage V2 binding is internally "
-        "inconsistent or combined with Coverage V1.");
-  }
-  if (!has_binding) {
-    return absl::FailedPreconditionError(
-        "Exact agent was constructed without CapsuleRestore Coverage V2 "
-        "admission.");
-  }
-  ABSL_ASSIGN_OR_RETURN(
-      AuthenticatedCapsuleRestoreStateWitnessAdmission current,
-      exact_executor_->GetAuthenticatedCapsuleRestoreStateWitnessAdmission(
-          *capsule_restore_state_witness_admission_));
   ABSL_RETURN_IF_ERROR(ValidateStateWitnessAdmissionForAgentRuntime(
       current, derived_profile_.session_identity,
       std::optional<ExactLiteRtProfile>(derived_profile_)));
   if (!HasSameStateWitnessAdmissionAuthority(
-          current, *initial_capsule_restore_state_witness_admission_)) {
+          current, *initial_capsule_restore_admission_)) {
     return absl::AbortedError(
-        "Authenticated CapsuleRestore Coverage V2 authority changed after "
-        "exact-runtime construction.");
+        "Authenticated CapsuleRestore authority changed after exact-runtime "
+        "construction.");
   }
   return current;
-}
-
-absl::StatusOr<std::optional<Hash256>>
-ExactRegenerationDPMAgentRuntime::GetCapsuleRestoreAdmissionRecordId() const {
-  ABSL_RETURN_IF_ERROR(ValidateSupport());
-  if (!capsule_restore_admission_.has_value()) {
-    return std::optional<Hash256>();
-  }
-  ABSL_ASSIGN_OR_RETURN(
-      const AuthenticatedCapsuleRestoreAdmission current,
-      ResolveCurrentCapsuleRestoreAdmission());
-  return std::optional<Hash256>(current.record.record_id);
-}
-
-absl::StatusOr<std::optional<Hash256>>
-ExactRegenerationDPMAgentRuntime::GetSessionHandoffCapabilityId() const {
-  ABSL_RETURN_IF_ERROR(ValidateSupport());
-  if (!capsule_restore_admission_.has_value()) {
-    return std::optional<Hash256>();
-  }
-  ABSL_ASSIGN_OR_RETURN(
-      const AuthenticatedCapsuleRestoreAdmission current,
-      ResolveCurrentCapsuleRestoreAdmission());
-  return std::optional<Hash256>(current.capability.capability_id);
 }
 
 absl::StatusOr<DPMStageCapabilities>
 ExactRegenerationDPMAgentRuntime::GetCapabilities() const {
   ABSL_RETURN_IF_ERROR(ValidateSupport());
-  ABSL_ASSIGN_OR_RETURN(
-      const Hash256 current_admission_record_id,
+  ABSL_ASSIGN_OR_RETURN(const Hash256 current_admission_record_id,
       exact_executor_->GetProfileAdmissionRecordId());
   if (IsZeroHash(current_admission_record_id)) {
     return absl::DataLossError(
@@ -2579,47 +2226,16 @@ ExactRegenerationDPMAgentRuntime::GetCapabilities() const {
   return capabilities;
 }
 
-absl::StatusOr<std::optional<SessionHandoffCapability>>
-ExactRegenerationDPMAgentRuntime::GetSessionHandoffCapability() const {
-  ABSL_RETURN_IF_ERROR(ValidateSupport());
-  if (!capsule_restore_admission_.has_value()) {
-    return std::optional<SessionHandoffCapability>();
-  }
-  ABSL_ASSIGN_OR_RETURN(
-      const AuthenticatedCapsuleRestoreAdmission current,
-      ResolveCurrentCapsuleRestoreAdmission());
-  return std::optional<SessionHandoffCapability>(current.capability);
-}
-
-absl::StatusOr<std::optional<CapsuleRestoreOperationalCoverage>>
-ExactRegenerationDPMAgentRuntime::GetCapsuleRestoreOperationalCoverage()
+absl::StatusOr<std::optional<AuthenticatedCapsuleRestoreAdmission>>
+ExactRegenerationDPMAgentRuntime::GetAuthenticatedCapsuleRestoreAdmission()
     const {
   ABSL_RETURN_IF_ERROR(ValidateSupport());
   if (!capsule_restore_admission_.has_value()) {
-    return std::optional<CapsuleRestoreOperationalCoverage>();
+    return std::optional<AuthenticatedCapsuleRestoreAdmission>();
   }
-  ABSL_ASSIGN_OR_RETURN(
-      const AuthenticatedCapsuleRestoreAdmission current,
+  ABSL_ASSIGN_OR_RETURN(AuthenticatedCapsuleRestoreAdmission current,
       ResolveCurrentCapsuleRestoreAdmission());
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreOperationalCoverage(
-      current.operational_coverage));
-  return std::optional<CapsuleRestoreOperationalCoverage>(
-      current.operational_coverage);
-}
-
-absl::StatusOr<std::optional<
-    AuthenticatedCapsuleRestoreStateWitnessAdmission>>
-ExactRegenerationDPMAgentRuntime::
-    GetAuthenticatedCapsuleRestoreStateWitnessAdmission() const {
-  ABSL_RETURN_IF_ERROR(ValidateSupport());
-  if (!capsule_restore_state_witness_admission_.has_value()) {
-    return std::optional<
-        AuthenticatedCapsuleRestoreStateWitnessAdmission>();
-  }
-  ABSL_ASSIGN_OR_RETURN(
-      AuthenticatedCapsuleRestoreStateWitnessAdmission current,
-      ResolveCurrentCapsuleRestoreStateWitnessAdmission());
-  return std::optional<AuthenticatedCapsuleRestoreStateWitnessAdmission>(
+  return std::optional<AuthenticatedCapsuleRestoreAdmission>(
       std::move(current));
 }
 
@@ -2628,32 +2244,16 @@ absl::Status ExactRegenerationDPMAgentRuntime::ValidateSupport() const {
     return absl::InvalidArgumentError(
         "Exact agent has no regeneration executor.");
   }
-  if (exact_executor_->GetReplayStage() !=
-          DPMReplayStage::kAgentDecision ||
+  if (exact_executor_->GetReplayStage() != DPMReplayStage::kAgentDecision ||
       exact_executor_->GetMaxOutputTokens() == 0) {
     return absl::FailedPreconditionError(
         "Exact agent executor is not bound to a valid agent-decision "
         "profile.");
   }
-  const bool has_v1_binding =
-      capsule_restore_admission_.has_value();
-  if (has_v1_binding !=
-          capsule_restore_admission_record_id_.has_value() ||
-      has_v1_binding != session_handoff_capability_.has_value() ||
-      has_v1_binding !=
-          capsule_restore_operational_coverage_.has_value()) {
+  const bool has_capsule_binding = capsule_restore_admission_.has_value();
+  if (has_capsule_binding != initial_capsule_restore_admission_.has_value()) {
     return absl::InternalError(
-        "Exact agent CapsuleRestore Coverage V1 binding is internally "
-        "inconsistent.");
-  }
-  const bool has_v2_binding =
-      capsule_restore_state_witness_admission_.has_value();
-  if (has_v2_binding !=
-          initial_capsule_restore_state_witness_admission_.has_value() ||
-      (has_v1_binding && has_v2_binding)) {
-    return absl::InternalError(
-        "Exact agent CapsuleRestore Coverage V2 binding is incomplete or "
-        "combined with Coverage V1.");
+        "Exact agent CapsuleRestore authority is internally inconsistent.");
   }
   ABSL_RETURN_IF_ERROR(exact_executor_->ValidateSupport());
   ABSL_ASSIGN_OR_RETURN(const ExactLiteRtProfile current,
@@ -2669,18 +2269,11 @@ absl::Status ExactRegenerationDPMAgentRuntime::ValidateSupport() const {
     return absl::FailedPreconditionError(
         "Exact agent Engine returned an empty derived profile ID.");
   }
-  if (has_v1_binding) {
+  if (has_capsule_binding) {
     ABSL_ASSIGN_OR_RETURN(
         const AuthenticatedCapsuleRestoreAdmission capsule_admission,
         ResolveCurrentCapsuleRestoreAdmission());
     (void)capsule_admission;
-  }
-  if (has_v2_binding) {
-    ABSL_ASSIGN_OR_RETURN(
-        const AuthenticatedCapsuleRestoreStateWitnessAdmission
-            state_witness_admission,
-        ResolveCurrentCapsuleRestoreStateWitnessAdmission());
-    (void)state_witness_admission;
   }
   return absl::OkStatus();
 }
@@ -2696,35 +2289,20 @@ absl::Status ExactRegenerationDPMAgentRuntime::ValidateGenerationLimit(
   return absl::OkStatus();
 }
 
-absl::Status
-ExactRegenerationDPMAgentRuntime::ValidateSessionHandoffSupport() const {
+absl::Status ExactRegenerationDPMAgentRuntime::ValidateSessionHandoffSupport()
+    const {
   ABSL_RETURN_IF_ERROR(ValidateSupport());
-  if (capsule_restore_state_witness_admission_.has_value()) {
-    ABSL_ASSIGN_OR_RETURN(
-        const AuthenticatedCapsuleRestoreStateWitnessAdmission before,
-        ResolveCurrentCapsuleRestoreStateWitnessAdmission());
-    ABSL_ASSIGN_OR_RETURN(
-        const AuthenticatedCapsuleRestoreStateWitnessAdmission after,
-        ResolveCurrentCapsuleRestoreStateWitnessAdmission());
-    if (!HasSameStateWitnessAdmissionAuthority(before, after)) {
-      return absl::AbortedError(
-          "Exact agent CapsuleRestore Coverage V2 authority changed during "
-          "support validation.");
-    }
-    return absl::OkStatus();
+  if (!capsule_restore_admission_.has_value()) {
+    return absl::FailedPreconditionError(
+        "Exact agent was constructed without CapsuleRestore admission.");
   }
-  ABSL_ASSIGN_OR_RETURN(
-      const AuthenticatedCapsuleRestoreAdmission current,
+  ABSL_ASSIGN_OR_RETURN(const AuthenticatedCapsuleRestoreAdmission before,
+                        ResolveCurrentCapsuleRestoreAdmission());
+  ABSL_ASSIGN_OR_RETURN(const AuthenticatedCapsuleRestoreAdmission after,
       ResolveCurrentCapsuleRestoreAdmission());
-  if (current.record.record_id !=
-          *capsule_restore_admission_record_id_ ||
-      current.profile != derived_profile_ ||
-      current.capability.capability_id !=
-          session_handoff_capability_->capability_id ||
-      current.operational_coverage !=
-          *capsule_restore_operational_coverage_) {
+  if (!HasSameStateWitnessAdmissionAuthority(before, after)) {
     return absl::AbortedError(
-        "Exact agent CapsuleRestore admission binding changed during "
+        "Exact agent CapsuleRestore authority changed during "
         "support validation.");
   }
   return absl::OkStatus();
@@ -2752,7 +2330,7 @@ ExactRegenerationDPMAgentRuntime::Generate(
           logical_request.max_output_tokens ||
       execution_request.restore_checkpoint_id.has_value() ||
       execution_request.restored_state_witness.has_value() ||
-      execution_request.capsule_restore_operation_v3.has_value() ||
+      execution_request.capsule_restore_operation.has_value() ||
       !ChunksEqual(execution_request.canonical_prefill_chunks,
                    logical_request.full_canonical_prefill_chunks)) {
     return absl::InvalidArgumentError(
@@ -2762,13 +2340,10 @@ ExactRegenerationDPMAgentRuntime::Generate(
   ABSL_ASSIGN_OR_RETURN(std::string encoded,
                         EncodeDPMAgentExecutionRequest(logical_request));
   const DPMCanonicalReplayRequest replay_request =
-      MakeReplayRequest(std::move(encoded),
-                        logical_request.max_output_tokens);
-  ABSL_ASSIGN_OR_RETURN(
-      const Hash256 expected_request_hash,
+      MakeReplayRequest(std::move(encoded), logical_request.max_output_tokens);
+  ABSL_ASSIGN_OR_RETURN(const Hash256 expected_request_hash,
       ComputeDPMCanonicalReplayRequestHash(replay_request));
-  ABSL_ASSIGN_OR_RETURN(
-      ExactRegenerationExecution exact,
+  ABSL_ASSIGN_OR_RETURN(ExactRegenerationExecution exact,
       exact_executor_->Run(replay_request));
   if (exact.request_evidence.prefill_mode !=
           FreshWorkerPrefillMode::kFullCanonicalPrefill ||
@@ -2798,13 +2373,10 @@ ExactRegenerationDPMAgentRuntime::GeneratePhysicalExact(
   ABSL_ASSIGN_OR_RETURN(std::string encoded,
                         EncodeDPMAgentExecutionRequest(logical_request));
   const DPMCanonicalReplayRequest replay_request =
-      MakeReplayRequest(std::move(encoded),
-                        logical_request.max_output_tokens);
-  ABSL_ASSIGN_OR_RETURN(
-      const Hash256 expected_request_hash,
+      MakeReplayRequest(std::move(encoded), logical_request.max_output_tokens);
+  ABSL_ASSIGN_OR_RETURN(const Hash256 expected_request_hash,
       ComputeDPMCanonicalReplayRequestHash(replay_request));
-  ABSL_RETURN_IF_ERROR(
-      ValidateFreshWorkerExecutionPlan(input.execution_plan));
+  ABSL_RETURN_IF_ERROR(ValidateFreshWorkerExecutionPlan(input.execution_plan));
   if (input.execution_plan.logical_replay_request_hash !=
       expected_request_hash) {
     return absl::FailedPreconditionError(
@@ -2833,17 +2405,13 @@ ExactRegenerationDPMAgentRuntime::GeneratePhysicalExact(
       input.execution_plan.prefill_mode ==
           FreshWorkerPrefillMode::kOwnPositionCapsuleDelta ||
       input.execution_plan.capture_producing_capsule;
-  std::optional<AuthenticatedCapsuleRestoreAdmission>
-      v1_capsule_admission_before;
-  std::optional<AuthenticatedCapsuleRestoreStateWitnessAdmission>
-      v2_capsule_admission_before;
+  std::optional<AuthenticatedCapsuleRestoreAdmission> capsule_admission_before;
   if (transfers_capsule) {
     ABSL_RETURN_IF_ERROR(ValidateSessionHandoffSupport());
-    if (capsule_restore_state_witness_admission_.has_value()) {
-      ABSL_ASSIGN_OR_RETURN(v2_capsule_admission_before,
-                            ResolveCurrentCapsuleRestoreStateWitnessAdmission());
+    ABSL_ASSIGN_OR_RETURN(capsule_admission_before,
+                          ResolveCurrentCapsuleRestoreAdmission());
       const CapsuleRestoreStateWitnessOperationalDomain& domain =
-          v2_capsule_admission_before->operational_coverage.operational_domain;
+        capsule_admission_before->operational_coverage.operational_domain;
       const std::vector<DPMAgentGenerationRequest::PrefillChunk>&
           physical_chunks =
               decoded_delta_request.has_value()
@@ -2860,8 +2428,8 @@ ExactRegenerationDPMAgentRuntime::GeneratePhysicalExact(
            input.execution_plan.restore_durable_envelope_size >
                kMaximumCapsuleRestoreCheckpointBytes)) {
         return absl::FailedPreconditionError(
-            "Exact worker restore transport is outside CapsuleRestore "
-            "Coverage V2.");
+          "Exact worker restore transport is outside the authenticated "
+          "CapsuleRestore domain.");
       }
       if (input.execution_plan.capture_producing_capsule &&
           (input.staging_capture_options == nullptr ||
@@ -2869,108 +2437,28 @@ ExactRegenerationDPMAgentRuntime::GeneratePhysicalExact(
            input.staging_capture_options->key_id !=
                domain.checkpoint_authentication_key_id)) {
         return absl::FailedPreconditionError(
-            "Exact worker capture transport is outside CapsuleRestore "
-            "Coverage V2.");
-      }
-    } else {
-      ABSL_ASSIGN_OR_RETURN(v1_capsule_admission_before,
-                            ResolveCurrentCapsuleRestoreAdmission());
-      const CapsuleRestoreOperationalCoverage& coverage =
-          v1_capsule_admission_before->operational_coverage;
-      if (input.execution_plan.capture_producing_capsule &&
-          input.execution_plan.prefill_mode ==
-              FreshWorkerPrefillMode::kOwnPositionCapsuleDelta) {
-        return absl::FailedPreconditionError(
-            "CapsuleRestore Coverage V1 cannot recursively capture a restored "
-            "continuation.");
-      }
-      if (decoded_delta_request.has_value()) {
-        ABSL_ASSIGN_OR_RETURN(
-            const std::vector<CapsuleRestorePrefillChunk> delta_chunks,
-            ToCapsuleRestoreChunks(
-                decoded_delta_request->canonical_delta_prefill_chunks));
-        ABSL_ASSIGN_OR_RETURN(
-            const Hash256 continuation_workload_hash,
-            ComputeCapsuleRestoreContinuationWorkloadHash(
-                delta_chunks, decoded_delta_request->max_output_tokens));
-        if (continuation_workload_hash !=
-                coverage.restore_continuation_workload_hash ||
-            decoded_delta_request->max_output_tokens !=
-                coverage.continuation_output_tokens ||
-            input.execution_plan.restore_durable_envelope_size !=
-                coverage.checkpoint_envelope_size ||
-            input.durable_restore_options == nullptr ||
-            input.durable_restore_options->key_id !=
-                coverage.checkpoint_authentication_key_id) {
-          return absl::FailedPreconditionError(
-              "Exact worker restore request is outside CapsuleRestore "
-              "Coverage V1.");
+          "Exact worker capture transport is outside the authenticated "
+          "CapsuleRestore domain.");
         }
       }
-      if (input.execution_plan.capture_producing_capsule) {
-        ABSL_ASSIGN_OR_RETURN(
-            const std::vector<CapsuleRestorePrefillChunk> full_chunks,
-            ToCapsuleRestoreChunks(
-                logical_request.full_canonical_prefill_chunks));
-        ABSL_ASSIGN_OR_RETURN(
-            const Hash256 capture_workload_hash,
-            ComputeCapsuleRestoreCheckpointWorkloadHash(
-                full_chunks, logical_request.max_output_tokens));
-        if (capture_workload_hash !=
-                coverage.checkpoint_capture_workload_hash ||
-            logical_request.max_output_tokens !=
-                coverage.checkpoint_output_tokens ||
-            input.staging_capture_options == nullptr ||
-            input.staging_capture_options->key_id !=
-                coverage.checkpoint_authentication_key_id) {
-          return absl::FailedPreconditionError(
-              "Exact worker capture request is outside CapsuleRestore "
-              "Coverage V1.");
-        }
-      }
-    }
-  }
-  absl::StatusOr<ExactRegenerationExecution> exact_result = [&]()
-      -> absl::StatusOr<ExactRegenerationExecution> {
-    if (transfers_capsule && v1_capsule_admission_before.has_value()) {
-      return exact_executor_->RunPhysical(
-          replay_request, input, *capsule_restore_admission_);
-    }
-    if (transfers_capsule && v2_capsule_admission_before.has_value()) {
-      return exact_executor_->RunPhysical(
-          replay_request, input, *capsule_restore_state_witness_admission_);
-    }
-    return exact_executor_->RunPhysical(replay_request, input);
-  }();
+
+  absl::StatusOr<ExactRegenerationExecution> exact_result =
+      transfers_capsule
+          ? exact_executor_->RunPhysical(replay_request, input,
+                                         *capsule_restore_admission_)
+          : exact_executor_->RunPhysical(replay_request, input);
   ABSL_ASSIGN_OR_RETURN(ExactRegenerationExecution exact,
                         std::move(exact_result));
-  if (input.execution_plan.capture_producing_capsule &&
-      v1_capsule_admission_before.has_value()) {
+
+  if (capsule_admission_before.has_value()) {
     ABSL_ASSIGN_OR_RETURN(
-        const AuthenticatedCapsuleRestoreAdmission current_capsule,
+        const AuthenticatedCapsuleRestoreAdmission capsule_admission_after,
         ResolveCurrentCapsuleRestoreAdmission());
-    if (!exact.durable_producing_capsule_evidence.has_value() ||
-        exact.durable_producing_capsule_evidence->envelope_size !=
-            current_capsule.operational_coverage
-                .checkpoint_envelope_size ||
-        exact.durable_producing_capsule_evidence->key_id !=
-            current_capsule.operational_coverage
-                .checkpoint_authentication_key_id) {
-      return absl::FailedPreconditionError(
-          "Exact worker produced a capsule outside CapsuleRestore Coverage "
-          "V1.");
-    }
-  }
-  if (v2_capsule_admission_before.has_value()) {
-    ABSL_ASSIGN_OR_RETURN(
-        const AuthenticatedCapsuleRestoreStateWitnessAdmission
-            current_capsule_after,
-        ResolveCurrentCapsuleRestoreStateWitnessAdmission());
-    if (!HasSameStateWitnessAdmissionAuthority(
-            current_capsule_after, *v2_capsule_admission_before)) {
+    if (!HasSameStateWitnessAdmissionAuthority(capsule_admission_after,
+                                               *capsule_admission_before)) {
       return absl::AbortedError(
-          "Exact worker CapsuleRestore Coverage V2 authority changed during "
-          "physical work.");
+          "Exact worker CapsuleRestore authority changed during physical "
+          "work.");
     }
     if (!exact.prepared_prefill_plan.has_value()) {
       return absl::DataLossError(
@@ -2980,10 +2468,10 @@ ExactRegenerationDPMAgentRuntime::GeneratePhysicalExact(
     ABSL_RETURN_IF_ERROR(ValidateStateWitnessPreparedPlanDomain(
         *exact.prepared_prefill_plan, logical_request.max_output_tokens,
         restored,
-        current_capsule_after.operational_coverage.operational_domain));
+        capsule_admission_after.operational_coverage.operational_domain));
     if (input.execution_plan.capture_producing_capsule) {
       const CapsuleRestoreStateWitnessOperationalDomain& domain =
-          current_capsule_after.operational_coverage.operational_domain;
+          capsule_admission_after.operational_coverage.operational_domain;
       if (exact.request_evidence.runs.empty() ||
           !exact.request_evidence.runs.front()
                .transient_producing_capsule_evidence.has_value()) {
@@ -3008,11 +2496,12 @@ ExactRegenerationDPMAgentRuntime::GeneratePhysicalExact(
           static_cast<uint64_t>(producing_witness.current_step) >
               domain.maximum_context_positions) {
         return absl::FailedPreconditionError(
-            "Exact worker produced a capsule outside CapsuleRestore Coverage "
-            "V2.");
+            "Exact worker produced a capsule outside the authenticated "
+            "CapsuleRestore domain.");
       }
     }
   }
+
   ABSL_ASSIGN_OR_RETURN(
       DPMAgentReplayExecution replay_execution,
       BuildExactAgentReplayExecution(
@@ -3032,8 +2521,7 @@ ExactRegenerationDPMAgentRuntime::GeneratePhysicalExact(
           input.execution_plan.prefill_mode ||
       exact.request_evidence.restored_checkpoint_id !=
           input.execution_plan.restore_checkpoint_id ||
-      exact.request_evidence.capture_run_policy !=
-          expected_capture_policy) {
+      exact.request_evidence.capture_run_policy != expected_capture_policy) {
     return absl::DataLossError(
         "Exact agent worker evidence changed the selected physical plan.");
   }
@@ -3045,20 +2533,17 @@ ExactRegenerationDPMAgentRuntime::GeneratePhysicalExact(
       .physical_execution_plan_hash =
           exact.request_evidence.physical_execution_plan_hash,
       .prefill_mode = exact.request_evidence.prefill_mode,
-      .restored_checkpoint_id =
-          exact.request_evidence.restored_checkpoint_id,
+      .restored_checkpoint_id = exact.request_evidence.restored_checkpoint_id,
       .capture_run_policy = exact.request_evidence.capture_run_policy,
       .run_zero_restore_reauthentication_evidence =
           run_zero.restore_reauthentication_evidence,
-      .run_zero_restored_state_witness =
-          run_zero.restored_state_witness,
+      .run_zero_restored_state_witness = run_zero.restored_state_witness,
       .run_zero_transient_producing_capsule_evidence =
           run_zero.transient_producing_capsule_evidence,
       .durable_producing_capsule_evidence =
           exact.durable_producing_capsule_evidence,
   };
-  ABSL_RETURN_IF_ERROR(
-      ValidateExactRegenerationDPMAgentPhysicalExecution(
+  ABSL_RETURN_IF_ERROR(ValidateExactRegenerationDPMAgentPhysicalExecution(
           physical, logical_request.max_output_tokens));
   return physical;
 }

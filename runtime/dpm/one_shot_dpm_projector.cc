@@ -211,11 +211,7 @@ OneShotDPMProjector::SelectNewestCompatibleBaseline(
       continue;
     }
     const DPMTurnReceipt& receipt = *event->turn_receipt;
-    if ((receipt.format_version != DPMTurnReceipt::kLegacyFormatVersion &&
-         receipt.format_version != DPMTurnReceipt::kPreviousFormatVersion &&
-         receipt.format_version != DPMTurnReceipt::kCoverageV1FormatVersion &&
-         receipt.format_version != DPMTurnReceipt::kCoverageV2FormatVersion &&
-         receipt.format_version != DPMTurnReceipt::kFormatVersion) ||
+    if (receipt.format_version != DPMTurnReceipt::kFormatVersion ||
         receipt.operation_id.empty() ||
         event->index >= authoritative_request.log.events.size() ||
         receipt.response_event_index != event->index ||
@@ -402,7 +398,6 @@ absl::StatusOr<DPMProjectionOutcome> OneShotDPMProjector::Project(
           execution.exact_profile_admission_record_id,
       .exact_output_evidence_hash = exact_output_evidence_hash,
       .exact_logit_frame_count = exact_logit_frame_count,
-      .reused_canonical_winner = execution.reused_canonical_winner,
   };
   ABSL_ASSIGN_OR_RETURN(manifest.manifest_hash,
                         ComputeDPMProjectionManifestHash(manifest));

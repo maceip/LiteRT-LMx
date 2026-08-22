@@ -47,12 +47,12 @@
 namespace litert::lm {
 namespace {
 
-constexpr absl::string_view kTranscriptDomain = "DPM_AGENT_TRANSCRIPT_V1";
-constexpr absl::string_view kAgentRequestDomain = "DPM_AGENT_REQUEST_V2";
+constexpr absl::string_view kTranscriptDomain = "DPM_AGENT_TRANSCRIPT";
+constexpr absl::string_view kAgentRequestDomain = "DPM_AGENT_REQUEST";
 constexpr absl::string_view kWinnerRestoreTransientKeyDomain =
-    "LITERT_LMX_DPM_WINNER_RESTORE_TRANSIENT_KEY_HMAC_SHA256_V1";
+    "LITERT_LMX_DPM_WINNER_RESTORE_TRANSIENT_KEY_HMAC_SHA256";
 constexpr absl::string_view kWinnerCaptureTransientKeyDomain =
-    "LITERT_LMX_DPM_WINNER_CAPTURE_TRANSIENT_KEY_HMAC_SHA256_V1";
+    "LITERT_LMX_DPM_WINNER_CAPTURE_TRANSIENT_KEY_HMAC_SHA256";
 constexpr size_t kMaximumCheckpointKeyIdSize = 1024;
 
 bool IsZeroHash(const Hash256& hash) {
@@ -126,15 +126,13 @@ void UpdateU32(uint32_t value, Sha256Hasher* hasher) {
   hasher->Update(absl::string_view(encoded.data(), encoded.size()));
 }
 
-void UpdateBytesFrame(char tag, absl::string_view bytes,
-                      Sha256Hasher* hasher) {
+void UpdateBytesFrame(char tag, absl::string_view bytes, Sha256Hasher* hasher) {
   hasher->Update(absl::string_view(&tag, 1));
   UpdateU64(bytes.size(), hasher);
   hasher->Update(bytes);
 }
 
-void UpdateTokenFrame(const std::vector<int>& token_ids,
-                      Sha256Hasher* hasher) {
+void UpdateTokenFrame(const std::vector<int>& token_ids, Sha256Hasher* hasher) {
   constexpr char kTag = 'T';
   hasher->Update(absl::string_view(&kTag, 1));
   UpdateU64(token_ids.size(), hasher);
@@ -148,23 +146,23 @@ absl::string_view HashBytes(const Hash256& hash) {
                            hash.bytes.size());
 }
 
-std::string DeriveRequestTransientKey(
-    absl::string_view parent_key, absl::string_view domain,
+std::string DeriveRequestTransientKey(absl::string_view parent_key,
+                                      absl::string_view domain,
     const Hash256& logical_agent_request_hash,
-    const Hash256& source_checkpoint_id, absl::string_view operation_id) {
-  const Hash256 derived = HmacSha256(
-      parent_key,
-      {domain, HashBytes(logical_agent_request_hash),
+                                      const Hash256& source_checkpoint_id,
+                                      absl::string_view operation_id) {
+  const Hash256 derived =
+      HmacSha256(parent_key, {domain, HashBytes(logical_agent_request_hash),
        HashBytes(source_checkpoint_id), operation_id});
   return std::string(reinterpret_cast<const char*>(derived.bytes.data()),
                      derived.bytes.size());
 }
 
 bool SameCapsuleRestoreRuntimeAuthority(
-    const AuthenticatedCapsuleRestoreStateWitnessAdmission& left_admission,
-    const CapsuleRestoreAuthorityV2& left_authority,
-    const AuthenticatedCapsuleRestoreStateWitnessAdmission& right_admission,
-    const CapsuleRestoreAuthorityV2& right_authority) {
+    const AuthenticatedCapsuleRestoreAdmission& left_admission,
+    const CapsuleRestoreAuthority& left_authority,
+    const AuthenticatedCapsuleRestoreAdmission& right_admission,
+    const CapsuleRestoreAuthority& right_authority) {
   return left_authority == right_authority &&
          left_admission.record.record_id == right_admission.record.record_id &&
          left_admission.profile == right_admission.profile &&
@@ -173,13 +171,13 @@ bool SameCapsuleRestoreRuntimeAuthority(
              right_admission.operational_coverage;
 }
 
-absl::StatusOr<std::vector<CapsuleCanonicalPrefillChunkV2>>
-ToCapsuleCanonicalPrefillChunksV2(
+absl::StatusOr<std::vector<CapsuleCanonicalPrefillChunk>>
+ToCapsuleCanonicalPrefillChunks(
     const std::vector<DPMAgentGenerationRequest::PrefillChunk>& chunks) {
-  std::vector<CapsuleCanonicalPrefillChunkV2> converted;
+  std::vector<CapsuleCanonicalPrefillChunk> converted;
   converted.reserve(chunks.size());
   for (const DPMAgentGenerationRequest::PrefillChunk& chunk : chunks) {
-    CapsuleCanonicalPrefillChunkV2 converted_chunk;
+    CapsuleCanonicalPrefillChunk converted_chunk;
     switch (chunk.encoding) {
       case DPMAgentGenerationRequest::PrefillChunk::Encoding::kUtf8Text:
         if (!chunk.token_ids.empty()) {
@@ -187,7 +185,7 @@ ToCapsuleCanonicalPrefillChunksV2(
               "DPM text prefill chunk also contains token IDs.");
         }
         converted_chunk.encoding =
-            CapsuleCanonicalPrefillChunkV2::Encoding::kUtf8Text;
+            CapsuleCanonicalPrefillChunk::Encoding::kUtf8Text;
         converted_chunk.utf8_text = chunk.text;
         break;
       case DPMAgentGenerationRequest::PrefillChunk::Encoding::kTokenIds:
@@ -196,19 +194,17 @@ ToCapsuleCanonicalPrefillChunksV2(
               "DPM token prefill chunk also contains UTF-8 text.");
         }
         converted_chunk.encoding =
-            CapsuleCanonicalPrefillChunkV2::Encoding::kExactTokenIds;
+            CapsuleCanonicalPrefillChunk::Encoding::kExactTokenIds;
         converted_chunk.token_ids.reserve(chunk.token_ids.size());
         for (int token_id : chunk.token_ids) {
-          if (token_id < 0 ||
-              static_cast<uint64_t>(token_id) >
+          if (token_id < 0 || static_cast<uint64_t>(token_id) >
                   static_cast<uint64_t>(
                       (std::numeric_limits<int32_t>::max)())) {
             return absl::InvalidArgumentError(
-                "DPM prefill contains a token outside the V3 evidence "
+                "DPM prefill contains a token outside the capsule evidence "
                 "range.");
           }
-          converted_chunk.token_ids.push_back(
-              static_cast<int32_t>(token_id));
+          converted_chunk.token_ids.push_back(static_cast<int32_t>(token_id));
         }
         break;
       default:
@@ -217,47 +213,45 @@ ToCapsuleCanonicalPrefillChunksV2(
     }
     converted.push_back(std::move(converted_chunk));
   }
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleCanonicalPrefillChunksV2(converted));
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleCanonicalPrefillChunks(converted));
   return converted;
 }
 
-absl::StatusOr<CapsulePrefillPlanV2> BuildCapsulePrefillPlanV2(
+absl::StatusOr<CapsulePrefillPlan> BuildCapsulePrefillPlan(
     const std::vector<DPMAgentGenerationRequest::PrefillChunk>& chunks,
-    const DPMPreparedPrefillPlan& prepared_plan,
-    uint64_t event_range_start, uint64_t event_range_end) {
+    const DPMPreparedPrefillPlan& prepared_plan, uint64_t event_range_start,
+    uint64_t event_range_end) {
   ABSL_RETURN_IF_ERROR(ValidateDPMPreparedPrefillPlan(prepared_plan));
-  if (prepared_plan.start_step >
-          (std::numeric_limits<uint32_t>::max)() ||
+  if (prepared_plan.start_step > (std::numeric_limits<uint32_t>::max)() ||
       prepared_plan.end_step > (std::numeric_limits<uint32_t>::max)()) {
     return absl::ResourceExhaustedError(
-        "DPM prepared prefill positions exceed the V3 evidence domain.");
+        "DPM prepared prefill positions exceed the capsule evidence domain.");
   }
-  CapsulePrefillPlanV2 plan;
+  CapsulePrefillPlan plan;
   plan.event_range_start = event_range_start;
   plan.event_range_end = event_range_end;
   plan.start_step = static_cast<uint32_t>(prepared_plan.start_step);
   plan.end_step = static_cast<uint32_t>(prepared_plan.end_step);
   ABSL_ASSIGN_OR_RETURN(plan.canonical_chunks,
-                        ToCapsuleCanonicalPrefillChunksV2(chunks));
+                        ToCapsuleCanonicalPrefillChunks(chunks));
   plan.prepared_plan = prepared_plan;
   switch (prepared_plan.start_kind) {
     case DPMPreparedPrefillStartKind::kFreshSession: {
-      plan.mode = CapsulePrefillModeV2::kFullCanonicalPrefill;
+      plan.mode = CapsulePrefillMode::kFullCanonicalPrefill;
       ABSL_ASSIGN_OR_RETURN(
           plan.canonical_full_prefill_chunks_hash,
-          ComputeCapsuleCanonicalFullPrefillChunksHashV2(
-              plan.canonical_chunks));
+          ComputeCapsuleCanonicalFullPrefillChunksHash(plan.canonical_chunks));
       break;
     }
     case DPMPreparedPrefillStartKind::kOwnPositionRestore: {
-      plan.mode = CapsulePrefillModeV2::kOwnPositionCapsuleDelta;
+      plan.mode = CapsulePrefillMode::kOwnPositionCapsuleDelta;
       ABSL_ASSIGN_OR_RETURN(
           plan.canonical_delta_chunks_hash,
-          ComputeCapsuleCanonicalDeltaChunksHashV2(plan.canonical_chunks));
+          ComputeCapsuleCanonicalDeltaChunksHash(plan.canonical_chunks));
       break;
     }
   }
-  ABSL_RETURN_IF_ERROR(ValidateCapsulePrefillPlanV2(plan));
+  ABSL_RETURN_IF_ERROR(ValidateCapsulePrefillPlan(plan));
   return plan;
 }
 
@@ -278,21 +272,18 @@ uint64_t ActiveCorrectionEpochStart(const DPMLogSnapshot& snapshot) {
   return ActiveCorrectionEpochStart(snapshot, snapshot.events.size());
 }
 
-absl::StatusOr<CapsuleRestoreEvidenceV3>
-BuildExactCapsuleRestoreEvidenceV3(
+absl::StatusOr<CapsuleRestoreEvidence> BuildExactCapsuleRestoreEvidence(
     const DPMSessionCheckpointArtifact& source_artifact,
-    const CapsuleCaptureEvidenceV3& source_capture_evidence,
-    const CapsuleRestoreAuthorityV2& current_authority,
-    const CapsuleDPMRestoreTargetV2& target_state,
+    const CapsuleCaptureEvidence& source_capture_evidence,
+    const CapsuleRestoreAuthority& current_authority,
+    const CapsuleDPMRestoreTarget& target_state,
     const std::vector<DPMAgentGenerationRequest::PrefillChunk>& delta_chunks,
     const DPMPreparedPrefillPlan& prepared_prefill_plan,
     const SessionHandoffReauthenticationEvidence& reauthentication,
     const SessionContinuationStateWitness& restored_state_witness,
     uint32_t maximum_output_tokens) {
-  ABSL_RETURN_IF_ERROR(
-      ValidateDPMSessionCheckpointArtifact(source_artifact));
-  ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleCaptureEvidenceV3(source_capture_evidence));
+  ABSL_RETURN_IF_ERROR(ValidateDPMSessionCheckpointArtifact(source_artifact));
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleCaptureEvidence(source_capture_evidence));
   if (source_capture_evidence.checkpoint_id !=
           source_artifact.descriptor.descriptor_id ||
       prepared_prefill_plan.start_kind !=
@@ -305,13 +296,12 @@ BuildExactCapsuleRestoreEvidenceV3(
         "Exact DPM restore inputs do not describe one own-position source "
         "checkpoint and prepared delta.");
   }
-  ABSL_ASSIGN_OR_RETURN(
-      CapsulePrefillPlanV2 prefill,
-      BuildCapsulePrefillPlanV2(
+  ABSL_ASSIGN_OR_RETURN(CapsulePrefillPlan prefill,
+                        BuildCapsulePrefillPlan(
           delta_chunks, prepared_prefill_plan,
           source_artifact.descriptor.response_event_index + 1,
           target_state.source_event_count));
-  CapsuleRestorePlanV2 plan;
+  CapsuleRestorePlan plan;
   plan.authority = current_authority;
   plan.source_capture_plan_hash = source_capture_evidence.plan.plan_hash;
   plan.source_capture_evidence_id = source_capture_evidence.evidence_id;
@@ -319,25 +309,23 @@ BuildExactCapsuleRestoreEvidenceV3(
   plan.checkpoint_state = source_capture_evidence.plan.checkpoint_state;
   plan.checkpoint_envelope_hash = source_artifact.descriptor.envelope_hash;
   plan.checkpoint_envelope_size = source_artifact.descriptor.envelope_size;
-  plan.checkpoint_authentication_key_id =
-      source_artifact.descriptor.key_id;
+  plan.checkpoint_authentication_key_id = source_artifact.descriptor.key_id;
   plan.checkpoint_step = source_capture_evidence.plan.capture_end_step;
   plan.checkpoint_history_token_bytes_hash =
       source_capture_evidence.checkpoint_history_token_bytes_hash;
   plan.target_state = target_state;
   plan.prefill = std::move(prefill);
   plan.maximum_output_tokens = maximum_output_tokens;
-  ABSL_ASSIGN_OR_RETURN(plan.plan_hash,
-                        ComputeCapsuleRestorePlanV2Hash(plan));
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestorePlanV2(plan));
+  ABSL_ASSIGN_OR_RETURN(plan.plan_hash, ComputeCapsuleRestorePlanHash(plan));
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestorePlan(plan));
 
-  CapsuleRestoreEvidenceV3 evidence;
+  CapsuleRestoreEvidence evidence;
   evidence.plan = std::move(plan);
   evidence.durable_to_transient_reauthentication = reauthentication;
   evidence.target_post_import = restored_state_witness;
   ABSL_ASSIGN_OR_RETURN(evidence.evidence_id,
-                        ComputeCapsuleRestoreEvidenceV3Id(evidence));
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreEvidenceV3(evidence));
+                        ComputeCapsuleRestoreEvidenceId(evidence));
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreEvidence(evidence));
   return evidence;
 }
 
@@ -365,7 +353,7 @@ void ResetTranscriptHasher(const Hash256& correction_digest,
 Hash256 ComputeLogicalAgentRequestHash(
     const TranscriptCursor& transcript_before_turn,
     absl::string_view canonical_agent_input, uint32_t max_decision_tokens,
-    const Hash256& correction_digest,
+    const Hash256& correction_digest, const Hash256& projection_manifest_hash,
     const SessionHandoffIdentity& agent_identity) {
   TranscriptCursor logical_prefix = transcript_before_turn;
   if (!logical_prefix.correction_digest.has_value() ||
@@ -375,31 +363,38 @@ Hash256 ComputeLogicalAgentRequestHash(
   const Hash256 prefix_hash = SnapshotDigest(logical_prefix.hasher);
   Sha256Hasher hasher;
   hasher.Update(kAgentRequestDomain);
-  UpdateBytesFrame(
-      'C',
-      absl::string_view(
-          reinterpret_cast<const char*>(correction_digest.bytes.data()),
-          correction_digest.bytes.size()),
-      &hasher);
+  UpdateBytesFrame('C',
+                   absl::string_view(reinterpret_cast<const char*>(
+                                         correction_digest.bytes.data()),
+                                     correction_digest.bytes.size()),
+                   &hasher);
   UpdateBytesFrame(
       'T',
       absl::string_view(reinterpret_cast<const char*>(prefix_hash.bytes.data()),
                         prefix_hash.bytes.size()),
       &hasher);
+  UpdateBytesFrame('X',
+                   absl::string_view(reinterpret_cast<const char*>(
+                                         projection_manifest_hash.bytes.data()),
+                                     projection_manifest_hash.bytes.size()),
+                   &hasher);
   UpdateBytesFrame(
-      'M', absl::string_view(reinterpret_cast<const char*>(
-                                 agent_identity.model_artifact_hash.bytes.data()),
-                             agent_identity.model_artifact_hash.bytes.size()),
+      'M',
+      absl::string_view(reinterpret_cast<const char*>(
+                            agent_identity.model_artifact_hash.bytes.data()),
+                        agent_identity.model_artifact_hash.bytes.size()),
       &hasher);
   UpdateBytesFrame(
-      'R', absl::string_view(reinterpret_cast<const char*>(
-                                 agent_identity.runtime_artifact_hash.bytes.data()),
-                             agent_identity.runtime_artifact_hash.bytes.size()),
+      'R',
+      absl::string_view(reinterpret_cast<const char*>(
+                            agent_identity.runtime_artifact_hash.bytes.data()),
+                        agent_identity.runtime_artifact_hash.bytes.size()),
       &hasher);
   UpdateBytesFrame(
-      'P', absl::string_view(reinterpret_cast<const char*>(
-                                 agent_identity.inference_profile_hash.bytes.data()),
-                             agent_identity.inference_profile_hash.bytes.size()),
+      'P',
+      absl::string_view(reinterpret_cast<const char*>(
+                            agent_identity.inference_profile_hash.bytes.data()),
+                        agent_identity.inference_profile_hash.bytes.size()),
       &hasher);
   constexpr char kLimitTag = 'L';
   hasher.Update(absl::string_view(&kLimitTag, 1));
@@ -462,8 +457,8 @@ absl::Status ValidateSnapshotShape(const DPMLogSnapshot& snapshot) {
   return absl::OkStatus();
 }
 
-absl::StatusOr<Hash256> SnapshotPrefixHashAt(
-    const DPMLogSnapshot& snapshot, uint64_t event_count) {
+absl::StatusOr<Hash256> SnapshotPrefixHashAt(const DPMLogSnapshot& snapshot,
+                                             uint64_t event_count) {
   if (event_count > snapshot.generation ||
       snapshot.prefix_hashes.size() != snapshot.events.size() + 1 ||
       snapshot.prefix_hashes.empty() ||
@@ -491,7 +486,8 @@ absl::StatusOr<Hash256> ComputeReceiptAgentReplayRequestHash(
 
 absl::Status ValidateInputEvent(const DPMEvent& event,
                                 const DPMTurnRequest& request) {
-  if (event.kind != request.kind || event.operation_id != request.operation_id ||
+  if (event.kind != request.kind ||
+      event.operation_id != request.operation_id ||
       event.case_id != request.case_id || event.payload != request.payload) {
     return absl::AlreadyExistsError(
         "DPM operation id is already bound to different input bytes.");
@@ -506,8 +502,7 @@ absl::Status ValidateInputEvent(const DPMEvent& event,
         "DPM input event unexpectedly contains a model-turn receipt.");
   }
   if (event.timestamp_us <= 0) {
-    return absl::DataLossError(
-        "DPM input event has a non-positive timestamp.");
+    return absl::DataLossError("DPM input event has a non-positive timestamp.");
   }
   return absl::OkStatus();
 }
@@ -521,11 +516,7 @@ absl::Status ValidateReceiptAndAdvance(const DPMLogSnapshot& snapshot,
         "DPM model event is missing its authoritative turn receipt.");
   }
   const DPMTurnReceipt& receipt = *response.turn_receipt;
-  if (receipt.format_version != DPMTurnReceipt::kLegacyFormatVersion &&
-      receipt.format_version != DPMTurnReceipt::kPreviousFormatVersion &&
-      receipt.format_version != DPMTurnReceipt::kCoverageV1FormatVersion &&
-      receipt.format_version != DPMTurnReceipt::kCoverageV2FormatVersion &&
-      receipt.format_version != DPMTurnReceipt::kFormatVersion) {
+  if (receipt.format_version != DPMTurnReceipt::kFormatVersion) {
     return absl::FailedPreconditionError(
         "Unsupported DPM turn receipt version.");
   }
@@ -533,8 +524,7 @@ absl::Status ValidateReceiptAndAdvance(const DPMLogSnapshot& snapshot,
       receipt.operation_id != response.operation_id ||
       receipt.response_event_index != response.index ||
       receipt.decision_output != response.payload) {
-    return absl::DataLossError(
-        "DPM model event and turn receipt disagree.");
+    return absl::DataLossError("DPM model event and turn receipt disagree.");
   }
   if (receipt.input_event_index >= response.index ||
       receipt.input_event_index >= snapshot.events.size()) {
@@ -573,8 +563,8 @@ absl::Status ValidateReceiptAndAdvance(const DPMLogSnapshot& snapshot,
     return absl::DataLossError(
         "DPM turn receipt contains non-UTF-8 reconstruction fields.");
   }
-  ABSL_RETURN_IF_ERROR(ValidateDPMProjectionManifest(
-      receipt.projection_manifest));
+  ABSL_RETURN_IF_ERROR(
+      ValidateDPMProjectionManifest(receipt.projection_manifest));
   if (receipt.projection_manifest.log_id != snapshot.log_id ||
       receipt.projection_manifest.case_id != snapshot.case_id ||
       receipt.projection_manifest.source_event_count != response.index ||
@@ -613,8 +603,7 @@ absl::Status ValidateReceiptAndAdvance(const DPMLogSnapshot& snapshot,
     }
     const DPMProjectionManifest& baseline =
         baseline_response.turn_receipt->projection_manifest;
-    ABSL_ASSIGN_OR_RETURN(
-        const Hash256 expected_baseline_correction_digest,
+    ABSL_ASSIGN_OR_RETURN(const Hash256 expected_baseline_correction_digest,
         ComputeDPMCorrectionDigestForPrefix(
             snapshot, baseline.source_event_count));
     if (baseline.source_event_count != baseline_response_index ||
@@ -638,8 +627,7 @@ absl::Status ValidateReceiptAndAdvance(const DPMLogSnapshot& snapshot,
   ABSL_ASSIGN_OR_RETURN(
       const Hash256 expected_agent_replay_request_hash,
       ComputeReceiptAgentReplayRequestHash(snapshot, response, receipt));
-  if (expected_agent_replay_request_hash !=
-      receipt.agent_replay_request_hash) {
+  if (expected_agent_replay_request_hash != receipt.agent_replay_request_hash) {
     return absl::DataLossError(
         "DPM agent replay request hash is not derived from the "
         "authoritative full correction-epoch transcript.");
@@ -650,8 +638,7 @@ absl::Status ValidateReceiptAndAdvance(const DPMLogSnapshot& snapshot,
   }
   for (int token_id : receipt.decision_token_ids) {
     if (token_id < 0 ||
-        static_cast<int64_t>(token_id) >
-            std::numeric_limits<int32_t>::max()) {
+        static_cast<int64_t>(token_id) > std::numeric_limits<int32_t>::max()) {
       return absl::DataLossError(
           "DPM turn receipt contains a non-canonical decision token id.");
     }
@@ -661,6 +648,7 @@ absl::Status ValidateReceiptAndAdvance(const DPMLogSnapshot& snapshot,
           *transcript, receipt.canonical_agent_input,
           receipt.max_decision_tokens,
           receipt.projection_manifest.correction_digest,
+          receipt.projection_manifest.manifest_hash,
           receipt.agent_session_identity) != receipt.agent_request_hash) {
     return absl::DataLossError(
         "DPM turn receipt agent request hash is not canonical.");
@@ -784,11 +772,9 @@ absl::StatusOr<AuthoritativeLogIndex> ValidateAndIndexAuthoritativeLog(
   return index;
 }
 
-DPMAgentGenerationRequest::PrefillChunk TextChunk(
-    absl::string_view value) {
+DPMAgentGenerationRequest::PrefillChunk TextChunk(absl::string_view value) {
   DPMAgentGenerationRequest::PrefillChunk chunk;
-  chunk.encoding =
-      DPMAgentGenerationRequest::PrefillChunk::Encoding::kUtf8Text;
+  chunk.encoding = DPMAgentGenerationRequest::PrefillChunk::Encoding::kUtf8Text;
   chunk.text.assign(value.data(), value.size());
   return chunk;
 }
@@ -796,8 +782,7 @@ DPMAgentGenerationRequest::PrefillChunk TextChunk(
 DPMAgentGenerationRequest::PrefillChunk TokenChunk(
     const std::vector<int>& value) {
   DPMAgentGenerationRequest::PrefillChunk chunk;
-  chunk.encoding =
-      DPMAgentGenerationRequest::PrefillChunk::Encoding::kTokenIds;
+  chunk.encoding = DPMAgentGenerationRequest::PrefillChunk::Encoding::kTokenIds;
   chunk.token_ids = value;
   return chunk;
 }
@@ -809,7 +794,7 @@ absl::StatusOr<Hash256> ComputeAgentReplayRequestHash(
   DPMCanonicalReplayRequest replay_request{
       .stage = DPMReplayStage::kAgentDecision,
       .max_output_tokens = logical_request.max_output_tokens,
-      .request_contract_version = std::string(kDPMAgentReplayContractVersion),
+      .request_contract = std::string(kDPMAgentReplayContract),
       .canonical_payload = std::move(encoded),
   };
   return ComputeDPMCanonicalReplayRequestHash(replay_request);
@@ -867,9 +852,8 @@ void AppendTextSection(absl::string_view name, absl::string_view bytes,
   output->push_back('\n');
 }
 
-absl::Status ValidateProjectionOutcome(
-    const DPMProjectionOutcome& projection,
-    const DPMProjectionRequest& request) {
+absl::Status ValidateProjectionOutcome(const DPMProjectionOutcome& projection,
+                                       const DPMProjectionRequest& request) {
   if (projection.projected_memory.empty() ||
       projection.projected_memory.size() > kMaximumDPMEventPayloadBytes ||
       !IsValidUtf8(projection.projected_memory)) {
@@ -890,11 +874,22 @@ absl::Status ValidateProjectionOutcome(
         "DPM projection provider returned an identity not bound to the "
         "requested raw-log prefix and projected-memory bytes.");
   }
+  const auto validate_model_view = [](const std::optional<std::string>& view) {
+    return !view.has_value() ||
+           (!view->empty() && view->size() <= kMaximumDPMEventPayloadBytes &&
+            IsValidUtf8(*view));
+  };
+  if (!validate_model_view(projection.model_visible_memory) ||
+      !validate_model_view(projection.model_visible_input)) {
+    return absl::FailedPreconditionError(
+        "DPM projection provider returned an empty, over-bound, or non-UTF-8 "
+        "model-visible semantic view.");
+  }
   return absl::OkStatus();
 }
 
-absl::Status ValidateAgentOutcome(
-    const DPMAgentGenerationOutcome& outcome, uint32_t max_decision_tokens) {
+absl::Status ValidateAgentOutcome(const DPMAgentGenerationOutcome& outcome,
+                                  uint32_t max_decision_tokens) {
   if (outcome.decision_output.size() > kMaximumDPMEventPayloadBytes ||
       !IsValidUtf8(outcome.decision_output)) {
     return absl::DataLossError(
@@ -910,21 +905,20 @@ absl::Status ValidateAgentOutcome(
   }
   for (int token_id : outcome.decision_token_ids) {
     if (token_id < 0 ||
-        static_cast<int64_t>(token_id) >
-            std::numeric_limits<int32_t>::max()) {
+        static_cast<int64_t>(token_id) > std::numeric_limits<int32_t>::max()) {
       return absl::DataLossError(
           "DPM agent returned a non-canonical decision token id.");
     }
   }
   if (outcome.prepared_prefill_plan.has_value()) {
-    ABSL_RETURN_IF_ERROR(ValidateDPMPreparedPrefillPlan(
-        *outcome.prepared_prefill_plan));
+    ABSL_RETURN_IF_ERROR(
+        ValidateDPMPreparedPrefillPlan(*outcome.prepared_prefill_plan));
   }
-  if (outcome.capsule_restore_evidence_v3.has_value()) {
-    ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreEvidenceV3(
-        *outcome.capsule_restore_evidence_v3));
+  if (outcome.capsule_restore_evidence.has_value()) {
+    ABSL_RETURN_IF_ERROR(
+        ValidateCapsuleRestoreEvidence(*outcome.capsule_restore_evidence));
     if (!outcome.prepared_prefill_plan.has_value() ||
-        !(outcome.capsule_restore_evidence_v3->plan.prefill.prepared_plan ==
+        !(outcome.capsule_restore_evidence->plan.prefill.prepared_plan ==
           *outcome.prepared_prefill_plan)) {
       return absl::DataLossError(
           "DPM agent restore evidence is detached from its runtime-prepared "
@@ -957,11 +951,11 @@ DPMEngine::DPMEngine(DPMEventLog* log,
                      DPMAgentReplayRuntime* agent_runtime,
                      DPMSessionCheckpointRepository* checkpoint_repository,
                      DPMEngineConfig config, DPMClock* clock)
-    : DPMEngine(log, projection_provider, agent_runtime,
-                checkpoint_repository, nullptr, std::move(config), clock) {}
+    : DPMEngine(log, projection_provider, agent_runtime, checkpoint_repository,
+                nullptr, std::move(config), clock) {}
 
-DPMEngine::DPMEngine(
-    DPMEventLog* log, DPMProjectionProvider* projection_provider,
+DPMEngine::DPMEngine(DPMEventLog* log,
+                     DPMProjectionProvider* projection_provider,
     DPMAgentReplayRuntime* agent_runtime,
     DPMSessionCheckpointRepository* checkpoint_repository,
     CapsuleRestoreEvidenceRepository* evidence_repository,
@@ -981,18 +975,18 @@ DPMEngine::RequireCurrentCapsuleRestoreAuthority() const {
         "CapsuleRestore authority requires an agent runtime.");
   }
   ABSL_ASSIGN_OR_RETURN(
-      std::optional<AuthenticatedCapsuleRestoreStateWitnessAdmission>
-          admission,
-      agent_runtime_->GetAuthenticatedCapsuleRestoreStateWitnessAdmission());
+      std::optional<AuthenticatedCapsuleRestoreAdmission> admission,
+      agent_runtime_->GetAuthenticatedCapsuleRestoreAdmission());
   if (!admission.has_value()) {
     return absl::FailedPreconditionError(
-        "DPM capsule restore/capture requires one current atomic Coverage V2 "
+        "DPM capsule restore/capture requires "
+        "one current atomic CapsuleRestore "
         "admission from the loaded Engine.");
   }
-  ABSL_ASSIGN_OR_RETURN(CapsuleRestoreAuthorityV2 authority,
-                        BuildCapsuleRestoreAuthorityV2(*admission));
+  ABSL_ASSIGN_OR_RETURN(CapsuleRestoreAuthority authority,
+                        BuildCapsuleRestoreAuthority(*admission));
   ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleRestoreAuthorityV2ForAdmission(authority, *admission));
+      ValidateCapsuleRestoreAuthorityForAdmission(authority, *admission));
   if (authority.capability.session_identity !=
       agent_runtime_->GetSessionHandoffIdentity()) {
     return absl::FailedPreconditionError(
@@ -1021,8 +1015,7 @@ DPMEngine::RequireCurrentCapsuleRestoreAuthority() const {
       }
       break;
     case DPMReplayMode::kExactRegeneration:
-      if (!exact_profile_id.has_value() ||
-          !stage.exact_profile.has_value() ||
+      if (!exact_profile_id.has_value() || !stage.exact_profile.has_value() ||
           *exact_profile_id != stage.exact_profile->profile_id ||
           authority.capability.exact_profile_id !=
               stage.exact_profile->profile_id ||
@@ -1088,15 +1081,14 @@ absl::Status DPMEngine::ValidateConfiguration() const {
     return absl::FailedPreconditionError(
         "DPM agent runtime has not resolved its loaded session identity.");
   }
-  const bool uses_session_checkpoints =
-      config_.restore_session_checkpoints ||
+  const bool uses_session_checkpoints = config_.restore_session_checkpoints ||
       config_.checkpoint_interval_turns != 0;
   if (!uses_session_checkpoints) {
     return absl::OkStatus();
   }
   if (checkpoint_repository_ == nullptr || evidence_repository_ == nullptr) {
     return absl::InvalidArgumentError(
-        "Enabled DPM checkpoint restore/capture requires checkpoint and V3 "
+        "Enabled DPM checkpoint restore/capture requires checkpoint and "
         "operation-evidence repositories.");
   }
   if (config_.checkpoint_key_id.empty() ||
@@ -1108,17 +1100,15 @@ absl::Status DPMEngine::ValidateConfiguration() const {
     return absl::InvalidArgumentError(
         "DPM checkpoint authentication key must contain at least 32 bytes.");
   }
-  ABSL_RETURN_IF_ERROR(ValidateFreshWorkerAuthentication(
-      FreshWorkerAuthentication{
+  ABSL_RETURN_IF_ERROR(
+      ValidateFreshWorkerAuthentication(FreshWorkerAuthentication{
           .key_id = config_.operation_evidence_key_id,
-          .authentication_key =
-              config_.operation_evidence_authentication_key,
+          .authentication_key = config_.operation_evidence_authentication_key,
       }));
   if (config_.checkpoint_key_id == config_.operation_evidence_key_id ||
       config_.checkpoint_key_id == kFreshWorkerTransientRestoreKeyId ||
       config_.checkpoint_key_id == kFreshWorkerTransientProducingKeyId ||
-      config_.operation_evidence_key_id ==
-          kFreshWorkerTransientRestoreKeyId ||
+      config_.operation_evidence_key_id == kFreshWorkerTransientRestoreKeyId ||
       config_.operation_evidence_key_id ==
           kFreshWorkerTransientProducingKeyId) {
     return absl::FailedPreconditionError(
@@ -1137,7 +1127,7 @@ absl::Status DPMEngine::ValidateConfiguration() const {
           static_cast<uint32_t>(config_.max_decision_tokens)) {
     return absl::FailedPreconditionError(
         "DPM checkpoint/evidence transport or decision limit is outside the "
-        "authenticated Coverage V2 operational domain.");
+        "authenticated CapsuleRestore operational domain.");
   }
   return absl::OkStatus();
 }
@@ -1153,8 +1143,7 @@ absl::StatusOr<DPMCapabilities> DPMEngine::GetCapabilities() const {
   if (projection.stage != DPMCapabilityStage::kProjection ||
       agent.stage != DPMCapabilityStage::kAgentDecision ||
       projection.replay_mode != agent.replay_mode ||
-      agent.runtime_identity !=
-          agent_runtime_->GetSessionHandoffIdentity() ||
+      agent.runtime_identity != agent_runtime_->GetSessionHandoffIdentity() ||
       projection.max_output_tokens == 0 ||
       agent.max_output_tokens <
           static_cast<uint32_t>(config_.max_decision_tokens)) {
@@ -1191,8 +1180,7 @@ absl::StatusOr<DPMCapabilities> DPMEngine::GetCapabilities() const {
         "current ExactRegeneration admission.");
   }
   if (exact_mode) {
-    ABSL_RETURN_IF_ERROR(
-        ValidateExactLiteRtProfile(*projection.exact_profile));
+    ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(*projection.exact_profile));
     ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(*agent.exact_profile));
     if (*current_agent_exact_profile_id != agent.exact_profile->profile_id ||
         *current_agent_exact_admission_id !=
@@ -1240,8 +1228,7 @@ absl::StatusOr<DPMCapabilities> DPMEngine::GetCapabilities() const {
         "authenticated transport contract.");
   }
   if (has_operation_evidence_key_id &&
-      (config_.operation_evidence_key_id.size() >
-           kMaximumCheckpointKeyIdSize ||
+      (config_.operation_evidence_key_id.size() > kMaximumCheckpointKeyIdSize ||
        config_.operation_evidence_authentication_key.size() < 32 ||
        config_.operation_evidence_authentication_key.size() >
            kMaximumFreshWorkerAuthenticationKeyBytes)) {
@@ -1268,24 +1255,24 @@ absl::StatusOr<DPMCapabilities> DPMEngine::GetCapabilities() const {
         "authenticated checkpoint and operation-evidence transport.");
   }
   ABSL_ASSIGN_OR_RETURN(
-      std::optional<AuthenticatedCapsuleRestoreStateWitnessAdmission>
+      std::optional<AuthenticatedCapsuleRestoreAdmission>
           state_witness_admission,
-      agent_runtime_->GetAuthenticatedCapsuleRestoreStateWitnessAdmission());
+      agent_runtime_->GetAuthenticatedCapsuleRestoreAdmission());
   const bool capsule_admitted = state_witness_admission.has_value();
   if (capsule_admitted) {
-    ABSL_ASSIGN_OR_RETURN(const CapsuleRestoreAuthorityV2 authority,
-                          BuildCapsuleRestoreAuthorityV2(
-                              *state_witness_admission));
-    ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreAuthorityV2ForAdmission(
+    ABSL_ASSIGN_OR_RETURN(
+        const CapsuleRestoreAuthority authority,
+        BuildCapsuleRestoreAuthority(*state_witness_admission));
+    ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreAuthorityForAdmission(
         authority, *state_witness_admission));
     if (authority.capability.session_identity != agent.runtime_identity) {
       return absl::DataLossError(
-          "DPM Coverage V2 capability belongs to another agent runtime.");
+          "DPM CapsuleRestore capability belongs to another agent runtime.");
     }
     checkpoints.session_handoff_capability = authority.capability;
     checkpoints.capsule_restore_admission_record_id =
         authority.admission_record_id;
-    checkpoints.state_witness_operational_coverage =
+    checkpoints.operational_coverage =
         state_witness_admission->operational_coverage;
     ABSL_ASSIGN_OR_RETURN(
         const CapsuleRestoreRuntimeAuthority current_authority,
@@ -1327,8 +1314,7 @@ absl::StatusOr<DPMCapabilities> DPMEngine::GetCapabilities() const {
                   : (!capabilities.checkpoints
                            .operation_evidence_transport_configured
                          ? "operation_evidence_transport_not_configured"
-                  : (!capsule_admitted
-                         ? "capsule_restore_not_admitted"
+                         : (!capsule_admitted ? "capsule_restore_not_admitted"
                          : "")),
       },
       DPMGuaranteeAvailability{
@@ -1349,9 +1335,8 @@ absl::StatusOr<DPMCapabilities> DPMEngine::GetCapabilities() const {
   return capabilities;
 }
 
-absl::StatusOr<std::optional<DPMTurnResult>>
-DPMEngine::RecoverCommittedTurn(const DPMLogSnapshot& snapshot,
-                                const DPMTurnRequest& request) const {
+absl::StatusOr<std::optional<DPMTurnResult>> DPMEngine::RecoverCommittedTurn(
+    const DPMLogSnapshot& snapshot, const DPMTurnRequest& request) const {
   const DPMEvent* committed = nullptr;
   for (const DPMEvent& event : snapshot.events) {
     if (event.kind != DPMEvent::Kind::kModelTurn || !event.turn_receipt ||
@@ -1391,8 +1376,7 @@ DPMEngine::RecoverCommittedTurn(const DPMLogSnapshot& snapshot,
   result.decision_token_ids = receipt.decision_token_ids;
   result.input_event_index = receipt.input_event_index;
   result.response_event_index = receipt.response_event_index;
-  result.projection_manifest_hash =
-      receipt.projection_manifest.manifest_hash;
+  result.projection_manifest_hash = receipt.projection_manifest.manifest_hash;
   result.projection_replay_mode = receipt.projection_manifest.replay_mode;
   result.projection_execution_evidence_hash =
       receipt.projection_manifest.execution_evidence_hash;
@@ -1401,17 +1385,14 @@ DPMEngine::RecoverCommittedTurn(const DPMLogSnapshot& snapshot,
   result.projection_exact_profile_admission_record_id =
       receipt.projection_manifest.exact_profile_admission_record_id;
   result.agent_replay_mode = receipt.agent_replay_mode;
-  result.agent_execution_evidence_hash =
-      receipt.agent_execution_evidence_hash;
+  result.agent_execution_evidence_hash = receipt.agent_execution_evidence_hash;
   result.agent_exact_profile_id = receipt.agent_exact_profile_id;
   result.agent_exact_profile_admission_record_id =
       receipt.agent_exact_profile_admission_record_id;
   result.agent_exact_output_evidence_hash =
       receipt.agent_exact_output_evidence_hash;
-  result.agent_exact_logit_frame_count =
-      receipt.agent_exact_logit_frame_count;
-  result.agent_reused_canonical_winner =
-      receipt.agent_reused_canonical_winner;
+  result.agent_exact_logit_frame_count = receipt.agent_exact_logit_frame_count;
+  result.agent_reused_canonical_winner = receipt.agent_reused_canonical_winner;
   result.agent_rematerialized_canonical_winner =
       receipt.agent_rematerialized_canonical_winner;
   result.agent_producing_session_matched_output =
@@ -1435,10 +1416,8 @@ DPMEngine::RecoverCommittedTurn(const DPMLogSnapshot& snapshot,
       receipt.agent_capsule_restore_coverage_id;
   result.agent_exact_worker_checkpoint_provenance =
       receipt.agent_exact_worker_checkpoint_provenance;
-  result.agent_prepared_prefill_work =
-      receipt.agent_prepared_prefill_work;
-  result.published_checkpoint_capture =
-      receipt.published_checkpoint_capture;
+  result.agent_prepared_prefill_work = receipt.agent_prepared_prefill_work;
+  result.published_checkpoint_capture = receipt.published_checkpoint_capture;
   result.restored_checkpoint_capture_evidence_id =
       receipt.restored_checkpoint_capture_evidence_id;
   result.agent_capsule_restore_evidence_id =
@@ -1450,13 +1429,12 @@ DPMEngine::RecoverCommittedTurn(const DPMLogSnapshot& snapshot,
 }
 
 absl::Status DPMEngine::ValidateRestoreCandidate(
-    const DPMLogSnapshot& current,
-    const DPMProjectionOutcome& projection,
+    const DPMLogSnapshot& current, const DPMProjectionOutcome& projection,
     const RestoreCandidate& candidate,
     const CapsuleRestoreRuntimeAuthority& current_authority) const {
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreAuthorityV2ForAdmission(
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreAuthorityForAdmission(
       current_authority.authority, current_authority.admission));
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleCaptureEvidenceV3CheckpointBinding(
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleCaptureEvidenceCheckpointBinding(
       candidate.artifact, candidate.receipt, candidate.capture_evidence,
       current_authority.authority, current_authority.admission));
   const DPMSessionCheckpointDescriptor& descriptor =
@@ -1492,15 +1470,13 @@ absl::Status DPMEngine::ValidateRestoreCandidate(
         "DPM checkpoint descriptor is not attached to this log receipt.");
   }
   const DPMEvent& response = current.events[descriptor.response_event_index];
-  if (response.kind != DPMEvent::Kind::kModelTurn ||
-      !response.turn_receipt ||
+  if (response.kind != DPMEvent::Kind::kModelTurn || !response.turn_receipt ||
       response.turn_receipt->session_checkpoint_id !=
           receipt.session_checkpoint_id ||
       response.turn_receipt->published_checkpoint_capture !=
           receipt.published_checkpoint_capture ||
       response.turn_receipt->operation_id != receipt.operation_id ||
-      response.turn_receipt->agent_request_hash !=
-          receipt.agent_request_hash ||
+      response.turn_receipt->agent_request_hash != receipt.agent_request_hash ||
       response.turn_receipt->agent_transcript_hash !=
           receipt.agent_transcript_hash) {
     return absl::FailedPreconditionError(
@@ -1519,8 +1495,7 @@ absl::Status DPMEngine::ValidateRestoreCandidate(
       descriptor.agent_request_hash != receipt.agent_request_hash ||
       descriptor.agent_transcript_hash != receipt.agent_transcript_hash ||
       descriptor.session_identity != receipt.agent_session_identity ||
-      descriptor.correction_digest !=
-          projection.manifest.correction_digest ||
+      descriptor.correction_digest != projection.manifest.correction_digest ||
       !(descriptor.session_identity ==
         agent_runtime_->GetSessionHandoffIdentity()) ||
       descriptor.key_id != config_.checkpoint_key_id ||
@@ -1564,15 +1539,14 @@ absl::Status DPMEngine::ValidateRestoreCandidate(
         "DPM checkpoint raw-log prefix has changed.");
   }
 
-  const CapsuleCapturePlanV2& capture_plan =
-      candidate.capture_evidence.plan;
+  const CapsuleCapturePlan& capture_plan = candidate.capture_evidence.plan;
   uint64_t expected_prefill_event_range_start = 0;
   switch (capture_plan.capture_basis) {
-    case CapsuleCaptureBasisV2::kRootFreshSession:
-      expected_prefill_event_range_start = ActiveCorrectionEpochStart(
-          current, descriptor.response_event_index);
+    case CapsuleCaptureBasis::kRootFreshSession:
+      expected_prefill_event_range_start =
+          ActiveCorrectionEpochStart(current, descriptor.response_event_index);
       break;
-    case CapsuleCaptureBasisV2::kVerifiedParentRestore: {
+    case CapsuleCaptureBasis::kVerifiedParentRestore: {
       if (!capture_plan.parent_checkpoint_id.has_value() ||
           !capture_plan.parent_response_event_index.has_value() ||
           !capture_plan.parent_restore_evidence_id.has_value()) {
@@ -1586,8 +1560,7 @@ absl::Status DPMEngine::ValidateRestoreCandidate(
         return absl::FailedPreconditionError(
             "DPM descendant capture names an invalid parent response.");
       }
-      const DPMEvent& parent_response =
-          current.events[parent_response_index];
+      const DPMEvent& parent_response = current.events[parent_response_index];
       if (parent_response.kind != DPMEvent::Kind::kModelTurn ||
           !parent_response.turn_receipt.has_value() ||
           parent_response.turn_receipt->session_checkpoint_id !=
@@ -1606,8 +1579,7 @@ absl::Status DPMEngine::ValidateRestoreCandidate(
             "checkpoint and restore-evidence lineage.");
       }
       expected_prefill_event_range_start = parent_response_index + 1;
-      if (ActiveCorrectionEpochStart(current,
-                                     descriptor.response_event_index) >
+      if (ActiveCorrectionEpochStart(current, descriptor.response_event_index) >
           expected_prefill_event_range_start) {
         return absl::FailedPreconditionError(
             "DPM descendant capture crosses a correction boundary.");
@@ -1620,8 +1592,7 @@ absl::Status DPMEngine::ValidateRestoreCandidate(
   }
   if (capture_plan.prefill.event_range_start !=
           expected_prefill_event_range_start ||
-      capture_plan.prefill.event_range_end !=
-          descriptor.source_event_count) {
+      capture_plan.prefill.event_range_end != descriptor.source_event_count) {
     return absl::FailedPreconditionError(
         "DPM checkpoint physical prefill interval is not derived from its "
         "authoritative correction epoch or verified parent.");
@@ -1650,8 +1621,7 @@ absl::Status DPMEngine::ValidateRestoreCandidate(
         ResetTranscriptHasher(receipt.projection_manifest.correction_digest,
                               &prefix);
       }
-      UpdateBytesFrame('I', receipt.canonical_agent_input,
-                       &prefix.hasher);
+      UpdateBytesFrame('I', receipt.canonical_agent_input, &prefix.hasher);
       candidate_transcript_prefix_hash = SnapshotDigest(prefix.hasher);
       authoritative_prefill_chunks.push_back(
           TextChunk(receipt.canonical_agent_input));
@@ -1677,9 +1647,9 @@ absl::Status DPMEngine::ValidateRestoreCandidate(
     }
   }
   ABSL_ASSIGN_OR_RETURN(
-      const std::vector<CapsuleCanonicalPrefillChunkV2>
+      const std::vector<CapsuleCanonicalPrefillChunk>
           authoritative_capsule_chunks,
-      ToCapsuleCanonicalPrefillChunksV2(authoritative_prefill_chunks));
+      ToCapsuleCanonicalPrefillChunks(authoritative_prefill_chunks));
   if (!found || candidate_transcript_hash != descriptor.agent_transcript_hash ||
       candidate_transcript_prefix_hash !=
           capture_plan.agent_transcript_prefix_hash ||
@@ -1693,14 +1663,13 @@ absl::Status DPMEngine::ValidateRestoreCandidate(
 
 absl::StatusOr<std::optional<DPMEngine::RestoreCandidate>>
 DPMEngine::FindRestoreCandidate(
-    const DPMLogSnapshot& current,
-    const DPMProjectionOutcome& projection,
+    const DPMLogSnapshot& current, const DPMProjectionOutcome& projection,
     const CapsuleRestoreRuntimeAuthority& current_authority) const {
   if (!config_.restore_session_checkpoints ||
       checkpoint_repository_ == nullptr || evidence_repository_ == nullptr) {
     return std::optional<RestoreCandidate>();
   }
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreAuthorityV2ForAdmission(
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreAuthorityForAdmission(
       current_authority.authority, current_authority.admission));
   const DPMReplayMode active_replay_mode = agent_runtime_->GetReplayMode();
   std::optional<Hash256> current_exact_profile_id;
@@ -1733,8 +1702,7 @@ DPMEngine::FindRestoreCandidate(
       continue;
     }
     const DPMTurnReceipt& receipt = *it->turn_receipt;
-    if (receipt.response_event_index >=
-            projection.manifest.input_event_index ||
+    if (receipt.response_event_index >= projection.manifest.input_event_index ||
         receipt.projection_manifest.correction_digest !=
             projection.manifest.correction_digest ||
         receipt.agent_replay_mode != active_replay_mode ||
@@ -1766,8 +1734,8 @@ DPMEngine::FindRestoreCandidate(
       // unavailable storage must not prevent reconstruction from the log.
       continue;
     }
-    absl::StatusOr<CapsuleCaptureEvidenceV3> capture_evidence =
-        evidence_repository_->GetCaptureV3(
+    absl::StatusOr<CapsuleCaptureEvidence> capture_evidence =
+        evidence_repository_->GetCapture(
             *receipt.session_checkpoint_id,
             receipt.published_checkpoint_capture->capture_evidence_id,
             evidence_authentication);
@@ -1785,11 +1753,9 @@ DPMEngine::FindRestoreCandidate(
   return std::optional<RestoreCandidate>();
 }
 
-absl::StatusOr<
-    std::vector<DPMAgentGenerationRequest::PrefillChunk>>
+absl::StatusOr<std::vector<DPMAgentGenerationRequest::PrefillChunk>>
 DPMEngine::BuildFullTranscriptChunks(
-    const DPMLogSnapshot& snapshot,
-    absl::string_view current_agent_input,
+    const DPMLogSnapshot& snapshot, absl::string_view current_agent_input,
     const Hash256& current_correction_digest) const {
   std::vector<DPMAgentGenerationRequest::PrefillChunk> chunks;
   TranscriptCursor transcript;
@@ -1817,8 +1783,7 @@ DPMEngine::BuildFullTranscriptChunks(
   return chunks;
 }
 
-absl::StatusOr<
-    std::vector<DPMAgentGenerationRequest::PrefillChunk>>
+absl::StatusOr<std::vector<DPMAgentGenerationRequest::PrefillChunk>>
 DPMEngine::BuildDeltaTranscriptChunks(
     const DPMLogSnapshot& snapshot, uint64_t restored_response_event_index,
     absl::string_view current_agent_input,
@@ -1866,8 +1831,7 @@ DPMEngine::BuildDeltaTranscriptChunks(
 
 absl::StatusOr<std::string> DPMEngine::BuildCanonicalAgentInput(
     const DPMTurnRequest& request, const DPMLogSnapshot& source_snapshot,
-    uint64_t input_event_index,
-    const DPMProjectionOutcome& projection) const {
+    uint64_t input_event_index, const DPMProjectionOutcome& projection) const {
   ABSL_RETURN_IF_ERROR(ValidateSnapshotShape(source_snapshot));
   if (input_event_index >= source_snapshot.events.size()) {
     return absl::InvalidArgumentError(
@@ -1879,27 +1843,20 @@ absl::StatusOr<std::string> DPMEngine::BuildCanonicalAgentInput(
     return absl::ResourceExhaustedError(
         "DPM canonical agent input field exceeds its product bound.");
   }
+  const absl::string_view model_memory =
+      projection.model_visible_memory.has_value()
+          ? absl::string_view(*projection.model_visible_memory)
+          : absl::string_view(projection.projected_memory);
+  const absl::string_view model_input =
+      projection.model_visible_input.has_value()
+          ? absl::string_view(*projection.model_visible_input)
+          : absl::string_view(request.payload);
   std::string input;
-  input.reserve(request.payload.size() + projection.projected_memory.size() +
-                request.case_id.size() + source_snapshot.log_id.size() + 512);
-  input.append("DPM_AGENT_INPUT_V1\n");
-  AppendTextSection("LOG_ID_BYTES", source_snapshot.log_id, &input);
-  absl::StrAppend(&input, "SOURCE_GENERATION ", source_snapshot.generation,
-                  "\nSOURCE_PREFIX_SHA256 ",
-                  source_snapshot.prefix_hash.ToHex(),
-                  "\nINPUT_EVENT_INDEX ", input_event_index,
-                  "\nINPUT_KIND ", static_cast<int>(request.kind), "\n");
-  AppendTextSection("CASE_ID_BYTES", request.case_id, &input);
-  absl::StrAppend(&input, "PROJECTION_REQUEST_SHA256 ",
-                  projection.manifest.request_hash.ToHex(),
-                  "\nPROJECTION_MANIFEST_SHA256 ",
-                  projection.manifest.manifest_hash.ToHex(),
-                  "\nCORRECTION_SET_SHA256 ",
-                  projection.manifest.correction_digest.ToHex(), "\n");
-  AppendTextSection("PROJECTED_MEMORY_BYTES", projection.projected_memory,
-                    &input);
-  AppendTextSection("REQUEST_BYTES", request.payload, &input);
-  input.append("END_DPM_AGENT_INPUT\n");
+  input.reserve(model_input.size() + model_memory.size() + 64);
+  input.append("DPM1\nUse MEMORY for INPUT.\n");
+  AppendTextSection("MEMORY", model_memory, &input);
+  absl::StrAppend(&input, "KIND ", static_cast<int>(request.kind), "\n");
+  AppendTextSection("INPUT", model_input, &input);
   if (input.size() > kMaximumDPMCanonicalAgentInputBytes) {
     return absl::ResourceExhaustedError(
         "DPM canonical agent input exceeds its derived product bound.");
@@ -1949,24 +1906,19 @@ absl::StatusOr<Hash256> DPMEngine::ComputeTranscriptPrefixHash(
   return transcript.hasher.Finalize();
 }
 
-absl::StatusOr<DPMEngine::CheckpointCapture>
-DPMEngine::CaptureProducingSession(
+absl::StatusOr<DPMEngine::CheckpointCapture> DPMEngine::CaptureProducingSession(
     Engine::Session* session, const DPMLogSnapshot& source_snapshot,
-    uint64_t response_event_index,
-    const DPMProjectionOutcome& projection,
-    const Hash256& agent_request_hash,
-    const Hash256& transcript_prefix_hash,
+    uint64_t response_event_index, const DPMProjectionOutcome& projection,
+    const Hash256& agent_request_hash, const Hash256& transcript_prefix_hash,
     const Hash256& transcript_hash,
     const CapsuleRestoreRuntimeAuthority& capsule_restore_authority,
     const std::vector<DPMAgentGenerationRequest::PrefillChunk>&
         physical_prefill_chunks,
     const DPMPreparedPrefillPlan& prepared_prefill_plan,
     const Hash256& producing_output_evidence_hash,
-    uint32_t generated_token_count,
-    uint64_t prefill_event_range_start,
-    const std::optional<CapsuleRestoreEvidenceV3>& parent_restore_evidence,
-    absl::string_view operation_id,
-    int64_t created_unix_micros) const {
+    uint32_t generated_token_count, uint64_t prefill_event_range_start,
+    const std::optional<CapsuleRestoreEvidence>& parent_restore_evidence,
+    absl::string_view operation_id, int64_t created_unix_micros) const {
   if (session == nullptr) {
     return absl::InvalidArgumentError(
         "Cannot capture a null DPM producing session.");
@@ -1976,11 +1928,10 @@ DPMEngine::CaptureProducingSession(
     return absl::InvalidArgumentError(
         "DPM live capture lacks its operation or producing-output evidence.");
   }
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreAuthorityV2ForAdmission(
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreAuthorityForAdmission(
       capsule_restore_authority.authority,
       capsule_restore_authority.admission));
-  ABSL_ASSIGN_OR_RETURN(
-      const CapsuleRestoreRuntimeAuthority authority_before,
+  ABSL_ASSIGN_OR_RETURN(const CapsuleRestoreRuntimeAuthority authority_before,
       RequireCurrentCapsuleRestoreAuthority());
   if (!SameCapsuleRestoreRuntimeAuthority(
           authority_before.admission, authority_before.authority,
@@ -2000,7 +1951,7 @@ DPMEngine::CaptureProducingSession(
 
   if (parent_restore_evidence.has_value()) {
     ABSL_RETURN_IF_ERROR(
-        ValidateCapsuleRestoreEvidenceV3(*parent_restore_evidence));
+        ValidateCapsuleRestoreEvidence(*parent_restore_evidence));
     if (prepared_prefill_plan.start_kind !=
             DPMPreparedPrefillStartKind::kOwnPositionRestore ||
         prepared_prefill_plan.restore_checkpoint_id !=
@@ -2027,17 +1978,16 @@ DPMEngine::CaptureProducingSession(
   }
 
   ABSL_ASSIGN_OR_RETURN(
-      CapsulePrefillPlanV2 prefill_plan,
-      BuildCapsulePrefillPlanV2(
-          physical_prefill_chunks, prepared_prefill_plan,
-          prefill_event_range_start, source_snapshot.events.size()));
-  CapsuleCapturePlanV2 capture_plan;
+      CapsulePrefillPlan prefill_plan,
+      BuildCapsulePrefillPlan(physical_prefill_chunks, prepared_prefill_plan,
+                              prefill_event_range_start,
+                              source_snapshot.events.size()));
+  CapsuleCapturePlan capture_plan;
   capture_plan.authority = capsule_restore_authority.authority;
-  capture_plan.capture_basis =
-      parent_restore_evidence.has_value()
-          ? CapsuleCaptureBasisV2::kVerifiedParentRestore
-          : CapsuleCaptureBasisV2::kRootFreshSession;
-  capture_plan.checkpoint_state = CapsuleDPMCheckpointStateV2{
+  capture_plan.capture_basis = parent_restore_evidence.has_value()
+                                   ? CapsuleCaptureBasis::kVerifiedParentRestore
+                                   : CapsuleCaptureBasis::kRootFreshSession;
+  capture_plan.checkpoint_state = CapsuleDPMCheckpointState{
       .log_id = source_snapshot.log_id,
       .source_event_count = source_snapshot.events.size(),
       .source_prefix_hash = source_snapshot.prefix_hash,
@@ -2050,8 +2000,7 @@ DPMEngine::CaptureProducingSession(
   };
   capture_plan.agent_transcript_prefix_hash = transcript_prefix_hash;
   capture_plan.prefill = std::move(prefill_plan);
-  capture_plan.producing_output_evidence_hash =
-      producing_output_evidence_hash;
+  capture_plan.producing_output_evidence_hash = producing_output_evidence_hash;
   capture_plan.generated_token_count = generated_token_count;
   if (capture_plan.prefill.end_step >
       (std::numeric_limits<uint32_t>::max)() - generated_token_count) {
@@ -2072,35 +2021,30 @@ DPMEngine::CaptureProducingSession(
     transient_parent_id = parent_restore_evidence->plan.checkpoint_id;
   }
   ABSL_ASSIGN_OR_RETURN(capture_plan.plan_hash,
-                        ComputeCapsuleCapturePlanV2Hash(capture_plan));
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleCapturePlanV2(capture_plan));
+                        ComputeCapsuleCapturePlanHash(capture_plan));
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleCapturePlan(capture_plan));
 
   SessionHandoffOptions transient_options;
-  transient_options.key_id =
-      std::string(kFreshWorkerTransientProducingKeyId);
+  transient_options.key_id = std::string(kFreshWorkerTransientProducingKeyId);
   transient_options.authentication_key = DeriveRequestTransientKey(
-      config_.checkpoint_authentication_key,
-      kWinnerCaptureTransientKeyDomain, agent_request_hash,
-      transient_parent_id, operation_id);
+      config_.checkpoint_authentication_key, kWinnerCaptureTransientKeyDomain,
+      agent_request_hash, transient_parent_id, operation_id);
   transient_options.expected_identity = session_identity;
   SessionHandoffOptions durable_options;
   durable_options.key_id = config_.checkpoint_key_id;
-  durable_options.authentication_key =
-      config_.checkpoint_authentication_key;
+  durable_options.authentication_key = config_.checkpoint_authentication_key;
   durable_options.expected_identity = session_identity;
 
   std::string transient_envelope;
   StringByteSink transient_sink(&transient_envelope);
   ABSL_ASSIGN_OR_RETURN(
       const SessionContinuationStateWitness producer_before_export,
-      session->ExportHandoffToWithWitness(transient_options,
-                                          &transient_sink));
+      session->ExportHandoffToWithWitness(transient_options, &transient_sink));
   std::string repeated_transient_envelope;
   StringByteSink repeated_sink(&repeated_transient_envelope);
   ABSL_ASSIGN_OR_RETURN(
       const SessionContinuationStateWitness producer_after_export,
-      session->ExportHandoffToWithWitness(transient_options,
-                                          &repeated_sink));
+      session->ExportHandoffToWithWitness(transient_options, &repeated_sink));
   if (transient_envelope != repeated_transient_envelope ||
       producer_before_export != producer_after_export) {
     return absl::DataLossError(
@@ -2112,8 +2056,7 @@ DPMEngine::CaptureProducingSession(
     return absl::InternalError(
         "DPM capture runtime returned a null fresh import target.");
   }
-  ABSL_ASSIGN_OR_RETURN(
-      const SessionHandoffIdentity fresh_target_identity,
+  ABSL_ASSIGN_OR_RETURN(const SessionHandoffIdentity fresh_target_identity,
       fresh_target->GetSessionHandoffIdentity());
   if (fresh_target_identity != session_identity) {
     return absl::FailedPreconditionError(
@@ -2140,8 +2083,7 @@ DPMEngine::CaptureProducingSession(
           kFreshWorkerTransientProducingToDurableReauthenticationPurpose,
           &durable_sink));
 
-  DPMSessionCheckpointDescriptor& descriptor =
-      capture.artifact.descriptor;
+  DPMSessionCheckpointDescriptor& descriptor = capture.artifact.descriptor;
   descriptor.log_id = source_snapshot.log_id;
   descriptor.stage = DPMSessionCheckpointStage::kAgentDecision;
   descriptor.source_event_count = source_snapshot.events.size();
@@ -2159,8 +2101,7 @@ DPMEngine::CaptureProducingSession(
   descriptor.created_unix_micros = created_unix_micros;
   descriptor.replay_mode = DPMReplayMode::kCanonicalWinnerReplay;
   descriptor.capture_origin = DPMCheckpointCaptureOrigin::kLiveParentSession;
-  descriptor.restored_from_checkpoint_id =
-      capture_plan.parent_checkpoint_id;
+  descriptor.restored_from_checkpoint_id = capture_plan.parent_checkpoint_id;
   descriptor.capsule_restore_capability_id =
       capsule_restore_authority.authority.capability.capability_id;
   descriptor.capsule_restore_admission_record_id =
@@ -2173,36 +2114,28 @@ DPMEngine::CaptureProducingSession(
       BuildDPMPreparedPrefillWorkBinding(prepared_prefill_plan));
   ABSL_ASSIGN_OR_RETURN(descriptor.descriptor_id,
                         ComputeDPMSessionCheckpointId(descriptor));
-  ABSL_RETURN_IF_ERROR(
-      ValidateDPMSessionCheckpointArtifact(capture.artifact));
+  ABSL_RETURN_IF_ERROR(ValidateDPMSessionCheckpointArtifact(capture.artifact));
 
   capture.capture_evidence.plan = std::move(capture_plan);
   capture.capture_evidence.checkpoint_id = descriptor.descriptor_id;
-  capture.capture_evidence.checkpoint_envelope_hash =
-      descriptor.envelope_hash;
-  capture.capture_evidence.checkpoint_envelope_size =
-      descriptor.envelope_size;
-  capture.capture_evidence.checkpoint_authentication_key_id =
-      descriptor.key_id;
+  capture.capture_evidence.checkpoint_envelope_hash = descriptor.envelope_hash;
+  capture.capture_evidence.checkpoint_envelope_size = descriptor.envelope_size;
+  capture.capture_evidence.checkpoint_authentication_key_id = descriptor.key_id;
   capture.capture_evidence.checkpoint_history_token_bytes_hash =
       producer_before_export.processed_history_token_bytes_hash;
-  capture.capture_evidence.producer_before_export =
-      producer_before_export;
-  capture.capture_evidence.producer_after_export =
-      producer_after_export;
+  capture.capture_evidence.producer_before_export = producer_before_export;
+  capture.capture_evidence.producer_after_export = producer_after_export;
   capture.capture_evidence.fresh_import_target = fresh_import_target;
   capture.capture_evidence.transient_to_durable_reauthentication =
       reauthentication;
-  capture.capture_evidence.parent_restore_evidence =
-      parent_restore_evidence;
+  capture.capture_evidence.parent_restore_evidence = parent_restore_evidence;
   ABSL_ASSIGN_OR_RETURN(
       capture.capture_evidence.evidence_id,
-      ComputeCapsuleCaptureEvidenceV3Id(capture.capture_evidence));
+      ComputeCapsuleCaptureEvidenceId(capture.capture_evidence));
   ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleCaptureEvidenceV3(capture.capture_evidence));
+      ValidateCapsuleCaptureEvidence(capture.capture_evidence));
 
-  ABSL_ASSIGN_OR_RETURN(
-      const CapsuleRestoreRuntimeAuthority authority_after,
+  ABSL_ASSIGN_OR_RETURN(const CapsuleRestoreRuntimeAuthority authority_after,
       RequireCurrentCapsuleRestoreAuthority());
   if (!SameCapsuleRestoreRuntimeAuthority(
           authority_before.admission, authority_before.authority,
@@ -2218,21 +2151,18 @@ DPMEngine::BuildExactWorkerCheckpointCapture(
     absl::string_view authenticated_envelope,
     const ExactRegenerationDPMAgentPhysicalExecution& physical_execution,
     const DPMLogSnapshot& source_snapshot, uint64_t response_event_index,
-    const DPMProjectionOutcome& projection,
-    const Hash256& agent_request_hash,
-    const Hash256& transcript_prefix_hash,
-    const Hash256& transcript_hash,
+    const DPMProjectionOutcome& projection, const Hash256& agent_request_hash,
+    const Hash256& transcript_prefix_hash, const Hash256& transcript_hash,
     const CapsuleRestoreRuntimeAuthority& capsule_restore_authority,
     const std::vector<DPMAgentGenerationRequest::PrefillChunk>&
         physical_prefill_chunks,
     uint64_t prefill_event_range_start,
-    const std::optional<CapsuleRestoreEvidenceV3>& parent_restore_evidence,
+    const std::optional<CapsuleRestoreEvidence>& parent_restore_evidence,
     int64_t created_unix_micros) const {
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreAuthorityV2ForAdmission(
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreAuthorityForAdmission(
       capsule_restore_authority.authority,
       capsule_restore_authority.admission));
-  ABSL_ASSIGN_OR_RETURN(
-      const CapsuleRestoreRuntimeAuthority authority_before,
+  ABSL_ASSIGN_OR_RETURN(const CapsuleRestoreRuntimeAuthority authority_before,
       RequireCurrentCapsuleRestoreAuthority());
   if (!SameCapsuleRestoreRuntimeAuthority(
           authority_before.admission, authority_before.authority,
@@ -2242,12 +2172,9 @@ DPMEngine::BuildExactWorkerCheckpointCapture(
         "CapsuleRestore authority changed before exact checkpoint "
         "publication.");
   }
-  ABSL_RETURN_IF_ERROR(
-      ValidateExactRegenerationDPMAgentPhysicalExecution(
-          physical_execution,
-          static_cast<uint32_t>(config_.max_decision_tokens)));
-  const DPMAgentReplayExecution& replay =
-      physical_execution.replay_execution;
+  ABSL_RETURN_IF_ERROR(ValidateExactRegenerationDPMAgentPhysicalExecution(
+      physical_execution, static_cast<uint32_t>(config_.max_decision_tokens)));
+  const DPMAgentReplayExecution& replay = physical_execution.replay_execution;
   if (replay.mode != DPMReplayMode::kExactRegeneration ||
       !replay.exact_profile_id.has_value() ||
       !replay.exact_profile_admission_record_id.has_value() ||
@@ -2281,7 +2208,7 @@ DPMEngine::BuildExactWorkerCheckpointCapture(
       *replay.prepared_prefill_plan;
   if (parent_restore_evidence.has_value()) {
     ABSL_RETURN_IF_ERROR(
-        ValidateCapsuleRestoreEvidenceV3(*parent_restore_evidence));
+        ValidateCapsuleRestoreEvidence(*parent_restore_evidence));
     if (physical_execution.restored_checkpoint_id !=
             std::optional<Hash256>(
                 parent_restore_evidence->plan.checkpoint_id) ||
@@ -2314,9 +2241,9 @@ DPMEngine::BuildExactWorkerCheckpointCapture(
       durable.key_id != config_.checkpoint_key_id ||
       durable.envelope_size != authenticated_envelope.size() ||
       durable.envelope_hash != Sha256(authenticated_envelope) ||
-      durable.key_id != capsule_restore_authority.admission
-                             .operational_coverage.operational_domain
-                             .checkpoint_authentication_key_id ||
+      durable.key_id !=
+          capsule_restore_authority.admission.operational_coverage
+              .operational_domain.checkpoint_authentication_key_id ||
       durable.output_evidence_hash != *replay.exact_output_evidence_hash ||
       transient.output_evidence_hash != *replay.exact_output_evidence_hash) {
     return absl::DataLossError(
@@ -2325,10 +2252,10 @@ DPMEngine::BuildExactWorkerCheckpointCapture(
   }
 
   ABSL_ASSIGN_OR_RETURN(
-      CapsulePrefillPlanV2 prefill_plan,
-      BuildCapsulePrefillPlanV2(
-          physical_prefill_chunks, prepared_prefill_plan,
-          prefill_event_range_start, source_snapshot.events.size()));
+      CapsulePrefillPlan prefill_plan,
+      BuildCapsulePrefillPlan(physical_prefill_chunks, prepared_prefill_plan,
+                              prefill_event_range_start,
+                              source_snapshot.events.size()));
   if (replay.decision_token_ids.size() >
       (std::numeric_limits<uint32_t>::max)()) {
     return absl::ResourceExhaustedError(
@@ -2336,13 +2263,12 @@ DPMEngine::BuildExactWorkerCheckpointCapture(
   }
   const uint32_t generated_token_count =
       static_cast<uint32_t>(replay.decision_token_ids.size());
-  CapsuleCapturePlanV2 capture_plan;
+  CapsuleCapturePlan capture_plan;
   capture_plan.authority = capsule_restore_authority.authority;
-  capture_plan.capture_basis =
-      parent_restore_evidence.has_value()
-          ? CapsuleCaptureBasisV2::kVerifiedParentRestore
-          : CapsuleCaptureBasisV2::kRootFreshSession;
-  capture_plan.checkpoint_state = CapsuleDPMCheckpointStateV2{
+  capture_plan.capture_basis = parent_restore_evidence.has_value()
+                                   ? CapsuleCaptureBasis::kVerifiedParentRestore
+                                   : CapsuleCaptureBasis::kRootFreshSession;
+  capture_plan.checkpoint_state = CapsuleDPMCheckpointState{
       .log_id = source_snapshot.log_id,
       .source_event_count = source_snapshot.events.size(),
       .source_prefix_hash = source_snapshot.prefix_hash,
@@ -2375,14 +2301,13 @@ DPMEngine::BuildExactWorkerCheckpointCapture(
         parent_restore_evidence->evidence_id;
   }
   ABSL_ASSIGN_OR_RETURN(capture_plan.plan_hash,
-                        ComputeCapsuleCapturePlanV2Hash(capture_plan));
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleCapturePlanV2(capture_plan));
+                        ComputeCapsuleCapturePlanHash(capture_plan));
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleCapturePlan(capture_plan));
 
   CheckpointCapture capture;
-  capture.artifact.authenticated_envelope.assign(
-      authenticated_envelope.data(), authenticated_envelope.size());
-  DPMSessionCheckpointDescriptor& descriptor =
-      capture.artifact.descriptor;
+  capture.artifact.authenticated_envelope.assign(authenticated_envelope.data(),
+                                                 authenticated_envelope.size());
+  DPMSessionCheckpointDescriptor& descriptor = capture.artifact.descriptor;
   descriptor.log_id = source_snapshot.log_id;
   descriptor.stage = DPMSessionCheckpointStage::kAgentDecision;
   descriptor.source_event_count = source_snapshot.events.size();
@@ -2418,8 +2343,7 @@ DPMEngine::BuildExactWorkerCheckpointCapture(
       ToCheckpointWorkerPrefillMode(physical_execution.prefill_mode);
   descriptor.execution_plan_hash =
       physical_execution.physical_execution_plan_hash;
-  descriptor.exact_output_evidence_hash =
-      *replay.exact_output_evidence_hash;
+  descriptor.exact_output_evidence_hash = *replay.exact_output_evidence_hash;
   descriptor.worker_provenance = DPMExactWorkerCheckpointProvenance{
       .run_index = run_zero.run_index,
       .execution_plan_hash = physical_execution.physical_execution_plan_hash,
@@ -2435,37 +2359,30 @@ DPMEngine::BuildExactWorkerCheckpointCapture(
       BuildDPMPreparedPrefillWorkBinding(prepared_prefill_plan));
   ABSL_ASSIGN_OR_RETURN(descriptor.descriptor_id,
                         ComputeDPMSessionCheckpointId(descriptor));
-  ABSL_RETURN_IF_ERROR(
-      ValidateDPMSessionCheckpointArtifact(capture.artifact));
+  ABSL_RETURN_IF_ERROR(ValidateDPMSessionCheckpointArtifact(capture.artifact));
 
   capture.capture_evidence.plan = std::move(capture_plan);
   capture.capture_evidence.checkpoint_id = descriptor.descriptor_id;
-  capture.capture_evidence.checkpoint_envelope_hash =
-      descriptor.envelope_hash;
-  capture.capture_evidence.checkpoint_envelope_size =
-      descriptor.envelope_size;
-  capture.capture_evidence.checkpoint_authentication_key_id =
-      descriptor.key_id;
+  capture.capture_evidence.checkpoint_envelope_hash = descriptor.envelope_hash;
+  capture.capture_evidence.checkpoint_envelope_size = descriptor.envelope_size;
+  capture.capture_evidence.checkpoint_authentication_key_id = descriptor.key_id;
   capture.capture_evidence.checkpoint_history_token_bytes_hash =
       transient.producer_first_export.processed_history_token_bytes_hash;
   capture.capture_evidence.producer_before_export =
       transient.producer_first_export;
   capture.capture_evidence.producer_after_export =
       transient.producer_second_export;
-  capture.capture_evidence.fresh_import_target =
-      transient.fresh_import_target;
+  capture.capture_evidence.fresh_import_target = transient.fresh_import_target;
   capture.capture_evidence.transient_to_durable_reauthentication =
       durable.reauthentication_evidence;
-  capture.capture_evidence.parent_restore_evidence =
-      parent_restore_evidence;
+  capture.capture_evidence.parent_restore_evidence = parent_restore_evidence;
   ABSL_ASSIGN_OR_RETURN(
       capture.capture_evidence.evidence_id,
-      ComputeCapsuleCaptureEvidenceV3Id(capture.capture_evidence));
+      ComputeCapsuleCaptureEvidenceId(capture.capture_evidence));
   ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleCaptureEvidenceV3(capture.capture_evidence));
+      ValidateCapsuleCaptureEvidence(capture.capture_evidence));
 
-  ABSL_ASSIGN_OR_RETURN(
-      const CapsuleRestoreRuntimeAuthority authority_after,
+  ABSL_ASSIGN_OR_RETURN(const CapsuleRestoreRuntimeAuthority authority_after,
       RequireCurrentCapsuleRestoreAuthority());
   if (!SameCapsuleRestoreRuntimeAuthority(
           authority_before.admission, authority_before.authority,
@@ -2521,7 +2438,8 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
   ABSL_ASSIGN_OR_RETURN(std::unique_ptr<DPMEventLogOperationLease> operation,
                         log_->AcquireOperationLease());
   if (operation == nullptr) {
-    return absl::InternalError("DPM event log returned a null operation lease.");
+    return absl::InternalError(
+        "DPM event log returned a null operation lease.");
   }
   ABSL_ASSIGN_OR_RETURN(DPMLogSnapshot initial, log_->Snapshot());
   ABSL_ASSIGN_OR_RETURN(AuthoritativeLogIndex initial_index,
@@ -2538,8 +2456,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
   }
 
   std::optional<uint64_t> existing_input_index;
-  auto current_operation =
-      initial_index.operations.find(request.operation_id);
+  auto current_operation = initial_index.operations.find(request.operation_id);
   if (current_operation != initial_index.operations.end()) {
     const OperationRecord& record = current_operation->second;
     if (record.correction != nullptr) {
@@ -2608,8 +2525,8 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
       return absl::DataLossError(
           "DPM log append did not return its authoritative input event.");
     }
-    ABSL_RETURN_IF_ERROR(ValidateInputEvent(
-        source_snapshot.events[input_event_index], request));
+    ABSL_RETURN_IF_ERROR(
+        ValidateInputEvent(source_snapshot.events[input_event_index], request));
   }
 
   ABSL_ASSIGN_OR_RETURN(AuthoritativeLogIndex source_index,
@@ -2642,8 +2559,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
                         projection_provider_->Project(projection_request));
   ABSL_RETURN_IF_ERROR(
       ValidateProjectionOutcome(projection, projection_request));
-  if (projection.manifest.correction_digest !=
-      source_index.correction_digest) {
+  if (projection.manifest.correction_digest != source_index.correction_digest) {
     return absl::FailedPreconditionError(
         "DPM projection correction digest is not derived from the raw log.");
   }
@@ -2661,7 +2577,8 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
       static_cast<uint32_t>(config_.max_decision_tokens);
   const Hash256 agent_request_hash = ComputeLogicalAgentRequestHash(
       source_index.transcript, canonical_agent_input, max_decision_tokens,
-      projection.manifest.correction_digest, loaded_identity);
+      projection.manifest.correction_digest, projection.manifest.manifest_hash,
+      loaded_identity);
 
   ABSL_ASSIGN_OR_RETURN(
       std::vector<DPMAgentGenerationRequest::PrefillChunk> full_chunks,
@@ -2676,8 +2593,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
   ABSL_RETURN_IF_ERROR(
       ValidateDPMAgentExecutionRequest(logical_generation_request));
 
-  if (source_snapshot.events.size() >=
-      std::numeric_limits<uint64_t>::max()) {
+  if (source_snapshot.events.size() >= std::numeric_limits<uint64_t>::max()) {
     return absl::ResourceExhaustedError(
         "DPM log cannot address another response event.");
   }
@@ -2703,7 +2619,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
       const Hash256 transcript_prefix_hash,
       ComputeTranscriptPrefixHash(source_snapshot, canonical_agent_input,
                                   projection.manifest.correction_digest));
-  const CapsuleDPMRestoreTargetV2 restore_target{
+  const CapsuleDPMRestoreTarget restore_target{
       .log_id = source_snapshot.log_id,
       .source_event_count = source_snapshot.events.size(),
       .source_prefix_hash = source_snapshot.prefix_hash,
@@ -2715,8 +2631,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
       .logical_agent_request_hash = agent_request_hash,
   };
 
-  std::optional<CapsuleRestoreRuntimeAuthority>
-      capsule_restore_authority;
+  std::optional<CapsuleRestoreRuntimeAuthority> capsule_restore_authority;
   if (config_.restore_session_checkpoints || capture_milestone) {
     ABSL_ASSIGN_OR_RETURN(capsule_restore_authority,
                           RequireCurrentCapsuleRestoreAuthority());
@@ -2763,7 +2678,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
   };
 
   std::optional<Hash256> restored_from_checkpoint_id;
-  std::optional<CapsuleRestoreEvidenceV3> successful_restore_evidence;
+  std::optional<CapsuleRestoreEvidence> successful_restore_evidence;
   std::vector<DPMAgentGenerationRequest::PrefillChunk>
       successful_physical_prefill_chunks;
   uint64_t successful_prefill_event_range_start =
@@ -2777,7 +2692,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
     std::string staged_capsule;
     std::vector<DPMAgentGenerationRequest::PrefillChunk> physical_chunks;
     uint64_t prefill_event_range_start = 0;
-    std::optional<CapsuleRestoreEvidenceV3> restore_evidence;
+    std::optional<CapsuleRestoreEvidence> restore_evidence;
   };
   std::function<absl::StatusOr<ExactAttempt>(const RestoreCandidate*, bool)>
       run_exact_attempt;
@@ -2786,16 +2701,15 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
     DPMAgentGenerationRequest generation_request;
     DPMAgentReplayExecution execution;
     std::optional<Hash256> restored_checkpoint_id;
-    std::optional<CapsuleRestoreEvidenceV3> restore_evidence;
+    std::optional<CapsuleRestoreEvidence> restore_evidence;
     std::vector<DPMAgentGenerationRequest::PrefillChunk> physical_chunks;
     uint64_t prefill_event_range_start = 0;
   };
-  std::function<absl::StatusOr<WinnerAttempt>(
-      const RestoreCandidate*, const DPMAgentReplayExecution*)>
+  std::function<absl::StatusOr<WinnerAttempt>(const RestoreCandidate*,
+                                              const DPMAgentReplayExecution*)>
       execute_winner_attempt;
   if (agent_replay_mode == DPMReplayMode::kCanonicalWinnerReplay) {
-    execute_winner_attempt =
-        [&](const RestoreCandidate* selected_checkpoint,
+    execute_winner_attempt = [&](const RestoreCandidate* selected_checkpoint,
             const DPMAgentReplayExecution* selected_winner)
         -> absl::StatusOr<WinnerAttempt> {
       WinnerAttempt attempt;
@@ -2807,14 +2721,14 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
       attempt.physical_chunks = full_chunks;
       attempt.prefill_event_range_start =
           ActiveCorrectionEpochStart(source_snapshot);
-      ABSL_ASSIGN_OR_RETURN(attempt.session,
-                            agent_runtime_->CreateSession());
+      ABSL_ASSIGN_OR_RETURN(attempt.session, agent_runtime_->CreateSession());
       ABSL_RETURN_IF_ERROR(validate_created_session(attempt.session.get()));
 
       if (selected_checkpoint != nullptr) {
         if (!capsule_restore_authority.has_value()) {
           return absl::InternalError(
-              "WinnerReplay restore lost its current V2 authority.");
+              "WinnerReplay restore lost its current "
+              "CapsuleRestore authority.");
         }
         ABSL_ASSIGN_OR_RETURN(
             const CapsuleRestoreRuntimeAuthority current_authority,
@@ -2827,17 +2741,15 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
               "CapsuleRestore authority changed before WinnerReplay "
               "restore.");
         }
-        ABSL_RETURN_IF_ERROR(ValidateRestoreCandidate(
-            source_snapshot, projection, *selected_checkpoint,
-            current_authority));
+        ABSL_RETURN_IF_ERROR(
+            ValidateRestoreCandidate(source_snapshot, projection,
+                                     *selected_checkpoint, current_authority));
         ABSL_ASSIGN_OR_RETURN(
             std::vector<DPMAgentGenerationRequest::PrefillChunk> delta_chunks,
             BuildDeltaTranscriptChunks(
                 source_snapshot,
-                selected_checkpoint->artifact.descriptor
-                    .response_event_index,
-                canonical_agent_input,
-                projection.manifest.correction_digest));
+                selected_checkpoint->artifact.descriptor.response_event_index,
+                canonical_agent_input, projection.manifest.correction_digest));
 
         SessionHandoffOptions durable_options;
         durable_options.key_id = config_.checkpoint_key_id;
@@ -2868,8 +2780,8 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
         StringByteSource transient_source(transient_envelope);
         ABSL_ASSIGN_OR_RETURN(
             const SessionContinuationStateWitness import_witness,
-            attempt.session->ImportHandoffFromWithWitness(
-                transient_source, transient_options));
+            attempt.session->ImportHandoffFromWithWitness(transient_source,
+                                                          transient_options));
         ABSL_RETURN_IF_ERROR(
             ValidateSessionContinuationStateWitness(import_witness));
         ABSL_RETURN_IF_ERROR(reauthenticate_capsule_authority());
@@ -2878,12 +2790,11 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
         attempt.generation_request.restore_checkpoint_id =
             selected_checkpoint->artifact.descriptor.descriptor_id;
         attempt.generation_request.restored_state_witness = import_witness;
-        attempt.generation_request.capsule_restore_operation_v3 =
-            DPMAgentCapsuleRestoreOperationV3{
+        attempt.generation_request.capsule_restore_operation =
+            DPMAgentCapsuleRestoreOperation{
                 .source_capture_evidence =
                     selected_checkpoint->capture_evidence,
-                .current_authority =
-                    capsule_restore_authority->authority,
+                .current_authority = capsule_restore_authority->authority,
                 .target_state = restore_target,
                 .durable_to_transient_reauthentication = reauthentication,
             };
@@ -2891,21 +2802,20 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
             selected_checkpoint->artifact.descriptor.descriptor_id;
         attempt.physical_chunks = std::move(delta_chunks);
         attempt.prefill_event_range_start =
-            selected_checkpoint->artifact.descriptor.response_event_index +
-            1;
+            selected_checkpoint->artifact.descriptor.response_event_index + 1;
       }
 
       absl::StatusOr<DPMAgentReplayExecution> generated =
           selected_winner == nullptr
-              ? agent_runtime_->Generate(
-                    attempt.session.get(), attempt.generation_request,
+              ? agent_runtime_->Generate(attempt.session.get(),
+                                         attempt.generation_request,
                     logical_generation_request)
               : agent_runtime_->RematerializeCanonicalWinner(
                     attempt.session.get(), attempt.generation_request,
                     logical_generation_request, *selected_winner);
       if (!generated.ok()) return generated.status();
-      ABSL_RETURN_IF_ERROR(ValidateDPMAgentReplayExecution(
-          *generated, max_decision_tokens));
+      ABSL_RETURN_IF_ERROR(
+          ValidateDPMAgentReplayExecution(*generated, max_decision_tokens));
       if (selected_checkpoint != nullptr) {
         ABSL_RETURN_IF_ERROR(reauthenticate_capsule_authority());
       }
@@ -2929,15 +2839,15 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
             "WinnerReplay live producer omitted its prepared work.");
       }
       if (selected_checkpoint == nullptr) {
-        if (attempt.execution.capsule_restore_evidence_v3.has_value()) {
+        if (attempt.execution.capsule_restore_evidence.has_value()) {
           return absl::DataLossError(
               "Fresh WinnerReplay generation invented restore evidence.");
         }
         return attempt;
       }
-      if (!attempt.execution.capsule_restore_evidence_v3.has_value()) {
+      if (!attempt.execution.capsule_restore_evidence.has_value()) {
         return absl::DataLossError(
-            "Restored WinnerReplay generation omitted V3 operation "
+            "Restored WinnerReplay generation omitted capsule operation "
             "evidence.");
       }
       ABSL_ASSIGN_OR_RETURN(
@@ -2952,13 +2862,12 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
             "generation.");
       }
       ABSL_RETURN_IF_ERROR(
-          ValidateCapsuleRestoreEvidenceV3SourceCheckpointBinding(
-              *attempt.execution.capsule_restore_evidence_v3,
+          ValidateCapsuleRestoreEvidenceSourceCheckpointBinding(
+              *attempt.execution.capsule_restore_evidence,
               selected_checkpoint->capture_evidence,
               selected_checkpoint->artifact, selected_checkpoint->receipt,
               current_authority.authority, current_authority.admission));
-      attempt.restore_evidence =
-          attempt.execution.capsule_restore_evidence_v3;
+      attempt.restore_evidence = attempt.execution.capsule_restore_evidence;
       return attempt;
     };
 
@@ -2977,8 +2886,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
 
     if (!winner_attempt->execution.producing_session_matches_output &&
         capture_this_turn) {
-      const DPMAgentReplayExecution selected_winner =
-          winner_attempt->execution;
+      const DPMAgentReplayExecution selected_winner = winner_attempt->execution;
       absl::StatusOr<WinnerAttempt> rematerialized =
           execute_winner_attempt(selected_candidate, &selected_winner);
       if (!rematerialized.ok() &&
@@ -2986,8 +2894,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
         return rematerialized.status();
       }
       if (!rematerialized.ok() && selected_candidate != nullptr) {
-        rematerialized =
-            execute_winner_attempt(nullptr, &selected_winner);
+        rematerialized = execute_winner_attempt(nullptr, &selected_winner);
       }
       if (rematerialized.ok()) {
         winner_attempt = std::move(rematerialized);
@@ -3000,10 +2907,8 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
 
     session = std::move(winner_attempt->session);
     agent_execution = std::move(winner_attempt->execution);
-    restored_from_checkpoint_id =
-        winner_attempt->restored_checkpoint_id;
-    successful_restore_evidence =
-        std::move(winner_attempt->restore_evidence);
+    restored_from_checkpoint_id = winner_attempt->restored_checkpoint_id;
+    successful_restore_evidence = std::move(winner_attempt->restore_evidence);
     successful_physical_prefill_chunks =
         std::move(winner_attempt->physical_chunks);
     successful_prefill_event_range_start =
@@ -3014,9 +2919,9 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
         ComputeAgentReplayRequestHash(logical_generation_request));
 
     run_exact_attempt =
-        [&, replay_request_hash](const RestoreCandidate* selected_checkpoint,
-                                 bool capture_producing_capsule)
-        -> absl::StatusOr<ExactAttempt> {
+        [&, replay_request_hash](
+            const RestoreCandidate* selected_checkpoint,
+            bool capture_producing_capsule) -> absl::StatusOr<ExactAttempt> {
       ExactAttempt attempt;
       attempt.physical_chunks = full_chunks;
       attempt.prefill_event_range_start =
@@ -3026,7 +2931,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
       if (selected_checkpoint != nullptr) {
         if (!capsule_restore_authority.has_value()) {
           return absl::InternalError(
-              "Exact restore lost its current V2 authority.");
+              "Exact restore lost its current CapsuleRestore authority.");
         }
         ABSL_ASSIGN_OR_RETURN(
             const CapsuleRestoreRuntimeAuthority current_authority,
@@ -3038,9 +2943,9 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
           return absl::AbortedError(
               "CapsuleRestore authority changed before exact restore.");
         }
-        ABSL_RETURN_IF_ERROR(ValidateRestoreCandidate(
-            source_snapshot, projection, *selected_checkpoint,
-            current_authority));
+        ABSL_RETURN_IF_ERROR(
+            ValidateRestoreCandidate(source_snapshot, projection,
+                                     *selected_checkpoint, current_authority));
         const DPMSessionCheckpointDescriptor& descriptor =
             selected_checkpoint->artifact.descriptor;
         ABSL_ASSIGN_OR_RETURN(
@@ -3052,17 +2957,13 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
             .logical_agent_request_hash = agent_request_hash,
             .correction_digest = projection.manifest.correction_digest,
             .restore_checkpoint_id = descriptor.descriptor_id,
-            .restored_response_event_index =
-                descriptor.response_event_index,
-            .restored_agent_transcript_hash =
-                descriptor.agent_transcript_hash,
+            .restored_response_event_index = descriptor.response_event_index,
+            .restored_agent_transcript_hash = descriptor.agent_transcript_hash,
             .max_output_tokens = max_decision_tokens,
             .canonical_delta_prefill_chunks = std::move(delta_chunks),
         };
-        attempt.physical_chunks =
-            delta_request.canonical_delta_prefill_chunks;
-        attempt.prefill_event_range_start =
-            descriptor.response_event_index + 1;
+        attempt.physical_chunks = delta_request.canonical_delta_prefill_chunks;
+        attempt.prefill_event_range_start = descriptor.response_event_index + 1;
         ABSL_ASSIGN_OR_RETURN(
             execution_plan.canonical_execution_payload,
             EncodeDPMAgentDeltaExecutionRequest(delta_request));
@@ -3070,19 +2971,16 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
             FreshWorkerPrefillMode::kOwnPositionCapsuleDelta;
         execution_plan.restore_checkpoint_id = descriptor.descriptor_id;
         execution_plan.session_identity = descriptor.session_identity;
-        execution_plan.restore_durable_envelope_hash =
-            descriptor.envelope_hash;
-        execution_plan.restore_durable_envelope_size =
-            descriptor.envelope_size;
+        execution_plan.restore_durable_envelope_hash = descriptor.envelope_hash;
+        execution_plan.restore_durable_envelope_size = descriptor.envelope_size;
       }
       if (capture_producing_capsule) {
         if (!capsule_restore_authority.has_value()) {
           return absl::InternalError(
-              "Exact capture lost its current V2 authority.");
+              "Exact capture lost its current CapsuleRestore authority.");
         }
       }
-      execution_plan.capture_producing_capsule =
-          capture_producing_capsule;
+      execution_plan.capture_producing_capsule = capture_producing_capsule;
       ABSL_ASSIGN_OR_RETURN(
           execution_plan.plan_hash,
           ComputeFreshWorkerExecutionPlanHash(execution_plan));
@@ -3116,8 +3014,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
 
       const bool transfers_capsule =
           selected_checkpoint != nullptr || capture_producing_capsule;
-      std::optional<CapsuleRestoreRuntimeAuthority>
-          authority_before_execution;
+      std::optional<CapsuleRestoreRuntimeAuthority> authority_before_execution;
       if (transfers_capsule) {
         if (!capsule_restore_authority.has_value()) {
           return absl::InternalError(
@@ -3139,10 +3036,9 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
         }
       }
 
-      ABSL_ASSIGN_OR_RETURN(
-          ExactRegenerationDPMAgentPhysicalExecution physical,
-          agent_runtime_->GeneratePhysicalExact(logical_generation_request,
-                                                physical_input));
+      ABSL_ASSIGN_OR_RETURN(ExactRegenerationDPMAgentPhysicalExecution physical,
+                            agent_runtime_->GeneratePhysicalExact(
+                                logical_generation_request, physical_input));
       if (transfers_capsule) {
         absl::StatusOr<CapsuleRestoreRuntimeAuthority> current_authority =
             RequireCurrentCapsuleRestoreAuthority();
@@ -3160,8 +3056,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
               "CapsuleRestore authority changed during exact worker use.");
         }
       }
-      ABSL_RETURN_IF_ERROR(
-          ValidateExactRegenerationDPMAgentPhysicalExecution(
+      ABSL_RETURN_IF_ERROR(ValidateExactRegenerationDPMAgentPhysicalExecution(
               physical, max_decision_tokens));
       if (physical.physical_execution_plan_hash != execution_plan.plan_hash ||
           physical.restored_checkpoint_id !=
@@ -3192,8 +3087,8 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
               "witness, or prepared plan.");
         }
         ABSL_ASSIGN_OR_RETURN(
-            CapsuleRestoreEvidenceV3 restore_evidence,
-            BuildExactCapsuleRestoreEvidenceV3(
+            CapsuleRestoreEvidence restore_evidence,
+            BuildExactCapsuleRestoreEvidence(
                 selected_checkpoint->artifact,
                 selected_checkpoint->capture_evidence,
                 capsule_restore_authority->authority, restore_target,
@@ -3214,19 +3109,17 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
               "restore evidence.");
         }
         ABSL_RETURN_IF_ERROR(
-            ValidateCapsuleRestoreEvidenceV3SourceCheckpointBinding(
+            ValidateCapsuleRestoreEvidenceSourceCheckpointBinding(
                 restore_evidence, selected_checkpoint->capture_evidence,
-                selected_checkpoint->artifact,
-                selected_checkpoint->receipt, current_authority.authority,
-                current_authority.admission));
+                selected_checkpoint->artifact, selected_checkpoint->receipt,
+                current_authority.authority, current_authority.admission));
         attempt.restore_evidence = std::move(restore_evidence);
       }
       attempt.physical_execution = std::move(physical);
       return attempt;
     };
 
-    absl::StatusOr<ExactAttempt> generated_exact =
-        run_exact_attempt(
+    absl::StatusOr<ExactAttempt> generated_exact = run_exact_attempt(
             restore_candidate.has_value() ? &*restore_candidate : nullptr,
             capture_this_turn);
     if (!generated_exact.ok() &&
@@ -3251,10 +3144,8 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
         std::move(generated_exact->physical_chunks);
     successful_prefill_event_range_start =
         generated_exact->prefill_event_range_start;
-    successful_restore_evidence =
-        std::move(generated_exact->restore_evidence);
-    exact_physical_execution =
-        std::move(generated_exact->physical_execution);
+    successful_restore_evidence = std::move(generated_exact->restore_evidence);
+    exact_physical_execution = std::move(generated_exact->physical_execution);
     agent_execution = exact_physical_execution->replay_execution;
     restored_from_checkpoint_id =
         exact_physical_execution->restored_checkpoint_id;
@@ -3278,10 +3169,9 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
     MaterializedAgentDecision material;
     material.outcome.decision_output = execution.decision_output;
     material.outcome.decision_token_ids = execution.decision_token_ids;
-    material.outcome.prepared_prefill_plan =
-        execution.prepared_prefill_plan;
-    material.outcome.capsule_restore_evidence_v3 =
-        execution.capsule_restore_evidence_v3;
+    material.outcome.prepared_prefill_plan = execution.prepared_prefill_plan;
+    material.outcome.capsule_restore_evidence =
+        execution.capsule_restore_evidence;
     ABSL_RETURN_IF_ERROR(
         ValidateAgentOutcome(material.outcome, max_decision_tokens));
     if (execution.mode == DPMReplayMode::kExactRegeneration) {
@@ -3294,12 +3184,11 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
           .decision_output = execution.decision_output,
           .canonical_token_bytes = execution.exact_token_bytes,
       };
-      ABSL_ASSIGN_OR_RETURN(
-          const std::string canonical_decision_envelope,
+      ABSL_ASSIGN_OR_RETURN(const std::string canonical_decision_envelope,
           EncodeDPMAgentDecisionEnvelope(decision_envelope));
       material.exact_output_evidence_hash =
-          ComputeFreshWorkerOutputEvidenceHash(
-              canonical_decision_envelope, execution.exact_token_bytes,
+          ComputeFreshWorkerOutputEvidenceHash(canonical_decision_envelope,
+                                               execution.exact_token_bytes,
               execution.exact_logit_frames);
       if (!execution.exact_output_evidence_hash.has_value() ||
           *execution.exact_output_evidence_hash !=
@@ -3324,17 +3213,14 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
 
   auto adopt_exact_attempt = [&](ExactAttempt attempt) -> absl::Status {
     exact_staged_capsule = std::move(attempt.staged_capsule);
-    successful_physical_prefill_chunks =
-        std::move(attempt.physical_chunks);
-    successful_prefill_event_range_start =
-        attempt.prefill_event_range_start;
+    successful_physical_prefill_chunks = std::move(attempt.physical_chunks);
+    successful_prefill_event_range_start = attempt.prefill_event_range_start;
     successful_restore_evidence = std::move(attempt.restore_evidence);
     exact_physical_execution = std::move(attempt.physical_execution);
     agent_execution = exact_physical_execution->replay_execution;
     restored_from_checkpoint_id =
         exact_physical_execution->restored_checkpoint_id;
-    ABSL_ASSIGN_OR_RETURN(
-        materialized_decision,
+    ABSL_ASSIGN_OR_RETURN(materialized_decision,
         materialize_agent_decision(agent_execution));
     return absl::OkStatus();
   };
@@ -3343,12 +3229,9 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
     agent_execution = std::move(attempt.execution);
     restored_from_checkpoint_id = attempt.restored_checkpoint_id;
     successful_restore_evidence = std::move(attempt.restore_evidence);
-    successful_physical_prefill_chunks =
-        std::move(attempt.physical_chunks);
-    successful_prefill_event_range_start =
-        attempt.prefill_event_range_start;
-    ABSL_ASSIGN_OR_RETURN(
-        materialized_decision,
+    successful_physical_prefill_chunks = std::move(attempt.physical_chunks);
+    successful_prefill_event_range_start = attempt.prefill_event_range_start;
+    ABSL_ASSIGN_OR_RETURN(materialized_decision,
         materialize_agent_decision(agent_execution));
     return absl::OkStatus();
   };
@@ -3365,21 +3248,20 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
     if (request_capture &&
         !attempt.execution.producing_session_matches_output) {
       const DPMAgentReplayExecution selected_winner = attempt.execution;
-      ABSL_ASSIGN_OR_RETURN(
-          attempt,
+      ABSL_ASSIGN_OR_RETURN(attempt,
           execute_winner_attempt(nullptr, &selected_winner));
     }
     return adopt_winner_attempt(std::move(attempt));
   };
 
-  auto build_checkpoint_capture = [&]()
-      -> absl::StatusOr<std::optional<CheckpointCapture>> {
+  auto build_checkpoint_capture =
+      [&]() -> absl::StatusOr<std::optional<CheckpointCapture>> {
     if (!capture_this_turn) {
       return std::optional<CheckpointCapture>();
     }
     if (!capsule_restore_authority.has_value()) {
       return absl::InternalError(
-          "DPM checkpoint capture lost its current V2 authority.");
+          "DPM checkpoint capture lost its current CapsuleRestore authority.");
     }
     if (agent_replay_mode == DPMReplayMode::kCanonicalWinnerReplay) {
       if (!agent_execution.producing_session_matches_output ||
@@ -3392,18 +3274,15 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
       ABSL_ASSIGN_OR_RETURN(
           CheckpointCapture capture,
           CaptureProducingSession(
-              session.get(), source_snapshot, response_event_index,
-              projection, agent_request_hash, transcript_prefix_hash,
-              materialized_decision.transcript_hash,
-              *capsule_restore_authority,
+              session.get(), source_snapshot, response_event_index, projection,
+              agent_request_hash, transcript_prefix_hash,
+              materialized_decision.transcript_hash, *capsule_restore_authority,
               successful_physical_prefill_chunks,
               *agent_execution.prepared_prefill_plan,
               agent_execution.execution_evidence_hash,
-              static_cast<uint32_t>(
-                  agent_execution.decision_token_ids.size()),
-              successful_prefill_event_range_start,
-              successful_restore_evidence, request.operation_id,
-              response_timestamp));
+              static_cast<uint32_t>(agent_execution.decision_token_ids.size()),
+              successful_prefill_event_range_start, successful_restore_evidence,
+              request.operation_id, response_timestamp));
       return std::optional<CheckpointCapture>(std::move(capture));
     }
     if (!exact_physical_execution.has_value() ||
@@ -3418,10 +3297,9 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
             exact_staged_capsule, *exact_physical_execution, source_snapshot,
             response_event_index, projection, agent_request_hash,
             transcript_prefix_hash, materialized_decision.transcript_hash,
-            *capsule_restore_authority,
-            successful_physical_prefill_chunks,
-            successful_prefill_event_range_start,
-            successful_restore_evidence, response_timestamp));
+            *capsule_restore_authority, successful_physical_prefill_chunks,
+            successful_prefill_event_range_start, successful_restore_evidence,
+            response_timestamp));
     return std::optional<CheckpointCapture>(std::move(capture));
   };
 
@@ -3486,15 +3364,12 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
         agent_execution.producing_session_matches_output;
     receipt.projected_memory = projection.projected_memory;
     receipt.canonical_agent_input = canonical_agent_input;
-    receipt.decision_output =
-        materialized_decision.outcome.decision_output;
+    receipt.decision_output = materialized_decision.outcome.decision_output;
     receipt.decision_token_ids =
         materialized_decision.outcome.decision_token_ids;
-    receipt.agent_transcript_hash =
-        materialized_decision.transcript_hash;
+    receipt.agent_transcript_hash = materialized_decision.transcript_hash;
     if (agent_execution.prepared_prefill_plan.has_value()) {
-      ABSL_ASSIGN_OR_RETURN(
-          receipt.agent_prepared_prefill_work,
+      ABSL_ASSIGN_OR_RETURN(receipt.agent_prepared_prefill_work,
           BuildDPMPreparedPrefillWorkBinding(
               *agent_execution.prepared_prefill_plan));
     }
@@ -3509,8 +3384,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
             "DPM accepted restore evidence without its selected source "
             "checkpoint.");
       }
-      receipt.restored_from_session_checkpoint_id =
-          restored_from_checkpoint_id;
+      receipt.restored_from_session_checkpoint_id = restored_from_checkpoint_id;
       receipt.restored_checkpoint_capture_evidence_id =
           restore_candidate->capture_evidence.evidence_id;
       receipt.agent_capsule_restore_evidence_id =
@@ -3532,13 +3406,12 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
                   checkpoint_capture->capture_evidence.evidence_id,
           };
     }
-    const bool receipt_uses_capsule =
-        successful_restore_evidence.has_value() ||
+    const bool receipt_uses_capsule = successful_restore_evidence.has_value() ||
         checkpoint_capture.has_value();
     if (receipt_uses_capsule) {
       if (!capsule_restore_authority.has_value()) {
         return absl::InternalError(
-            "DPM capsule use lost its current V2 authority.");
+            "DPM capsule use lost its current CapsuleRestore authority.");
       }
       ABSL_RETURN_IF_ERROR(reauthenticate_capsule_authority());
       receipt.agent_capsule_restore_capability_id =
@@ -3549,8 +3422,8 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
           capsule_restore_authority->authority.coverage_id;
     }
     if (exact_physical_execution.has_value()) {
-      receipt.agent_worker_prefill_mode = ToCheckpointWorkerPrefillMode(
-          exact_physical_execution->prefill_mode);
+      receipt.agent_worker_prefill_mode =
+          ToCheckpointWorkerPrefillMode(exact_physical_execution->prefill_mode);
       receipt.agent_physical_execution_plan_hash =
           exact_physical_execution->physical_execution_plan_hash;
       if (checkpoint_capture.has_value()) {
@@ -3577,38 +3450,30 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
             "CapsuleRestore authority changed before derivative binding.");
       }
       if (successful_restore_evidence.has_value()) {
-        ABSL_RETURN_IF_ERROR(
-            ValidateCapsuleRestoreEvidenceV3TurnBinding(
-                *successful_restore_evidence,
-                restore_candidate->capture_evidence,
-                restore_candidate->artifact, restore_candidate->receipt,
-                receipt, current_authority.authority,
-                current_authority.admission));
+        ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreEvidenceTurnBinding(
+            *successful_restore_evidence, restore_candidate->capture_evidence,
+            restore_candidate->artifact, restore_candidate->receipt, receipt,
+            current_authority.authority, current_authority.admission));
       }
       if (checkpoint_capture.has_value()) {
-        ABSL_RETURN_IF_ERROR(
-            ValidateCapsuleCaptureEvidenceV3CheckpointBinding(
+        ABSL_RETURN_IF_ERROR(ValidateCapsuleCaptureEvidenceCheckpointBinding(
                 checkpoint_capture->artifact, receipt,
-                checkpoint_capture->capture_evidence,
-                current_authority.authority,
+            checkpoint_capture->capture_evidence, current_authority.authority,
                 current_authority.admission));
         if (successful_restore_evidence.has_value()) {
-          ABSL_RETURN_IF_ERROR(
-              ValidateCapsuleCaptureEvidenceV3ForParentCapture(
+          ABSL_RETURN_IF_ERROR(ValidateCapsuleCaptureEvidenceForParentCapture(
                   checkpoint_capture->capture_evidence,
                   restore_candidate->capture_evidence));
         }
       }
     }
 
-    DerivativePublicationStage failed_stage =
-        DerivativePublicationStage::kNone;
+    DerivativePublicationStage failed_stage = DerivativePublicationStage::kNone;
     absl::Status publication_status = absl::OkStatus();
     if (successful_restore_evidence.has_value()) {
       ABSL_RETURN_IF_ERROR(reauthenticate_capsule_authority());
-      publication_status = evidence_repository_->PutRestoreV3IfAbsent(
-          *successful_restore_evidence,
-          operation_evidence_authentication);
+      publication_status = evidence_repository_->PutRestoreIfAbsent(
+          *successful_restore_evidence, operation_evidence_authentication);
       ABSL_RETURN_IF_ERROR(reauthenticate_capsule_authority());
       if (!publication_status.ok()) {
         failed_stage = DerivativePublicationStage::kRestoreEvidence;
@@ -3625,7 +3490,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
     }
     if (publication_status.ok() && checkpoint_capture.has_value()) {
       ABSL_RETURN_IF_ERROR(reauthenticate_capsule_authority());
-      publication_status = evidence_repository_->PutCaptureV3IfAbsent(
+      publication_status = evidence_repository_->PutCaptureIfAbsent(
           checkpoint_capture->capture_evidence,
           operation_evidence_authentication);
       ABSL_RETURN_IF_ERROR(reauthenticate_capsule_authority());
@@ -3669,8 +3534,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
     ABSL_RETURN_IF_ERROR(reauthenticate_capsule_authority());
   }
 
-  DPMAgentGenerationOutcome& agent_outcome =
-      materialized_decision.outcome;
+  DPMAgentGenerationOutcome& agent_outcome = materialized_decision.outcome;
 
   DPMEvent response;
   response.kind = DPMEvent::Kind::kModelTurn;
@@ -3679,9 +3543,9 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
   response.case_id = request.case_id;
   response.payload = agent_outcome.decision_output;
   response.turn_receipt = std::move(receipt);
-  ABSL_ASSIGN_OR_RETURN(
-      DPMAppendResult committed,
-      log_->AppendIfGeneration(std::move(response), source_snapshot.generation));
+  ABSL_ASSIGN_OR_RETURN(DPMAppendResult committed,
+                        log_->AppendIfGeneration(std::move(response),
+                                                 source_snapshot.generation));
   if (receipt_uses_capsule) {
     ABSL_RETURN_IF_ERROR(reauthenticate_capsule_authority());
   }
@@ -3704,8 +3568,7 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
   }
   ABSL_ASSIGN_OR_RETURN(
       Hash256 committed_prefix,
-      SnapshotPrefixHashAt(committed.snapshot,
-                           committed.snapshot.generation));
+      SnapshotPrefixHashAt(committed.snapshot, committed.snapshot.generation));
   if (committed_prefix != committed.snapshot.prefix_hash) {
     return absl::AbortedError(
         "DPM log changed after committing the authoritative response.");
@@ -3728,13 +3591,11 @@ absl::StatusOr<DPMTurnResult> DPMEngine::RunTurn(
   result.projection_exact_profile_id =
       committed_receipt.projection_manifest.exact_profile_id;
   result.projection_exact_profile_admission_record_id =
-      committed_receipt.projection_manifest
-          .exact_profile_admission_record_id;
+      committed_receipt.projection_manifest.exact_profile_admission_record_id;
   result.agent_replay_mode = committed_receipt.agent_replay_mode;
   result.agent_execution_evidence_hash =
       committed_receipt.agent_execution_evidence_hash;
-  result.agent_exact_profile_id =
-      committed_receipt.agent_exact_profile_id;
+  result.agent_exact_profile_id = committed_receipt.agent_exact_profile_id;
   result.agent_exact_profile_admission_record_id =
       committed_receipt.agent_exact_profile_admission_record_id;
   result.agent_exact_output_evidence_hash =
@@ -3817,7 +3678,8 @@ absl::StatusOr<DPMCorrectionResult> DPMEngine::AppendCorrection(
   ABSL_ASSIGN_OR_RETURN(std::unique_ptr<DPMEventLogOperationLease> operation,
                         log_->AcquireOperationLease());
   if (operation == nullptr) {
-    return absl::InternalError("DPM event log returned a null operation lease.");
+    return absl::InternalError(
+        "DPM event log returned a null operation lease.");
   }
   ABSL_ASSIGN_OR_RETURN(DPMLogSnapshot snapshot, log_->Snapshot());
   ABSL_ASSIGN_OR_RETURN(AuthoritativeLogIndex index,

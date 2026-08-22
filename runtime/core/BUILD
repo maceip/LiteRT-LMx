@@ -562,6 +562,7 @@ cc_library(
         "@litert//litert/cc:litert_tensor_buffer",
         "//runtime/engine:engine_interface",
         "//runtime/engine:engine_settings",
+        "//runtime/engine:exact_litert_decode",
         "//runtime/engine:io_types",
         "//runtime/executor:llm_executor_io_types",
         "//support/tokenizer",

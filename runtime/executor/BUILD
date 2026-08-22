@@ -667,6 +667,7 @@ cc_library(
         "//runtime/components:model_resources",
         "//runtime/components/constrained_decoding:logits_processor",
         "//runtime/components/embedding_lookup:embedding_lookup_manager",
+        "//runtime/engine:exact_litert_profile",
         "//runtime/executor/litert:legacy_map_state",
         "//runtime/util:convert_tensor_buffer",
         "//runtime/util:litert_status_util",

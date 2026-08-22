@@ -65,10 +65,11 @@ target_link_libraries(runtime_dpm
     LITERTLM_DEPS
 )
 
-# Optional dpm.factmap.v1 schema support. The production DPM engine remains
+# Optional dpm.factmap schema support. The production DPM engine remains
 # schema-agnostic and does not link this module in the reverse direction.
 add_litertlm_library(runtime_dpm_fact_map STATIC
   dpm_fact_map.cc
+  deterministic_dpm_fact_map_projector.cc
 )
 add_library(LiteRTLM::Runtime::DPMFactMap ALIAS runtime_dpm_fact_map)
 

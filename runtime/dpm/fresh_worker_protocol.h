@@ -30,10 +30,10 @@
 
 namespace litert::lm {
 
-inline constexpr uint32_t kFreshWorkerProtocolVersion = 3;
+inline constexpr uint32_t kFreshWorkerEnvelopeFormatVersion = 1;
 // DPMTOK01 is an independent canonical product format. Worker-envelope
 // evolution must not silently change already-recorded exact token bytes.
-inline constexpr uint32_t kFreshWorkerTokenEncodingVersion = 1;
+inline constexpr uint32_t kFreshWorkerTokenEncodingFormatVersion = 1;
 inline constexpr uint32_t kFreshWorkerExecutionPlanFormatVersion = 1;
 inline constexpr uint32_t kMaximumFreshWorkerRuns = 64;
 inline constexpr uint64_t kMaximumFreshWorkerRequestPayloadBytes =
@@ -100,7 +100,7 @@ absl::StatusOr<Hash256> ComputeFreshWorkerExecutionPlanHash(
 // profile digest must be derived by the loaded runtime; this protocol treats it
 // only as an opaque binding and never lets it stand in for runtime derivation.
 struct FreshWorkerRequest {
-  uint32_t format_version = kFreshWorkerProtocolVersion;
+  uint32_t format_version = kFreshWorkerEnvelopeFormatVersion;
   Hash256 exact_profile_hash;
   Hash256 qualification_id;
   uint32_t run_index = 0;
@@ -207,7 +207,7 @@ struct FreshWorkerProducingCapsuleEvidence {
 // deterministic. A non-OK result carries no model output and cannot be used by
 // admission.
 struct FreshWorkerResult {
-  uint32_t format_version = kFreshWorkerProtocolVersion;
+  uint32_t format_version = kFreshWorkerEnvelopeFormatVersion;
   Hash256 exact_profile_hash;
   Hash256 qualification_id;
   uint32_t run_index = 0;

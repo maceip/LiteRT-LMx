@@ -89,7 +89,7 @@ struct CanonicalDPMProjectionRequest {
 
 absl::Status ValidateDPMProjectionConfig(const DPMProjectionConfig& config);
 
-// SHA-256 of the versioned canonical configuration encoding.
+// SHA-256 of the format-tagged canonical configuration encoding.
 absl::StatusOr<Hash256> ComputeDPMProjectionConfigHash(
     const DPMProjectionConfig& config);
 

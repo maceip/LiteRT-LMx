@@ -30,13 +30,12 @@
 
 namespace litert::lm {
 
-// Coverage V2 records exact physical work rather than promoting a coverage ID
-// to a profile-wide authorization. The complete, currently reauthenticated
-// capability/admission/qualification binding below is required at every plan
-// and evidence boundary. The limits keep canonical hashing bounded even though
-// text and exact token sequences remain self-contained.
-inline constexpr uint32_t kCapsuleRestoreEvidenceV2FormatVersion = 2;
-inline constexpr uint32_t kCapsuleRestoreEvidenceV3FormatVersion = 3;
+// Capsule evidence records exact physical work rather than promoting a
+// coverage ID to profile-wide authorization. The complete, currently
+// reauthenticated capability/admission/qualification binding below is required
+// at every plan and evidence boundary. This is the sole development format;
+// earlier unshipped formats are intentionally unsupported.
+inline constexpr uint32_t kCapsuleRestoreEvidenceFormatVersion = 1;
 inline constexpr std::size_t kMaximumCapsuleEvidenceLogIdBytes = 16 * 1024;
 inline constexpr std::size_t kMaximumCapsuleEvidenceKeyIdBytes = 1024;
 inline constexpr uint32_t kMaximumCapsuleEvidencePrefillChunks = 65'536;
@@ -48,7 +47,7 @@ inline constexpr uint64_t kMaximumCapsuleEvidenceEnvelopeBytes =
     uint64_t{8} * 1024 * 1024 * 1024;
 inline constexpr uint32_t kMaximumCapsuleEvidenceGenerationTokens = 1'000'000;
 
-enum class CapsulePrefillModeV2 : uint32_t {
+enum class CapsulePrefillMode : uint32_t {
   kFullCanonicalPrefill = 1,
   kOwnPositionCapsuleDelta = 2,
 };
@@ -59,7 +58,7 @@ enum class CapsulePrefillModeV2 : uint32_t {
 // most recent correction boundary. A verified-parent capture starts only after
 // the complete parent restore evidence below has been validated against its
 // source capture. No third/off-position basis exists.
-enum class CapsuleCaptureBasisV2 : uint32_t {
+enum class CapsuleCaptureBasis : uint32_t {
   kRootFreshSession = 1,
   kVerifiedParentRestore = 2,
 };
@@ -67,7 +66,7 @@ enum class CapsuleCaptureBasisV2 : uint32_t {
 // Exact model-visible chunk boundaries. Text stays as canonical UTF-8 bytes;
 // exact token IDs are never detokenized and re-tokenized. Exactly one payload
 // representation is populated.
-struct CapsuleCanonicalPrefillChunkV2 {
+struct CapsuleCanonicalPrefillChunk {
   enum class Encoding : uint32_t {
     kUtf8Text = 1,
     kExactTokenIds = 2,
@@ -77,7 +76,7 @@ struct CapsuleCanonicalPrefillChunkV2 {
   std::string utf8_text;
   std::vector<int32_t> token_ids;
 
-  bool operator==(const CapsuleCanonicalPrefillChunkV2& other) const {
+  bool operator==(const CapsuleCanonicalPrefillChunk& other) const {
     return encoding == other.encoding && utf8_text == other.utf8_text &&
            token_ids == other.token_ids;
   }
@@ -88,22 +87,19 @@ struct CapsuleCanonicalPrefillChunkV2 {
 // reauthenticated admission record and qualification specification named here.
 // Repository authentication remains an integration boundary; this value does
 // not turn hashes supplied by an application into runtime facts.
-struct CapsuleRestoreAuthorityV2 {
+struct CapsuleRestoreAuthority {
   SessionHandoffCapability capability;
   Hash256 admission_record_id;
   Hash256 coverage_id;
-  // The legacy field/wire name is retained. For state-witnessed Coverage V2,
-  // this carries operational_coverage.qualification_evidence_hash; the engine
-  // operation gate and cross-binder must enforce that exact mapping.
-  Hash256 qualification_spec_hash;
+  Hash256 qualification_evidence_hash;
 
-  bool operator==(const CapsuleRestoreAuthorityV2& other) const {
+  bool operator==(const CapsuleRestoreAuthority& other) const {
     return capability == other.capability &&
            admission_record_id == other.admission_record_id &&
            coverage_id == other.coverage_id &&
-           qualification_spec_hash == other.qualification_spec_hash;
+           qualification_evidence_hash == other.qualification_evidence_hash;
   }
-  bool operator!=(const CapsuleRestoreAuthorityV2& other) const {
+  bool operator!=(const CapsuleRestoreAuthority& other) const {
     return !(*this == other);
   }
 };
@@ -112,7 +108,7 @@ struct CapsuleRestoreAuthorityV2 {
 // authoritative raw prefix is the input-bearing prefix [0,
 // source_event_count); its not-yet-appended response occupies exactly
 // `response_event_index == source_event_count`.
-struct CapsuleDPMCheckpointStateV2 {
+struct CapsuleDPMCheckpointState {
   std::string log_id;
   uint64_t source_event_count = 0;
   Hash256 source_prefix_hash;
@@ -123,7 +119,7 @@ struct CapsuleDPMCheckpointStateV2 {
   Hash256 agent_transcript_hash;
   Hash256 logical_agent_request_hash;
 
-  bool operator==(const CapsuleDPMCheckpointStateV2& other) const {
+  bool operator==(const CapsuleDPMCheckpointState& other) const {
     return log_id == other.log_id &&
            source_event_count == other.source_event_count &&
            source_prefix_hash == other.source_prefix_hash &&
@@ -134,7 +130,7 @@ struct CapsuleDPMCheckpointStateV2 {
            agent_transcript_hash == other.agent_transcript_hash &&
            logical_agent_request_hash == other.logical_agent_request_hash;
   }
-  bool operator!=(const CapsuleDPMCheckpointStateV2& other) const {
+  bool operator!=(const CapsuleDPMCheckpointState& other) const {
     return !(*this == other);
   }
 };
@@ -142,8 +138,8 @@ struct CapsuleDPMCheckpointStateV2 {
 // Pending target decision for an operational restore. The transcript-prefix
 // hash commits the canonical history plus current input before the new decoded
 // response is appended; the completed descendant transcript is committed by a
-// later CapsuleCapturePlanV2.
-struct CapsuleDPMRestoreTargetV2 {
+// later CapsuleCapturePlan.
+struct CapsuleDPMRestoreTarget {
   std::string log_id;
   uint64_t source_event_count = 0;
   Hash256 source_prefix_hash;
@@ -154,7 +150,7 @@ struct CapsuleDPMRestoreTargetV2 {
   Hash256 agent_transcript_prefix_hash;
   Hash256 logical_agent_request_hash;
 
-  bool operator==(const CapsuleDPMRestoreTargetV2& other) const {
+  bool operator==(const CapsuleDPMRestoreTarget& other) const {
     return log_id == other.log_id &&
            source_event_count == other.source_event_count &&
            source_prefix_hash == other.source_prefix_hash &&
@@ -163,11 +159,10 @@ struct CapsuleDPMRestoreTargetV2 {
            projection_request_hash == other.projection_request_hash &&
            projection_manifest_hash == other.projection_manifest_hash &&
            correction_digest == other.correction_digest &&
-           agent_transcript_prefix_hash ==
-               other.agent_transcript_prefix_hash &&
+           agent_transcript_prefix_hash == other.agent_transcript_prefix_hash &&
            logical_agent_request_hash == other.logical_agent_request_hash;
   }
-  bool operator!=(const CapsuleDPMRestoreTargetV2& other) const {
+  bool operator!=(const CapsuleDPMRestoreTarget& other) const {
     return !(*this == other);
   }
 };
@@ -182,29 +177,28 @@ struct CapsuleDPMRestoreTargetV2 {
 // Validators recompute all prepared-plan hashes and join each call back to the
 // corresponding canonical source chunk; no flattened or opaque digest can hide
 // BOS insertion, buffer segmentation, or a changed physical call schedule.
-struct CapsulePrefillPlanV2 {
-  CapsulePrefillModeV2 mode = CapsulePrefillModeV2::kFullCanonicalPrefill;
+struct CapsulePrefillPlan {
+  CapsulePrefillMode mode = CapsulePrefillMode::kFullCanonicalPrefill;
   uint64_t event_range_start = 0;
   uint64_t event_range_end = 0;
   uint32_t start_step = 0;
   uint32_t end_step = 0;
-  std::vector<CapsuleCanonicalPrefillChunkV2> canonical_chunks;
+  std::vector<CapsuleCanonicalPrefillChunk> canonical_chunks;
   Hash256 canonical_full_prefill_chunks_hash;
   Hash256 canonical_delta_chunks_hash;
   DPMPreparedPrefillPlan prepared_plan;
 
-  bool operator==(const CapsulePrefillPlanV2& other) const {
+  bool operator==(const CapsulePrefillPlan& other) const {
     return mode == other.mode && event_range_start == other.event_range_start &&
            event_range_end == other.event_range_end &&
            start_step == other.start_step && end_step == other.end_step &&
            canonical_chunks == other.canonical_chunks &&
            canonical_full_prefill_chunks_hash ==
                other.canonical_full_prefill_chunks_hash &&
-           canonical_delta_chunks_hash ==
-               other.canonical_delta_chunks_hash &&
+           canonical_delta_chunks_hash == other.canonical_delta_chunks_hash &&
            prepared_plan == other.prepared_plan;
   }
-  bool operator!=(const CapsulePrefillPlanV2& other) const {
+  bool operator!=(const CapsulePrefillPlan& other) const {
     return !(*this == other);
   }
 };
@@ -217,21 +211,20 @@ struct CapsulePrefillPlanV2 {
 // contains an own-position delta and names the exact restore evidence that put
 // the producer at `prefill.start_step`. The new checkpoint ID is intentionally
 // absent because it depends on the envelope produced by this plan.
-struct CapsuleCapturePlanV2 {
+struct CapsuleCapturePlan {
   static constexpr uint32_t kFormatVersion =
-      kCapsuleRestoreEvidenceV2FormatVersion;
+      kCapsuleRestoreEvidenceFormatVersion;
 
   uint32_t format_version = kFormatVersion;
   Hash256 plan_hash;
-  CapsuleRestoreAuthorityV2 authority;
-  CapsuleCaptureBasisV2 capture_basis =
-      CapsuleCaptureBasisV2::kRootFreshSession;
-  CapsuleDPMCheckpointStateV2 checkpoint_state;
+  CapsuleRestoreAuthority authority;
+  CapsuleCaptureBasis capture_basis = CapsuleCaptureBasis::kRootFreshSession;
+  CapsuleDPMCheckpointState checkpoint_state;
   // Canonical transcript immediately before the producing decode. This makes
   // the restore-target-to-descendant join exact; checkpoint_state separately
   // commits the transcript after the decoded output was appended.
   Hash256 agent_transcript_prefix_hash;
-  CapsulePrefillPlanV2 prefill;
+  CapsulePrefillPlan prefill;
   Hash256 producing_output_evidence_hash;
   uint32_t generated_token_count = 0;
   uint32_t capture_end_step = 0;
@@ -243,132 +236,59 @@ struct CapsuleCapturePlanV2 {
 
 // Content-addressed operational plan for one own-position restore followed by
 // an exact delta. It binds both the source checkpoint state and the later raw
-// log prefix/request. Import occurs at `checkpoint_step`; delta prefill advances
-// exactly to `prefill.end_step`. Off-position grafting and full-prefill restore
-// modes are intentionally unrepresentable by a valid plan.
-struct CapsuleRestorePlanV2 {
+// log prefix/request. Import occurs at `checkpoint_step`; delta prefill
+// advances exactly to `prefill.end_step`. Off-position grafting and
+// full-prefill restore modes are intentionally unrepresentable by a valid plan.
+struct CapsuleRestorePlan {
   static constexpr uint32_t kFormatVersion =
-      kCapsuleRestoreEvidenceV2FormatVersion;
+      kCapsuleRestoreEvidenceFormatVersion;
 
   uint32_t format_version = kFormatVersion;
   Hash256 plan_hash;
-  CapsuleRestoreAuthorityV2 authority;
+  CapsuleRestoreAuthority authority;
   Hash256 source_capture_plan_hash;
   Hash256 source_capture_evidence_id;
   Hash256 checkpoint_id;
-  CapsuleDPMCheckpointStateV2 checkpoint_state;
+  CapsuleDPMCheckpointState checkpoint_state;
   Hash256 checkpoint_envelope_hash;
   uint64_t checkpoint_envelope_size = 0;
   std::string checkpoint_authentication_key_id;
   uint32_t checkpoint_step = 0;
   Hash256 checkpoint_history_token_bytes_hash;
-  CapsuleDPMRestoreTargetV2 target_state;
-  CapsulePrefillPlanV2 prefill;
+  CapsuleDPMRestoreTarget target_state;
+  CapsulePrefillPlan prefill;
   uint32_t maximum_output_tokens = 0;
 };
 
-// Actual target observation immediately after import and a canonical re-export,
-// before any delta token is applied. This evidence alone is not authorization:
-// ValidateCapsuleRestoreEvidenceV2ForSourceCapture must also match the complete
-// source capture artifact and current authority.
-struct CapsuleRestoreEvidenceV2 {
-  static constexpr uint32_t kFormatVersion =
-      kCapsuleRestoreEvidenceV2FormatVersion;
+absl::Status ValidateCapsuleCanonicalPrefillChunks(
+    const std::vector<CapsuleCanonicalPrefillChunk>& chunks);
+absl::StatusOr<Hash256> ComputeCapsuleCanonicalFullPrefillChunksHash(
+    const std::vector<CapsuleCanonicalPrefillChunk>& chunks);
+absl::StatusOr<Hash256> ComputeCapsuleCanonicalDeltaChunksHash(
+    const std::vector<CapsuleCanonicalPrefillChunk>& chunks);
 
-  uint32_t format_version = kFormatVersion;
-  Hash256 evidence_id;
-  CapsuleRestorePlanV2 plan;
-  SessionContinuationStateWitness target_post_import;
-};
+absl::Status ValidateCapsulePrefillPlan(const CapsulePrefillPlan& plan);
 
-// Evidence for a newly captured decoded session. Export must be observational:
-// producer-before and producer-after witnesses are identical. A separate fresh
-// session then imports and re-exports the envelope, producing the same canonical
-// decoded witness. Recursive capture additionally carries the exact parent
-// restore evidence used to establish its own-position starting state.
-struct CapsuleCaptureEvidenceV2 {
-  static constexpr uint32_t kFormatVersion =
-      kCapsuleRestoreEvidenceV2FormatVersion;
+absl::StatusOr<Hash256> ComputeCapsuleCapturePlanHash(
+    const CapsuleCapturePlan& plan);
+absl::Status ValidateCapsuleCapturePlan(const CapsuleCapturePlan& plan);
 
-  uint32_t format_version = kFormatVersion;
-  Hash256 evidence_id;
-  CapsuleCapturePlanV2 plan;
-  Hash256 checkpoint_id;
-  Hash256 checkpoint_envelope_hash;
-  uint64_t checkpoint_envelope_size = 0;
-  std::string checkpoint_authentication_key_id;
-  Hash256 checkpoint_history_token_bytes_hash;
-  SessionContinuationStateWitness producer_before_export;
-  SessionContinuationStateWitness producer_after_export;
-  SessionContinuationStateWitness fresh_import_target;
-  std::optional<CapsuleRestoreEvidenceV2> parent_restore_evidence;
-};
-
-absl::Status ValidateCapsuleCanonicalPrefillChunksV2(
-    const std::vector<CapsuleCanonicalPrefillChunkV2>& chunks);
-absl::StatusOr<Hash256> ComputeCapsuleCanonicalFullPrefillChunksHashV2(
-    const std::vector<CapsuleCanonicalPrefillChunkV2>& chunks);
-absl::StatusOr<Hash256> ComputeCapsuleCanonicalDeltaChunksHashV2(
-    const std::vector<CapsuleCanonicalPrefillChunkV2>& chunks);
-
-absl::Status ValidateCapsulePrefillPlanV2(
-    const CapsulePrefillPlanV2& plan);
-
-absl::StatusOr<Hash256> ComputeCapsuleCapturePlanV2Hash(
-    const CapsuleCapturePlanV2& plan);
-absl::Status ValidateCapsuleCapturePlanV2(
-    const CapsuleCapturePlanV2& plan);
-
-absl::StatusOr<Hash256> ComputeCapsuleRestorePlanV2Hash(
-    const CapsuleRestorePlanV2& plan);
-absl::Status ValidateCapsuleRestorePlanV2(
-    const CapsuleRestorePlanV2& plan);
-
-absl::StatusOr<Hash256> ComputeCapsuleRestoreEvidenceV2Id(
-    const CapsuleRestoreEvidenceV2& evidence);
-absl::Status ValidateCapsuleRestoreEvidenceV2(
-    const CapsuleRestoreEvidenceV2& evidence);
-
-absl::StatusOr<Hash256> ComputeCapsuleCaptureEvidenceV2Id(
-    const CapsuleCaptureEvidenceV2& evidence);
-absl::Status ValidateCapsuleCaptureEvidenceV2(
-    const CapsuleCaptureEvidenceV2& evidence);
-
-// Required authorization join for an operational restore. It proves that the
-// source capture, checkpoint, envelope, exact own-position witness, and full
-// authority all match the restore plan. A matching coverage_id without this
-// join is rejected.
-absl::Status ValidateCapsuleRestoreEvidenceV2ForSourceCapture(
-    const CapsuleRestoreEvidenceV2& restore_evidence,
-    const CapsuleCaptureEvidenceV2& source_capture_evidence);
-
-// Required authorization join for a verified-parent descendant capture. It
-// validates the embedded parent restore against the supplied parent capture and
-// then proves that the child's delta plan starts from that restored own-position
-// state. Root captures are rejected by this function.
-absl::Status ValidateCapsuleCaptureEvidenceV2ForParentCapture(
-    const CapsuleCaptureEvidenceV2& child_capture_evidence,
-    const CapsuleCaptureEvidenceV2& parent_capture_evidence);
-
-// Runtime-owned schema identities bound by Coverage V2 admission. These do
-// not authenticate an operation; they prevent an admission record for another
-// capture/restore evidence contract from being applied to these validators.
-Hash256 GetCapsuleRestoreCaptureEvidenceV2ContractHash();
-Hash256 GetCapsuleRestoreRestoreEvidenceV2ContractHash();
+absl::StatusOr<Hash256> ComputeCapsuleRestorePlanHash(
+    const CapsuleRestorePlan& plan);
+absl::Status ValidateCapsuleRestorePlan(const CapsuleRestorePlan& plan);
 
 // Operational proof for one durable-checkpoint to request-transient rewrap
 // followed by import into a fresh target. The target witness describes the
 // transient destination actually imported; it must not be relabeled as the
 // durable source envelope.
-struct CapsuleRestoreEvidenceV3 {
+struct CapsuleRestoreEvidence {
   static constexpr uint32_t kFormatVersion =
-      kCapsuleRestoreEvidenceV3FormatVersion;
+      kCapsuleRestoreEvidenceFormatVersion;
 
   uint32_t format_version = kFormatVersion;
   Hash256 evidence_id;
-  CapsuleRestorePlanV2 plan;
-  SessionHandoffReauthenticationEvidence
-      durable_to_transient_reauthentication;
+  CapsuleRestorePlan plan;
+  SessionHandoffReauthenticationEvidence durable_to_transient_reauthentication;
   SessionContinuationStateWitness target_post_import;
 };
 
@@ -376,15 +296,15 @@ struct CapsuleRestoreEvidenceV3 {
 // all describe the same worker-transient producer envelope. The explicit
 // reauthentication evidence joins that exact transient endpoint to the
 // separately keyed durable checkpoint while committing the complete canonical
-// continuation state. Recursive capture embeds the V3 restore evidence that
+// continuation state. Recursive capture embeds the restore evidence that
 // established the producing session's own-position starting state.
-struct CapsuleCaptureEvidenceV3 {
+struct CapsuleCaptureEvidence {
   static constexpr uint32_t kFormatVersion =
-      kCapsuleRestoreEvidenceV3FormatVersion;
+      kCapsuleRestoreEvidenceFormatVersion;
 
   uint32_t format_version = kFormatVersion;
   Hash256 evidence_id;
-  CapsuleCapturePlanV2 plan;
+  CapsuleCapturePlan plan;
   Hash256 checkpoint_id;
   Hash256 checkpoint_envelope_hash;
   uint64_t checkpoint_envelope_size = 0;
@@ -393,36 +313,35 @@ struct CapsuleCaptureEvidenceV3 {
   SessionContinuationStateWitness producer_before_export;
   SessionContinuationStateWitness producer_after_export;
   SessionContinuationStateWitness fresh_import_target;
-  SessionHandoffReauthenticationEvidence
-      transient_to_durable_reauthentication;
-  std::optional<CapsuleRestoreEvidenceV3> parent_restore_evidence;
+  SessionHandoffReauthenticationEvidence transient_to_durable_reauthentication;
+  std::optional<CapsuleRestoreEvidence> parent_restore_evidence;
 };
 
-absl::StatusOr<Hash256> ComputeCapsuleRestoreEvidenceV3Id(
-    const CapsuleRestoreEvidenceV3& evidence);
-absl::Status ValidateCapsuleRestoreEvidenceV3(
-    const CapsuleRestoreEvidenceV3& evidence);
+absl::StatusOr<Hash256> ComputeCapsuleRestoreEvidenceId(
+    const CapsuleRestoreEvidence& evidence);
+absl::Status ValidateCapsuleRestoreEvidence(
+    const CapsuleRestoreEvidence& evidence);
 
-absl::StatusOr<Hash256> ComputeCapsuleCaptureEvidenceV3Id(
-    const CapsuleCaptureEvidenceV3& evidence);
-absl::Status ValidateCapsuleCaptureEvidenceV3(
-    const CapsuleCaptureEvidenceV3& evidence);
+absl::StatusOr<Hash256> ComputeCapsuleCaptureEvidenceId(
+    const CapsuleCaptureEvidence& evidence);
+absl::Status ValidateCapsuleCaptureEvidence(
+    const CapsuleCaptureEvidence& evidence);
 
 // Proves the complete endpoint chain
 // capture-transient -> durable checkpoint -> restore-transient. The two
 // transient envelopes and witnesses remain intentionally distinct; the exact
 // durable endpoint and the rewrap-invariant canonical continuation-state hash
 // must agree.
-absl::Status ValidateCapsuleRestoreEvidenceV3ForSourceCapture(
-    const CapsuleRestoreEvidenceV3& restore_evidence,
-    const CapsuleCaptureEvidenceV3& source_capture_evidence);
+absl::Status ValidateCapsuleRestoreEvidenceForSourceCapture(
+    const CapsuleRestoreEvidence& restore_evidence,
+    const CapsuleCaptureEvidence& source_capture_evidence);
 
-absl::Status ValidateCapsuleCaptureEvidenceV3ForParentCapture(
-    const CapsuleCaptureEvidenceV3& child_capture_evidence,
-    const CapsuleCaptureEvidenceV3& parent_capture_evidence);
+absl::Status ValidateCapsuleCaptureEvidenceForParentCapture(
+    const CapsuleCaptureEvidence& child_capture_evidence,
+    const CapsuleCaptureEvidence& parent_capture_evidence);
 
-Hash256 GetCapsuleRestoreCaptureEvidenceV3ContractHash();
-Hash256 GetCapsuleRestoreRestoreEvidenceV3ContractHash();
+Hash256 GetCapsuleRestoreCaptureEvidenceContractHash();
+Hash256 GetCapsuleRestoreRestoreEvidenceContractHash();
 
 }  // namespace litert::lm
 

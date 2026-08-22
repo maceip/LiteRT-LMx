@@ -244,7 +244,7 @@ absl::Status ValidateRepositoryTree(
   ABSL_RETURN_IF_ERROR(ValidateSecureDirectory(
       root / "exact-profile-admission", "admission product directory"));
   ABSL_RETURN_IF_ERROR(ValidateSecureDirectory(
-      repository_directory, "admission version directory"));
+      repository_directory, "admission repository directory"));
   return ValidateSecureDirectory(records_directory,
                                  "admission records directory");
 }
@@ -390,12 +390,7 @@ std::filesystem::path RecordPath(const std::filesystem::path& directory,
 FilesystemExactProfileAdmissionRepository::
     FilesystemExactProfileAdmissionRepository(std::filesystem::path root)
     : root_(std::move(root)),
-      // Admission v3 additionally binds the certified executable image, stable
-      // file identity, canonical argv, empty environment, and Engine adapter
-      // contract-version label. Keep it in a disjoint create-once namespace so
-      // older records can never block or masquerade as certified cold-process
-      // evidence.
-      directory_(root_ / "exact-profile-admission" / "v3"),
+      directory_(root_ / "exact-profile-admission"),
       records_directory_(directory_ / "records"),
       lock_path_(directory_ / "repository.lock") {}
 
@@ -422,11 +417,8 @@ FilesystemExactProfileAdmissionRepository::Create(
 }
 
 absl::Status FilesystemExactProfileAdmissionRepository::Initialize() {
-  const std::filesystem::path product = root_ / "exact-profile-admission";
   ABSL_RETURN_IF_ERROR(EnsureOwnedDirectory(
-      root_, product, "admission product directory"));
-  ABSL_RETURN_IF_ERROR(EnsureOwnedDirectory(
-      product, directory_, "admission version directory"));
+      root_, directory_, "admission product directory"));
   ABSL_RETURN_IF_ERROR(EnsureOwnedDirectory(
       directory_, records_directory_, "admission records directory"));
   ABSL_ASSIGN_OR_RETURN(ScopedFileLock lock, AcquireLock(lock_path_, true));

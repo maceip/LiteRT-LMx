@@ -65,7 +65,7 @@ struct ExactProfileAdmissionRunEvidence {
 // key lookups by the complete Engine-derived profile and require the currently
 // certified worker digest to equal worker_certification_hash.
 struct ExactProfileAdmissionRecord {
-  static constexpr uint32_t kFormatVersion = 3;
+  static constexpr uint32_t kFormatVersion = 1;
 
   uint32_t format_version = kFormatVersion;
   Hash256 record_id;

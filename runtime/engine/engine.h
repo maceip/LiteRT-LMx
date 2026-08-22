@@ -492,6 +492,16 @@ class EngineT {
         "Engine-derived session handoff identity is not available.");
   }
 
+  // Returns OK only when the runtime-artifact component of the loaded
+  // identity was also established with the platform's strongest supported
+  // loaded-image evidence (for example, untainted kernel-validated Mach-O
+  // pages). A content identity may still be available for reproducibility and
+  // WinnerReplay when this stronger admission is unavailable.
+  virtual absl::Status ValidateStrongRuntimeArtifactIdentity() const {
+    return absl::UnimplementedError(
+        "Strong loaded runtime-artifact identity is not available.");
+  }
+
   // Reports whether this loaded Engine can derive an ExactLiteRtProfile.
   // Candidate availability is not ExactRegeneration admission; admission
   // requires a separate independent cold-process equality record.

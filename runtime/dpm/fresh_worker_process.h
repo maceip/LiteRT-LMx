@@ -47,23 +47,23 @@ inline constexpr int kFreshWorkerAuthenticationFd = 198;
 inline constexpr uint64_t kMaximumFreshWorkerCapsuleBytes =
     uint64_t{8} * 1024 * 1024 * 1024;
 
-// Public, versioned non-secret key IDs for the parent-derived transient
+// Stable public, non-secret key IDs for the parent-derived transient
 // envelopes. They let durable evidence validators distinguish a live worker
 // witness from the caller's parent-only checkpoint key without exposing either
 // authentication key.
 inline constexpr absl::string_view kFreshWorkerTransientRestoreKeyId =
-    "litert-lmx-fresh-worker-restore-v3";
+    "litert-lmx-fresh-worker-restore";
 inline constexpr absl::string_view kFreshWorkerTransientProducingKeyId =
-    "litert-lmx-fresh-worker-producing-v3";
+    "litert-lmx-fresh-worker-producing";
 
 // Stable, evidence-bound purposes for the two parent-only capsule rewraps.
 // These labels are public protocol identifiers, not authentication material.
 inline constexpr absl::string_view
     kFreshWorkerDurableRestoreToTransientReauthenticationPurpose =
-        "litert-lmx/fresh-worker/durable-restore-to-transient/v1";
+        "litert-lmx/fresh-worker/durable-restore-to-transient";
 inline constexpr absl::string_view
     kFreshWorkerTransientProducingToDurableReauthenticationPurpose =
-        "litert-lmx/fresh-worker/transient-producing-to-durable/v1";
+        "litert-lmx/fresh-worker/transient-producing-to-durable";
 
 struct FreshWorkerProcessOptions {
   // Must be an absolute path to a regular executable. `arguments` excludes
@@ -118,8 +118,8 @@ class FreshWorkerCertification final {
   FreshWorkerEnvironmentContract environment_contract() const {
     return environment_contract_;
   }
-  const std::string& engine_adapter_contract_version() const {
-    return engine_adapter_contract_version_;
+  const std::string& engine_adapter_contract() const {
+    return engine_adapter_contract_;
   }
   const Hash256& certification_hash() const { return certification_hash_; }
 
@@ -153,7 +153,7 @@ class FreshWorkerCertification final {
   Hash256 executable_image_hash_;
   FreshWorkerEnvironmentContract environment_contract_ =
       FreshWorkerEnvironmentContract::kEmpty;
-  std::string engine_adapter_contract_version_;
+  std::string engine_adapter_contract_;
   Hash256 certification_hash_;
 };
 
@@ -351,7 +351,7 @@ using FreshWorkerCapsuleFreeExecutionCallback = std::function<
 
 // Worker-side contract entry point. Both overloads use the same authenticated
 // request-plus-capsule and result-plus-capsule framing, so one fixed worker
-// executable needs no unauthenticated argv mode selector. The legacy-shaped
+// executable needs no unauthenticated argv mode selector. The capsule-free
 // callback overload is an explicit full-prefill/no-capture adapter; a restore
 // or capture request fails closed before reaching that callback. Model load,
 // profile derivation, and catalog-free construction remain the concrete

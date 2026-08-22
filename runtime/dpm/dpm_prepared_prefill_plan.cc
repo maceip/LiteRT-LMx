@@ -31,22 +31,22 @@ namespace litert::lm {
 namespace {
 
 constexpr absl::string_view kSourceChunksDomain =
-    "litert-lmx-dpm-prepared-prefill-source-chunks-v1";
+    "litert-lmx-dpm-prepared-prefill-source-chunks";
 constexpr absl::string_view kUtf8SourceChunkDomain =
-    "litert-lmx-dpm-prefill-utf8-source-chunk-v1";
+    "litert-lmx-dpm-prefill-utf8-source-chunk";
 constexpr absl::string_view kTokenSourceChunkDomain =
-    "litert-lmx-dpm-prefill-token-source-chunk-v1";
+    "litert-lmx-dpm-prefill-token-source-chunk";
 constexpr absl::string_view kResolvedTokenPlanDomain =
-    "litert-lmx-dpm-prepared-prefill-token-plan-v1";
+    "litert-lmx-dpm-prepared-prefill-token-plan";
 constexpr absl::string_view kShapeScheduleDomain =
-    "litert-lmx-dpm-prepared-prefill-shape-schedule-v1";
+    "litert-lmx-dpm-prepared-prefill-shape-schedule";
 constexpr absl::string_view kPlanIdDomain =
-    "litert-lmx-dpm-prepared-prefill-plan-id-v1";
+    "litert-lmx-dpm-prepared-prefill-plan-id";
 constexpr absl::string_view kPreparedPrefillPlanMagic = "DPMPRP01";
 constexpr absl::string_view kPreparedPrefillPlanContractDomain =
-    "litert-lmx-dpm-prepared-prefill-plan-contract-v1";
+    "litert-lmx-dpm-prepared-prefill-plan-contract";
 constexpr absl::string_view kPreparedPrefillShapeClassContractDomain =
-    "litert-lmx-dpm-prepared-prefill-shape-class-contract-v1";
+    "litert-lmx-dpm-prepared-prefill-shape-class-contract";
 
 bool IsZeroHash(const Hash256& hash) {
   for (uint8_t byte : hash.bytes) {

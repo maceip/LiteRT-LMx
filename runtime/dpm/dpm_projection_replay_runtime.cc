@@ -41,7 +41,7 @@ constexpr std::array<char, 8> kProjectionExecutionMagic = {
 constexpr uint64_t kProjectionExecutionFramingBytes =
     8 + 4 + 8 + 32 + 32 + 4 + 8 + 8 + 4 + 8 + 8 + 4 + 8 + 8;
 constexpr absl::string_view kWinnerEvidenceDomain =
-    "LITERT_LMX_CANONICAL_WINNER_PROJECTION_EVIDENCE_V1";
+    "LITERT_LMX_CANONICAL_WINNER_PROJECTION_EVIDENCE";
 
 bool IsZeroHash(const Hash256& hash) {
   uint8_t combined = 0;
@@ -200,8 +200,8 @@ DPMCanonicalReplayRequest MakeReplayRequest(
   return DPMCanonicalReplayRequest{
       .stage = DPMReplayStage::kProjection,
       .max_output_tokens = max_output_tokens,
-      .request_contract_version =
-          std::string(kDPMProjectionReplayContractVersion),
+      .request_contract =
+          std::string(kDPMProjectionReplayContract),
       .canonical_payload = std::move(encoded_projection_request),
   };
 }
@@ -236,7 +236,7 @@ absl::Status ValidateDPMProjectionExecutionRequest(
   uint64_t encoded_envelope_size =
       kProjectionExecutionFramingBytes +
       kDPMCanonicalReplayRequestFramingBytes +
-      kDPMProjectionReplayContractVersion.size();
+      kDPMProjectionReplayContract.size();
   const auto add_bounded = [&encoded_envelope_size](size_t size) {
     if (size > kMaximumFreshWorkerRequestPayloadBytes -
                    encoded_envelope_size) {
@@ -483,8 +483,8 @@ CanonicalWinnerDPMProjectionRuntime::Generate(
   ABSL_RETURN_IF_ERROR(ValidateDPMCanonicalReplayRequest(request));
   if (request.stage != DPMReplayStage::kProjection ||
       request.max_output_tokens != config_.max_output_tokens ||
-      request.request_contract_version !=
-          kDPMProjectionReplayContractVersion) {
+      request.request_contract !=
+          kDPMProjectionReplayContract) {
     return absl::InvalidArgumentError(
         "WinnerReplay projection received another request contract.");
   }

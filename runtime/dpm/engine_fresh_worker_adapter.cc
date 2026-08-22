@@ -242,8 +242,8 @@ absl::StatusOr<DecodedWorkerInvocation> DecodeCanonicalInvocation(
   invocation.replay_request = replay_request;
   switch (replay_request.stage) {
     case DPMReplayStage::kProjection: {
-      if (replay_request.request_contract_version !=
-          kDPMProjectionReplayContractVersion) {
+      if (replay_request.request_contract !=
+          kDPMProjectionReplayContract) {
         return absl::FailedPreconditionError(
             "Fresh worker projection contract version is unsupported.");
       }
@@ -276,8 +276,8 @@ absl::StatusOr<DecodedWorkerInvocation> DecodeCanonicalInvocation(
     }
 
     case DPMReplayStage::kAgentDecision: {
-      if (replay_request.request_contract_version !=
-          kDPMAgentReplayContractVersion) {
+      if (replay_request.request_contract !=
+          kDPMAgentReplayContract) {
         return absl::FailedPreconditionError(
             "Fresh worker agent-decision contract version is unsupported.");
       }

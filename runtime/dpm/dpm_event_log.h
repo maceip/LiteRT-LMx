@@ -43,17 +43,13 @@ inline constexpr uint32_t kMaximumDPMGenerationTokens = 65'536;
 // this shared with durable decoding prevents receipt bytes from admitting an
 // input the engine itself could never produce.
 inline constexpr size_t kMaximumDPMCanonicalAgentInputBytes =
-    2 * kMaximumDPMEventPayloadBytes +
-    2 * kMaximumDPMProjectionIdentityBytes + 4 * 1024;
+    2 * kMaximumDPMEventPayloadBytes + 2 * kMaximumDPMProjectionIdentityBytes +
+    4 * 1024;
 
 // The raw event log is the authority for a DPM session. Session checkpoints,
 // projections, and manifests are disposable derivatives of these events.
 struct DPMTurnReceipt {
-  static constexpr uint32_t kLegacyFormatVersion = 3;
-  static constexpr uint32_t kPreviousFormatVersion = 4;
-  static constexpr uint32_t kCoverageV1FormatVersion = 5;
-  static constexpr uint32_t kCoverageV2FormatVersion = 6;
-  static constexpr uint32_t kFormatVersion = 7;
+  static constexpr uint32_t kFormatVersion = 1;
 
   uint32_t format_version = kFormatVersion;
   std::string operation_id;
@@ -71,8 +67,7 @@ struct DPMTurnReceipt {
 
   // Agent-decision execution provenance. WinnerReplay and ExactRegeneration
   // remain distinct in the immutable receipt just as they do for projection.
-  DPMReplayMode agent_replay_mode =
-      DPMReplayMode::kCanonicalWinnerReplay;
+  DPMReplayMode agent_replay_mode = DPMReplayMode::kCanonicalWinnerReplay;
   Hash256 agent_replay_request_hash;
   // WinnerReplay stores the authenticated catalog execution evidence. For
   // ExactRegeneration this is exclusively the request-scoped N-process
@@ -110,10 +105,6 @@ struct DPMTurnReceipt {
   // means the checkpoint policy did not select this turn.
   std::optional<Hash256> session_checkpoint_id;
 
-  // Version 4 physical-execution and checkpoint provenance. These fields are
-  // deliberately appended to the version 3 durable encoding so an existing
-  // version 3 receipt retains byte-for-byte canonical serialization.
-  //
   // restored_from_session_checkpoint_id names an older, already-published
   // own-position capsule consumed before this turn. It is independent of
   // session_checkpoint_id: a turn can restore without capturing a new
@@ -130,19 +121,16 @@ struct DPMTurnReceipt {
   // selected for every independent worker. Post-output capsule capture policy
   // is intentionally outside this hash and is proven separately by
   // checkpoint_capture_origin plus authenticated run-zero provenance.
-  // WinnerReplay and legacy receipts use kNone plus the all-zero hash. A delta
+  // WinnerReplay receipts use kNone plus the all-zero hash. A delta
   // plan requires restored_from_session_checkpoint_id.
   DPMCheckpointWorkerPrefillMode agent_worker_prefill_mode =
       DPMCheckpointWorkerPrefillMode::kNone;
   Hash256 agent_physical_execution_plan_hash;
 
-  // CapsuleRestore is separate from exact-profile admission. Version 5 binds
-  // the Engine-derived capability, current authenticated admission, and the
-  // concrete versioned operational coverage matched whenever either replay
-  // mode consumes or publishes a capsule. Version 4 exact receipts carried
-  // only the admission ID; version 4 Winner receipts carried neither and are
-  // never upgraded implicitly. The capability and generic coverage IDs are
-  // appended after the complete version 4 durable encoding.
+  // CapsuleRestore is separate from exact-profile admission. These fields bind
+  // the Engine-derived capability, current authenticated admission, and
+  // concrete operational coverage whenever either replay mode consumes or
+  // publishes a capsule.
   std::optional<Hash256> agent_capsule_restore_admission_record_id;
   std::optional<Hash256> agent_capsule_restore_capability_id;
   std::optional<Hash256> agent_capsule_restore_coverage_id;
@@ -154,11 +142,9 @@ struct DPMTurnReceipt {
   std::optional<DPMExactWorkerCheckpointProvenance>
       agent_exact_worker_checkpoint_provenance;
 
-  // Version 6 Coverage V2 evidence. These fields are appended only after the
-  // complete version 5 durable encoding. Prepared work is mode-neutral: an
-  // exact worker and a live WinnerReplay producer both bind the runtime-derived
-  // call/segment and shape plan, while a catalog-only WinnerReplay result has no
-  // physical plan to claim.
+  // Prepared work is mode-neutral: an exact worker and a live WinnerReplay
+  // producer both bind the runtime-derived call/segment and shape plan, while
+  // a catalog-only WinnerReplay result has no physical plan to claim.
   std::optional<DPMPreparedPrefillWorkBinding> agent_prepared_prefill_work;
 
   // Present exactly when session_checkpoint_id is present. The plan hash can be
@@ -174,10 +160,6 @@ struct DPMTurnReceipt {
   // restore by itself.
   std::optional<Hash256> restored_checkpoint_capture_evidence_id;
   std::optional<Hash256> agent_capsule_restore_evidence_id;
-
-  // Version 7 appends the explicit WinnerReplay rematerialization bit after
-  // all version 6 Coverage V2 evidence. Older receipts cannot claim this
-  // provenance and current checkpoint selection never silently upgrades them.
 };
 
 struct DPMEvent {

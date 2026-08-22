@@ -170,7 +170,7 @@ absl::StatusOr<std::string> EncodeDPMPreparedPrefillPlan(
 absl::StatusOr<DPMPreparedPrefillPlan> DecodeDPMPreparedPrefillPlan(
     absl::string_view bytes);
 
-// Runtime-owned identities used by Coverage V2 admission. The plan contract
+// Runtime-owned identities used by CapsuleRestore admission. The plan contract
 // binds the canonical field/hash/transport semantics; the shape-class contract
 // separately binds batch-one call and tensor-segment scheduling.
 Hash256 GetDPMPreparedPrefillPlanContractHash();

@@ -49,6 +49,7 @@
 #endif
 
 #if defined(__APPLE__)
+#include <dlfcn.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <mach/vm_statistics.h>
@@ -542,7 +543,8 @@ struct MeasuredImage {
 
 absl::StatusOr<MeasuredImage> MeasureImage(const mach_header* image_header,
                                            uintptr_t runtime_anchor,
-                                           bool include_without_anchor) {
+                                           bool include_without_anchor,
+                                           bool require_kernel_validation) {
   if (image_header == nullptr) {
     return absl::FailedPreconditionError(
         "dyld returned a null loaded-image header.");
@@ -693,8 +695,16 @@ absl::StatusOr<MeasuredImage> MeasureImage(const mach_header* image_header,
     }
     command_offset += command.cmdsize;
   }
-  if (!found_base || command_offset != header->sizeofcmds ||
-      executable_segments.empty()) {
+  if (command_offset != header->sizeofcmds) {
+    return absl::FailedPreconditionError(
+        "Loaded Mach-O image lacks a complete executable layout.");
+  }
+  if ((!found_base || executable_segments.empty()) &&
+      !include_without_anchor) {
+    return MeasuredImage{.contains_runtime_anchor = false,
+                         .has_digest = false};
+  }
+  if (!found_base || executable_segments.empty()) {
     return absl::FailedPreconditionError(
         "Loaded Mach-O image lacks a complete executable layout.");
   }
@@ -814,24 +824,26 @@ absl::StatusOr<MeasuredImage> MeasureImage(const mach_header* image_header,
   // file-backed page in the covered range to have untainted kernel code-sign
   // validation evidence. Immutable loaded bytes are also hashed directly
   // below; mutable relocated process data is deliberately not hashed.
-  for (const SegmentEvidence& evidence : segments) {
-    const segment_command_64& segment = evidence.segment;
-    if (segment.filesize == 0 ||
-        segment.fileoff >= code_signature->dataoff) {
-      continue;
+  if (require_kernel_validation) {
+    for (const SegmentEvidence& evidence : segments) {
+      const segment_command_64& segment = evidence.segment;
+      if (segment.filesize == 0 ||
+          segment.fileoff >= code_signature->dataoff) {
+        continue;
+      }
+      if ((segment.flags & SG_PROTECTED_VERSION_1) != 0) {
+        return absl::UnimplementedError(
+            "Loaded image has protected file-backed pages whose signing "
+            "state cannot be measured safely.");
+      }
+      const uint64_t signed_size = std::min(
+          segment.filesize,
+          static_cast<uint64_t>(code_signature->dataoff) - segment.fileoff);
+      ABSL_ASSIGN_OR_RETURN(const uintptr_t address,
+                            segment_runtime_address(segment));
+      ABSL_RETURN_IF_ERROR(FaultAndValidateCodeSignedPages(
+          address, signed_size, "Loaded Mach-O file-backed segment"));
     }
-    if ((segment.flags & SG_PROTECTED_VERSION_1) != 0) {
-      return absl::UnimplementedError(
-          "Loaded image has protected file-backed pages whose signing state "
-          "cannot be measured safely.");
-    }
-    const uint64_t signed_size = std::min(
-        segment.filesize,
-        static_cast<uint64_t>(code_signature->dataoff) - segment.fileoff);
-    ABSL_ASSIGN_OR_RETURN(const uintptr_t address,
-                          segment_runtime_address(segment));
-    ABSL_RETURN_IF_ERROR(FaultAndValidateCodeSignedPages(
-        address, signed_size, "Loaded Mach-O file-backed segment"));
   }
 
   std::vector<size_t> immutable_segments;
@@ -905,62 +917,47 @@ absl::StatusOr<MeasuredImage> MeasureImage(const mach_header* image_header,
                        .has_digest = true};
 }
 
-absl::StatusOr<Hash256> MeasureImageContainingAnchor(uintptr_t code_anchor) {
+absl::StatusOr<Hash256> MeasureImageContainingAnchor(
+    uintptr_t code_anchor, bool require_kernel_validation) {
   if (code_anchor == 0) {
     return absl::FailedPreconditionError(
         "Cannot measure a zero loaded-image code anchor.");
   }
   for (int attempt = 0; attempt < 3; ++attempt) {
-    const uint32_t image_count = ::_dyld_image_count();
-    std::vector<const mach_header*> image_headers;
-    std::vector<std::string> image_names;
-    image_headers.reserve(image_count);
-    image_names.reserve(image_count);
-    std::optional<Hash256> anchored_digest;
-    for (uint32_t index = 0; index < image_count; ++index) {
-      const mach_header* image_header = ::_dyld_get_image_header(index);
-      const char* image_name = ::_dyld_get_image_name(index);
-      if (image_header == nullptr || image_name == nullptr ||
-          image_name[0] == '\0') {
-        return absl::FailedPreconditionError(
-            "dyld reported incomplete anchored-image evidence.");
-      }
-      image_headers.push_back(image_header);
-      image_names.emplace_back(image_name);
-      ABSL_ASSIGN_OR_RETURN(
-          MeasuredImage measured,
-          MeasureImage(image_header, code_anchor,
-                       /*include_without_anchor=*/false));
-      if (!measured.contains_runtime_anchor) continue;
-      if (!measured.has_digest || anchored_digest.has_value()) {
-        return absl::FailedPreconditionError(
-            "Loaded code anchor has missing or ambiguous image identity.");
-      }
-      anchored_digest = measured.digest;
-    }
-    if (::_dyld_image_count() != image_count) continue;
-    bool stable = true;
-    for (uint32_t index = 0; index < image_count; ++index) {
-      const char* image_name = ::_dyld_get_image_name(index);
-      if (::_dyld_get_image_header(index) != image_headers[index] ||
-          image_name == nullptr || image_names[index] != image_name) {
-        stable = false;
-        break;
-      }
-    }
-    if (!stable) continue;
-    if (!anchored_digest.has_value()) {
+    Dl_info before{};
+    if (::dladdr(reinterpret_cast<const void*>(code_anchor), &before) == 0 ||
+        before.dli_fbase == nullptr || before.dli_fname == nullptr ||
+        before.dli_fname[0] == '\0') {
       return absl::FailedPreconditionError(
-          "No loaded Mach-O image contains the requested code anchor.");
+          "dyld could not resolve the loaded image containing the code "
+          "anchor.");
     }
-    return *anchored_digest;
+    const auto* image_header =
+        reinterpret_cast<const mach_header*>(before.dli_fbase);
+    const std::string image_name(before.dli_fname);
+    ABSL_ASSIGN_OR_RETURN(
+        MeasuredImage measured,
+        MeasureImage(image_header, code_anchor,
+                     /*include_without_anchor=*/false,
+                     require_kernel_validation));
+    if (!measured.contains_runtime_anchor || !measured.has_digest) {
+      return absl::FailedPreconditionError(
+          "Resolved Mach-O image does not contain its requested code anchor.");
+    }
+    Dl_info after{};
+    if (::dladdr(reinterpret_cast<const void*>(code_anchor), &after) != 0 &&
+        after.dli_fbase == before.dli_fbase && after.dli_fname != nullptr &&
+        image_name == after.dli_fname) {
+      return measured.digest;
+    }
   }
   return absl::UnavailableError(
-      "Loaded image set changed during anchored identity measurement.");
+      "Loaded anchored image changed during identity measurement.");
 }
 
 absl::StatusOr<Hash256> MeasureAppleCpuRuntimeArtifact(
-    const SessionHandoffRuntimeProfile& profile) {
+    const SessionHandoffRuntimeProfile& profile,
+    bool require_kernel_validation) {
   if (profile.runtime_code_anchor == 0 || profile.canonical_profile.empty()) {
     return absl::FailedPreconditionError(
         "Loaded CPU runtime profile lacks measurable evidence.");
@@ -971,7 +968,8 @@ absl::StatusOr<Hash256> MeasureAppleCpuRuntimeArtifact(
   // different profile.
   ABSL_ASSIGN_OR_RETURN(
       const Hash256 runtime_image_digest,
-      MeasureImageContainingAnchor(profile.runtime_code_anchor));
+      MeasureImageContainingAnchor(profile.runtime_code_anchor,
+                                   require_kernel_validation));
 
   constexpr std::array<absl::string_view, 7> kPlatformEvidence = {
       "kern.osversion", "kern.osrelease", "hw.model",     "hw.machine",
@@ -1019,10 +1017,13 @@ absl::StatusOr<Hash256> MeasureAppleMetalRuntimeArtifact(
   // plus a GPU label from impersonating the actually selected Metal plugin.
   ABSL_ASSIGN_OR_RETURN(
       const Hash256 runtime_image_digest,
-      MeasureImageContainingAnchor(profile.runtime_code_anchor));
+      MeasureImageContainingAnchor(profile.runtime_code_anchor,
+                                   /*require_kernel_validation=*/true));
   ABSL_ASSIGN_OR_RETURN(
       const Hash256 accelerator_image_digest,
-      MeasureImageContainingAnchor(metal.selected_accelerator_code_anchor));
+      MeasureImageContainingAnchor(
+          metal.selected_accelerator_code_anchor,
+          /*require_kernel_validation=*/true));
   ABSL_ASSIGN_OR_RETURN(
       std::string metal_device_identity,
       DeriveMacOsMetalDeviceIdentity(metal.metal_device,
@@ -2229,7 +2230,8 @@ absl::StatusOr<Hash256> MeasureLoadedRuntimeArtifact(
 #if defined(__APPLE__)
   switch (profile.runtime_class) {
     case SessionHandoffRuntimeClass::kLiteRtCpu:
-      return MeasureAppleCpuRuntimeArtifact(profile);
+      return MeasureAppleCpuRuntimeArtifact(
+          profile, /*require_kernel_validation=*/true);
     case SessionHandoffRuntimeClass::kLiteRtMetal:
       return MeasureAppleMetalRuntimeArtifact(profile);
     default:
@@ -2250,6 +2252,19 @@ absl::StatusOr<Hash256> MeasureLoadedRuntimeArtifact(
   return absl::UnimplementedError(
       "Exact loaded LiteRT runtime artifact measurement is currently "
       "implemented only for Apple and ELF Linux/Android CPU processes.");
+#endif
+}
+
+absl::StatusOr<Hash256> MeasureLoadedRuntimeArtifactForReproducibility(
+    const SessionHandoffRuntimeProfile& profile) {
+#if defined(__APPLE__)
+  if (profile.runtime_class != SessionHandoffRuntimeClass::kLiteRtCpu) {
+    return MeasureLoadedRuntimeArtifact(profile);
+  }
+  return MeasureAppleCpuRuntimeArtifact(
+      profile, /*require_kernel_validation=*/false);
+#else
+  return MeasureLoadedRuntimeArtifact(profile);
 #endif
 }
 

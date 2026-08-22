@@ -34,9 +34,9 @@ namespace litert::lm {
 namespace {
 
 constexpr std::array<char, 8> kRequestMagic = {'D', 'P', 'M', 'W', 'R', 'Q',
-                                                '0', '3'};
+                                                '0', '1'};
 constexpr std::array<char, 8> kResultMagic = {'D', 'P', 'M', 'W', 'R', 'S',
-                                               '0', '3'};
+                                               '0', '1'};
 constexpr std::array<char, 8> kTokenBytesMagic = {'D', 'P', 'M', 'T', 'O', 'K',
                                                    '0', '1'};
 constexpr std::array<char, 8> kExecutionPlanMagic = {
@@ -48,13 +48,13 @@ constexpr uint64_t kMaximumKeyIdBytes = 256;
 constexpr uint32_t kMaximumContinuationWitnessKeyIdBytes = 1024;
 constexpr uint64_t kEnvelopeFixedBytes = 8 + 4 + 4 + 4 + 8 + 32;
 constexpr absl::string_view kRequestMacDomain =
-    "LITERT_LMX_FRESH_WORKER_REQUEST_HMAC_SHA256_V3";
+    "LITERT_LMX_FRESH_WORKER_REQUEST_HMAC_SHA256";
 constexpr absl::string_view kResultMacDomain =
-    "LITERT_LMX_FRESH_WORKER_RESULT_HMAC_SHA256_V3";
+    "LITERT_LMX_FRESH_WORKER_RESULT_HMAC_SHA256";
 constexpr absl::string_view kExecutionPlanHashDomain =
-    "LITERT_LMX_FRESH_WORKER_EXECUTION_PLAN_SHA256_V1";
+    "LITERT_LMX_FRESH_WORKER_EXECUTION_PLAN_SHA256";
 constexpr absl::string_view kOutputEvidenceHashDomain =
-    "LITERT_LMX_FRESH_WORKER_OUTPUT_EVIDENCE_SHA256_V1";
+    "LITERT_LMX_FRESH_WORKER_OUTPUT_EVIDENCE_SHA256";
 
 bool IsZeroHash(const Hash256& hash) {
   uint8_t combined = 0;
@@ -489,7 +489,7 @@ absl::StatusOr<std::string> EncodeEnvelope(
   envelope.reserve(kEnvelopeFixedBytes + authentication.key_id.size() +
                    body.size());
   envelope.append(magic.data(), magic.size());
-  AppendU32(kFreshWorkerProtocolVersion, &envelope);
+  AppendU32(kFreshWorkerEnvelopeFormatVersion, &envelope);
   AppendU32(kind, &envelope);
   AppendU32(static_cast<uint32_t>(authentication.key_id.size()), &envelope);
   AppendU64(body.size(), &envelope);
@@ -520,7 +520,7 @@ absl::StatusOr<DecodedEnvelopeBody> DecodeEnvelope(
   ABSL_ASSIGN_OR_RETURN(const uint32_t kind, header.ReadU32());
   ABSL_ASSIGN_OR_RETURN(const uint32_t key_id_size, header.ReadU32());
   ABSL_ASSIGN_OR_RETURN(const uint64_t body_size, header.ReadU64());
-  if (version != kFreshWorkerProtocolVersion || kind != expected_kind) {
+  if (version != kFreshWorkerEnvelopeFormatVersion || kind != expected_kind) {
     return absl::FailedPreconditionError(
         "Fresh-worker envelope version or kind is unsupported.");
   }
@@ -867,7 +867,7 @@ absl::Status ValidateFreshWorkerAuthentication(
 }
 
 absl::Status ValidateFreshWorkerRequest(const FreshWorkerRequest& request) {
-  if (request.format_version != kFreshWorkerProtocolVersion) {
+  if (request.format_version != kFreshWorkerEnvelopeFormatVersion) {
     return absl::FailedPreconditionError(
         "Fresh-worker request version is unsupported.");
   }
@@ -1004,7 +1004,7 @@ absl::Status ValidateFreshWorkerLogitFrameEvidence(
 }
 
 absl::Status ValidateFreshWorkerResult(const FreshWorkerResult& result) {
-  if (result.format_version != kFreshWorkerProtocolVersion) {
+  if (result.format_version != kFreshWorkerEnvelopeFormatVersion) {
     return absl::FailedPreconditionError(
         "Fresh-worker result version is unsupported.");
   }
@@ -1226,7 +1226,7 @@ absl::StatusOr<std::string> EncodeFreshWorkerTokenIds(
   std::string encoded;
   encoded.reserve(kTokenBytesMagic.size() + 4 + 4 + token_ids.size() * 4);
   encoded.append(kTokenBytesMagic.data(), kTokenBytesMagic.size());
-  AppendU32(kFreshWorkerTokenEncodingVersion, &encoded);
+  AppendU32(kFreshWorkerTokenEncodingFormatVersion, &encoded);
   AppendU32(static_cast<uint32_t>(token_ids.size()), &encoded);
   for (int32_t token_id : token_ids) {
     if (token_id < 0) {
@@ -1251,7 +1251,7 @@ absl::StatusOr<std::vector<int32_t>> DecodeFreshWorkerTokenIds(
   Reader reader(canonical_token_bytes.substr(kTokenBytesMagic.size()));
   ABSL_ASSIGN_OR_RETURN(const uint32_t version, reader.ReadU32());
   ABSL_ASSIGN_OR_RETURN(const uint32_t token_count, reader.ReadU32());
-  if (version != kFreshWorkerTokenEncodingVersion) {
+  if (version != kFreshWorkerTokenEncodingFormatVersion) {
     return absl::FailedPreconditionError(
         "Fresh-worker token encoding version is unsupported.");
   }

@@ -33,29 +33,21 @@ namespace litert::lm {
 namespace {
 
 constexpr absl::string_view kFullPrefillChunksDomain =
-    "LITERT_LMX_CAPSULE_FULL_PREFILL_CHUNKS_SHA256_V2";
+    "LITERT_LMX_CAPSULE_FULL_PREFILL_CHUNKS_SHA256";
 constexpr absl::string_view kDeltaChunksDomain =
-    "LITERT_LMX_CAPSULE_DELTA_CHUNKS_SHA256_V2";
+    "LITERT_LMX_CAPSULE_DELTA_CHUNKS_SHA256";
 constexpr absl::string_view kCapturePlanDomain =
-    "LITERT_LMX_CAPSULE_CAPTURE_PLAN_SHA256_V2";
+    "LITERT_LMX_CAPSULE_CAPTURE_PLAN_SHA256";
 constexpr absl::string_view kRestorePlanDomain =
-    "LITERT_LMX_CAPSULE_RESTORE_PLAN_SHA256_V2";
-constexpr absl::string_view kCaptureEvidenceDomain =
-    "LITERT_LMX_CAPSULE_CAPTURE_EVIDENCE_SHA256_V2";
-constexpr absl::string_view kRestoreEvidenceDomain =
-    "LITERT_LMX_CAPSULE_RESTORE_EVIDENCE_SHA256_V2";
+    "LITERT_LMX_CAPSULE_RESTORE_PLAN_SHA256";
 constexpr absl::string_view kCaptureEvidenceContractDomain =
-    "LITERT_LMX_CAPSULE_CAPTURE_EVIDENCE_CONTRACT_SHA256_V2";
+    "LITERT_LMX_CAPSULE_CAPTURE_EXPLICIT_REAUTH_CONTRACT_SHA256";
 constexpr absl::string_view kRestoreEvidenceContractDomain =
-    "LITERT_LMX_CAPSULE_RESTORE_EVIDENCE_CONTRACT_SHA256_V2";
-constexpr absl::string_view kCaptureEvidenceV3Domain =
-    "LITERT_LMX_CAPSULE_CAPTURE_EVIDENCE_SHA256_V3";
-constexpr absl::string_view kRestoreEvidenceV3Domain =
-    "LITERT_LMX_CAPSULE_RESTORE_EVIDENCE_SHA256_V3";
-constexpr absl::string_view kCaptureEvidenceV3ContractDomain =
-    "LITERT_LMX_CAPSULE_CAPTURE_EXPLICIT_REAUTH_CONTRACT_SHA256_V3";
-constexpr absl::string_view kRestoreEvidenceV3ContractDomain =
-    "LITERT_LMX_CAPSULE_RESTORE_EXPLICIT_REAUTH_CONTRACT_SHA256_V3";
+    "LITERT_LMX_CAPSULE_RESTORE_EXPLICIT_REAUTH_CONTRACT_SHA256";
+constexpr absl::string_view kCaptureEvidenceDomain =
+    "LITERT_LMX_CAPSULE_CAPTURE_EVIDENCE_SHA256";
+constexpr absl::string_view kRestoreEvidenceDomain =
+    "LITERT_LMX_CAPSULE_RESTORE_EVIDENCE_SHA256";
 
 bool IsZeroHash(const Hash256& hash) {
   uint8_t combined = 0;
@@ -168,16 +160,16 @@ void AppendCapability(const SessionHandoffCapability& capability,
 }
 
 void AppendCanonicalChunks(
-    const std::vector<CapsuleCanonicalPrefillChunkV2>& chunks,
+    const std::vector<CapsuleCanonicalPrefillChunk>& chunks,
     std::string* output) {
   AppendU32(static_cast<uint32_t>(chunks.size()), output);
-  for (const CapsuleCanonicalPrefillChunkV2& chunk : chunks) {
+  for (const CapsuleCanonicalPrefillChunk& chunk : chunks) {
     AppendU32(static_cast<uint32_t>(chunk.encoding), output);
     switch (chunk.encoding) {
-      case CapsuleCanonicalPrefillChunkV2::Encoding::kUtf8Text:
+      case CapsuleCanonicalPrefillChunk::Encoding::kUtf8Text:
         AppendString(chunk.utf8_text, output);
         break;
-      case CapsuleCanonicalPrefillChunkV2::Encoding::kExactTokenIds:
+      case CapsuleCanonicalPrefillChunk::Encoding::kExactTokenIds:
         AppendU32(static_cast<uint32_t>(chunk.token_ids.size()), output);
         for (int32_t token_id : chunk.token_ids) {
           AppendI32(token_id, output);
@@ -221,15 +213,15 @@ void AppendPreparedPrefillPlan(const DPMPreparedPrefillPlan& plan,
   AppendHash(plan.shape_schedule_hash, output);
 }
 
-void AppendAuthority(const CapsuleRestoreAuthorityV2& authority,
+void AppendAuthority(const CapsuleRestoreAuthority& authority,
                      std::string* output) {
   AppendCapability(authority.capability, output);
   AppendHash(authority.admission_record_id, output);
   AppendHash(authority.coverage_id, output);
-  AppendHash(authority.qualification_spec_hash, output);
+  AppendHash(authority.qualification_evidence_hash, output);
 }
 
-void AppendCheckpointState(const CapsuleDPMCheckpointStateV2& state,
+void AppendCheckpointState(const CapsuleDPMCheckpointState& state,
                            std::string* output) {
   AppendString(state.log_id, output);
   AppendU64(state.source_event_count, output);
@@ -242,7 +234,7 @@ void AppendCheckpointState(const CapsuleDPMCheckpointStateV2& state,
   AppendHash(state.logical_agent_request_hash, output);
 }
 
-void AppendRestoreTarget(const CapsuleDPMRestoreTargetV2& state,
+void AppendRestoreTarget(const CapsuleDPMRestoreTarget& state,
                          std::string* output) {
   AppendString(state.log_id, output);
   AppendU64(state.source_event_count, output);
@@ -255,8 +247,7 @@ void AppendRestoreTarget(const CapsuleDPMRestoreTargetV2& state,
   AppendHash(state.logical_agent_request_hash, output);
 }
 
-void AppendPrefillPlan(const CapsulePrefillPlanV2& plan,
-                       std::string* output) {
+void AppendPrefillPlan(const CapsulePrefillPlan& plan, std::string* output) {
   AppendU32(static_cast<uint32_t>(plan.mode), output);
   AppendU64(plan.event_range_start, output);
   AppendU64(plan.event_range_end, output);
@@ -268,7 +259,7 @@ void AppendPrefillPlan(const CapsulePrefillPlanV2& plan,
   AppendPreparedPrefillPlan(plan.prepared_plan, output);
 }
 
-std::string EncodeCapturePlanFields(const CapsuleCapturePlanV2& plan) {
+std::string EncodeCapturePlanFields(const CapsuleCapturePlan& plan) {
   std::string encoded;
   AppendU32(plan.format_version, &encoded);
   AppendAuthority(plan.authority, &encoded);
@@ -286,7 +277,7 @@ std::string EncodeCapturePlanFields(const CapsuleCapturePlanV2& plan) {
   return encoded;
 }
 
-std::string EncodeRestorePlanFields(const CapsuleRestorePlanV2& plan) {
+std::string EncodeRestorePlanFields(const CapsuleRestorePlan& plan) {
   std::string encoded;
   AppendU32(plan.format_version, &encoded);
   AppendAuthority(plan.authority, &encoded);
@@ -338,17 +329,19 @@ void AppendReauthenticationEvidence(
 }
 
 std::string EncodeRestoreEvidenceFields(
-    const CapsuleRestoreEvidenceV2& evidence) {
+    const CapsuleRestoreEvidence& evidence) {
   std::string encoded;
   AppendU32(evidence.format_version, &encoded);
   AppendHash(evidence.plan.plan_hash, &encoded);
   encoded.append(EncodeRestorePlanFields(evidence.plan));
+  AppendReauthenticationEvidence(evidence.durable_to_transient_reauthentication,
+                                 &encoded);
   AppendWitness(evidence.target_post_import, &encoded);
   return encoded;
 }
 
 std::string EncodeCaptureEvidenceFields(
-    const CapsuleCaptureEvidenceV2& evidence) {
+    const CapsuleCaptureEvidence& evidence) {
   std::string encoded;
   AppendU32(evidence.format_version, &encoded);
   AppendHash(evidence.plan.plan_hash, &encoded);
@@ -361,48 +354,13 @@ std::string EncodeCaptureEvidenceFields(
   AppendWitness(evidence.producer_before_export, &encoded);
   AppendWitness(evidence.producer_after_export, &encoded);
   AppendWitness(evidence.fresh_import_target, &encoded);
+  AppendReauthenticationEvidence(evidence.transient_to_durable_reauthentication,
+                                 &encoded);
   AppendU32(evidence.parent_restore_evidence.has_value() ? 1 : 0, &encoded);
   if (evidence.parent_restore_evidence.has_value()) {
     AppendHash(evidence.parent_restore_evidence->evidence_id, &encoded);
     encoded.append(
         EncodeRestoreEvidenceFields(*evidence.parent_restore_evidence));
-  }
-  return encoded;
-}
-
-std::string EncodeRestoreEvidenceV3Fields(
-    const CapsuleRestoreEvidenceV3& evidence) {
-  std::string encoded;
-  AppendU32(evidence.format_version, &encoded);
-  AppendHash(evidence.plan.plan_hash, &encoded);
-  encoded.append(EncodeRestorePlanFields(evidence.plan));
-  AppendReauthenticationEvidence(
-      evidence.durable_to_transient_reauthentication, &encoded);
-  AppendWitness(evidence.target_post_import, &encoded);
-  return encoded;
-}
-
-std::string EncodeCaptureEvidenceV3Fields(
-    const CapsuleCaptureEvidenceV3& evidence) {
-  std::string encoded;
-  AppendU32(evidence.format_version, &encoded);
-  AppendHash(evidence.plan.plan_hash, &encoded);
-  encoded.append(EncodeCapturePlanFields(evidence.plan));
-  AppendHash(evidence.checkpoint_id, &encoded);
-  AppendHash(evidence.checkpoint_envelope_hash, &encoded);
-  AppendU64(evidence.checkpoint_envelope_size, &encoded);
-  AppendString(evidence.checkpoint_authentication_key_id, &encoded);
-  AppendHash(evidence.checkpoint_history_token_bytes_hash, &encoded);
-  AppendWitness(evidence.producer_before_export, &encoded);
-  AppendWitness(evidence.producer_after_export, &encoded);
-  AppendWitness(evidence.fresh_import_target, &encoded);
-  AppendReauthenticationEvidence(
-      evidence.transient_to_durable_reauthentication, &encoded);
-  AppendU32(evidence.parent_restore_evidence.has_value() ? 1 : 0, &encoded);
-  if (evidence.parent_restore_evidence.has_value()) {
-    AppendHash(evidence.parent_restore_evidence->evidence_id, &encoded);
-    encoded.append(
-        EncodeRestoreEvidenceV3Fields(*evidence.parent_restore_evidence));
   }
   return encoded;
 }
@@ -422,8 +380,7 @@ absl::StatusOr<Hash256> HashCanonical(absl::string_view domain,
 
 absl::StatusOr<Hash256> ComputeEmptyHistoryHash() {
   ABSL_ASSIGN_OR_RETURN(const std::string empty_history,
-                        EncodeFreshWorkerTokenIds(
-                            std::vector<int32_t>()));
+                        EncodeFreshWorkerTokenIds(std::vector<int32_t>()));
   Sha256Hasher hasher;
   const Hash256 result = hasher.OneShot(empty_history);
   if (IsZeroHash(result)) {
@@ -452,22 +409,20 @@ absl::Status ValidateLogId(absl::string_view log_id) {
   return absl::OkStatus();
 }
 
-absl::Status ValidateAuthority(const CapsuleRestoreAuthorityV2& authority) {
-  ABSL_RETURN_IF_ERROR(
-      ValidateSessionHandoffCapability(authority.capability));
+absl::Status ValidateAuthority(const CapsuleRestoreAuthority& authority) {
+  ABSL_RETURN_IF_ERROR(ValidateSessionHandoffCapability(authority.capability));
   if (!IsCompleteIdentity(authority.capability.session_identity) ||
       IsZeroHash(authority.admission_record_id) ||
       IsZeroHash(authority.coverage_id) ||
-      IsZeroHash(authority.qualification_spec_hash)) {
+      IsZeroHash(authority.qualification_evidence_hash)) {
     return absl::InvalidArgumentError(
-        "CapsuleRestore V2 requires the complete capability, admission, "
+        "CapsuleRestore requires the complete capability, admission, "
         "coverage, and qualification binding.");
   }
   return absl::OkStatus();
 }
 
-absl::Status ValidateCheckpointState(
-    const CapsuleDPMCheckpointStateV2& state) {
+absl::Status ValidateCheckpointState(const CapsuleDPMCheckpointState& state) {
   ABSL_RETURN_IF_ERROR(ValidateLogId(state.log_id));
   if (state.source_event_count == 0 ||
       state.response_event_index != state.source_event_count ||
@@ -484,7 +439,7 @@ absl::Status ValidateCheckpointState(
   return absl::OkStatus();
 }
 
-absl::Status ValidateRestoreTarget(const CapsuleDPMRestoreTargetV2& state) {
+absl::Status ValidateRestoreTarget(const CapsuleDPMRestoreTarget& state) {
   ABSL_RETURN_IF_ERROR(ValidateLogId(state.log_id));
   if (state.source_event_count == 0 ||
       state.prospective_response_event_index != state.source_event_count ||
@@ -502,11 +457,11 @@ absl::Status ValidateRestoreTarget(const CapsuleDPMRestoreTargetV2& state) {
 }
 
 absl::StatusOr<Hash256> ComputePreparedSourceChunkHash(
-    const CapsuleCanonicalPrefillChunkV2& chunk) {
+    const CapsuleCanonicalPrefillChunk& chunk) {
   switch (chunk.encoding) {
-    case CapsuleCanonicalPrefillChunkV2::Encoding::kUtf8Text:
+    case CapsuleCanonicalPrefillChunk::Encoding::kUtf8Text:
       return ComputeDPMPreparedPrefillUtf8SourceChunkHash(chunk.utf8_text);
-    case CapsuleCanonicalPrefillChunkV2::Encoding::kExactTokenIds:
+    case CapsuleCanonicalPrefillChunk::Encoding::kExactTokenIds:
       return ComputeDPMPreparedPrefillExactTokenSourceChunkHash(
           chunk.token_ids);
     default:
@@ -517,7 +472,7 @@ absl::StatusOr<Hash256> ComputePreparedSourceChunkHash(
 
 absl::Status ValidatePreparedPlanAgainstCanonicalChunks(
     const DPMPreparedPrefillPlan& prepared,
-    const std::vector<CapsuleCanonicalPrefillChunkV2>& chunks) {
+    const std::vector<CapsuleCanonicalPrefillChunk>& chunks) {
   ABSL_RETURN_IF_ERROR(ValidateDPMPreparedPrefillPlan(prepared));
   if (prepared.calls.size() != chunks.size()) {
     return absl::FailedPreconditionError(
@@ -525,18 +480,17 @@ absl::Status ValidatePreparedPlanAgainstCanonicalChunks(
         "canonical source chunk.");
   }
   for (size_t index = 0; index < chunks.size(); ++index) {
-    const CapsuleCanonicalPrefillChunkV2& chunk = chunks[index];
+    const CapsuleCanonicalPrefillChunk& chunk = chunks[index];
     const DPMPreparedPrefillCall& call = prepared.calls[index];
     ABSL_ASSIGN_OR_RETURN(const Hash256 expected_source_hash,
                           ComputePreparedSourceChunkHash(chunk));
     const DPMPreparedPrefillSourceEncoding expected_encoding =
-        chunk.encoding ==
-                CapsuleCanonicalPrefillChunkV2::Encoding::kUtf8Text
+        chunk.encoding == CapsuleCanonicalPrefillChunk::Encoding::kUtf8Text
             ? DPMPreparedPrefillSourceEncoding::kUtf8Text
             : DPMPreparedPrefillSourceEncoding::kExactTokenIds;
     const bool may_have_bos_segment =
-        index == 0 && prepared.start_kind ==
-                          DPMPreparedPrefillStartKind::kFreshSession;
+        index == 0 &&
+        prepared.start_kind == DPMPreparedPrefillStartKind::kFreshSession;
     if (call.source_encoding != expected_encoding ||
         call.source_chunk_hash != expected_source_hash ||
         call.token_segments.empty() || call.token_segments.size() > 2 ||
@@ -548,7 +502,7 @@ absl::Status ValidatePreparedPlanAgainstCanonicalChunks(
           "call/BOS/token-buffer segment boundary.");
     }
     if (chunk.encoding ==
-            CapsuleCanonicalPrefillChunkV2::Encoding::kExactTokenIds &&
+            CapsuleCanonicalPrefillChunk::Encoding::kExactTokenIds &&
         call.token_segments.back().token_ids != chunk.token_ids) {
       return absl::FailedPreconditionError(
           "Prepared DPM prefill changed the exact token-buffer segment for a "
@@ -558,28 +512,7 @@ absl::Status ValidatePreparedPlanAgainstCanonicalChunks(
   return absl::OkStatus();
 }
 
-absl::Status ValidateDecodedWitness(
-    const SessionContinuationStateWitness& witness,
-    const SessionHandoffIdentity& expected_identity, uint32_t expected_step,
-    const Hash256& expected_history_hash, const Hash256& expected_envelope_hash,
-    uint64_t expected_envelope_size, absl::string_view expected_key_id) {
-  ABSL_RETURN_IF_ERROR(ValidateSessionContinuationStateWitness(witness));
-  if (witness.session_identity != expected_identity ||
-      witness.phase != SessionHandoffPhase::kDecoded || !witness.ran_decode ||
-      witness.current_step < 0 ||
-      static_cast<uint32_t>(witness.current_step) != expected_step ||
-      witness.processed_history_token_bytes_hash != expected_history_hash ||
-      witness.envelope_hash != expected_envelope_hash ||
-      witness.envelope_size != expected_envelope_size ||
-      witness.key_id != expected_key_id) {
-    return absl::FailedPreconditionError(
-        "CapsuleRestore decoded state witness does not match the exact "
-        "identity, own position, history, envelope, or authentication key.");
-  }
-  return absl::OkStatus();
-}
-
-absl::Status ValidateDecodedWitnessStateV3(
+absl::Status ValidateDecodedWitnessState(
     const SessionContinuationStateWitness& witness,
     const SessionHandoffIdentity& expected_identity, uint32_t expected_step,
     const Hash256& expected_history_hash) {
@@ -596,7 +529,7 @@ absl::Status ValidateDecodedWitnessStateV3(
   return absl::OkStatus();
 }
 
-bool ContinuationStateProjectionMatchesV3(
+bool ContinuationStateProjectionMatches(
     const SessionContinuationStateWitness& left,
     const SessionContinuationStateWitness& right) {
   return left.session_identity == right.session_identity &&
@@ -606,9 +539,8 @@ bool ContinuationStateProjectionMatchesV3(
              right.processed_history_token_bytes_hash;
 }
 
-bool RestoreTargetMatchesCapture(
-    const CapsuleDPMRestoreTargetV2& target,
-    const CapsuleCapturePlanV2& capture) {
+bool RestoreTargetMatchesCapture(const CapsuleDPMRestoreTarget& target,
+                                 const CapsuleCapturePlan& capture) {
   return target.log_id == capture.checkpoint_state.log_id &&
          target.source_event_count ==
              capture.checkpoint_state.source_event_count &&
@@ -628,30 +560,25 @@ bool RestoreTargetMatchesCapture(
              capture.checkpoint_state.logical_agent_request_hash;
 }
 
-absl::Status ValidateCapturePlanFields(const CapsuleCapturePlanV2& plan,
+absl::Status ValidateCapturePlanFields(const CapsuleCapturePlan& plan,
                                        bool require_plan_hash);
-absl::Status ValidateRestorePlanFields(const CapsuleRestorePlanV2& plan,
+absl::Status ValidateRestorePlanFields(const CapsuleRestorePlan& plan,
                                        bool require_plan_hash);
-absl::Status ValidateRestoreEvidenceFields(
-    const CapsuleRestoreEvidenceV2& evidence, bool require_evidence_id);
-absl::Status ValidateCaptureEvidenceFields(
-    const CapsuleCaptureEvidenceV2& evidence, bool require_evidence_id);
 
 }  // namespace
 
-absl::Status ValidateCapsuleCanonicalPrefillChunksV2(
-    const std::vector<CapsuleCanonicalPrefillChunkV2>& chunks) {
-  if (chunks.empty() ||
-      chunks.size() > kMaximumCapsuleEvidencePrefillChunks) {
+absl::Status ValidateCapsuleCanonicalPrefillChunks(
+    const std::vector<CapsuleCanonicalPrefillChunk>& chunks) {
+  if (chunks.empty() || chunks.size() > kMaximumCapsuleEvidencePrefillChunks) {
     return absl::InvalidArgumentError(
         "CapsuleRestore canonical prefill requires a bounded nonempty chunk "
         "sequence.");
   }
   uint64_t text_bytes = 0;
   uint64_t token_ids = 0;
-  for (const CapsuleCanonicalPrefillChunkV2& chunk : chunks) {
+  for (const CapsuleCanonicalPrefillChunk& chunk : chunks) {
     switch (chunk.encoding) {
-      case CapsuleCanonicalPrefillChunkV2::Encoding::kUtf8Text:
+      case CapsuleCanonicalPrefillChunk::Encoding::kUtf8Text:
         if (chunk.utf8_text.empty() || !chunk.token_ids.empty() ||
             !IsValidUtf8(chunk.utf8_text)) {
           return absl::InvalidArgumentError(
@@ -665,7 +592,7 @@ absl::Status ValidateCapsuleCanonicalPrefillChunksV2(
         }
         text_bytes += chunk.utf8_text.size();
         break;
-      case CapsuleCanonicalPrefillChunkV2::Encoding::kExactTokenIds:
+      case CapsuleCanonicalPrefillChunk::Encoding::kExactTokenIds:
         if (!chunk.utf8_text.empty() || chunk.token_ids.empty()) {
           return absl::InvalidArgumentError(
               "CapsuleRestore exact-token chunk is empty or mixed with "
@@ -693,26 +620,25 @@ absl::Status ValidateCapsuleCanonicalPrefillChunksV2(
   return absl::OkStatus();
 }
 
-absl::StatusOr<Hash256> ComputeCapsuleCanonicalFullPrefillChunksHashV2(
-    const std::vector<CapsuleCanonicalPrefillChunkV2>& chunks) {
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleCanonicalPrefillChunksV2(chunks));
+absl::StatusOr<Hash256> ComputeCapsuleCanonicalFullPrefillChunksHash(
+    const std::vector<CapsuleCanonicalPrefillChunk>& chunks) {
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleCanonicalPrefillChunks(chunks));
   std::string canonical;
-  AppendU32(kCapsuleRestoreEvidenceV2FormatVersion, &canonical);
+  AppendU32(kCapsuleRestoreEvidenceFormatVersion, &canonical);
   AppendCanonicalChunks(chunks, &canonical);
   return HashCanonical(kFullPrefillChunksDomain, canonical);
 }
 
-absl::StatusOr<Hash256> ComputeCapsuleCanonicalDeltaChunksHashV2(
-    const std::vector<CapsuleCanonicalPrefillChunkV2>& chunks) {
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleCanonicalPrefillChunksV2(chunks));
+absl::StatusOr<Hash256> ComputeCapsuleCanonicalDeltaChunksHash(
+    const std::vector<CapsuleCanonicalPrefillChunk>& chunks) {
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleCanonicalPrefillChunks(chunks));
   std::string canonical;
-  AppendU32(kCapsuleRestoreEvidenceV2FormatVersion, &canonical);
+  AppendU32(kCapsuleRestoreEvidenceFormatVersion, &canonical);
   AppendCanonicalChunks(chunks, &canonical);
   return HashCanonical(kDeltaChunksDomain, canonical);
 }
 
-absl::Status ValidateCapsulePrefillPlanV2(
-    const CapsulePrefillPlanV2& plan) {
+absl::Status ValidateCapsulePrefillPlan(const CapsulePrefillPlan& plan) {
   if (plan.event_range_start >= plan.event_range_end ||
       plan.start_step >= plan.end_step ||
       plan.end_step > kMaximumCapsuleEvidenceTokenIds) {
@@ -720,7 +646,7 @@ absl::Status ValidateCapsulePrefillPlanV2(
         "CapsuleRestore prefill has an invalid event or own-position range.");
   }
   ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleCanonicalPrefillChunksV2(plan.canonical_chunks));
+      ValidateCapsuleCanonicalPrefillChunks(plan.canonical_chunks));
   ABSL_RETURN_IF_ERROR(ValidatePreparedPlanAgainstCanonicalChunks(
       plan.prepared_plan, plan.canonical_chunks));
   if (plan.prepared_plan.start_step != plan.start_step ||
@@ -732,11 +658,10 @@ absl::Status ValidateCapsulePrefillPlanV2(
   }
 
   switch (plan.mode) {
-    case CapsulePrefillModeV2::kFullCanonicalPrefill: {
+    case CapsulePrefillMode::kFullCanonicalPrefill: {
       ABSL_ASSIGN_OR_RETURN(
           const Hash256 expected_chunks_hash,
-          ComputeCapsuleCanonicalFullPrefillChunksHashV2(
-              plan.canonical_chunks));
+          ComputeCapsuleCanonicalFullPrefillChunksHash(plan.canonical_chunks));
       ABSL_ASSIGN_OR_RETURN(const Hash256 empty_history_hash,
                             ComputeEmptyHistoryHash());
       if (plan.canonical_full_prefill_chunks_hash != expected_chunks_hash ||
@@ -753,10 +678,10 @@ absl::Status ValidateCapsulePrefillPlanV2(
       }
       break;
     }
-    case CapsulePrefillModeV2::kOwnPositionCapsuleDelta: {
+    case CapsulePrefillMode::kOwnPositionCapsuleDelta: {
       ABSL_ASSIGN_OR_RETURN(
           const Hash256 expected_chunks_hash,
-          ComputeCapsuleCanonicalDeltaChunksHashV2(plan.canonical_chunks));
+          ComputeCapsuleCanonicalDeltaChunksHash(plan.canonical_chunks));
       if (plan.canonical_delta_chunks_hash != expected_chunks_hash ||
           !IsZeroHash(plan.canonical_full_prefill_chunks_hash) ||
           plan.prepared_plan.start_kind !=
@@ -779,15 +704,15 @@ absl::Status ValidateCapsulePrefillPlanV2(
 
 namespace {
 
-absl::Status ValidateCapturePlanFields(const CapsuleCapturePlanV2& plan,
+absl::Status ValidateCapturePlanFields(const CapsuleCapturePlan& plan,
                                        bool require_plan_hash) {
-  if (plan.format_version != CapsuleCapturePlanV2::kFormatVersion) {
+  if (plan.format_version != CapsuleCapturePlan::kFormatVersion) {
     return absl::FailedPreconditionError(
         "Capsule capture plan version is unsupported.");
   }
   ABSL_RETURN_IF_ERROR(ValidateAuthority(plan.authority));
   ABSL_RETURN_IF_ERROR(ValidateCheckpointState(plan.checkpoint_state));
-  ABSL_RETURN_IF_ERROR(ValidateCapsulePrefillPlanV2(plan.prefill));
+  ABSL_RETURN_IF_ERROR(ValidateCapsulePrefillPlan(plan.prefill));
   ABSL_RETURN_IF_ERROR(
       ValidatePublicKeyId(plan.checkpoint_authentication_key_id));
   if (IsZeroHash(plan.agent_transcript_prefix_hash) ||
@@ -796,8 +721,7 @@ absl::Status ValidateCapturePlanFields(const CapsuleCapturePlanV2& plan,
       plan.generated_token_count > kMaximumCapsuleEvidenceGenerationTokens ||
       plan.capture_end_step > kMaximumCapsuleEvidenceTokenIds ||
       plan.prefill.end_step >
-          (std::numeric_limits<uint32_t>::max)() -
-              plan.generated_token_count ||
+          (std::numeric_limits<uint32_t>::max)() - plan.generated_token_count ||
       plan.capture_end_step !=
           plan.prefill.end_step + plan.generated_token_count ||
       plan.prefill.event_range_end !=
@@ -813,10 +737,8 @@ absl::Status ValidateCapturePlanFields(const CapsuleCapturePlanV2& plan,
   }
 
   const bool has_parent_checkpoint = plan.parent_checkpoint_id.has_value();
-  const bool has_parent_response =
-      plan.parent_response_event_index.has_value();
-  const bool has_parent_restore =
-      plan.parent_restore_evidence_id.has_value();
+  const bool has_parent_response = plan.parent_response_event_index.has_value();
+  const bool has_parent_restore = plan.parent_restore_evidence_id.has_value();
   if (has_parent_checkpoint != has_parent_response ||
       has_parent_checkpoint != has_parent_restore ||
       (has_parent_checkpoint &&
@@ -828,9 +750,8 @@ absl::Status ValidateCapturePlanFields(const CapsuleCapturePlanV2& plan,
   }
 
   switch (plan.capture_basis) {
-    case CapsuleCaptureBasisV2::kRootFreshSession:
-      if (plan.prefill.mode !=
-              CapsulePrefillModeV2::kFullCanonicalPrefill ||
+    case CapsuleCaptureBasis::kRootFreshSession:
+      if (plan.prefill.mode != CapsulePrefillMode::kFullCanonicalPrefill ||
           plan.prefill.start_step != 0 || has_parent_checkpoint) {
         return absl::FailedPreconditionError(
             "A root capsule capture requires a fresh-session full prefill of "
@@ -838,9 +759,8 @@ absl::Status ValidateCapturePlanFields(const CapsuleCapturePlanV2& plan,
             "evidence.");
       }
       break;
-    case CapsuleCaptureBasisV2::kVerifiedParentRestore:
-      if (plan.prefill.mode !=
-              CapsulePrefillModeV2::kOwnPositionCapsuleDelta ||
+    case CapsuleCaptureBasis::kVerifiedParentRestore:
+      if (plan.prefill.mode != CapsulePrefillMode::kOwnPositionCapsuleDelta ||
           plan.prefill.start_step == 0 || !has_parent_checkpoint ||
           *plan.parent_response_event_index ==
               (std::numeric_limits<uint64_t>::max)() ||
@@ -856,22 +776,21 @@ absl::Status ValidateCapturePlanFields(const CapsuleCapturePlanV2& plan,
       }
       break;
     default:
-      return absl::UnimplementedError(
-          "Capsule capture basis is unsupported.");
+      return absl::UnimplementedError("Capsule capture basis is unsupported.");
   }
   return absl::OkStatus();
 }
 
-absl::Status ValidateRestorePlanFields(const CapsuleRestorePlanV2& plan,
+absl::Status ValidateRestorePlanFields(const CapsuleRestorePlan& plan,
                                        bool require_plan_hash) {
-  if (plan.format_version != CapsuleRestorePlanV2::kFormatVersion) {
+  if (plan.format_version != CapsuleRestorePlan::kFormatVersion) {
     return absl::FailedPreconditionError(
         "Capsule restore plan version is unsupported.");
   }
   ABSL_RETURN_IF_ERROR(ValidateAuthority(plan.authority));
   ABSL_RETURN_IF_ERROR(ValidateCheckpointState(plan.checkpoint_state));
   ABSL_RETURN_IF_ERROR(ValidateRestoreTarget(plan.target_state));
-  ABSL_RETURN_IF_ERROR(ValidateCapsulePrefillPlanV2(plan.prefill));
+  ABSL_RETURN_IF_ERROR(ValidateCapsulePrefillPlan(plan.prefill));
   ABSL_RETURN_IF_ERROR(
       ValidatePublicKeyId(plan.checkpoint_authentication_key_id));
 
@@ -886,8 +805,7 @@ absl::Status ValidateRestorePlanFields(const CapsuleRestorePlanV2& plan,
       IsZeroHash(plan.checkpoint_history_token_bytes_hash) ||
       plan.maximum_output_tokens == 0 ||
       plan.maximum_output_tokens > kMaximumCapsuleEvidenceGenerationTokens ||
-      plan.prefill.mode !=
-          CapsulePrefillModeV2::kOwnPositionCapsuleDelta ||
+      plan.prefill.mode != CapsulePrefillMode::kOwnPositionCapsuleDelta ||
       plan.prefill.start_step != plan.checkpoint_step ||
       plan.prefill.prepared_plan.session_identity !=
           plan.authority.capability.session_identity ||
@@ -917,39 +835,96 @@ absl::Status ValidateRestorePlanFields(const CapsuleRestorePlanV2& plan,
   return absl::OkStatus();
 }
 
+absl::Status ValidateReauthentication(
+    const SessionHandoffReauthenticationEvidence& reauthentication,
+    const CapsuleRestoreAuthority& authority,
+    absl::string_view expected_purpose) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateSessionHandoffReauthenticationEvidence(reauthentication));
+  ABSL_RETURN_IF_ERROR(ValidatePublicKeyId(reauthentication.source_key_id));
+  ABSL_RETURN_IF_ERROR(
+      ValidatePublicKeyId(reauthentication.destination_key_id));
+  if (reauthentication.session_identity !=
+          authority.capability.session_identity ||
+      reauthentication.capsule_codec_contract_hash !=
+          authority.capability.capsule_codec_contract_hash ||
+      reauthentication.capsule_codec_contract_hash !=
+          GetSessionHandoffCapsuleCodecContractHash() ||
+      reauthentication.reauthentication_contract_hash !=
+          GetSessionHandoffReauthenticationEvidenceContractHash() ||
+      reauthentication.purpose != expected_purpose) {
+    return absl::FailedPreconditionError(
+        "CapsuleRestore reauthentication evidence belongs to another "
+        "runtime, capsule/state-commitment contract, or product direction.");
+  }
+  return absl::OkStatus();
+}
+
+bool WitnessEnvelopeMatchesReauthenticationSource(
+    const SessionContinuationStateWitness& witness,
+    const SessionHandoffReauthenticationEvidence& reauthentication) {
+  return witness.envelope_hash == reauthentication.source_envelope_hash &&
+         witness.envelope_size == reauthentication.source_envelope_size &&
+         witness.key_id == reauthentication.source_key_id;
+}
+
+bool WitnessEnvelopeMatchesReauthenticationDestination(
+    const SessionContinuationStateWitness& witness,
+    const SessionHandoffReauthenticationEvidence& reauthentication) {
+  return witness.envelope_hash == reauthentication.destination_envelope_hash &&
+         witness.envelope_size == reauthentication.destination_envelope_size &&
+         witness.key_id == reauthentication.destination_key_id;
+}
+
 absl::Status ValidateRestoreEvidenceFields(
-    const CapsuleRestoreEvidenceV2& evidence, bool require_evidence_id) {
-  if (evidence.format_version != CapsuleRestoreEvidenceV2::kFormatVersion) {
+    const CapsuleRestoreEvidence& evidence, bool require_evidence_id) {
+  if (evidence.format_version != CapsuleRestoreEvidence::kFormatVersion) {
     return absl::FailedPreconditionError(
         "Capsule restore evidence version is unsupported.");
   }
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestorePlanV2(evidence.plan));
-  ABSL_RETURN_IF_ERROR(ValidateDecodedWitness(
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestorePlan(evidence.plan));
+  const SessionHandoffReauthenticationEvidence& reauthentication =
+      evidence.durable_to_transient_reauthentication;
+  ABSL_RETURN_IF_ERROR(ValidateReauthentication(
+      reauthentication, evidence.plan.authority,
+      kFreshWorkerDurableRestoreToTransientReauthenticationPurpose));
+  ABSL_RETURN_IF_ERROR(ValidateDecodedWitnessState(
       evidence.target_post_import,
       evidence.plan.authority.capability.session_identity,
       evidence.plan.checkpoint_step,
-      evidence.plan.checkpoint_history_token_bytes_hash,
-      evidence.plan.checkpoint_envelope_hash,
-      evidence.plan.checkpoint_envelope_size,
-      evidence.plan.checkpoint_authentication_key_id));
+      evidence.plan.checkpoint_history_token_bytes_hash));
+  if (reauthentication.source_envelope_hash !=
+          evidence.plan.checkpoint_envelope_hash ||
+      reauthentication.source_envelope_size !=
+          evidence.plan.checkpoint_envelope_size ||
+      reauthentication.source_key_id !=
+          evidence.plan.checkpoint_authentication_key_id ||
+      reauthentication.destination_key_id !=
+          kFreshWorkerTransientRestoreKeyId ||
+      !WitnessEnvelopeMatchesReauthenticationDestination(
+          evidence.target_post_import, reauthentication)) {
+    return absl::FailedPreconditionError(
+        "Capsule restore evidence does not join the exact durable "
+        "checkpoint source to the transient envelope imported by its live "
+        "target.");
+  }
   if (evidence.plan.prefill.prepared_plan.start_state_witness_id !=
       std::optional<Hash256>(evidence.target_post_import.witness_id)) {
     return absl::FailedPreconditionError(
         "Capsule restore prepared prefill is not bound to the actual "
-        "post-import target witness.");
+        "transient post-import target witness.");
   }
   if (require_evidence_id && IsZeroHash(evidence.evidence_id)) {
-    return absl::InvalidArgumentError(
-        "Capsule restore evidence ID is absent.");
+    return absl::InvalidArgumentError("Capsule restore evidence ID is absent.");
   }
   return absl::OkStatus();
 }
 
 absl::Status ValidateParentRestoreLink(
-    const CapsuleCaptureEvidenceV2& child,
-    const CapsuleRestoreEvidenceV2& parent_restore) {
-  const CapsuleCapturePlanV2& capture = child.plan;
-  const CapsuleRestorePlanV2& restore = parent_restore.plan;
+    const CapsuleCaptureEvidence& child,
+    const CapsuleRestoreEvidence& parent_restore) {
+  const CapsuleCapturePlan& capture = child.plan;
+  const CapsuleRestorePlan& restore = parent_restore.plan;
   if (!capture.parent_checkpoint_id.has_value() ||
       !capture.parent_response_event_index.has_value() ||
       !capture.parent_restore_evidence_id.has_value() ||
@@ -972,19 +947,20 @@ absl::Status ValidateParentRestoreLink(
       static_cast<uint32_t>(parent_restore.target_post_import.current_step) !=
           capture.prefill.start_step) {
     return absl::FailedPreconditionError(
-        "Recursive capsule capture is not bound to the exact verified parent "
-        "restore, target request, own position, and delta plan.");
+        "Recursive capsule capture is not bound to the exact verified "
+        "parent restore, transient target witness, own position, and delta "
+        "plan.");
   }
   return absl::OkStatus();
 }
 
 absl::Status ValidateCaptureEvidenceFields(
-    const CapsuleCaptureEvidenceV2& evidence, bool require_evidence_id) {
-  if (evidence.format_version != CapsuleCaptureEvidenceV2::kFormatVersion) {
+    const CapsuleCaptureEvidence& evidence, bool require_evidence_id) {
+  if (evidence.format_version != CapsuleCaptureEvidence::kFormatVersion) {
     return absl::FailedPreconditionError(
         "Capsule capture evidence version is unsupported.");
   }
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleCapturePlanV2(evidence.plan));
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleCapturePlan(evidence.plan));
   ABSL_RETURN_IF_ERROR(
       ValidatePublicKeyId(evidence.checkpoint_authentication_key_id));
   if (IsZeroHash(evidence.checkpoint_id) ||
@@ -995,53 +971,69 @@ absl::Status ValidateCaptureEvidenceFields(
       IsZeroHash(evidence.checkpoint_history_token_bytes_hash) ||
       evidence.checkpoint_authentication_key_id !=
           evidence.plan.checkpoint_authentication_key_id ||
+      evidence.checkpoint_authentication_key_id ==
+          kFreshWorkerTransientRestoreKeyId ||
+      evidence.checkpoint_authentication_key_id ==
+          kFreshWorkerTransientProducingKeyId ||
       (require_evidence_id && IsZeroHash(evidence.evidence_id))) {
     return absl::InvalidArgumentError(
-        "Capsule capture evidence has incomplete checkpoint, envelope, key, "
-        "or processed-history metadata.");
+        "Capsule capture evidence has incomplete checkpoint, envelope, "
+        "key, history, or content-address metadata.");
   }
 
   const SessionHandoffIdentity& identity =
       evidence.plan.authority.capability.session_identity;
-  ABSL_RETURN_IF_ERROR(ValidateDecodedWitness(
-      evidence.producer_before_export, identity,
-      evidence.plan.capture_end_step,
-      evidence.checkpoint_history_token_bytes_hash,
-      evidence.checkpoint_envelope_hash, evidence.checkpoint_envelope_size,
-      evidence.checkpoint_authentication_key_id));
-  ABSL_RETURN_IF_ERROR(ValidateDecodedWitness(
-      evidence.producer_after_export, identity,
-      evidence.plan.capture_end_step,
-      evidence.checkpoint_history_token_bytes_hash,
-      evidence.checkpoint_envelope_hash, evidence.checkpoint_envelope_size,
-      evidence.checkpoint_authentication_key_id));
-  ABSL_RETURN_IF_ERROR(ValidateDecodedWitness(
+  ABSL_RETURN_IF_ERROR(ValidateDecodedWitnessState(
+      evidence.producer_before_export, identity, evidence.plan.capture_end_step,
+      evidence.checkpoint_history_token_bytes_hash));
+  ABSL_RETURN_IF_ERROR(ValidateDecodedWitnessState(
+      evidence.producer_after_export, identity, evidence.plan.capture_end_step,
+      evidence.checkpoint_history_token_bytes_hash));
+  ABSL_RETURN_IF_ERROR(ValidateDecodedWitnessState(
       evidence.fresh_import_target, identity, evidence.plan.capture_end_step,
-      evidence.checkpoint_history_token_bytes_hash,
-      evidence.checkpoint_envelope_hash, evidence.checkpoint_envelope_size,
-      evidence.checkpoint_authentication_key_id));
+      evidence.checkpoint_history_token_bytes_hash));
   if (evidence.producer_before_export != evidence.producer_after_export ||
       evidence.producer_before_export != evidence.fresh_import_target) {
     return absl::DataLossError(
-        "Capsule capture changed the producer or failed fresh-target exact "
-        "import/re-export equality.");
+        "Capsule capture transient producer exports and fresh-target "
+        "import/re-export witnesses are not canonically equal.");
+  }
+
+  const SessionHandoffReauthenticationEvidence& reauthentication =
+      evidence.transient_to_durable_reauthentication;
+  ABSL_RETURN_IF_ERROR(ValidateReauthentication(
+      reauthentication, evidence.plan.authority,
+      kFreshWorkerTransientProducingToDurableReauthenticationPurpose));
+  if (!WitnessEnvelopeMatchesReauthenticationSource(
+          evidence.producer_before_export, reauthentication) ||
+      reauthentication.source_key_id != kFreshWorkerTransientProducingKeyId ||
+      reauthentication.destination_envelope_hash !=
+          evidence.checkpoint_envelope_hash ||
+      reauthentication.destination_envelope_size !=
+          evidence.checkpoint_envelope_size ||
+      reauthentication.destination_key_id !=
+          evidence.checkpoint_authentication_key_id) {
+    return absl::FailedPreconditionError(
+        "Capsule capture evidence does not join the exact transient "
+        "producer envelope to the durable checkpoint endpoint.");
   }
 
   switch (evidence.plan.capture_basis) {
-    case CapsuleCaptureBasisV2::kRootFreshSession:
+    case CapsuleCaptureBasis::kRootFreshSession:
       if (evidence.parent_restore_evidence.has_value()) {
         return absl::FailedPreconditionError(
-            "A root capsule capture must not carry parent restore evidence.");
-      }
-      break;
-    case CapsuleCaptureBasisV2::kVerifiedParentRestore:
-      if (!evidence.parent_restore_evidence.has_value()) {
-        return absl::FailedPreconditionError(
-            "A verified-parent capsule capture omitted its parent restore "
+            "A root capsule capture must not carry parent restore "
             "evidence.");
       }
-      ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreEvidenceV2(
-          *evidence.parent_restore_evidence));
+      break;
+    case CapsuleCaptureBasis::kVerifiedParentRestore:
+      if (!evidence.parent_restore_evidence.has_value()) {
+        return absl::FailedPreconditionError(
+            "A verified-parent capsule capture omitted its parent "
+            "restore evidence.");
+      }
+      ABSL_RETURN_IF_ERROR(
+          ValidateCapsuleRestoreEvidence(*evidence.parent_restore_evidence));
       ABSL_RETURN_IF_ERROR(ValidateParentRestoreLink(
           evidence, *evidence.parent_restore_evidence));
       break;
@@ -1052,433 +1044,83 @@ absl::Status ValidateCaptureEvidenceFields(
   return absl::OkStatus();
 }
 
-absl::Status ValidateV3Reauthentication(
-    const SessionHandoffReauthenticationEvidence& reauthentication,
-    const CapsuleRestoreAuthorityV2& authority,
-    absl::string_view expected_purpose) {
-  ABSL_RETURN_IF_ERROR(
-      ValidateSessionHandoffReauthenticationEvidence(reauthentication));
-  ABSL_RETURN_IF_ERROR(
-      ValidatePublicKeyId(reauthentication.source_key_id));
-  ABSL_RETURN_IF_ERROR(
-      ValidatePublicKeyId(reauthentication.destination_key_id));
-  if (reauthentication.session_identity !=
-          authority.capability.session_identity ||
-      reauthentication.capsule_codec_contract_hash !=
-          authority.capability.capsule_codec_contract_hash ||
-      reauthentication.capsule_codec_contract_hash !=
-          GetSessionHandoffCapsuleCodecContractHash() ||
-      reauthentication.reauthentication_contract_hash !=
-          GetSessionHandoffReauthenticationEvidenceContractHash() ||
-      reauthentication.purpose != expected_purpose) {
-    return absl::FailedPreconditionError(
-        "CapsuleRestore V3 reauthentication evidence belongs to another "
-        "runtime, capsule/state-commitment contract, or product direction.");
-  }
-  return absl::OkStatus();
-}
-
-bool WitnessEnvelopeMatchesReauthenticationSource(
-    const SessionContinuationStateWitness& witness,
-    const SessionHandoffReauthenticationEvidence& reauthentication) {
-  return witness.envelope_hash == reauthentication.source_envelope_hash &&
-         witness.envelope_size == reauthentication.source_envelope_size &&
-         witness.key_id == reauthentication.source_key_id;
-}
-
-bool WitnessEnvelopeMatchesReauthenticationDestination(
-    const SessionContinuationStateWitness& witness,
-    const SessionHandoffReauthenticationEvidence& reauthentication) {
-  return witness.envelope_hash ==
-             reauthentication.destination_envelope_hash &&
-         witness.envelope_size ==
-             reauthentication.destination_envelope_size &&
-         witness.key_id == reauthentication.destination_key_id;
-}
-
-absl::Status ValidateRestoreEvidenceV3Fields(
-    const CapsuleRestoreEvidenceV3& evidence, bool require_evidence_id) {
-  if (evidence.format_version != CapsuleRestoreEvidenceV3::kFormatVersion) {
-    return absl::FailedPreconditionError(
-        "Capsule restore V3 evidence version is unsupported.");
-  }
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestorePlanV2(evidence.plan));
-  const SessionHandoffReauthenticationEvidence& reauthentication =
-      evidence.durable_to_transient_reauthentication;
-  ABSL_RETURN_IF_ERROR(ValidateV3Reauthentication(
-      reauthentication, evidence.plan.authority,
-      kFreshWorkerDurableRestoreToTransientReauthenticationPurpose));
-  ABSL_RETURN_IF_ERROR(ValidateDecodedWitnessStateV3(
-      evidence.target_post_import,
-      evidence.plan.authority.capability.session_identity,
-      evidence.plan.checkpoint_step,
-      evidence.plan.checkpoint_history_token_bytes_hash));
-  if (reauthentication.source_envelope_hash !=
-          evidence.plan.checkpoint_envelope_hash ||
-      reauthentication.source_envelope_size !=
-          evidence.plan.checkpoint_envelope_size ||
-      reauthentication.source_key_id !=
-          evidence.plan.checkpoint_authentication_key_id ||
-      reauthentication.destination_key_id !=
-          kFreshWorkerTransientRestoreKeyId ||
-      !WitnessEnvelopeMatchesReauthenticationDestination(
-          evidence.target_post_import, reauthentication)) {
-    return absl::FailedPreconditionError(
-        "Capsule restore V3 evidence does not join the exact durable "
-        "checkpoint source to the transient envelope imported by its live "
-        "target.");
-  }
-  if (evidence.plan.prefill.prepared_plan.start_state_witness_id !=
-      std::optional<Hash256>(evidence.target_post_import.witness_id)) {
-    return absl::FailedPreconditionError(
-        "Capsule restore V3 prepared prefill is not bound to the actual "
-        "transient post-import target witness.");
-  }
-  if (require_evidence_id && IsZeroHash(evidence.evidence_id)) {
-    return absl::InvalidArgumentError(
-        "Capsule restore V3 evidence ID is absent.");
-  }
-  return absl::OkStatus();
-}
-
-absl::Status ValidateParentRestoreLinkV3(
-    const CapsuleCaptureEvidenceV3& child,
-    const CapsuleRestoreEvidenceV3& parent_restore) {
-  const CapsuleCapturePlanV2& capture = child.plan;
-  const CapsuleRestorePlanV2& restore = parent_restore.plan;
-  if (!capture.parent_checkpoint_id.has_value() ||
-      !capture.parent_response_event_index.has_value() ||
-      !capture.parent_restore_evidence_id.has_value() ||
-      *capture.parent_checkpoint_id != restore.checkpoint_id ||
-      *capture.parent_response_event_index !=
-          restore.checkpoint_state.response_event_index ||
-      *capture.parent_restore_evidence_id != parent_restore.evidence_id ||
-      capture.authority != restore.authority ||
-      !RestoreTargetMatchesCapture(restore.target_state, capture) ||
-      capture.prefill != restore.prefill ||
-      capture.prefill.start_step != restore.checkpoint_step ||
-      capture.prefill.prepared_plan.start_state_witness_id !=
-          std::optional<Hash256>(parent_restore.target_post_import.witness_id) ||
-      capture.prefill.prepared_plan.start_history_token_bytes_hash !=
-          parent_restore.target_post_import
-              .processed_history_token_bytes_hash ||
-      capture.generated_token_count > restore.maximum_output_tokens ||
-      parent_restore.target_post_import.current_step < 0 ||
-      static_cast<uint32_t>(parent_restore.target_post_import.current_step) !=
-          capture.prefill.start_step) {
-    return absl::FailedPreconditionError(
-        "Recursive capsule V3 capture is not bound to the exact verified "
-        "parent restore, transient target witness, own position, and delta "
-        "plan.");
-  }
-  return absl::OkStatus();
-}
-
-absl::Status ValidateCaptureEvidenceV3Fields(
-    const CapsuleCaptureEvidenceV3& evidence, bool require_evidence_id) {
-  if (evidence.format_version != CapsuleCaptureEvidenceV3::kFormatVersion) {
-    return absl::FailedPreconditionError(
-        "Capsule capture V3 evidence version is unsupported.");
-  }
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleCapturePlanV2(evidence.plan));
-  ABSL_RETURN_IF_ERROR(
-      ValidatePublicKeyId(evidence.checkpoint_authentication_key_id));
-  if (IsZeroHash(evidence.checkpoint_id) ||
-      IsZeroHash(evidence.checkpoint_envelope_hash) ||
-      evidence.checkpoint_envelope_size == 0 ||
-      evidence.checkpoint_envelope_size >
-          kMaximumCapsuleEvidenceEnvelopeBytes ||
-      IsZeroHash(evidence.checkpoint_history_token_bytes_hash) ||
-      evidence.checkpoint_authentication_key_id !=
-          evidence.plan.checkpoint_authentication_key_id ||
-      evidence.checkpoint_authentication_key_id ==
-          kFreshWorkerTransientRestoreKeyId ||
-      evidence.checkpoint_authentication_key_id ==
-          kFreshWorkerTransientProducingKeyId ||
-      (require_evidence_id && IsZeroHash(evidence.evidence_id))) {
-    return absl::InvalidArgumentError(
-        "Capsule capture V3 evidence has incomplete checkpoint, envelope, "
-        "key, history, or content-address metadata.");
-  }
-
-  const SessionHandoffIdentity& identity =
-      evidence.plan.authority.capability.session_identity;
-  ABSL_RETURN_IF_ERROR(ValidateDecodedWitnessStateV3(
-      evidence.producer_before_export, identity,
-      evidence.plan.capture_end_step,
-      evidence.checkpoint_history_token_bytes_hash));
-  ABSL_RETURN_IF_ERROR(ValidateDecodedWitnessStateV3(
-      evidence.producer_after_export, identity,
-      evidence.plan.capture_end_step,
-      evidence.checkpoint_history_token_bytes_hash));
-  ABSL_RETURN_IF_ERROR(ValidateDecodedWitnessStateV3(
-      evidence.fresh_import_target, identity, evidence.plan.capture_end_step,
-      evidence.checkpoint_history_token_bytes_hash));
-  if (evidence.producer_before_export != evidence.producer_after_export ||
-      evidence.producer_before_export != evidence.fresh_import_target) {
-    return absl::DataLossError(
-        "Capsule capture V3 transient producer exports and fresh-target "
-        "import/re-export witnesses are not canonically equal.");
-  }
-
-  const SessionHandoffReauthenticationEvidence& reauthentication =
-      evidence.transient_to_durable_reauthentication;
-  ABSL_RETURN_IF_ERROR(ValidateV3Reauthentication(
-      reauthentication, evidence.plan.authority,
-      kFreshWorkerTransientProducingToDurableReauthenticationPurpose));
-  if (!WitnessEnvelopeMatchesReauthenticationSource(
-          evidence.producer_before_export, reauthentication) ||
-      reauthentication.source_key_id !=
-          kFreshWorkerTransientProducingKeyId ||
-      reauthentication.destination_envelope_hash !=
-          evidence.checkpoint_envelope_hash ||
-      reauthentication.destination_envelope_size !=
-          evidence.checkpoint_envelope_size ||
-      reauthentication.destination_key_id !=
-          evidence.checkpoint_authentication_key_id) {
-    return absl::FailedPreconditionError(
-        "Capsule capture V3 evidence does not join the exact transient "
-        "producer envelope to the durable checkpoint endpoint.");
-  }
-
-  switch (evidence.plan.capture_basis) {
-    case CapsuleCaptureBasisV2::kRootFreshSession:
-      if (evidence.parent_restore_evidence.has_value()) {
-        return absl::FailedPreconditionError(
-            "A root capsule V3 capture must not carry parent restore "
-            "evidence.");
-      }
-      break;
-    case CapsuleCaptureBasisV2::kVerifiedParentRestore:
-      if (!evidence.parent_restore_evidence.has_value()) {
-        return absl::FailedPreconditionError(
-            "A verified-parent capsule V3 capture omitted its parent "
-            "restore evidence.");
-      }
-      ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreEvidenceV3(
-          *evidence.parent_restore_evidence));
-      ABSL_RETURN_IF_ERROR(ValidateParentRestoreLinkV3(
-          evidence, *evidence.parent_restore_evidence));
-      break;
-    default:
-      return absl::UnimplementedError(
-          "Capsule capture V3 evidence basis is unsupported.");
-  }
-  return absl::OkStatus();
-}
-
 }  // namespace
 
-absl::StatusOr<Hash256> ComputeCapsuleCapturePlanV2Hash(
-    const CapsuleCapturePlanV2& plan) {
+absl::StatusOr<Hash256> ComputeCapsuleCapturePlanHash(
+    const CapsuleCapturePlan& plan) {
   ABSL_RETURN_IF_ERROR(ValidateCapturePlanFields(plan, false));
   return HashCanonical(kCapturePlanDomain, EncodeCapturePlanFields(plan));
 }
 
-absl::Status ValidateCapsuleCapturePlanV2(
-    const CapsuleCapturePlanV2& plan) {
+absl::Status ValidateCapsuleCapturePlan(const CapsuleCapturePlan& plan) {
   ABSL_RETURN_IF_ERROR(ValidateCapturePlanFields(plan, true));
   ABSL_ASSIGN_OR_RETURN(const Hash256 expected_hash,
-                        ComputeCapsuleCapturePlanV2Hash(plan));
+                        ComputeCapsuleCapturePlanHash(plan));
   if (plan.plan_hash != expected_hash) {
-    return absl::DataLossError(
-        "Capsule capture plan hash is not canonical.");
+    return absl::DataLossError("Capsule capture plan hash is not canonical.");
   }
   return absl::OkStatus();
 }
 
-absl::StatusOr<Hash256> ComputeCapsuleRestorePlanV2Hash(
-    const CapsuleRestorePlanV2& plan) {
+absl::StatusOr<Hash256> ComputeCapsuleRestorePlanHash(
+    const CapsuleRestorePlan& plan) {
   ABSL_RETURN_IF_ERROR(ValidateRestorePlanFields(plan, false));
   return HashCanonical(kRestorePlanDomain, EncodeRestorePlanFields(plan));
 }
 
-absl::Status ValidateCapsuleRestorePlanV2(
-    const CapsuleRestorePlanV2& plan) {
+absl::Status ValidateCapsuleRestorePlan(const CapsuleRestorePlan& plan) {
   ABSL_RETURN_IF_ERROR(ValidateRestorePlanFields(plan, true));
   ABSL_ASSIGN_OR_RETURN(const Hash256 expected_hash,
-                        ComputeCapsuleRestorePlanV2Hash(plan));
+                        ComputeCapsuleRestorePlanHash(plan));
   if (plan.plan_hash != expected_hash) {
-    return absl::DataLossError(
-        "Capsule restore plan hash is not canonical.");
+    return absl::DataLossError("Capsule restore plan hash is not canonical.");
   }
   return absl::OkStatus();
 }
 
-absl::StatusOr<Hash256> ComputeCapsuleRestoreEvidenceV2Id(
-    const CapsuleRestoreEvidenceV2& evidence) {
+absl::StatusOr<Hash256> ComputeCapsuleRestoreEvidenceId(
+    const CapsuleRestoreEvidence& evidence) {
   ABSL_RETURN_IF_ERROR(ValidateRestoreEvidenceFields(evidence, false));
   return HashCanonical(kRestoreEvidenceDomain,
                        EncodeRestoreEvidenceFields(evidence));
 }
 
-absl::Status ValidateCapsuleRestoreEvidenceV2(
-    const CapsuleRestoreEvidenceV2& evidence) {
+absl::Status ValidateCapsuleRestoreEvidence(
+    const CapsuleRestoreEvidence& evidence) {
   ABSL_RETURN_IF_ERROR(ValidateRestoreEvidenceFields(evidence, true));
   ABSL_ASSIGN_OR_RETURN(const Hash256 expected_id,
-                        ComputeCapsuleRestoreEvidenceV2Id(evidence));
+                        ComputeCapsuleRestoreEvidenceId(evidence));
   if (evidence.evidence_id != expected_id) {
-    return absl::DataLossError(
-        "Capsule restore evidence ID is not canonical.");
+    return absl::DataLossError("Capsule restore evidence ID is not canonical.");
   }
   return absl::OkStatus();
 }
 
-absl::StatusOr<Hash256> ComputeCapsuleCaptureEvidenceV2Id(
-    const CapsuleCaptureEvidenceV2& evidence) {
+absl::StatusOr<Hash256> ComputeCapsuleCaptureEvidenceId(
+    const CapsuleCaptureEvidence& evidence) {
   ABSL_RETURN_IF_ERROR(ValidateCaptureEvidenceFields(evidence, false));
   return HashCanonical(kCaptureEvidenceDomain,
                        EncodeCaptureEvidenceFields(evidence));
 }
 
-absl::Status ValidateCapsuleCaptureEvidenceV2(
-    const CapsuleCaptureEvidenceV2& evidence) {
+absl::Status ValidateCapsuleCaptureEvidence(
+    const CapsuleCaptureEvidence& evidence) {
   ABSL_RETURN_IF_ERROR(ValidateCaptureEvidenceFields(evidence, true));
   ABSL_ASSIGN_OR_RETURN(const Hash256 expected_id,
-                        ComputeCapsuleCaptureEvidenceV2Id(evidence));
+                        ComputeCapsuleCaptureEvidenceId(evidence));
   if (evidence.evidence_id != expected_id) {
-    return absl::DataLossError(
-        "Capsule capture evidence ID is not canonical.");
+    return absl::DataLossError("Capsule capture evidence ID is not canonical.");
   }
   return absl::OkStatus();
 }
 
-absl::Status ValidateCapsuleRestoreEvidenceV2ForSourceCapture(
-    const CapsuleRestoreEvidenceV2& restore_evidence,
-    const CapsuleCaptureEvidenceV2& source_capture_evidence) {
-  ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleRestoreEvidenceV2(restore_evidence));
-  ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleCaptureEvidenceV2(source_capture_evidence));
-  const CapsuleRestorePlanV2& restore = restore_evidence.plan;
-  const CapsuleCaptureEvidenceV2& capture = source_capture_evidence;
-  if (restore.authority != capture.plan.authority ||
-      restore.source_capture_plan_hash != capture.plan.plan_hash ||
-      restore.source_capture_evidence_id != capture.evidence_id ||
-      restore.checkpoint_id != capture.checkpoint_id ||
-      restore.checkpoint_state != capture.plan.checkpoint_state ||
-      restore.checkpoint_envelope_hash != capture.checkpoint_envelope_hash ||
-      restore.checkpoint_envelope_size != capture.checkpoint_envelope_size ||
-      restore.checkpoint_authentication_key_id !=
-          capture.checkpoint_authentication_key_id ||
-      restore.checkpoint_step != capture.plan.capture_end_step ||
-      restore.checkpoint_history_token_bytes_hash !=
-          capture.checkpoint_history_token_bytes_hash ||
-      restore_evidence.target_post_import != capture.fresh_import_target) {
-    return absl::FailedPreconditionError(
-        "Capsule restore does not match the complete authorized source "
-        "capture, checkpoint, envelope, own position, and runtime authority.");
-  }
-  return absl::OkStatus();
-}
-
-absl::Status ValidateCapsuleCaptureEvidenceV2ForParentCapture(
-    const CapsuleCaptureEvidenceV2& child_capture_evidence,
-    const CapsuleCaptureEvidenceV2& parent_capture_evidence) {
-  ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleCaptureEvidenceV2(child_capture_evidence));
-  ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleCaptureEvidenceV2(parent_capture_evidence));
-  if (child_capture_evidence.plan.capture_basis !=
-          CapsuleCaptureBasisV2::kVerifiedParentRestore ||
-      !child_capture_evidence.parent_restore_evidence.has_value()) {
-    return absl::FailedPreconditionError(
-        "Parent-capture validation requires a verified-parent descendant.");
-  }
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreEvidenceV2ForSourceCapture(
-      *child_capture_evidence.parent_restore_evidence,
-      parent_capture_evidence));
-  return ValidateParentRestoreLink(
-      child_capture_evidence,
-      *child_capture_evidence.parent_restore_evidence);
-}
-
-Hash256 GetCapsuleRestoreCaptureEvidenceV2ContractHash() {
-  std::string canonical;
-  const auto append_frame = [&canonical](absl::string_view value) {
-    AppendU32(static_cast<uint32_t>(value.size()), &canonical);
-    canonical.append(value.data(), value.size());
-  };
-  AppendU32(kCapsuleRestoreEvidenceV2FormatVersion, &canonical);
-  AppendU64(kMaximumCapsuleEvidenceEnvelopeBytes, &canonical);
-  AppendU32(kMaximumCapsuleEvidenceTokenIds, &canonical);
-  append_frame("ROOT_OR_VERIFIED_PARENT_CAPTURE");
-  append_frame("ROOT_FULL_PREFILL_CURRENT_CORRECTION_EPOCH");
-  append_frame("COMPLETE_RUNTIME_PREPARED_PREFILL_PLAN");
-  append_frame("PRODUCER_BEFORE_AFTER_AND_FRESH_IMPORT_EQUALITY");
-  append_frame("EDGE_VALIDATED_RECURSIVE_ANCESTRY");
-  Sha256Hasher hasher;
-  hasher.Update(kCaptureEvidenceContractDomain);
-  hasher.Update(canonical);
-  return hasher.Finalize();
-}
-
-Hash256 GetCapsuleRestoreRestoreEvidenceV2ContractHash() {
-  std::string canonical;
-  const auto append_frame = [&canonical](absl::string_view value) {
-    AppendU32(static_cast<uint32_t>(value.size()), &canonical);
-    canonical.append(value.data(), value.size());
-  };
-  AppendU32(kCapsuleRestoreEvidenceV2FormatVersion, &canonical);
-  AppendU64(kMaximumCapsuleEvidenceEnvelopeBytes, &canonical);
-  AppendU32(kMaximumCapsuleEvidenceTokenIds, &canonical);
-  append_frame("SOURCE_CAPTURE_AND_AUTHORITY_JOIN");
-  append_frame("OWN_POSITION_POST_IMPORT_WITNESS");
-  append_frame("COMPLETE_RUNTIME_PREPARED_DELTA_PLAN");
-  append_frame("OFF_POSITION_GRAFT_UNREPRESENTABLE");
-  Sha256Hasher hasher;
-  hasher.Update(kRestoreEvidenceContractDomain);
-  hasher.Update(canonical);
-  return hasher.Finalize();
-}
-
-absl::StatusOr<Hash256> ComputeCapsuleRestoreEvidenceV3Id(
-    const CapsuleRestoreEvidenceV3& evidence) {
-  ABSL_RETURN_IF_ERROR(ValidateRestoreEvidenceV3Fields(evidence, false));
-  return HashCanonical(kRestoreEvidenceV3Domain,
-                       EncodeRestoreEvidenceV3Fields(evidence));
-}
-
-absl::Status ValidateCapsuleRestoreEvidenceV3(
-    const CapsuleRestoreEvidenceV3& evidence) {
-  ABSL_RETURN_IF_ERROR(ValidateRestoreEvidenceV3Fields(evidence, true));
-  ABSL_ASSIGN_OR_RETURN(const Hash256 expected_id,
-                        ComputeCapsuleRestoreEvidenceV3Id(evidence));
-  if (evidence.evidence_id != expected_id) {
-    return absl::DataLossError(
-        "Capsule restore V3 evidence ID is not canonical.");
-  }
-  return absl::OkStatus();
-}
-
-absl::StatusOr<Hash256> ComputeCapsuleCaptureEvidenceV3Id(
-    const CapsuleCaptureEvidenceV3& evidence) {
-  ABSL_RETURN_IF_ERROR(ValidateCaptureEvidenceV3Fields(evidence, false));
-  return HashCanonical(kCaptureEvidenceV3Domain,
-                       EncodeCaptureEvidenceV3Fields(evidence));
-}
-
-absl::Status ValidateCapsuleCaptureEvidenceV3(
-    const CapsuleCaptureEvidenceV3& evidence) {
-  ABSL_RETURN_IF_ERROR(ValidateCaptureEvidenceV3Fields(evidence, true));
-  ABSL_ASSIGN_OR_RETURN(const Hash256 expected_id,
-                        ComputeCapsuleCaptureEvidenceV3Id(evidence));
-  if (evidence.evidence_id != expected_id) {
-    return absl::DataLossError(
-        "Capsule capture V3 evidence ID is not canonical.");
-  }
-  return absl::OkStatus();
-}
-
-absl::Status ValidateCapsuleRestoreEvidenceV3ForSourceCapture(
-    const CapsuleRestoreEvidenceV3& restore_evidence,
-    const CapsuleCaptureEvidenceV3& source_capture_evidence) {
-  ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleRestoreEvidenceV3(restore_evidence));
-  ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleCaptureEvidenceV3(source_capture_evidence));
-  const CapsuleRestorePlanV2& restore = restore_evidence.plan;
-  const CapsuleCaptureEvidenceV3& capture = source_capture_evidence;
+absl::Status ValidateCapsuleRestoreEvidenceForSourceCapture(
+    const CapsuleRestoreEvidence& restore_evidence,
+    const CapsuleCaptureEvidence& source_capture_evidence) {
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreEvidence(restore_evidence));
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleCaptureEvidence(source_capture_evidence));
+  const CapsuleRestorePlan& restore = restore_evidence.plan;
+  const CapsuleCaptureEvidence& capture = source_capture_evidence;
   if (restore.authority != capture.plan.authority ||
       restore.source_capture_plan_hash != capture.plan.plan_hash ||
       restore.source_capture_evidence_id != capture.evidence_id ||
@@ -1492,7 +1134,7 @@ absl::Status ValidateCapsuleRestoreEvidenceV3ForSourceCapture(
       restore.checkpoint_history_token_bytes_hash !=
           capture.checkpoint_history_token_bytes_hash) {
     return absl::FailedPreconditionError(
-        "Capsule restore V3 does not match the complete authorized source "
+        "Capsule restore does not match the complete authorized source "
         "capture, durable checkpoint, own position, and runtime authority.");
   }
 
@@ -1515,78 +1157,73 @@ absl::Status ValidateCapsuleRestoreEvidenceV3ForSourceCapture(
       capture_reauthentication.reauthentication_contract_hash !=
           restore_reauthentication.reauthentication_contract_hash) {
     return absl::FailedPreconditionError(
-        "Capsule restore V3 does not prove the exact durable endpoint and "
+        "Capsule restore does not prove the exact durable endpoint and "
         "complete canonical continuation state produced by its source "
         "capture.");
   }
-  if (!ContinuationStateProjectionMatchesV3(
-          restore_evidence.target_post_import,
+  if (!ContinuationStateProjectionMatches(restore_evidence.target_post_import,
           capture.fresh_import_target)) {
     return absl::FailedPreconditionError(
-        "Capsule restore V3 target and source capture disagree on the "
+        "Capsule restore target and source capture disagree on the "
         "continuation identity, decoded phase, own position, decode state, "
         "or processed history.");
   }
   return absl::OkStatus();
 }
 
-absl::Status ValidateCapsuleCaptureEvidenceV3ForParentCapture(
-    const CapsuleCaptureEvidenceV3& child_capture_evidence,
-    const CapsuleCaptureEvidenceV3& parent_capture_evidence) {
-  ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleCaptureEvidenceV3(child_capture_evidence));
-  ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleCaptureEvidenceV3(parent_capture_evidence));
+absl::Status ValidateCapsuleCaptureEvidenceForParentCapture(
+    const CapsuleCaptureEvidence& child_capture_evidence,
+    const CapsuleCaptureEvidence& parent_capture_evidence) {
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleCaptureEvidence(child_capture_evidence));
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleCaptureEvidence(parent_capture_evidence));
   if (child_capture_evidence.plan.capture_basis !=
-          CapsuleCaptureBasisV2::kVerifiedParentRestore ||
+          CapsuleCaptureBasis::kVerifiedParentRestore ||
       !child_capture_evidence.parent_restore_evidence.has_value()) {
     return absl::FailedPreconditionError(
-        "Parent-capture V3 validation requires a verified-parent "
+        "Parent-capture validation requires a verified-parent "
         "descendant.");
   }
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreEvidenceV3ForSourceCapture(
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreEvidenceForSourceCapture(
       *child_capture_evidence.parent_restore_evidence,
       parent_capture_evidence));
-  return ValidateParentRestoreLinkV3(
-      child_capture_evidence,
-      *child_capture_evidence.parent_restore_evidence);
+  return ValidateParentRestoreLink(
+      child_capture_evidence, *child_capture_evidence.parent_restore_evidence);
 }
 
-Hash256 GetCapsuleRestoreCaptureEvidenceV3ContractHash() {
+Hash256 GetCapsuleRestoreCaptureEvidenceContractHash() {
   std::string canonical;
   const auto append_frame = [&canonical](absl::string_view value) {
     AppendU32(static_cast<uint32_t>(value.size()), &canonical);
     canonical.append(value.data(), value.size());
   };
-  AppendU32(kCapsuleRestoreEvidenceV3FormatVersion, &canonical);
+  AppendU32(kCapsuleRestoreEvidenceFormatVersion, &canonical);
   AppendU64(kMaximumCapsuleEvidenceEnvelopeBytes, &canonical);
   AppendU32(kMaximumCapsuleEvidenceTokenIds, &canonical);
   AppendHash(GetSessionContinuationStateWitnessContractHash(), &canonical);
   AppendHash(GetSessionHandoffCapsuleCodecContractHash(), &canonical);
   AppendHash(GetSessionHandoffReauthenticationEvidenceContractHash(),
              &canonical);
-  append_frame(
-      kFreshWorkerTransientProducingToDurableReauthenticationPurpose);
+  append_frame(kFreshWorkerTransientProducingToDurableReauthenticationPurpose);
   append_frame(kFreshWorkerTransientProducingKeyId);
-  append_frame("V2_LOGICAL_AND_RUNTIME_PREPARED_CAPTURE_PLAN");
+  append_frame("LOGICAL_AND_RUNTIME_PREPARED_CAPTURE_PLAN");
   append_frame("ROOT_FULL_PREFILL_CURRENT_CORRECTION_EPOCH");
   append_frame("THREE_EQUAL_TRANSIENT_PRODUCER_WITNESSES");
   append_frame("EXACT_TRANSIENT_SOURCE_TO_DURABLE_DESTINATION_ENDPOINTS");
   append_frame("REWRAP_INVARIANT_COMPLETE_CONTINUATION_STATE");
-  append_frame("V3_EDGE_VALIDATED_RECURSIVE_ANCESTRY");
+  append_frame("EDGE_VALIDATED_RECURSIVE_ANCESTRY");
   Sha256Hasher hasher;
-  hasher.Update(kCaptureEvidenceV3ContractDomain);
+  hasher.Update(kCaptureEvidenceContractDomain);
   hasher.Update(canonical);
   return hasher.Finalize();
 }
 
-Hash256 GetCapsuleRestoreRestoreEvidenceV3ContractHash() {
+Hash256 GetCapsuleRestoreRestoreEvidenceContractHash() {
   std::string canonical;
   const auto append_frame = [&canonical](absl::string_view value) {
     AppendU32(static_cast<uint32_t>(value.size()), &canonical);
     canonical.append(value.data(), value.size());
   };
-  AppendU32(kCapsuleRestoreEvidenceV3FormatVersion, &canonical);
+  AppendU32(kCapsuleRestoreEvidenceFormatVersion, &canonical);
   AppendU64(kMaximumCapsuleEvidenceEnvelopeBytes, &canonical);
   AppendU32(kMaximumCapsuleEvidenceTokenIds, &canonical);
   AppendHash(GetSessionContinuationStateWitnessContractHash(), &canonical);
@@ -1595,13 +1232,13 @@ Hash256 GetCapsuleRestoreRestoreEvidenceV3ContractHash() {
              &canonical);
   append_frame(kFreshWorkerDurableRestoreToTransientReauthenticationPurpose);
   append_frame(kFreshWorkerTransientRestoreKeyId);
-  append_frame("V2_LOGICAL_AND_RUNTIME_PREPARED_RESTORE_PLAN");
+  append_frame("LOGICAL_AND_RUNTIME_PREPARED_RESTORE_PLAN");
   append_frame("EXACT_DURABLE_SOURCE_TO_TRANSIENT_DESTINATION_ENDPOINTS");
   append_frame("TRANSIENT_POST_IMPORT_TARGET_WITNESS");
   append_frame("SOURCE_CAPTURE_DURABLE_ENDPOINT_AND_STATE_HASH_EQUALITY");
   append_frame("OFF_POSITION_GRAFT_UNREPRESENTABLE");
   Sha256Hasher hasher;
-  hasher.Update(kRestoreEvidenceV3ContractDomain);
+  hasher.Update(kRestoreEvidenceContractDomain);
   hasher.Update(canonical);
   return hasher.Finalize();
 }

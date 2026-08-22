@@ -81,8 +81,8 @@ struct DPMFeatureRestriction {
 // Stable process-lifetime view of the normative fail-closed feature table.
 absl::Span<const DPMFeatureRestriction> GetDPMFeatureRestrictions();
 
-// Canonical digest of the complete normative fail-closed feature table. A
-// Coverage V2 record must bind this current table before it can authorize any
+// Canonical digest of the complete normative fail-closed feature table. An
+// admission record must bind this current table before it can authorize any
 // capsule operation.
 Hash256 GetDPMRestrictedFeatureContractHash();
 
@@ -118,17 +118,11 @@ struct DPMAgentCheckpointCapabilities {
   // independent-regeneration claim.
   std::optional<SessionHandoffCapability> session_handoff_capability;
   std::optional<Hash256> capsule_restore_admission_record_id;
-  // Coverage V1 is exact-workload scoped. Its presence proves that an
-  // authenticated admission can be matched, not that arbitrary operations
-  // are already covered. Consumers must compare the concrete operation before
-  // claiming or using CapsuleRestore.
+  // One atomic, runtime-derived operational domain. Its presence never
+  // replaces per-operation capture/restore evidence, but it proves that the
+  // loaded runtime can attempt witnessed own-position restore within these
+  // exact bounds.
   std::optional<CapsuleRestoreOperationalCoverage> operational_coverage;
-  // Coverage V2 is one atomic, runtime-derived operational domain. Its
-  // presence never replaces per-operation capture/restore evidence, but it
-  // does prove that the loaded runtime can attempt the witnessed own-position
-  // mechanism within these exact bounds.
-  std::optional<CapsuleRestoreStateWitnessOperationalCoverage>
-      state_witness_operational_coverage;
 };
 
 struct DPMGuaranteeAvailability {
@@ -139,7 +133,7 @@ struct DPMGuaranteeAvailability {
 };
 
 struct DPMCapabilities {
-  static constexpr uint32_t kFormatVersion = 2;
+  static constexpr uint32_t kFormatVersion = 1;
   uint32_t format_version = kFormatVersion;
   DPMStageCapabilities projection;
   DPMStageCapabilities agent;

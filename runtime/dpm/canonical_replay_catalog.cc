@@ -58,9 +58,9 @@ constexpr uint64_t kMaximumWinnerFileBytes =
     static_cast<uint64_t>(kMaximumCanonicalReplayOutputBytes) +
     2 * kMaximumCanonicalReplayContractBytes + 1024;
 constexpr absl::string_view kAuthenticationDomain =
-    "LITERT_LM_CANONICAL_WINNER_REPLAY_HMAC_SHA256_V1";
+    "LITERT_LM_CANONICAL_WINNER_REPLAY_HMAC_SHA256";
 constexpr absl::string_view kAuthenticationPathDomain =
-    "LITERT_LM_CANONICAL_WINNER_REPLAY_KEY_ID_PATH_SHA256_V1";
+    "LITERT_LM_CANONICAL_WINNER_REPLAY_KEY_ID_PATH_SHA256";
 
 bool IsZeroHash(const Hash256& hash) {
   for (uint8_t byte : hash.bytes) {
@@ -278,7 +278,7 @@ absl::StatusOr<CanonicalReplayKey> DecodeCanonicalReplayKey(
       key.canonical_request_hash,
       reader.ReadHash("canonical replay request hash"));
   ABSL_ASSIGN_OR_RETURN(
-      key.request_contract_version,
+      key.request_contract,
       reader.ReadString(kMaximumCanonicalReplayContractBytes,
                         "canonical replay request contract"));
   if (!reader.empty()) {
@@ -786,8 +786,8 @@ absl::Status ValidateCanonicalReplayKey(const CanonicalReplayKey& key) {
         "Canonical replay request hash must be nonzero.");
   }
   return ValidateBoundedIdentityString(
-      key.request_contract_version,
-      "Canonical replay request contract version");
+      key.request_contract,
+      "Canonical replay request contract");
 }
 
 absl::Status ValidateCanonicalReplayCandidate(
@@ -857,7 +857,7 @@ absl::StatusOr<std::string> EncodeCanonicalReplayKey(
   AppendHash(key.runtime_identity.runtime_artifact_hash, &bytes);
   AppendHash(key.runtime_identity.inference_profile_hash, &bytes);
   AppendHash(key.canonical_request_hash, &bytes);
-  ABSL_RETURN_IF_ERROR(AppendString(key.request_contract_version,
+  ABSL_RETURN_IF_ERROR(AppendString(key.request_contract,
                                     kMaximumCanonicalReplayContractBytes,
                                     &bytes));
   return bytes;
@@ -891,15 +891,12 @@ static absl::Status EnsureCatalogDirectoryTree(
     const std::filesystem::path& root,
     const Hash256& authentication_path_hash) {
   const std::filesystem::path product = root / "canonical-winner-replay";
-  const std::filesystem::path version = product / "v1";
   const std::filesystem::path authentication_domain =
-      version / authentication_path_hash.ToHex();
+      product / authentication_path_hash.ToHex();
   ABSL_RETURN_IF_ERROR(
       ValidateNonSymlinkDirectory(root, "canonical replay root"));
   ABSL_RETURN_IF_ERROR(
       EnsureNonSymlinkDirectory(product, "canonical replay product directory"));
-  ABSL_RETURN_IF_ERROR(
-      EnsureNonSymlinkDirectory(version, "canonical replay version directory"));
   ABSL_RETURN_IF_ERROR(EnsureNonSymlinkDirectory(
       authentication_domain, "canonical replay authentication directory"));
   ABSL_RETURN_IF_ERROR(EnsureNonSymlinkDirectory(
@@ -918,15 +915,12 @@ static absl::Status ValidateCatalogDirectoryTree(
     const Hash256& authentication_path_hash, DPMReplayStage stage) {
   ABSL_RETURN_IF_ERROR(ValidateDPMReplayStage(stage));
   const std::filesystem::path product = root / "canonical-winner-replay";
-  const std::filesystem::path version = product / "v1";
   const std::filesystem::path authentication_domain =
-      version / authentication_path_hash.ToHex();
+      product / authentication_path_hash.ToHex();
   ABSL_RETURN_IF_ERROR(
       ValidateNonSymlinkDirectory(root, "canonical replay root"));
   ABSL_RETURN_IF_ERROR(ValidateNonSymlinkDirectory(
       product, "canonical replay product directory"));
-  ABSL_RETURN_IF_ERROR(ValidateNonSymlinkDirectory(
-      version, "canonical replay version directory"));
   ABSL_RETURN_IF_ERROR(ValidateNonSymlinkDirectory(
       authentication_domain, "canonical replay authentication directory"));
   return ValidateNonSymlinkDirectory(
@@ -980,7 +974,7 @@ LocalFilesystemCanonicalWinnerReplayCatalog::WinnerPathFor(
       ComputeAuthenticationPathHash(authentication_.key_id);
   ABSL_RETURN_IF_ERROR(ValidateCatalogDirectoryTree(
       root_, authentication_path_hash, key.stage));
-  return root_ / "canonical-winner-replay" / "v1" /
+  return root_ / "canonical-winner-replay" /
          authentication_path_hash.ToHex() /
          std::string(DPMReplayStageToString(key.stage)) /
          absl::StrCat(key_hash.ToHex(), ".winner");

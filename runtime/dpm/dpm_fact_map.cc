@@ -26,12 +26,12 @@
 #include <utility>
 #include <vector>
 
-#include "absl/status/status.h"        // from @com_google_absl
-#include "absl/status/status_macros.h" // from @com_google_absl
-#include "absl/status/statusor.h"      // from @com_google_absl
-#include "absl/strings/string_view.h"  // from @com_google_absl
-#include "absl/types/span.h"           // from @com_google_absl
-#include "nlohmann/json.hpp"           // from @nlohmann_json
+#include "absl/status/status.h"         // from @com_google_absl
+#include "absl/status/status_macros.h"  // from @com_google_absl
+#include "absl/status/statusor.h"       // from @com_google_absl
+#include "absl/strings/string_view.h"   // from @com_google_absl
+#include "absl/types/span.h"            // from @com_google_absl
+#include "nlohmann/json.hpp"            // from @nlohmann_json
 
 namespace litert::lm {
 namespace {
@@ -40,12 +40,11 @@ constexpr size_t kMaximumFactIdBytes = 128;
 constexpr size_t kMaximumRetractions = 4096;
 
 bool IsValidUtf8(absl::string_view text) {
-  const auto *bytes = reinterpret_cast<const uint8_t *>(text.data());
+  const auto* bytes = reinterpret_cast<const uint8_t*>(text.data());
   size_t index = 0;
   while (index < text.size()) {
     const uint8_t lead = bytes[index++];
-    if (lead <= 0x7f)
-      continue;
+    if (lead <= 0x7f) continue;
     size_t continuations = 0;
     uint8_t minimum_second = 0x80;
     uint8_t maximum_second = 0xbf;
@@ -53,16 +52,12 @@ bool IsValidUtf8(absl::string_view text) {
       continuations = 1;
     } else if (lead >= 0xe0 && lead <= 0xef) {
       continuations = 2;
-      if (lead == 0xe0)
-        minimum_second = 0xa0;
-      if (lead == 0xed)
-        maximum_second = 0x9f;
+      if (lead == 0xe0) minimum_second = 0xa0;
+      if (lead == 0xed) maximum_second = 0x9f;
     } else if (lead >= 0xf0 && lead <= 0xf4) {
       continuations = 3;
-      if (lead == 0xf0)
-        minimum_second = 0x90;
-      if (lead == 0xf4)
-        maximum_second = 0x8f;
+      if (lead == 0xf0) minimum_second = 0x90;
+      if (lead == 0xf4) maximum_second = 0x8f;
     } else {
       return false;
     }
@@ -72,16 +67,14 @@ bool IsValidUtf8(absl::string_view text) {
     }
     ++index;
     for (size_t i = 1; i < continuations; ++i, ++index) {
-      if (bytes[index] < 0x80 || bytes[index] > 0xbf)
-        return false;
+      if (bytes[index] < 0x80 || bytes[index] > 0xbf) return false;
     }
   }
   return true;
 }
 
 bool IsValidFactId(absl::string_view id) {
-  if (id.empty() || id.size() > kMaximumFactIdBytes)
-    return false;
+  if (id.empty() || id.size() > kMaximumFactIdBytes) return false;
   for (unsigned char byte : id) {
     const bool alpha_numeric = (byte >= 'a' && byte <= 'z') ||
                                (byte >= 'A' && byte <= 'Z') ||
@@ -94,7 +87,7 @@ bool IsValidFactId(absl::string_view id) {
   return true;
 }
 
-absl::Status ValidateLimits(const DPMFactMapLimits &limits) {
+absl::Status ValidateLimits(const DPMFactMapLimits& limits) {
   if (limits.memory_budget_bytes == 0 || limits.max_facts == 0 ||
       limits.max_value_bytes == 0 ||
       limits.max_value_bytes > limits.memory_budget_bytes) {
@@ -110,9 +103,9 @@ absl::StatusOr<nlohmann::ordered_json> ParseStrictJson(absl::string_view raw) {
   try {
     nlohmann::ordered_json parsed = nlohmann::ordered_json::parse(
         raw.begin(), raw.end(),
-        [&duplicate_key,
-         &object_keys](int, nlohmann::ordered_json::parse_event_t event,
-                       nlohmann::ordered_json &value) {
+        [&duplicate_key, &object_keys](
+            int, nlohmann::ordered_json::parse_event_t event,
+            nlohmann::ordered_json& value) {
           if (event == nlohmann::ordered_json::parse_event_t::object_start) {
             object_keys.emplace_back();
           } else if (event == nlohmann::ordered_json::parse_event_t::key) {
@@ -122,8 +115,7 @@ absl::StatusOr<nlohmann::ordered_json> ParseStrictJson(absl::string_view raw) {
             }
           } else if (event ==
                      nlohmann::ordered_json::parse_event_t::object_end) {
-            if (!object_keys.empty())
-              object_keys.pop_back();
+            if (!object_keys.empty()) object_keys.pop_back();
           }
           return true;
         },
@@ -133,16 +125,16 @@ absl::StatusOr<nlohmann::ordered_json> ParseStrictJson(absl::string_view raw) {
           "DPM fact-map JSON contains a duplicate object key.");
     }
     return parsed;
-  } catch (const std::exception &) {
+  } catch (const std::exception&) {
     return absl::InvalidArgumentError(
         "DPM fact-map bytes are not valid strict JSON.");
   }
 }
 
-absl::Status
-ValidateFact(const DPMFact &fact, uint64_t source_event_count,
-             const DPMFactMapLimits &limits,
-             const std::optional<std::set<uint64_t>> &allowed_source_events) {
+absl::Status ValidateFact(
+    const DPMFact& fact, uint64_t source_event_count,
+    const DPMFactMapLimits& limits,
+    const std::optional<std::set<uint64_t>>& allowed_source_events) {
   if (!IsValidFactId(fact.id) || fact.value.empty() ||
       fact.value.size() > limits.max_value_bytes || !IsValidUtf8(fact.value)) {
     return absl::InvalidArgumentError(
@@ -172,10 +164,10 @@ ValidateFact(const DPMFact &fact, uint64_t source_event_count,
   return absl::OkStatus();
 }
 
-absl::StatusOr<DPMFact>
-ParseFact(const nlohmann::ordered_json &value, uint64_t source_event_count,
-          const DPMFactMapLimits &limits,
-          const std::optional<std::set<uint64_t>> &allowed_source_events) {
+absl::StatusOr<DPMFact> ParseFact(
+    const nlohmann::ordered_json& value, uint64_t source_event_count,
+    const DPMFactMapLimits& limits,
+    const std::optional<std::set<uint64_t>>& allowed_source_events) {
   if (!value.is_object() || value.size() != 6 || !value.contains("id") ||
       !value.contains("value") || !value.contains("source_event") ||
       !value.contains("valid_from") || !value.contains("retracted_at") ||
@@ -206,10 +198,10 @@ ParseFact(const nlohmann::ordered_json &value, uint64_t source_event_count,
   return fact;
 }
 
-absl::StatusOr<DPMFactMap>
-ParseFactMap(absl::string_view raw, uint64_t source_event_count,
-             const DPMFactMapLimits &limits,
-             const std::optional<std::set<uint64_t>> &allowed_source_events) {
+absl::StatusOr<DPMFactMap> ParseFactMap(
+    absl::string_view raw, uint64_t source_event_count,
+    const DPMFactMapLimits& limits,
+    const std::optional<std::set<uint64_t>>& allowed_source_events) {
   ABSL_RETURN_IF_ERROR(ValidateLimits(limits));
   if (raw.empty() || raw.size() > limits.memory_budget_bytes ||
       !IsValidUtf8(raw)) {
@@ -228,7 +220,7 @@ ParseFactMap(absl::string_view raw, uint64_t source_event_count,
   DPMFactMap map;
   map.facts.reserve(parsed["facts"].size());
   std::set<std::string> ids;
-  for (const nlohmann::ordered_json &item : parsed["facts"]) {
+  for (const nlohmann::ordered_json& item : parsed["facts"]) {
     ABSL_ASSIGN_OR_RETURN(
         DPMFact fact,
         ParseFact(item, source_event_count, limits, allowed_source_events));
@@ -241,7 +233,7 @@ ParseFactMap(absl::string_view raw, uint64_t source_event_count,
   return map;
 }
 
-nlohmann::ordered_json EncodeFact(const DPMFact &fact) {
+nlohmann::ordered_json EncodeFact(const DPMFact& fact) {
   nlohmann::ordered_json encoded = nlohmann::ordered_json::object();
   encoded["id"] = fact.id;
   encoded["value"] = fact.value;
@@ -256,15 +248,15 @@ nlohmann::ordered_json EncodeFact(const DPMFact &fact) {
 }
 
 absl::StatusOr<std::string> EncodeFactMap(DPMFactMap map,
-                                          const DPMFactMapLimits &limits) {
+                                          const DPMFactMapLimits& limits) {
   std::sort(map.facts.begin(), map.facts.end(),
-            [](const DPMFact &left, const DPMFact &right) {
+            [](const DPMFact& left, const DPMFact& right) {
               return left.id < right.id;
             });
   nlohmann::ordered_json encoded = nlohmann::ordered_json::object();
   encoded["schema_id"] = kDPMFactMapSchemaId;
   encoded["facts"] = nlohmann::ordered_json::array();
-  for (const DPMFact &fact : map.facts) {
+  for (const DPMFact& fact : map.facts) {
     encoded["facts"].push_back(EncodeFact(fact));
   }
   const std::string bytes = encoded.dump();
@@ -275,9 +267,9 @@ absl::StatusOr<std::string> EncodeFactMap(DPMFactMap map,
   return bytes;
 }
 
-absl::Status MergeFacts(const DPMFactMap &delta,
-                        std::map<std::string, DPMFact> *facts) {
-  for (const DPMFact &incoming : delta.facts) {
+absl::Status MergeFacts(const DPMFactMap& delta,
+                        std::map<std::string, DPMFact>* facts) {
+  for (const DPMFact& incoming : delta.facts) {
     auto existing = facts->find(incoming.id);
     if (existing == facts->end()) {
       facts->emplace(incoming.id, incoming);
@@ -296,8 +288,8 @@ absl::Status MergeFacts(const DPMFactMap &delta,
 
 absl::Status ApplyRetractions(absl::Span<const std::string> ids,
                               uint64_t event_index, bool require_existing,
-                              std::map<std::string, DPMFact> *facts) {
-  for (const std::string &id : ids) {
+                              std::map<std::string, DPMFact>* facts) {
+  for (const std::string& id : ids) {
     auto existing = facts->find(id);
     if (existing == facts->end()) {
       if (require_existing) {
@@ -315,15 +307,15 @@ absl::Status ApplyRetractions(absl::Span<const std::string> ids,
   return absl::OkStatus();
 }
 
-absl::StatusOr<std::vector<std::string>>
-ParseRetractions(const nlohmann::ordered_json &value) {
+absl::StatusOr<std::vector<std::string>> ParseRetractions(
+    const nlohmann::ordered_json& value) {
   if (!value.is_array() || value.size() > kMaximumRetractions) {
     return absl::InvalidArgumentError(
         "DPM retractions must be a bounded JSON array.");
   }
   std::vector<std::string> ids;
   ids.reserve(value.size());
-  for (const nlohmann::ordered_json &item : value) {
+  for (const nlohmann::ordered_json& item : value) {
     if (!item.is_string()) {
       return absl::InvalidArgumentError(
           "Every DPM retraction must be a fact id string.");
@@ -346,7 +338,7 @@ ParseRetractions(const nlohmann::ordered_json &value) {
 absl::StatusOr<std::optional<std::pair<DPMFactMap, std::vector<std::string>>>>
 ParseTypedToolDelta(absl::string_view payload, uint64_t event_index,
                     uint64_t source_event_count,
-                    const DPMFactMapLimits &limits) {
+                    const DPMFactMapLimits& limits) {
   absl::StatusOr<nlohmann::ordered_json> parsed = ParseStrictJson(payload);
   if (!parsed.ok() || !parsed->is_object() || !parsed->contains("schema_id") ||
       !(*parsed)["schema_id"].is_string() ||
@@ -365,7 +357,7 @@ ParseTypedToolDelta(absl::string_view payload, uint64_t event_index,
         "Typed DPM tool delta contains too many facts.");
   }
   std::set<std::string> ids;
-  for (const nlohmann::ordered_json &item : (*parsed)["facts"]) {
+  for (const nlohmann::ordered_json& item : (*parsed)["facts"]) {
     ABSL_ASSIGN_OR_RETURN(DPMFact fact, ParseFact(item, source_event_count,
                                                   limits, allowed_sources));
     if (!ids.insert(fact.id).second) {
@@ -380,8 +372,8 @@ ParseTypedToolDelta(absl::string_view payload, uint64_t event_index,
       std::in_place, std::move(delta), std::move(retract));
 }
 
-absl::StatusOr<std::vector<std::string>>
-ParseCorrectionRetractions(absl::string_view payload) {
+absl::StatusOr<std::vector<std::string>> ParseCorrectionRetractions(
+    absl::string_view payload) {
   ABSL_ASSIGN_OR_RETURN(nlohmann::ordered_json parsed,
                         ParseStrictJson(payload));
   if (!parsed.is_object() || parsed.size() != 1 ||
@@ -392,48 +384,44 @@ ParseCorrectionRetractions(absl::string_view payload) {
   return ParseRetractions(parsed["retract"]);
 }
 
-DPMFactMap MapValues(const std::map<std::string, DPMFact> &values) {
+DPMFactMap MapValues(const std::map<std::string, DPMFact>& values) {
   DPMFactMap map;
   map.facts.reserve(values.size());
-  for (const auto &[id, fact] : values)
-    map.facts.push_back(fact);
+  for (const auto& [id, fact] : values) map.facts.push_back(fact);
   return map;
 }
 
 std::string Utf8Head(absl::string_view value, size_t maximum_bytes) {
   size_t length = std::min(value.size(), maximum_bytes);
-  while (length > 0 && !IsValidUtf8(value.substr(0, length)))
-    --length;
+  while (length > 0 && !IsValidUtf8(value.substr(0, length))) --length;
   return std::string(value.substr(0, length));
 }
 
-} // namespace
+}  // namespace
 
-const std::string &DPMFactMapJsonSchema() {
-  static const std::string *schema = new std::string(
-      R"({"type":"object","additionalProperties":false,"required":["schema_id","facts"],"properties":{"schema_id":{"const":"dpm.factmap.v1"},"facts":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["id","value","source_event","valid_from","retracted_at","prev"],"properties":{"id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9._:-]+$"},"value":{"type":"string","minLength":1},"source_event":{"type":"integer","minimum":0},"valid_from":{"type":"integer","minimum":0},"retracted_at":{"type":["integer","null"],"minimum":0},"prev":{"type":["string","null"]}}}}}})");
+const std::string& DPMFactMapJsonSchema() {
+  static const std::string* schema = new std::string(
+      R"({"type":"object","additionalProperties":false,"required":["schema_id","facts"],"properties":{"schema_id":{"const":"dpm.factmap"},"facts":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["id","value","source_event","valid_from","retracted_at","prev"],"properties":{"id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9._:-]+$"},"value":{"type":"string","minLength":1},"source_event":{"type":"integer","minimum":0},"valid_from":{"type":"integer","minimum":0},"retracted_at":{"type":["integer","null"],"minimum":0},"prev":{"type":["string","null"]}}}}}})");
   return *schema;
 }
 
 std::string EmptyDPMFactMap() {
-  return std::string("{\"schema_id\":\"dpm.factmap.v1\",\"facts\":[]}");
+  return std::string("{\"schema_id\":\"dpm.factmap\",\"facts\":[]}");
 }
 
-absl::StatusOr<std::string>
-CanonicalizeDPMFactMap(absl::string_view raw_output,
-                       uint64_t source_event_count,
-                       const DPMFactMapLimits &limits) {
+absl::StatusOr<std::string> CanonicalizeDPMFactMap(
+    absl::string_view raw_output, uint64_t source_event_count,
+    const DPMFactMapLimits& limits) {
   ABSL_ASSIGN_OR_RETURN(
       DPMFactMap map,
       ParseFactMap(raw_output, source_event_count, limits, std::nullopt));
   return EncodeFactMap(std::move(map), limits);
 }
 
-absl::StatusOr<std::string>
-CanonicalizeDPMFactDelta(absl::string_view raw_output,
-                         absl::Span<const uint64_t> allowed_source_events,
-                         uint64_t source_event_count,
-                         const DPMFactMapLimits &limits) {
+absl::StatusOr<std::string> CanonicalizeDPMFactDelta(
+    absl::string_view raw_output,
+    absl::Span<const uint64_t> allowed_source_events,
+    uint64_t source_event_count, const DPMFactMapLimits& limits) {
   const std::set<uint64_t> allowed(allowed_source_events.begin(),
                                    allowed_source_events.end());
   if (allowed.empty()) {
@@ -449,7 +437,7 @@ CanonicalizeDPMFactDelta(absl::string_view raw_output,
 absl::StatusOr<std::string> MergeDPMFactMap(absl::string_view canonical_base,
                                             absl::string_view canonical_delta,
                                             uint64_t source_event_count,
-                                            const DPMFactMapLimits &limits) {
+                                            const DPMFactMapLimits& limits) {
   ABSL_ASSIGN_OR_RETURN(
       DPMFactMap base,
       ParseFactMap(canonical_base, source_event_count, limits, std::nullopt));
@@ -457,16 +445,14 @@ absl::StatusOr<std::string> MergeDPMFactMap(absl::string_view canonical_base,
       DPMFactMap delta,
       ParseFactMap(canonical_delta, source_event_count, limits, std::nullopt));
   std::map<std::string, DPMFact> facts;
-  for (DPMFact &fact : base.facts)
-    facts.emplace(fact.id, std::move(fact));
+  for (DPMFact& fact : base.facts) facts.emplace(fact.id, std::move(fact));
   ABSL_RETURN_IF_ERROR(MergeFacts(delta, &facts));
   return EncodeFactMap(MapValues(facts), limits);
 }
 
-absl::StatusOr<DPMFactMapProjectionFold>
-FoldDeterministicDPMEvents(absl::string_view canonical_base,
-                           const DPMLogSnapshot &snapshot, uint64_t range_start,
-                           uint64_t range_end, const DPMFactMapLimits &limits) {
+absl::StatusOr<DPMFactMapProjectionFold> FoldDeterministicDPMEvents(
+    absl::string_view canonical_base, const DPMLogSnapshot& snapshot,
+    uint64_t range_start, uint64_t range_end, const DPMFactMapLimits& limits) {
   if (snapshot.generation != snapshot.events.size() ||
       range_start > range_end || range_end > snapshot.events.size() ||
       range_end == 0) {
@@ -480,15 +466,14 @@ FoldDeterministicDPMEvents(absl::string_view canonical_base,
       DPMFactMap base,
       ParseFactMap(canonical_base, range_start, limits, std::nullopt));
   std::map<std::string, DPMFact> facts;
-  for (DPMFact &fact : base.facts)
-    facts.emplace(fact.id, std::move(fact));
+  for (DPMFact& fact : base.facts) facts.emplace(fact.id, std::move(fact));
 
   DPMFactMapProjectionFold result{
       .event_range_start = range_start,
       .source_event_count = range_end,
   };
   for (uint64_t index = range_start; index < range_end; ++index) {
-    const DPMEvent &event = snapshot.events[index];
+    const DPMEvent& event = snapshot.events[index];
     if (event.index != index || event.case_id != snapshot.case_id) {
       return absl::DataLossError(
           "DPM deterministic fold received a contaminated event prefix.");
@@ -496,7 +481,7 @@ FoldDeterministicDPMEvents(absl::string_view canonical_base,
     if (event.kind == DPMEvent::Kind::kCorrection) {
       ABSL_ASSIGN_OR_RETURN(std::vector<std::string> retract,
                             ParseCorrectionRetractions(event.payload));
-      for (const std::string &id : retract) {
+      for (const std::string& id : retract) {
         result.retractions.push_back(
             DPMFactRetraction{.id = id, .source_event = event.index});
       }
@@ -511,7 +496,7 @@ FoldDeterministicDPMEvents(absl::string_view canonical_base,
           ParseTypedToolDelta(event.payload, event.index, range_end, limits));
       if (typed.has_value()) {
         ABSL_RETURN_IF_ERROR(MergeFacts(typed->first, &facts));
-        for (const std::string &id : typed->second) {
+        for (const std::string& id : typed->second) {
           result.retractions.push_back(
               DPMFactRetraction{.id = id, .source_event = event.index});
         }
@@ -525,8 +510,7 @@ FoldDeterministicDPMEvents(absl::string_view canonical_base,
     // response would both double-count that turn and make a typed-tool-only
     // delta spuriously invoke the LLM. Only source/user, internal, and
     // untyped-tool events are model-visible projection inputs.
-    if (event.kind == DPMEvent::Kind::kModelTurn)
-      continue;
+    if (event.kind == DPMEvent::Kind::kModelTurn) continue;
     result.llm_event_indices.push_back(event.index);
   }
   ABSL_ASSIGN_OR_RETURN(result.canonical_memory,
@@ -534,11 +518,10 @@ FoldDeterministicDPMEvents(absl::string_view canonical_base,
   return result;
 }
 
-absl::StatusOr<std::string>
-FinalizeDPMFactMapProjection(const DPMFactMapProjectionFold &fold,
-                             std::optional<absl::string_view> raw_model_delta,
-                             uint64_t source_event_count,
-                             const DPMFactMapLimits &limits) {
+absl::StatusOr<std::string> FinalizeDPMFactMapProjection(
+    const DPMFactMapProjectionFold& fold,
+    std::optional<absl::string_view> raw_model_delta,
+    uint64_t source_event_count, const DPMFactMapLimits& limits) {
   const bool requires_model_delta = !fold.llm_event_indices.empty();
   if (fold.source_event_count != source_event_count ||
       fold.event_range_start > source_event_count) {
@@ -570,8 +553,7 @@ FinalizeDPMFactMapProjection(const DPMFactMapProjectionFold &fold,
                         ParseFactMap(fold.canonical_memory, source_event_count,
                                      limits, std::nullopt));
   std::map<std::string, DPMFact> facts;
-  for (DPMFact &fact : base.facts)
-    facts.emplace(fact.id, std::move(fact));
+  for (DPMFact& fact : base.facts) facts.emplace(fact.id, std::move(fact));
 
   if (raw_model_delta.has_value()) {
     const std::set<uint64_t> allowed_sources(fold.llm_event_indices.begin(),
@@ -584,7 +566,7 @@ FinalizeDPMFactMapProjection(const DPMFactMapProjectionFold &fold,
 
   uint64_t previous_retraction_event = 0;
   bool have_previous_retraction = false;
-  for (const DPMFactRetraction &retraction : fold.retractions) {
+  for (const DPMFactRetraction& retraction : fold.retractions) {
     if (!IsValidFactId(retraction.id) ||
         retraction.source_event < fold.event_range_start ||
         retraction.source_event >= source_event_count ||
@@ -602,8 +584,8 @@ FinalizeDPMFactMapProjection(const DPMFactMapProjectionFold &fold,
   return EncodeFactMap(MapValues(facts), limits);
 }
 
-absl::StatusOr<std::string>
-CanonicalizeDPMRetractionPayload(absl::string_view raw_payload) {
+absl::StatusOr<std::string> CanonicalizeDPMRetractionPayload(
+    absl::string_view raw_payload) {
   ABSL_ASSIGN_OR_RETURN(std::vector<std::string> ids,
                         ParseCorrectionRetractions(raw_payload));
   nlohmann::ordered_json canonical = nlohmann::ordered_json::object();
@@ -611,9 +593,31 @@ CanonicalizeDPMRetractionPayload(absl::string_view raw_payload) {
   return canonical.dump();
 }
 
+absl::StatusOr<std::string> RenderDPMFactValues(
+    absl::string_view canonical_map, uint64_t source_event_count,
+    const DPMFactMapLimits& limits) {
+  ABSL_ASSIGN_OR_RETURN(
+      DPMFactMap map,
+      ParseFactMap(canonical_map, source_event_count, limits, std::nullopt));
+  std::sort(map.facts.begin(), map.facts.end(),
+            [](const DPMFact& left, const DPMFact& right) {
+              return left.id < right.id;
+            });
+  nlohmann::ordered_json values = nlohmann::ordered_json::object();
+  for (const DPMFact& fact : map.facts) {
+    if (!fact.retracted_at.has_value()) values[fact.id] = fact.value;
+  }
+  std::string rendered = values.dump();
+  if (rendered.size() > limits.memory_budget_bytes) {
+    return absl::ResourceExhaustedError(
+        "DPM fact values exceed their model-visible memory budget.");
+  }
+  return rendered;
+}
+
 absl::StatusOr<std::string> RenderDPMFactHeads(absl::string_view canonical_map,
                                                uint64_t source_event_count,
-                                               const DPMFactMapLimits &limits,
+                                               const DPMFactMapLimits& limits,
                                                size_t maximum_head_bytes,
                                                size_t maximum_total_bytes) {
   if (maximum_head_bytes == 0 || maximum_total_bytes == 0) {
@@ -624,13 +628,12 @@ absl::StatusOr<std::string> RenderDPMFactHeads(absl::string_view canonical_map,
       DPMFactMap map,
       ParseFactMap(canonical_map, source_event_count, limits, std::nullopt));
   std::sort(map.facts.begin(), map.facts.end(),
-            [](const DPMFact &left, const DPMFact &right) {
+            [](const DPMFact& left, const DPMFact& right) {
               return left.id < right.id;
             });
   std::string rendered;
-  for (const DPMFact &fact : map.facts) {
-    if (fact.retracted_at.has_value())
-      continue;
+  for (const DPMFact& fact : map.facts) {
+    if (fact.retracted_at.has_value()) continue;
     nlohmann::ordered_json head = nlohmann::ordered_json::object();
     head["id"] = fact.id;
     head["head"] = Utf8Head(fact.value, maximum_head_bytes);
@@ -652,4 +655,4 @@ absl::StatusOr<std::string> RenderDPMFactHeads(absl::string_view canonical_map,
   return rendered;
 }
 
-} // namespace litert::lm
+}  // namespace litert::lm

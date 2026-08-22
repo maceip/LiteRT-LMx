@@ -59,12 +59,12 @@ namespace litert::lm {
 namespace {
 
 constexpr std::array<char, 8> kIpcFrameMagic = {'D', 'P', 'M', 'I', 'P', 'C',
-                                                 '0', '3'};
+                                                 '0', '1'};
 constexpr std::array<char, 8> kCapsuleFrameMagic = {
-    'D', 'P', 'M', 'C', 'A', 'P', '0', '3'};
+    'D', 'P', 'M', 'C', 'A', 'P', '0', '1'};
 constexpr std::array<char, 8> kAuthenticationMagic = {
-    'D', 'P', 'M', 'K', 'E', 'Y', '0', '3'};
-constexpr uint32_t kAuthenticationPreludeVersion = 3;
+    'D', 'P', 'M', 'K', 'E', 'Y', '0', '1'};
+constexpr uint32_t kAuthenticationPreludeFormatVersion = 1;
 constexpr uint32_t kMaximumAuthenticationKeyIdBytes = 256;
 constexpr uint32_t kMinimumAuthenticationKeyBytes = 32;
 constexpr uint32_t kMaximumAuthenticationKeyBytes = 4096;
@@ -74,13 +74,13 @@ constexpr uint64_t kMaximumFailureMessageBytes = 4096;
 constexpr absl::Duration kMaximumWorkerTimeout = absl::Hours(1);
 constexpr absl::Duration kMaximumTerminationGrace = absl::Seconds(5);
 constexpr absl::string_view kLaunchSpecDomain =
-    "LITERT_LMX_FRESH_WORKER_LAUNCH_SPEC_SHA256_V3";
+    "LITERT_LMX_FRESH_WORKER_LAUNCH_SPEC_SHA256";
 constexpr absl::string_view kWorkerCertificationDomain =
-    "LITERT_LMX_FRESH_WORKER_CERTIFICATION_SHA256_V1";
+    "LITERT_LMX_FRESH_WORKER_CERTIFICATION_SHA256";
 constexpr absl::string_view kTransportKeyDomain =
-    "LITERT_LMX_FRESH_WORKER_PER_REQUEST_TRANSPORT_KEY_HMAC_SHA256_V3";
+    "LITERT_LMX_FRESH_WORKER_PER_REQUEST_TRANSPORT_KEY_HMAC_SHA256";
 constexpr absl::string_view kCapsuleKeyDomain =
-    "LITERT_LMX_FRESH_WORKER_CAPSULE_KEY_HMAC_SHA256_V3";
+    "LITERT_LMX_FRESH_WORKER_CAPSULE_KEY_HMAC_SHA256";
 constexpr absl::string_view kRestoreCapsuleDirection = "RESTORE_TO_WORKER";
 constexpr absl::string_view kProducingCapsuleDirection =
     "PRODUCING_FROM_WORKER";
@@ -228,7 +228,7 @@ absl::StatusOr<std::string> BuildAuthenticationPrelude(
                   authentication.key_id.size() +
                   authentication.authentication_key.size());
   prelude.append(kAuthenticationMagic.data(), kAuthenticationMagic.size());
-  AppendU32(kAuthenticationPreludeVersion, &prelude);
+  AppendU32(kAuthenticationPreludeFormatVersion, &prelude);
   AppendU32(static_cast<uint32_t>(authentication.key_id.size()), &prelude);
   AppendU32(static_cast<uint32_t>(authentication.authentication_key.size()),
             &prelude);
@@ -554,7 +554,7 @@ Hash256 ComputeWorkerCertificationHash(
     const std::vector<std::string>& canonical_arguments,
     const ExecutableInspection& inspection,
     FreshWorkerEnvironmentContract environment_contract,
-    absl::string_view engine_adapter_contract_version) {
+    absl::string_view engine_adapter_contract) {
   Sha256Hasher hasher;
   hasher.Update(kWorkerCertificationDomain);
   std::string encoded;
@@ -580,9 +580,9 @@ Hash256 ComputeWorkerCertificationHash(
   AppendU64(static_cast<uint64_t>(inspection.status_change_time_nanoseconds),
             &encoded);
   AppendU32(static_cast<uint32_t>(environment_contract), &encoded);
-  AppendU64(engine_adapter_contract_version.size(), &encoded);
-  encoded.append(engine_adapter_contract_version.data(),
-                 engine_adapter_contract_version.size());
+  AppendU64(engine_adapter_contract.size(), &encoded);
+  encoded.append(engine_adapter_contract.data(),
+                 engine_adapter_contract.size());
   hasher.Update(encoded);
   return hasher.Finalize();
 }
@@ -1274,7 +1274,7 @@ absl::StatusOr<FreshWorkerAuthentication> ReadAuthenticationPrelude(int fd) {
                                          "worker authentication prelude"));
   if (std::memcmp(header.data(), kAuthenticationMagic.data(),
                   kAuthenticationMagic.size()) != 0 ||
-      ReadU32(header.data() + 8) != kAuthenticationPreludeVersion) {
+      ReadU32(header.data() + 8) != kAuthenticationPreludeFormatVersion) {
     return absl::DataLossError(
         "Fresh-worker authentication prelude is invalid.");
   }
@@ -1570,16 +1570,16 @@ absl::StatusOr<FreshWorkerCertification> FreshWorkerCertification::Create(
   certification.environment_contract_ =
       FreshWorkerEnvironmentContract::kEmpty;
   // This is the product's expected adapter contract under local launcher and
-  // packaging trust. It contributes to versioned evidence but does not infer
+  // packaging trust. It contributes to authenticated evidence but does not infer
   // the executable's semantics from its bytes.
-  certification.engine_adapter_contract_version_.assign(
-      kEngineFreshWorkerAdapterContractVersion.data(),
-      kEngineFreshWorkerAdapterContractVersion.size());
+  certification.engine_adapter_contract_.assign(
+      kEngineFreshWorkerAdapterContract.data(),
+      kEngineFreshWorkerAdapterContract.size());
   certification.certification_hash_ = ComputeWorkerCertificationHash(
       certification.canonical_executable_path_,
       certification.canonical_arguments_, inspection,
       certification.environment_contract_,
-      certification.engine_adapter_contract_version_);
+      certification.engine_adapter_contract_);
   if (IsZeroHash(certification.executable_image_hash_) ||
       IsZeroHash(certification.certification_hash_)) {
     return absl::InternalError(
@@ -1598,8 +1598,8 @@ absl::Status FreshWorkerCertification::ValidateExecutableImage() const {
   if (format_version_ != kFormatVersion ||
       canonical_executable_path_.empty() ||
       environment_contract_ != FreshWorkerEnvironmentContract::kEmpty ||
-      absl::string_view(engine_adapter_contract_version_) !=
-          kEngineFreshWorkerAdapterContractVersion ||
+      absl::string_view(engine_adapter_contract_) !=
+          kEngineFreshWorkerAdapterContract ||
       IsZeroHash(executable_image_hash_) || IsZeroHash(certification_hash_)) {
     return absl::FailedPreconditionError(
         "Fresh-worker certification contract is incomplete or unsupported.");
@@ -1629,7 +1629,7 @@ absl::Status FreshWorkerCertification::ValidateExecutableImage() const {
   }
   const Hash256 expected_certification_hash = ComputeWorkerCertificationHash(
       canonical_executable_path_, canonical_arguments_, current,
-      environment_contract_, engine_adapter_contract_version_);
+      environment_contract_, engine_adapter_contract_);
   if (expected_certification_hash != certification_hash_) {
     return absl::DataLossError(
         "Fresh-worker certification digest is internally inconsistent.");

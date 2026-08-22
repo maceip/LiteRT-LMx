@@ -27,9 +27,9 @@ namespace litert::lm {
 namespace {
 
 constexpr absl::string_view kCorrectionRootDomain =
-    "DPM_CORRECTION_LINEAGE_ROOT_SHA256_V1";
+    "DPM_CORRECTION_LINEAGE_ROOT_SHA256";
 constexpr absl::string_view kCorrectionStepDomain =
-    "DPM_CORRECTION_LINEAGE_STEP_SHA256_V1";
+    "DPM_CORRECTION_LINEAGE_STEP_SHA256";
 
 void UpdateU64(uint64_t value, Sha256Hasher* hasher) {
   std::array<char, 8> bytes{};

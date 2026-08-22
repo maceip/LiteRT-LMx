@@ -43,8 +43,7 @@ enum class DPMCheckpointCaptureOrigin : uint8_t {
 
 // The physical work performed by an exact worker. This deliberately mirrors
 // FreshWorkerPrefillMode without making durable checkpoint descriptors depend
-// on the worker transport protocol. WinnerReplay and legacy descriptors use
-// kNone.
+// on the worker transport protocol. WinnerReplay descriptors use kNone.
 enum class DPMCheckpointWorkerPrefillMode : uint8_t {
   kNone = 0,
   kFullCanonicalPrefill = 1,
@@ -82,8 +81,7 @@ struct DPMPreparedPrefillWorkBinding {
 
   bool operator==(const DPMPreparedPrefillWorkBinding& other) const {
     return start_kind == other.start_kind && plan_id == other.plan_id &&
-           canonical_source_chunks_hash ==
-               other.canonical_source_chunks_hash &&
+           canonical_source_chunks_hash == other.canonical_source_chunks_hash &&
            resolved_token_plan_hash == other.resolved_token_plan_hash &&
            shape_schedule_hash == other.shape_schedule_hash;
   }
@@ -116,16 +114,12 @@ absl::Status ValidateDPMPreparedPrefillWorkBinding(
 // a disposable KV cache to the exact raw-log prefix and DPM artifacts that
 // produced it. A matching model/profile alone is intentionally insufficient.
 struct DPMSessionCheckpointDescriptor {
-  static constexpr uint32_t kLegacyFormatVersion = 1;
-  static constexpr uint32_t kPreviousFormatVersion = 2;
-  static constexpr uint32_t kCoverageV1FormatVersion = 3;
-  static constexpr uint32_t kFormatVersion = 4;
+  static constexpr uint32_t kFormatVersion = 1;
 
   uint32_t format_version = kFormatVersion;
   Hash256 descriptor_id;
   std::string log_id;
-  DPMSessionCheckpointStage stage =
-      DPMSessionCheckpointStage::kAgentDecision;
+  DPMSessionCheckpointStage stage = DPMSessionCheckpointStage::kAgentDecision;
 
   // Raw input prefix consumed by the turn. The response event is committed
   // after descriptor publication and names this descriptor, avoiding a hash
@@ -146,26 +140,19 @@ struct DPMSessionCheckpointDescriptor {
   uint64_t envelope_size = 0;
   int64_t created_unix_micros = 0;
 
-  // Version 2+ provenance. Version 1 descriptors infer
-  // CanonicalWinnerReplay plus a live-parent capture and serialize none of
-  // these fields. A restored-from ID points backward to an already-published
-  // descriptor and is therefore safe to include in this descriptor's content
-  // address.
+  // A restored-from ID points backward to an already-published descriptor and
+  // is therefore safe to include in this descriptor's content address.
   DPMReplayMode replay_mode = DPMReplayMode::kCanonicalWinnerReplay;
   DPMCheckpointCaptureOrigin capture_origin =
       DPMCheckpointCaptureOrigin::kLiveParentSession;
   std::optional<Hash256> restored_from_checkpoint_id;
 
-  // Mode-independent CapsuleRestore provenance added in version 3. Both IDs
-  // are required for every newly published checkpoint, whether its replay
-  // mode is WinnerReplay or ExactRegeneration. Version 2 exact descriptors
-  // carry only the admission record ID for backward compatibility; version 2
-  // Winner descriptors carry neither and are never upgraded implicitly.
+  // Mode-independent CapsuleRestore provenance. All identities are required
+  // for every newly published checkpoint, whether its replay mode is
+  // WinnerReplay or ExactRegeneration.
   Hash256 capsule_restore_capability_id;
   Hash256 capsule_restore_admission_record_id;
-  // Generic versioned operational-coverage identity. Version 3 binds the
-  // exact coverage contract matched at capture; future coverage versions keep
-  // this durable field stable.
+  // Identity of the exact operational coverage matched at capture.
   Hash256 capsule_restore_coverage_id;
 
   // ExactRegeneration-only identities. exact_profile_id is optional at the
@@ -181,11 +168,10 @@ struct DPMSessionCheckpointDescriptor {
   Hash256 exact_output_evidence_hash;
   std::optional<DPMExactWorkerCheckpointProvenance> worker_provenance;
 
-  // Version 4 Coverage V2 provenance. The capture-plan hash is safe in the
-  // descriptor because CapsuleCapturePlanV2 deliberately excludes the child
-  // checkpoint and evidence IDs. The later authoritative receipt joins this
-  // plan and descriptor ID to the capture evidence ID. Older descriptor
-  // versions require these fields to remain canonical defaults.
+  // The capture-plan hash is safe in the descriptor because
+  // CapsuleCapturePlan deliberately excludes the child checkpoint and
+  // evidence IDs. The later authoritative receipt joins this plan and
+  // descriptor ID to the capture evidence ID.
   Hash256 capsule_capture_plan_hash;
   DPMPreparedPrefillWorkBinding prepared_prefill_work;
 };
@@ -196,7 +182,8 @@ struct DPMSessionCheckpointArtifact {
 };
 
 // Computes the descriptor ID from every field except descriptor_id. The
-// encoding is versioned, length-delimited, and independent of host endianness.
+// encoding is format-tagged, length-delimited, and independent of host
+// endianness.
 absl::StatusOr<Hash256> ComputeDPMSessionCheckpointId(
     const DPMSessionCheckpointDescriptor& descriptor);
 
@@ -210,8 +197,7 @@ class DPMSessionCheckpointRepository {
   // Implementations publish the complete envelope before making the
   // descriptor visible. Re-publishing an identical content address is
   // idempotent; conflicting bytes for an existing address must fail closed.
-  virtual absl::Status Put(
-      const DPMSessionCheckpointArtifact& artifact) = 0;
+  virtual absl::Status Put(const DPMSessionCheckpointArtifact& artifact) = 0;
   virtual absl::StatusOr<DPMSessionCheckpointArtifact> Get(
       const Hash256& descriptor_id) const = 0;
 };

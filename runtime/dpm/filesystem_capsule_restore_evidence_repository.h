@@ -24,8 +24,7 @@
 
 namespace litert::lm {
 
-// Durable owner-only cache of authenticated legacy Coverage V2 capture
-// evidence and version-isolated Coverage V3 capture/restore evidence. Every
+// Durable owner-only cache of authenticated capture and restore evidence. Every
 // record has a create-once composite name containing both checkpoint_id and
 // evidence_id. There is intentionally no lookup by checkpoint alone, no
 // mutable latest pointer, and no enumeration-as-authority path. A caller must
@@ -39,27 +38,19 @@ class FilesystemCapsuleRestoreEvidenceRepository final
       std::unique_ptr<FilesystemCapsuleRestoreEvidenceRepository>>
   Create(std::filesystem::path root);
 
-  absl::Status PutIfAbsent(
-      const CapsuleCaptureEvidenceV2& evidence,
+  absl::Status PutCaptureIfAbsent(
+      const CapsuleCaptureEvidence& evidence,
       const FreshWorkerAuthentication& authentication) override;
 
-  absl::StatusOr<CapsuleCaptureEvidenceV2> Get(
+  absl::StatusOr<CapsuleCaptureEvidence> GetCapture(
       const Hash256& checkpoint_id, const Hash256& expected_evidence_id,
       const FreshWorkerAuthentication& authentication) const override;
 
-  absl::Status PutCaptureV3IfAbsent(
-      const CapsuleCaptureEvidenceV3& evidence,
+  absl::Status PutRestoreIfAbsent(
+      const CapsuleRestoreEvidence& evidence,
       const FreshWorkerAuthentication& authentication) override;
 
-  absl::StatusOr<CapsuleCaptureEvidenceV3> GetCaptureV3(
-      const Hash256& checkpoint_id, const Hash256& expected_evidence_id,
-      const FreshWorkerAuthentication& authentication) const override;
-
-  absl::Status PutRestoreV3IfAbsent(
-      const CapsuleRestoreEvidenceV3& evidence,
-      const FreshWorkerAuthentication& authentication) override;
-
-  absl::StatusOr<CapsuleRestoreEvidenceV3> GetRestoreV3(
+  absl::StatusOr<CapsuleRestoreEvidence> GetRestore(
       const Hash256& checkpoint_id, const Hash256& expected_evidence_id,
       const FreshWorkerAuthentication& authentication) const override;
 
@@ -71,13 +62,9 @@ class FilesystemCapsuleRestoreEvidenceRepository final
 
   std::filesystem::path root_;
   std::filesystem::path product_directory_;
-  std::filesystem::path version_directory_;
-  std::filesystem::path records_directory_;
+  std::filesystem::path capture_records_directory_;
+  std::filesystem::path restore_records_directory_;
   std::filesystem::path lock_path_;
-  std::filesystem::path v3_version_directory_;
-  std::filesystem::path v3_capture_records_directory_;
-  std::filesystem::path v3_restore_records_directory_;
-  std::filesystem::path v3_lock_path_;
 };
 
 }  // namespace litert::lm

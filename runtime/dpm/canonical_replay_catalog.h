@@ -44,13 +44,13 @@ struct CanonicalReplayKey {
   DPMReplayStage stage = DPMReplayStage::kProjection;
   SessionHandoffIdentity runtime_identity;
   Hash256 canonical_request_hash;
-  std::string request_contract_version;
+  std::string request_contract;
 
   bool operator==(const CanonicalReplayKey& other) const {
     return stage == other.stage &&
            runtime_identity == other.runtime_identity &&
            canonical_request_hash == other.canonical_request_hash &&
-           request_contract_version == other.request_contract_version;
+           request_contract == other.request_contract;
   }
 };
 

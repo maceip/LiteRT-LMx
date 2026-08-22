@@ -3572,6 +3572,12 @@ LlmLiteRtCompiledModelExecutorBase::GetExactLiteRtLogitsFrameContract() const {
 
 absl::StatusOr<SessionHandoffRuntimeProfile>
 LlmLiteRtCompiledModelExecutorBase::GetSessionHandoffRuntimeProfile() const {
+  ABSL_RETURN_IF_ERROR(ValidateSessionHandoffSupport());
+  return GetLoadedRuntimeIdentityProfile();
+}
+
+absl::StatusOr<SessionHandoffRuntimeProfile>
+LlmLiteRtCompiledModelExecutorBase::GetLoadedRuntimeIdentityProfile() const {
   if (compiled_model_ == nullptr || state_ == nullptr) {
     return absl::FailedPreconditionError(
         "Loaded LiteRT executor is missing compiled model or state evidence.");
@@ -3584,8 +3590,6 @@ LlmLiteRtCompiledModelExecutorBase::GetSessionHandoffRuntimeProfile() const {
     return absl::UnimplementedError(
         "Loaded runtime identity does not support graph callbacks.");
   }
-  ABSL_RETURN_IF_ERROR(ValidateLoadedModelStatefulness(model_));
-
   LlmExecutorSettings settings = [this]() {
     absl::MutexLock lock(executor_settings_mutex_);
     return executor_settings_;
@@ -3736,28 +3740,18 @@ LlmLiteRtCompiledModelExecutorBase::GetSessionHandoffRuntimeProfile() const {
         "Loaded runtime identity cannot measure the decode state "
         "allocation.");
   }
-  if (compiled_backend_ == Backend::CPU) {
-    ABSL_RETURN_IF_ERROR(state->ValidateSessionHandoffSupport());
-  } else {
-    ABSL_RETURN_IF_ERROR(state->ValidateSessionHandoffSupport());
+  if (compiled_backend_ == Backend::GPU) {
     ABSL_RETURN_IF_ERROR(
         state->ValidateDeterministicProjectionResetSupport());
     ABSL_RETURN_IF_ERROR(state->ValidateMetalStateStorageForExactProfile());
   }
-  ABSL_RETURN_IF_ERROR(ValidateAuthoritativeStateMetadata(
-      executor_metadata_, *state, "primary LiteRT state"));
   if (decode_state != nullptr) {
-    if (compiled_backend_ == Backend::CPU) {
-      ABSL_RETURN_IF_ERROR(decode_state->ValidateSessionHandoffSupport());
-    } else {
-      ABSL_RETURN_IF_ERROR(decode_state->ValidateSessionHandoffSupport());
+    if (compiled_backend_ == Backend::GPU) {
       ABSL_RETURN_IF_ERROR(
           decode_state->ValidateDeterministicProjectionResetSupport());
       ABSL_RETURN_IF_ERROR(
           decode_state->ValidateMetalStateStorageForExactProfile());
     }
-    ABSL_RETURN_IF_ERROR(ValidateAuthoritativeStateMetadata(
-        executor_metadata_, *decode_state, "LiteRT decode state"));
   }
 
   uint8_t executor_shape = 0;

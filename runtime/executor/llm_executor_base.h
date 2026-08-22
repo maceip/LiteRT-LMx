@@ -277,9 +277,20 @@ class LlmExecutorBase {
         ExecutorBackendName()));
   }
 
-  // Returns an executor-owned canonical profile captured from the concrete
-  // compiled executor and its live allocation policy. The default fails
-  // closed so an unsupported executor cannot be relabeled by a caller.
+  // Returns an executor-owned canonical identity profile captured from the
+  // concrete compiled executor and its live allocation policy. This is
+  // intentionally independent of capsule serialization support: ordinary
+  // generation and cold exact execution still need a measured identity when
+  // a model contains stateful operations that cannot be exported. Older
+  // executors fall back to their handoff-specific implementation.
+  virtual absl::StatusOr<SessionHandoffRuntimeProfile>
+  GetLoadedRuntimeIdentityProfile() const {
+    return GetSessionHandoffRuntimeProfile();
+  }
+
+  // Compatibility surface for callers that specifically require a
+  // handoff-admitted runtime profile. Implementations may keep this stricter
+  // than GetLoadedRuntimeIdentityProfile().
   virtual absl::StatusOr<SessionHandoffRuntimeProfile>
   GetSessionHandoffRuntimeProfile() const {
     return absl::UnimplementedError(absl::StrCat(

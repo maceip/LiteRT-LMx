@@ -150,6 +150,41 @@ cc_library(
     ],
 )
 
+# Product adapter for the pure structured-memory reducer. This stays above the
+# schema-agnostic DPM engine while implementing its projection-provider
+# boundary, so applications can opt into dpm.factmap without coupling that
+# representation into the low-level LiteRT-LM executor.
+cc_library(
+    name = "deterministic_dpm_fact_map_projector",
+    srcs = ["deterministic_dpm_fact_map_projector.cc"],
+    hdrs = ["deterministic_dpm_fact_map_projector.h"],
+    deps = [
+        ":dpm",
+        ":dpm_fact_map",
+        "//runtime/engine:session_handoff",
+        "//runtime/platform/hash",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+cc_test(
+    name = "deterministic_dpm_fact_map_projector_test",
+    srcs = ["deterministic_dpm_fact_map_projector_test.cc"],
+    deps = [
+        ":deterministic_dpm_fact_map_projector",
+        ":dpm",
+        "//runtime/engine:session_handoff",
+        "//runtime/platform/hash",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_test(
     name = "dpm_fact_map_test",
     srcs = ["dpm_fact_map_test.cc"],
@@ -159,5 +194,54 @@ cc_test(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_binary(
+    name = "dpm_main",
+    srcs = ["dpm_main.cc"],
+    additional_linker_inputs = select({
+        "@platforms//os:windows": [
+            "@litert//litert/c:windows_exported_symbols.def",
+        ],
+        "@platforms//os:linux": ["//runtime/engine:litert_lm_main.exported_symbols"],
+        "//conditions:default": [],
+    }),
+    linkopts = select({
+        "@litert//litert:litert_runtime_link_mode_dynamic": [],
+        "@platforms//os:ios": ["-Wl,-exported_symbol,_LiteRt*"],
+        "@platforms//os:macos": ["-Wl,-exported_symbol,_LiteRt*"],
+        "@platforms//os:windows": [
+            "/DEF:$(location @litert//litert/c:windows_exported_symbols.def)",
+        ],
+        "@platforms//os:linux": ["-Wl,--dynamic-list=$(location //runtime/engine:litert_lm_main.exported_symbols)"],
+        "//conditions:default": ["-Wl,--export-dynamic-symbol=LiteRt*"],
+    }) + select({
+        "@platforms//os:android": ["-lEGL", "-lGLESv3"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        ":deterministic_dpm_fact_map_projector",
+        ":dpm",
+        ":dpm_fact_map",
+        "//runtime/engine:engine_factory",
+        "//runtime/engine:engine_impl_selected",
+        "//runtime/engine:engine_interface",
+        "//runtime/engine:engine_settings",
+        "//runtime/executor:executor_settings_base",
+        "//runtime/executor:llm_executor_settings",
+        "//runtime/executor:session_handoff_runtime",
+        "//runtime/platform:runtime_artifact_identity",
+        "//runtime/platform/hash",
+        "@com_google_absl//absl/base:log_severity",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/flags:parse",
+        "@com_google_absl//absl/log:globals",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@nlohmann_json//:json",
     ],
 )

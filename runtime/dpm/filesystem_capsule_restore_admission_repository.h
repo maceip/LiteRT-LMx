@@ -27,7 +27,7 @@ namespace litert::lm {
 // Durable, owner-only, create-once admission-evidence store. This repository
 // never stores or serves LRTSESS1 checkpoint bytes and is not a checkpoint
 // repository. Its sole value is an authenticated qualification record keyed
-// by capability plus canonical qualification specification.
+// by the runtime-derived profile, capability, and coverage identity.
 class FilesystemCapsuleRestoreAdmissionRepository final
     : public CapsuleRestoreAdmissionRepository {
  public:
@@ -42,17 +42,6 @@ class FilesystemCapsuleRestoreAdmissionRepository final
   absl::StatusOr<CapsuleRestoreAdmissionRecord> Get(
       const ExactLiteRtProfile& runtime_derived_profile,
       const SessionHandoffCapability& runtime_derived_capability,
-      const CapsuleRestoreQualificationSpec& spec,
-      const FreshWorkerAuthentication& authentication) const override;
-
-  absl::Status PutStateWitnessedOwnPositionIfAbsent(
-      const CapsuleRestoreStateWitnessAdmissionRecord& record,
-      const FreshWorkerAuthentication& authentication) override;
-
-  absl::StatusOr<CapsuleRestoreStateWitnessAdmissionRecord>
-  GetStateWitnessedOwnPosition(
-      const ExactLiteRtProfile& runtime_derived_profile,
-      const SessionHandoffCapability& runtime_derived_capability,
       const Hash256& expected_coverage_id,
       const FreshWorkerAuthentication& authentication) const override;
 
@@ -65,9 +54,6 @@ class FilesystemCapsuleRestoreAdmissionRepository final
   std::filesystem::path directory_;
   std::filesystem::path records_directory_;
   std::filesystem::path lock_path_;
-  std::filesystem::path state_witness_directory_;
-  std::filesystem::path state_witness_records_directory_;
-  std::filesystem::path state_witness_lock_path_;
 };
 
 }  // namespace litert::lm

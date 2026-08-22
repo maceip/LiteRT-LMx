@@ -25,8 +25,8 @@
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
-#include "runtime/dpm/dpm_capabilities.h"
 #include "runtime/dpm/dpm_agent_replay_runtime.h"
+#include "runtime/dpm/dpm_capabilities.h"
 #include "runtime/dpm/dpm_prepared_prefill_plan.h"
 #include "runtime/dpm/dpm_projection_manifest.h"
 #include "runtime/dpm/dpm_receipt_validation.h"
@@ -48,43 +48,37 @@ absl::Status ValidateDistinctHashDomains(
     std::initializer_list<NamedHash> hashes) {
   for (auto first = hashes.begin(); first != hashes.end(); ++first) {
     if (IsZeroHash(first->value)) {
-      return absl::InvalidArgumentError(
-          absl::StrCat("CapsuleRestore binding has an empty ", first->name,
-                       " hash."));
+      return absl::InvalidArgumentError(absl::StrCat(
+          "CapsuleRestore binding has an empty ", first->name, " hash."));
     }
     for (auto second = first + 1; second != hashes.end(); ++second) {
       if (first->value == second->value) {
-        return absl::InvalidArgumentError(absl::StrCat(
-            "CapsuleRestore binding substituted ", first->name, " for ",
-            second->name, "."));
+        return absl::InvalidArgumentError(
+            absl::StrCat("CapsuleRestore binding substituted ", first->name,
+                         " for ", second->name, "."));
       }
     }
   }
   return absl::OkStatus();
 }
 
-absl::Status ValidateCurrentV3Admission(
-    const AuthenticatedCapsuleRestoreStateWitnessAdmission& admission) {
+absl::Status ValidateCurrentAdmission(
+    const AuthenticatedCapsuleRestoreAdmission& admission) {
   ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(admission.profile));
-  ABSL_RETURN_IF_ERROR(
-      ValidateSessionHandoffCapability(admission.capability));
-  ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleRestoreStateWitnessAdmissionRecord(admission.record));
-  ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleRestoreStateWitnessOperationalCoverage(
+  ABSL_RETURN_IF_ERROR(ValidateSessionHandoffCapability(admission.capability));
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreAdmissionRecord(admission.record));
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreOperationalCoverage(
           admission.operational_coverage));
-  ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleRestoreStateWitnessOperationalContracts(
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreOperationalContracts(
           admission.operational_coverage));
-  ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleRestoreStateWitnessAdmissionRecordForRuntime(
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreAdmissionRecordForRuntime(
           admission.record, admission.profile, admission.capability,
           admission.operational_coverage.coverage_id));
   ABSL_ASSIGN_OR_RETURN(
       const Hash256 canonical_record_id,
-      ComputeCapsuleRestoreStateWitnessAdmissionRecordId(admission.record));
+      ComputeCapsuleRestoreAdmissionRecordId(admission.record));
 
-  const CapsuleRestoreStateWitnessOperationalCoverage& coverage =
+  const CapsuleRestoreOperationalCoverage& coverage =
       admission.operational_coverage;
   const CapsuleRestoreStateWitnessOperationalDomain& domain =
       coverage.operational_domain;
@@ -109,16 +103,16 @@ absl::Status ValidateCurrentV3Admission(
   // Repeat the operation-boundary identities explicitly after the central
   // operational-contract validator. This keeps this cross-object binder
   // fail-closed if a future aggregate validator is accidentally weakened or
-  // routed to a legacy evidence contract.
+  // routed to a different evidence contract.
   if (domain.resolved_session_config_hash !=
           admission.profile.session_identity.inference_profile_hash ||
       domain.admitted_backend != admission.profile.backend ||
       domain.session_continuation_state_witness_contract_hash !=
           GetSessionContinuationStateWitnessContractHash() ||
       domain.capture_evidence_contract_hash !=
-          GetCapsuleRestoreCaptureEvidenceV3ContractHash() ||
+          GetCapsuleRestoreCaptureEvidenceContractHash() ||
       domain.restore_evidence_contract_hash !=
-          GetCapsuleRestoreRestoreEvidenceV3ContractHash() ||
+          GetCapsuleRestoreRestoreEvidenceContractHash() ||
       domain.deterministic_prefill_plan_contract_hash !=
           GetDPMPreparedPrefillPlanContractHash() ||
       domain.execution_shape_class_contract_hash !=
@@ -126,7 +120,7 @@ absl::Status ValidateCurrentV3Admission(
       domain.restricted_feature_contract_hash !=
           GetDPMRestrictedFeatureContractHash()) {
     return absl::FailedPreconditionError(
-        "CapsuleRestore authority was not qualified against the current V3 "
+        "CapsuleRestore authority was not qualified against the current "
         "capture, restore, witness, prepared-prefill, shape, and restricted-"
         "feature contracts.");
   }
@@ -143,7 +137,7 @@ absl::Status ValidateAuthoritativeCurrentReceipt(
     const DPMTurnReceipt& receipt) {
   if (receipt.format_version != DPMTurnReceipt::kFormatVersion) {
     return absl::FailedPreconditionError(
-        "CapsuleRestore evidence binding requires an authoritative version-7 "
+        "CapsuleRestore evidence binding requires an authoritative current "
         "turn receipt.");
   }
   ABSL_RETURN_IF_ERROR(
@@ -164,19 +158,18 @@ absl::Status ValidateAuthoritativeCurrentReceipt(
 }
 
 absl::StatusOr<std::vector<DPMAgentGenerationRequest::PrefillChunk>>
-ToAgentPrefillChunks(
-    const std::vector<CapsuleCanonicalPrefillChunkV2>& chunks) {
+ToAgentPrefillChunks(const std::vector<CapsuleCanonicalPrefillChunk>& chunks) {
   std::vector<DPMAgentGenerationRequest::PrefillChunk> converted;
   converted.reserve(chunks.size());
-  for (const CapsuleCanonicalPrefillChunkV2& chunk : chunks) {
+  for (const CapsuleCanonicalPrefillChunk& chunk : chunks) {
     DPMAgentGenerationRequest::PrefillChunk converted_chunk;
     switch (chunk.encoding) {
-      case CapsuleCanonicalPrefillChunkV2::Encoding::kUtf8Text:
+      case CapsuleCanonicalPrefillChunk::Encoding::kUtf8Text:
         converted_chunk.encoding =
             DPMAgentGenerationRequest::PrefillChunk::Encoding::kUtf8Text;
         converted_chunk.text = chunk.utf8_text;
         break;
-      case CapsuleCanonicalPrefillChunkV2::Encoding::kExactTokenIds:
+      case CapsuleCanonicalPrefillChunk::Encoding::kExactTokenIds:
         converted_chunk.encoding =
             DPMAgentGenerationRequest::PrefillChunk::Encoding::kTokenIds;
         converted_chunk.token_ids.reserve(chunk.token_ids.size());
@@ -200,14 +193,14 @@ ToAgentPrefillChunks(
 }
 
 absl::Status ValidateExactRestoreModelAffectingExecutionPlan(
-    const CapsuleRestoreEvidenceV3& restore_evidence,
+    const CapsuleRestoreEvidence& restore_evidence,
     const DPMSessionCheckpointArtifact& source_artifact,
     const DPMTurnReceipt& restoring_receipt) {
-  const CapsuleRestorePlanV2& restore_plan = restore_evidence.plan;
+  const CapsuleRestorePlan& restore_plan = restore_evidence.plan;
   const DPMSessionCheckpointDescriptor& source_descriptor =
       source_artifact.descriptor;
   if (restore_plan.prefill.mode !=
-          CapsulePrefillModeV2::kOwnPositionCapsuleDelta ||
+          CapsulePrefillMode::kOwnPositionCapsuleDelta ||
       restoring_receipt.agent_worker_prefill_mode !=
           DPMCheckpointWorkerPrefillMode::kOwnPositionCapsuleDelta) {
     return absl::FailedPreconditionError(
@@ -223,28 +216,22 @@ absl::Status ValidateExactRestoreModelAffectingExecutionPlan(
           restore_plan.target_state.logical_agent_request_hash,
       .correction_digest = restore_plan.target_state.correction_digest,
       .restore_checkpoint_id = source_descriptor.descriptor_id,
-      .restored_response_event_index =
-          source_descriptor.response_event_index,
-      .restored_agent_transcript_hash =
-          source_descriptor.agent_transcript_hash,
+      .restored_response_event_index = source_descriptor.response_event_index,
+      .restored_agent_transcript_hash = source_descriptor.agent_transcript_hash,
       .max_output_tokens = restore_plan.maximum_output_tokens,
       .canonical_delta_prefill_chunks = std::move(delta_chunks),
   };
-  ABSL_ASSIGN_OR_RETURN(
-      std::string canonical_delta_payload,
+  ABSL_ASSIGN_OR_RETURN(std::string canonical_delta_payload,
       EncodeDPMAgentDeltaExecutionRequest(delta_request));
 
   FreshWorkerExecutionPlan physical_plan;
-  physical_plan.prefill_mode =
-      FreshWorkerPrefillMode::kOwnPositionCapsuleDelta;
+  physical_plan.prefill_mode = FreshWorkerPrefillMode::kOwnPositionCapsuleDelta;
   physical_plan.logical_replay_request_hash =
       restoring_receipt.agent_replay_request_hash;
   physical_plan.restore_checkpoint_id = source_descriptor.descriptor_id;
   physical_plan.session_identity = source_descriptor.session_identity;
-  physical_plan.restore_durable_envelope_hash =
-      source_descriptor.envelope_hash;
-  physical_plan.restore_durable_envelope_size =
-      source_descriptor.envelope_size;
+  physical_plan.restore_durable_envelope_hash = source_descriptor.envelope_hash;
+  physical_plan.restore_durable_envelope_size = source_descriptor.envelope_size;
   physical_plan.canonical_execution_payload =
       std::move(canonical_delta_payload);
   // Capture is a post-output transport policy and is deliberately excluded
@@ -266,8 +253,7 @@ absl::Status ValidateExactRestoreModelAffectingExecutionPlan(
         "Exact restoring receipt capture policy lacks its separate "
         "authenticated run-zero checkpoint provenance.");
   }
-  ABSL_ASSIGN_OR_RETURN(
-      physical_plan.plan_hash,
+  ABSL_ASSIGN_OR_RETURN(physical_plan.plan_hash,
       ComputeFreshWorkerExecutionPlanHash(physical_plan));
   ABSL_RETURN_IF_ERROR(ValidateFreshWorkerExecutionPlan(physical_plan));
   if (restoring_receipt.agent_physical_execution_plan_hash !=
@@ -275,14 +261,13 @@ absl::Status ValidateExactRestoreModelAffectingExecutionPlan(
     return absl::FailedPreconditionError(
         "Exact restoring receipt model-affecting physical plan is not "
         "canonically derived from its logical replay request, source "
-        "checkpoint/envelope, and V3 delta payload.");
+        "checkpoint/envelope, and canonical delta payload.");
   }
   return absl::OkStatus();
 }
 
 absl::Status ValidateReceiptAuthority(
-    const DPMTurnReceipt& receipt,
-    const CapsuleRestoreAuthorityV2& authority) {
+    const DPMTurnReceipt& receipt, const CapsuleRestoreAuthority& authority) {
   if (!receipt.agent_capsule_restore_capability_id.has_value() ||
       !receipt.agent_capsule_restore_admission_record_id.has_value() ||
       !receipt.agent_capsule_restore_coverage_id.has_value() ||
@@ -291,8 +276,7 @@ absl::Status ValidateReceiptAuthority(
       *receipt.agent_capsule_restore_admission_record_id !=
           authority.admission_record_id ||
       *receipt.agent_capsule_restore_coverage_id != authority.coverage_id ||
-      receipt.agent_session_identity !=
-          authority.capability.session_identity) {
+      receipt.agent_session_identity != authority.capability.session_identity) {
     return absl::FailedPreconditionError(
         "Turn receipt does not carry the current complete CapsuleRestore "
         "authority and runtime-owned session identity.");
@@ -312,27 +296,25 @@ bool ExactWorkerProvenanceEqual(
          left.output_evidence_hash == right.output_evidence_hash;
 }
 
-DPMCheckpointWorkerPrefillMode WorkerModeForPrefill(
-    CapsulePrefillModeV2 mode) {
+DPMCheckpointWorkerPrefillMode WorkerModeForPrefill(CapsulePrefillMode mode) {
   switch (mode) {
-    case CapsulePrefillModeV2::kFullCanonicalPrefill:
+    case CapsulePrefillMode::kFullCanonicalPrefill:
       return DPMCheckpointWorkerPrefillMode::kFullCanonicalPrefill;
-    case CapsulePrefillModeV2::kOwnPositionCapsuleDelta:
+    case CapsulePrefillMode::kOwnPositionCapsuleDelta:
       return DPMCheckpointWorkerPrefillMode::kOwnPositionCapsuleDelta;
   }
   return DPMCheckpointWorkerPrefillMode::kNone;
 }
 
 absl::Status ValidateCanonicalPrefillWithinCoverage(
-    const CapsulePrefillPlanV2& prefill,
+    const CapsulePrefillPlan& prefill,
     const CapsuleRestoreStateWitnessOperationalDomain& domain) {
   uint64_t text_bytes = 0;
   uint64_t token_ids = 0;
   uint32_t encoding_mask = 0;
-  for (const CapsuleCanonicalPrefillChunkV2& chunk :
-       prefill.canonical_chunks) {
+  for (const CapsuleCanonicalPrefillChunk& chunk : prefill.canonical_chunks) {
     switch (chunk.encoding) {
-      case CapsuleCanonicalPrefillChunkV2::Encoding::kUtf8Text:
+      case CapsuleCanonicalPrefillChunk::Encoding::kUtf8Text:
         if (text_bytes > domain.maximum_prefill_text_bytes ||
             chunk.utf8_text.size() >
                 domain.maximum_prefill_text_bytes - text_bytes) {
@@ -344,7 +326,7 @@ absl::Status ValidateCanonicalPrefillWithinCoverage(
         encoding_mask |= CapsuleRestoreStateWitnessEncodingBit(
             CapsuleRestoreStateWitnessEncoding::kUtf8Text);
         break;
-      case CapsuleCanonicalPrefillChunkV2::Encoding::kExactTokenIds:
+      case CapsuleCanonicalPrefillChunk::Encoding::kExactTokenIds:
         if (token_ids > domain.maximum_prefill_token_ids ||
             chunk.token_ids.size() >
                 domain.maximum_prefill_token_ids - token_ids) {
@@ -374,9 +356,9 @@ absl::Status ValidateCanonicalPrefillWithinCoverage(
 }
 
 absl::Status ValidateCaptureWithinCoverage(
-    const CapsuleCaptureEvidenceV3& capture,
+    const CapsuleCaptureEvidence& capture,
     const CapsuleRestoreStateWitnessOperationalDomain& domain) {
-  const CapsuleCapturePlanV2& plan = capture.plan;
+  const CapsuleCapturePlan& plan = capture.plan;
   ABSL_RETURN_IF_ERROR(
       ValidateCanonicalPrefillWithinCoverage(plan.prefill, domain));
   if (plan.generated_token_count > domain.maximum_output_tokens ||
@@ -387,8 +369,7 @@ absl::Status ValidateCaptureWithinCoverage(
         "CapsuleRestore capture is outside the current authenticated output, "
         "checkpoint-position, or context domain.");
   }
-  if (plan.capture_basis ==
-      CapsuleCaptureBasisV2::kVerifiedParentRestore) {
+  if (plan.capture_basis == CapsuleCaptureBasis::kVerifiedParentRestore) {
     if (plan.prefill.start_step < domain.minimum_checkpoint_step ||
         plan.prefill.start_step > domain.maximum_checkpoint_step ||
         plan.prefill.end_step <= plan.prefill.start_step) {
@@ -397,8 +378,7 @@ absl::Status ValidateCaptureWithinCoverage(
           "authenticated own-position domain.");
     }
     const uint64_t delta_positions =
-        static_cast<uint64_t>(plan.prefill.end_step) -
-        plan.prefill.start_step;
+        static_cast<uint64_t>(plan.prefill.end_step) - plan.prefill.start_step;
     if (delta_positions < domain.minimum_delta_positions ||
         delta_positions > domain.maximum_delta_positions) {
       return absl::FailedPreconditionError(
@@ -410,9 +390,9 @@ absl::Status ValidateCaptureWithinCoverage(
 }
 
 absl::Status ValidateRestoreWithinCoverage(
-    const CapsuleRestoreEvidenceV3& restore,
+    const CapsuleRestoreEvidence& restore,
     const CapsuleRestoreStateWitnessOperationalDomain& domain) {
-  const CapsuleRestorePlanV2& plan = restore.plan;
+  const CapsuleRestorePlan& plan = restore.plan;
   ABSL_RETURN_IF_ERROR(
       ValidateCanonicalPrefillWithinCoverage(plan.prefill, domain));
   if (plan.maximum_output_tokens > domain.maximum_output_tokens ||
@@ -439,10 +419,9 @@ absl::Status ValidateRestoreWithinCoverage(
 
 absl::Status ValidateCaptureStateJoin(
     const DPMSessionCheckpointDescriptor& descriptor,
-    const DPMTurnReceipt& receipt,
-    const CapsuleCaptureEvidenceV3& capture) {
-  const CapsuleCapturePlanV2& plan = capture.plan;
-  const CapsuleDPMCheckpointStateV2& state = plan.checkpoint_state;
+    const DPMTurnReceipt& receipt, const CapsuleCaptureEvidence& capture) {
+  const CapsuleCapturePlan& plan = capture.plan;
+  const CapsuleDPMCheckpointState& state = plan.checkpoint_state;
   const DPMProjectionManifest& manifest = receipt.projection_manifest;
   if (descriptor.log_id != state.log_id ||
       descriptor.log_id != manifest.log_id ||
@@ -452,11 +431,9 @@ absl::Status ValidateCaptureStateJoin(
       descriptor.source_prefix_hash != manifest.source_prefix_hash ||
       descriptor.response_event_index != state.response_event_index ||
       descriptor.response_event_index != receipt.response_event_index ||
-      descriptor.projection_request_hash !=
-          state.projection_request_hash ||
+      descriptor.projection_request_hash != state.projection_request_hash ||
       descriptor.projection_request_hash != manifest.request_hash ||
-      descriptor.projection_manifest_hash !=
-          state.projection_manifest_hash ||
+      descriptor.projection_manifest_hash != state.projection_manifest_hash ||
       descriptor.projection_manifest_hash != manifest.manifest_hash ||
       descriptor.correction_digest != state.correction_digest ||
       descriptor.correction_digest != manifest.correction_digest ||
@@ -474,11 +451,10 @@ absl::Status ValidateCaptureStateJoin(
 
 absl::Status ValidateCaptureParentJoin(
     const DPMSessionCheckpointDescriptor& descriptor,
-    const DPMTurnReceipt& receipt,
-    const CapsuleCaptureEvidenceV3& capture) {
-  const CapsuleCapturePlanV2& plan = capture.plan;
+    const DPMTurnReceipt& receipt, const CapsuleCaptureEvidence& capture) {
+  const CapsuleCapturePlan& plan = capture.plan;
   switch (plan.capture_basis) {
-    case CapsuleCaptureBasisV2::kRootFreshSession:
+    case CapsuleCaptureBasis::kRootFreshSession:
       if (descriptor.restored_from_checkpoint_id.has_value() ||
           receipt.restored_from_session_checkpoint_id.has_value() ||
           receipt.restored_checkpoint_capture_evidence_id.has_value() ||
@@ -487,12 +463,11 @@ absl::Status ValidateCaptureParentJoin(
             "Root checkpoint capture carries restored-parent provenance.");
       }
       return absl::OkStatus();
-    case CapsuleCaptureBasisV2::kVerifiedParentRestore: {
+    case CapsuleCaptureBasis::kVerifiedParentRestore: {
       if (!plan.parent_checkpoint_id.has_value() ||
           !plan.parent_restore_evidence_id.has_value() ||
           !capture.parent_restore_evidence.has_value() ||
-          descriptor.restored_from_checkpoint_id !=
-              plan.parent_checkpoint_id ||
+          descriptor.restored_from_checkpoint_id != plan.parent_checkpoint_id ||
           receipt.restored_from_session_checkpoint_id !=
               plan.parent_checkpoint_id ||
           receipt.agent_capsule_restore_evidence_id !=
@@ -516,10 +491,9 @@ absl::Status ValidateCaptureParentJoin(
 
 absl::Status ValidateCaptureModeJoin(
     const DPMSessionCheckpointDescriptor& descriptor,
-    const DPMTurnReceipt& receipt,
-    const CapsuleCaptureEvidenceV3& capture,
-    const CapsuleRestoreAuthorityV2& authority) {
-  const CapsuleCapturePlanV2& plan = capture.plan;
+    const DPMTurnReceipt& receipt, const CapsuleCaptureEvidence& capture,
+    const CapsuleRestoreAuthority& authority) {
+  const CapsuleCapturePlan& plan = capture.plan;
   if (descriptor.replay_mode != receipt.agent_replay_mode ||
       descriptor.capture_origin != receipt.checkpoint_capture_origin) {
     return absl::FailedPreconditionError(
@@ -572,8 +546,7 @@ absl::Status ValidateCaptureModeJoin(
               receipt.agent_physical_execution_plan_hash ||
           descriptor.worker_prefill_mode !=
               WorkerModeForPrefill(plan.prefill.mode) ||
-          receipt.agent_worker_prefill_mode !=
-              descriptor.worker_prefill_mode ||
+          receipt.agent_worker_prefill_mode != descriptor.worker_prefill_mode ||
           !ExactWorkerProvenanceEqual(
               *descriptor.worker_provenance,
               *receipt.agent_exact_worker_checkpoint_provenance)) {
@@ -590,8 +563,7 @@ absl::Status ValidateCaptureModeJoin(
               reauthentication.source_envelope_hash ||
           worker.transient_envelope_size !=
               reauthentication.source_envelope_size ||
-          worker.output_evidence_hash !=
-              plan.producing_output_evidence_hash ||
+          worker.output_evidence_hash != plan.producing_output_evidence_hash ||
           worker.execution_plan_hash != descriptor.execution_plan_hash) {
         return absl::FailedPreconditionError(
             "Exact run-zero worker provenance does not describe the capture "
@@ -606,11 +578,10 @@ absl::Status ValidateCaptureModeJoin(
 
 absl::Status ValidateCaptureHashDomains(
     const DPMSessionCheckpointDescriptor& descriptor,
-    const DPMTurnReceipt& receipt,
-    const CapsuleCaptureEvidenceV3& capture,
+    const DPMTurnReceipt& receipt, const CapsuleCaptureEvidence& capture,
     const DPMPreparedPrefillWorkBinding& prepared,
-    const CapsuleRestoreAuthorityV2& authority) {
-  const CapsuleDPMCheckpointStateV2& state = capture.plan.checkpoint_state;
+    const CapsuleRestoreAuthority& authority) {
+  const CapsuleDPMCheckpointState& state = capture.plan.checkpoint_state;
   const SessionHandoffReauthenticationEvidence& reauthentication =
       capture.transient_to_durable_reauthentication;
   std::vector<NamedHash> hashes = {
@@ -627,7 +598,7 @@ absl::Status ValidateCaptureHashDomains(
       {"CapsuleRestore capability", authority.capability.capability_id},
       {"CapsuleRestore admission", authority.admission_record_id},
       {"CapsuleRestore coverage", authority.coverage_id},
-      {"qualification evidence", authority.qualification_spec_hash},
+      {"qualification evidence", authority.qualification_evidence_hash},
       {"source-prefix", state.source_prefix_hash},
       {"projection request", state.projection_request_hash},
       {"projection manifest", state.projection_manifest_hash},
@@ -657,15 +628,15 @@ absl::Status ValidateCaptureHashDomains(
   }
   for (std::size_t first = 0; first < hashes.size(); ++first) {
     if (IsZeroHash(hashes[first].value)) {
-      return absl::InvalidArgumentError(absl::StrCat(
-          "CapsuleRestore capture binding has an empty ", hashes[first].name,
-          " hash."));
+      return absl::InvalidArgumentError(
+          absl::StrCat("CapsuleRestore capture binding has an empty ",
+                       hashes[first].name, " hash."));
     }
     for (std::size_t second = first + 1; second < hashes.size(); ++second) {
       if (hashes[first].value == hashes[second].value) {
         return absl::InvalidArgumentError(absl::StrCat(
-            "CapsuleRestore capture binding substituted ",
-            hashes[first].name, " for ", hashes[second].name, "."));
+            "CapsuleRestore capture binding substituted ", hashes[first].name,
+            " for ", hashes[second].name, "."));
       }
     }
   }
@@ -673,23 +644,20 @@ absl::Status ValidateCaptureHashDomains(
 }
 
 absl::Status ValidateRestoreTargetReceiptJoin(
-    const CapsuleRestoreEvidenceV3& restore,
-    const DPMTurnReceipt& receipt) {
-  const CapsuleDPMRestoreTargetV2& target = restore.plan.target_state;
+    const CapsuleRestoreEvidence& restore, const DPMTurnReceipt& receipt) {
+  const CapsuleDPMRestoreTarget& target = restore.plan.target_state;
   const DPMProjectionManifest& manifest = receipt.projection_manifest;
   if (target.log_id != manifest.log_id ||
       target.source_event_count != manifest.source_event_count ||
       target.source_prefix_hash != manifest.source_prefix_hash ||
-      target.prospective_response_event_index !=
-          receipt.response_event_index ||
+      target.prospective_response_event_index != receipt.response_event_index ||
       target.projection_request_hash != manifest.request_hash ||
       target.projection_manifest_hash != manifest.manifest_hash ||
       target.correction_digest != manifest.correction_digest ||
       target.logical_agent_request_hash != receipt.agent_request_hash ||
       restore.plan.maximum_output_tokens != receipt.max_decision_tokens ||
       receipt.decision_token_ids.empty() ||
-      receipt.decision_token_ids.size() >
-          restore.plan.maximum_output_tokens ||
+      receipt.decision_token_ids.size() > restore.plan.maximum_output_tokens ||
       target.agent_transcript_prefix_hash == receipt.agent_transcript_hash) {
     return absl::FailedPreconditionError(
         "Restore target and authoritative receipt disagree on the pending "
@@ -701,24 +669,24 @@ absl::Status ValidateRestoreTargetReceiptJoin(
 
 }  // namespace
 
-absl::StatusOr<CapsuleRestoreAuthorityV2> BuildCapsuleRestoreAuthorityV2(
-    const AuthenticatedCapsuleRestoreStateWitnessAdmission& admission) {
-  ABSL_RETURN_IF_ERROR(ValidateCurrentV3Admission(admission));
-  CapsuleRestoreAuthorityV2 authority{
+absl::StatusOr<CapsuleRestoreAuthority> BuildCapsuleRestoreAuthority(
+    const AuthenticatedCapsuleRestoreAdmission& admission) {
+  ABSL_RETURN_IF_ERROR(ValidateCurrentAdmission(admission));
+  CapsuleRestoreAuthority authority{
       .capability = admission.capability,
       .admission_record_id = admission.record.record_id,
       .coverage_id = admission.operational_coverage.coverage_id,
-      .qualification_spec_hash =
+      .qualification_evidence_hash =
           admission.operational_coverage.qualification_evidence_hash,
   };
   return authority;
 }
 
-absl::Status ValidateCapsuleRestoreAuthorityV2ForAdmission(
-    const CapsuleRestoreAuthorityV2& authority,
-    const AuthenticatedCapsuleRestoreStateWitnessAdmission& admission) {
-  ABSL_ASSIGN_OR_RETURN(const CapsuleRestoreAuthorityV2 expected,
-                        BuildCapsuleRestoreAuthorityV2(admission));
+absl::Status ValidateCapsuleRestoreAuthorityForAdmission(
+    const CapsuleRestoreAuthority& authority,
+    const AuthenticatedCapsuleRestoreAdmission& admission) {
+  ABSL_ASSIGN_OR_RETURN(const CapsuleRestoreAuthority expected,
+                        BuildCapsuleRestoreAuthority(admission));
   if (authority != expected) {
     return absl::FailedPreconditionError(
         "CapsuleRestore authority differs from the freshly reauthenticated "
@@ -757,26 +725,23 @@ absl::Status ValidateDPMPreparedPrefillWorkBindingForPlan(
   return absl::OkStatus();
 }
 
-absl::Status ValidateCapsuleCaptureEvidenceV3CheckpointBinding(
+absl::Status ValidateCapsuleCaptureEvidenceCheckpointBinding(
     const DPMSessionCheckpointArtifact& artifact,
     const DPMTurnReceipt& source_receipt,
-    const CapsuleCaptureEvidenceV3& capture_evidence,
-    const CapsuleRestoreAuthorityV2& current_authority,
-    const AuthenticatedCapsuleRestoreStateWitnessAdmission&
-        current_admission) {
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreAuthorityV2ForAdmission(
+    const CapsuleCaptureEvidence& capture_evidence,
+    const CapsuleRestoreAuthority& current_authority,
+    const AuthenticatedCapsuleRestoreAdmission& current_admission) {
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreAuthorityForAdmission(
       current_authority, current_admission));
   ABSL_RETURN_IF_ERROR(ValidateDPMSessionCheckpointArtifact(artifact));
-  ABSL_RETURN_IF_ERROR(
-      ValidateAuthoritativeCurrentReceipt(source_receipt));
-  ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleCaptureEvidenceV3(capture_evidence));
+  ABSL_RETURN_IF_ERROR(ValidateAuthoritativeCurrentReceipt(source_receipt));
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleCaptureEvidence(capture_evidence));
   ABSL_RETURN_IF_ERROR(ValidateCaptureWithinCoverage(
       capture_evidence,
       current_admission.operational_coverage.operational_domain));
 
   const DPMSessionCheckpointDescriptor& descriptor = artifact.descriptor;
-  const CapsuleCapturePlanV2& plan = capture_evidence.plan;
+  const CapsuleCapturePlan& plan = capture_evidence.plan;
   if (descriptor.format_version !=
           DPMSessionCheckpointDescriptor::kFormatVersion ||
       plan.authority != current_authority ||
@@ -796,12 +761,11 @@ absl::Status ValidateCapsuleCaptureEvidenceV3CheckpointBinding(
           current_authority.capability.capability_id ||
       descriptor.capsule_restore_admission_record_id !=
           current_authority.admission_record_id ||
-      descriptor.capsule_restore_coverage_id !=
-          current_authority.coverage_id ||
+      descriptor.capsule_restore_coverage_id != current_authority.coverage_id ||
       descriptor.session_identity !=
           current_authority.capability.session_identity ||
-      descriptor.key_id != current_admission.operational_coverage
-                               .operational_domain
+      descriptor.key_id !=
+          current_admission.operational_coverage.operational_domain
                                .checkpoint_authentication_key_id) {
     return absl::FailedPreconditionError(
         "Checkpoint artifact, receipt, capture evidence, and current "
@@ -824,8 +788,8 @@ absl::Status ValidateCapsuleCaptureEvidenceV3CheckpointBinding(
 
   ABSL_RETURN_IF_ERROR(
       ValidateCaptureStateJoin(descriptor, source_receipt, capture_evidence));
-  ABSL_RETURN_IF_ERROR(ValidateCaptureParentJoin(
-      descriptor, source_receipt, capture_evidence));
+  ABSL_RETURN_IF_ERROR(
+      ValidateCaptureParentJoin(descriptor, source_receipt, capture_evidence));
   ABSL_RETURN_IF_ERROR(ValidateCaptureModeJoin(
       descriptor, source_receipt, capture_evidence, current_authority));
   return ValidateCaptureHashDomains(descriptor, source_receipt,
@@ -833,18 +797,17 @@ absl::Status ValidateCapsuleCaptureEvidenceV3CheckpointBinding(
                                     current_authority);
 }
 
-absl::Status ValidateCapsuleRestoreEvidenceV3SourceCheckpointBinding(
-    const CapsuleRestoreEvidenceV3& restore_evidence,
-    const CapsuleCaptureEvidenceV3& source_capture_evidence,
+absl::Status ValidateCapsuleRestoreEvidenceSourceCheckpointBinding(
+    const CapsuleRestoreEvidence& restore_evidence,
+    const CapsuleCaptureEvidence& source_capture_evidence,
     const DPMSessionCheckpointArtifact& source_artifact,
     const DPMTurnReceipt& source_receipt,
-    const CapsuleRestoreAuthorityV2& current_authority,
-    const AuthenticatedCapsuleRestoreStateWitnessAdmission&
-        current_admission) {
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleCaptureEvidenceV3CheckpointBinding(
+    const CapsuleRestoreAuthority& current_authority,
+    const AuthenticatedCapsuleRestoreAdmission& current_admission) {
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleCaptureEvidenceCheckpointBinding(
       source_artifact, source_receipt, source_capture_evidence,
       current_authority, current_admission));
-  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreEvidenceV3ForSourceCapture(
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreEvidenceForSourceCapture(
       restore_evidence, source_capture_evidence));
   ABSL_RETURN_IF_ERROR(ValidateRestoreWithinCoverage(
       restore_evidence,
@@ -854,8 +817,7 @@ absl::Status ValidateCapsuleRestoreEvidenceV3SourceCheckpointBinding(
         "Restore evidence does not carry the freshly reauthenticated current "
         "authority.");
   }
-  ABSL_ASSIGN_OR_RETURN(
-      const DPMPreparedPrefillWorkBinding prepared,
+  ABSL_ASSIGN_OR_RETURN(const DPMPreparedPrefillWorkBinding prepared,
       BuildDPMPreparedPrefillWorkBinding(
           restore_evidence.plan.prefill.prepared_plan));
   ABSL_RETURN_IF_ERROR(ValidateDistinctHashDomains(
@@ -874,7 +836,7 @@ absl::Status ValidateCapsuleRestoreEvidenceV3SourceCheckpointBinding(
        {"CapsuleRestore admission", current_authority.admission_record_id},
        {"CapsuleRestore coverage", current_authority.coverage_id},
        {"qualification evidence",
-        current_authority.qualification_spec_hash},
+        current_authority.qualification_evidence_hash},
        {"target source-prefix",
         restore_evidence.plan.target_state.source_prefix_hash},
        {"target projection request",
@@ -900,21 +862,18 @@ absl::Status ValidateCapsuleRestoreEvidenceV3SourceCheckpointBinding(
   return absl::OkStatus();
 }
 
-absl::Status ValidateCapsuleRestoreEvidenceV3TurnBinding(
-    const CapsuleRestoreEvidenceV3& restore_evidence,
-    const CapsuleCaptureEvidenceV3& source_capture_evidence,
+absl::Status ValidateCapsuleRestoreEvidenceTurnBinding(
+    const CapsuleRestoreEvidence& restore_evidence,
+    const CapsuleCaptureEvidence& source_capture_evidence,
     const DPMSessionCheckpointArtifact& source_artifact,
     const DPMTurnReceipt& source_receipt,
     const DPMTurnReceipt& restoring_receipt,
-    const CapsuleRestoreAuthorityV2& current_authority,
-    const AuthenticatedCapsuleRestoreStateWitnessAdmission&
-        current_admission) {
-  ABSL_RETURN_IF_ERROR(
-      ValidateCapsuleRestoreEvidenceV3SourceCheckpointBinding(
+    const CapsuleRestoreAuthority& current_authority,
+    const AuthenticatedCapsuleRestoreAdmission& current_admission) {
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreEvidenceSourceCheckpointBinding(
           restore_evidence, source_capture_evidence, source_artifact,
           source_receipt, current_authority, current_admission));
-  ABSL_RETURN_IF_ERROR(
-      ValidateAuthoritativeCurrentReceipt(restoring_receipt));
+  ABSL_RETURN_IF_ERROR(ValidateAuthoritativeCurrentReceipt(restoring_receipt));
   ABSL_RETURN_IF_ERROR(
       ValidateReceiptAuthority(restoring_receipt, current_authority));
   ABSL_RETURN_IF_ERROR(
@@ -932,15 +891,13 @@ absl::Status ValidateCapsuleRestoreEvidenceV3TurnBinding(
   }
   if (source_artifact.descriptor.replay_mode !=
           restoring_receipt.agent_replay_mode ||
-      source_receipt.agent_replay_mode !=
-          restoring_receipt.agent_replay_mode) {
+      source_receipt.agent_replay_mode != restoring_receipt.agent_replay_mode) {
     return absl::FailedPreconditionError(
         "CapsuleRestore cannot cross the CanonicalWinnerReplay and "
         "ExactRegeneration authority lineages.");
   }
 
-  ABSL_ASSIGN_OR_RETURN(
-      const DPMPreparedPrefillWorkBinding prepared,
+  ABSL_ASSIGN_OR_RETURN(const DPMPreparedPrefillWorkBinding prepared,
       BuildDPMPreparedPrefillWorkBinding(
           restore_evidence.plan.prefill.prepared_plan));
   if (restoring_receipt.agent_prepared_prefill_work !=
@@ -968,8 +925,7 @@ absl::Status ValidateCapsuleRestoreEvidenceV3TurnBinding(
             "Exact restoring receipt differs from the current profile or "
             "own-position worker prefill mode.");
       }
-      ABSL_RETURN_IF_ERROR(
-          ValidateExactRestoreModelAffectingExecutionPlan(
+      ABSL_RETURN_IF_ERROR(ValidateExactRestoreModelAffectingExecutionPlan(
               restore_evidence, source_artifact, restoring_receipt));
       break;
   }
@@ -983,12 +939,10 @@ absl::Status ValidateCapsuleRestoreEvidenceV3TurnBinding(
       {"prepared source", prepared.canonical_source_chunks_hash},
       {"prepared token plan", prepared.resolved_token_plan_hash},
       {"prepared shape schedule", prepared.shape_schedule_hash},
-      {"CapsuleRestore capability",
-       current_authority.capability.capability_id},
+      {"CapsuleRestore capability", current_authority.capability.capability_id},
       {"CapsuleRestore admission", current_authority.admission_record_id},
       {"CapsuleRestore coverage", current_authority.coverage_id},
-      {"qualification evidence",
-       current_authority.qualification_spec_hash},
+      {"qualification evidence", current_authority.qualification_evidence_hash},
       {"target source-prefix",
        restore_evidence.plan.target_state.source_prefix_hash},
       {"target projection request",
@@ -1015,15 +969,14 @@ absl::Status ValidateCapsuleRestoreEvidenceV3TurnBinding(
          *restoring_receipt.agent_exact_profile_admission_record_id});
     hashes.push_back(
         {"exact output", *restoring_receipt.agent_exact_output_evidence_hash});
-    hashes.push_back(
-        {"exact physical plan",
+    hashes.push_back({"exact physical plan",
          restoring_receipt.agent_physical_execution_plan_hash});
   }
   for (std::size_t first = 0; first < hashes.size(); ++first) {
     if (IsZeroHash(hashes[first].value)) {
-      return absl::InvalidArgumentError(absl::StrCat(
-          "CapsuleRestore turn binding has an empty ", hashes[first].name,
-          " hash."));
+      return absl::InvalidArgumentError(
+          absl::StrCat("CapsuleRestore turn binding has an empty ",
+                       hashes[first].name, " hash."));
     }
     for (std::size_t second = first + 1; second < hashes.size(); ++second) {
       if (hashes[first].value == hashes[second].value) {

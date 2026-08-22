@@ -38,11 +38,11 @@ namespace litert::lm {
 namespace {
 
 constexpr absl::string_view kConfigDomain =
-    "LITERT_LMX_DPM_PROJECTION_CONFIG_SHA256_V1";
+    "LITERT_LMX_DPM_PROJECTION_CONFIG_SHA256";
 constexpr absl::string_view kRequestDomain =
-    "LITERT_LMX_DPM_PROJECTION_REQUEST_SHA256_V1";
+    "LITERT_LMX_DPM_PROJECTION_REQUEST_SHA256";
 constexpr absl::string_view kOutputDomain =
-    "LITERT_LMX_DPM_PROJECTION_OUTPUT_SHA256_V1";
+    "LITERT_LMX_DPM_PROJECTION_OUTPUT_SHA256";
 constexpr size_t kMaximumSchemaIdBytes = 16 * 1024;
 constexpr size_t kMaximumSchemaBytes = 16 * 1024 * 1024;
 constexpr size_t kMaximumSchemaNestingDepth = 64;

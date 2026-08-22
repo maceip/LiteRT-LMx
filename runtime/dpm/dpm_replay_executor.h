@@ -39,7 +39,7 @@
 
 namespace litert::lm {
 
-inline constexpr uint32_t kDPMCanonicalReplayRequestFormatVersion = 2;
+inline constexpr uint32_t kDPMCanonicalReplayRequestFormatVersion = 1;
 // Magic, format version, stage, maximum output tokens, contract byte length,
 // and payload byte length.
 inline constexpr uint64_t kDPMCanonicalReplayRequestFramingBytes =
@@ -47,7 +47,8 @@ inline constexpr uint64_t kDPMCanonicalReplayRequestFramingBytes =
 
 // Stage-aware request bytes supplied to exactly one of the two disjoint replay
 // executors below. `canonical_payload` is the complete stage request, not an
-// untrusted digest. The executor computes its hash from the versioned encoding.
+// untrusted digest. The executor computes its hash from the format-tagged
+// encoding.
 struct DPMCanonicalReplayRequest {
   uint32_t format_version = kDPMCanonicalReplayRequestFormatVersion;
   DPMReplayStage stage = DPMReplayStage::kProjection;
@@ -55,7 +56,7 @@ struct DPMCanonicalReplayRequest {
   // worker. Stage codecs must independently require this to equal the limit
   // carried by their complete canonical payload.
   uint32_t max_output_tokens = 0;
-  std::string request_contract_version;
+  std::string request_contract;
   std::string canonical_payload;
 };
 
@@ -85,8 +86,7 @@ class CanonicalWinnerReplayGenerator {
  public:
   virtual ~CanonicalWinnerReplayGenerator() = default;
   virtual const SessionHandoffIdentity& GetRuntimeIdentity() const = 0;
-  virtual absl::Status ValidateSupport(
-      DPMReplayStage expected_stage) const = 0;
+  virtual absl::Status ValidateSupport(DPMReplayStage expected_stage) const = 0;
   virtual absl::StatusOr<CanonicalWinnerGeneratedCandidate> Generate(
       const DPMCanonicalReplayRequest& request) = 0;
 };
@@ -99,8 +99,7 @@ enum class CanonicalWinnerResolution : uint8_t {
 
 struct CanonicalWinnerReplayExecution {
   DPMReplayMode mode = DPMReplayMode::kCanonicalWinnerReplay;
-  CanonicalWinnerResolution resolution =
-      CanonicalWinnerResolution::kReplayed;
+  CanonicalWinnerResolution resolution = CanonicalWinnerResolution::kReplayed;
   SessionHandoffIdentity runtime_identity;
   Hash256 canonical_request_hash;
   std::string canonical_output;
@@ -118,8 +117,7 @@ struct CanonicalWinnerReplayExecution {
 // profile, admission repository, or fresh-worker dependency.
 class CanonicalWinnerReplayExecutor final {
  public:
-  explicit CanonicalWinnerReplayExecutor(
-      CanonicalWinnerReplayCatalog* catalog)
+  explicit CanonicalWinnerReplayExecutor(CanonicalWinnerReplayCatalog* catalog)
       : catalog_(catalog) {}
 
   // The generator is supplied per operation. This lets agent-decision replay
@@ -159,7 +157,7 @@ enum class ExactRegenerationCaptureRunPolicy : uint32_t {
 // worker_certification_hash binds the parent-measured executable image and
 // launch contract. This compact record does not duplicate model output bytes.
 struct ExactRegenerationRunEvidence {
-  static constexpr uint32_t kFormatVersion = 4;
+  static constexpr uint32_t kFormatVersion = 1;
 
   uint32_t format_version = kFormatVersion;
   Hash256 evidence_id;
@@ -203,7 +201,7 @@ absl::Status ValidateExactRegenerationRunEvidence(
 // profile, certified worker, complete logical request, physical work
 // selection, and every independently authenticated process observation.
 struct ExactRegenerationRequestEvidence {
-  static constexpr uint32_t kFormatVersion = 4;
+  static constexpr uint32_t kFormatVersion = 1;
 
   uint32_t format_version = kFormatVersion;
   Hash256 evidence_id;
@@ -323,21 +321,12 @@ class ExactRegenerationExecutor final {
   // descriptor before spawning any restored worker.
   absl::StatusOr<Hash256> GetProfileAdmissionRecordId() const;
 
-  // Resolves the binding's SessionConfig against this same loaded Engine,
-  // requires its complete exact profile/session semantics to equal the
-  // executor's immutable profile, derives the handoff capability, and asks
-  // the repository to reauthenticate and revalidate the bound record.
+  // Re-resolves the same loaded Engine profile and capability and
+  // reauthenticates the complete state-witness admission record at each call;
+  // a coverage ID by itself is never returned or accepted as authority.
   absl::StatusOr<AuthenticatedCapsuleRestoreAdmission>
   GetAuthenticatedCapsuleRestoreAdmission(
       const CapsuleRestoreAdmissionBinding& binding) const;
-
-  // Coverage V2 counterpart to the V1 accessor above. This re-resolves the
-  // same loaded Engine profile and capability and reauthenticates the complete
-  // state-witness admission record at each call; a coverage ID by itself is
-  // never returned or accepted as authority.
-  absl::StatusOr<AuthenticatedCapsuleRestoreStateWitnessAdmission>
-  GetAuthenticatedCapsuleRestoreStateWitnessAdmission(
-      const CapsuleRestoreStateWitnessAdmissionBinding& binding) const;
 
   absl::StatusOr<ExactRegenerationExecution> Run(
       const DPMCanonicalReplayRequest& request) const;
@@ -350,24 +339,13 @@ class ExactRegenerationExecutor final {
       const DPMCanonicalReplayRequest& request,
       const ExactRegenerationExecutionInput& input) const;
 
-  // This Coverage V1 admitted overload is mandatory for a V1 restore or
-  // capture. The overload above remains available only for physical
-  // full-prefill without capsule transfer, preserving exact execution without
-  // checkpoint support.
+  // Capsule transfer requires this atomic state-witness authority. Callers
+  // still provide the concrete authenticated transfer and per-operation
+  // evidence at higher DPM boundaries.
   absl::StatusOr<ExactRegenerationExecution> RunPhysical(
       const DPMCanonicalReplayRequest& request,
       const ExactRegenerationExecutionInput& input,
       const CapsuleRestoreAdmissionBinding& capsule_restore_admission) const;
-
-  // Additive Coverage V2 path. The loaded runtime and repository supply one
-  // atomic state-witness authority; callers still must provide the concrete
-  // authenticated capsule transfer and per-operation evidence at higher DPM
-  // boundaries.
-  absl::StatusOr<ExactRegenerationExecution> RunPhysical(
-      const DPMCanonicalReplayRequest& request,
-      const ExactRegenerationExecutionInput& input,
-      const CapsuleRestoreStateWitnessAdmissionBinding&
-          capsule_restore_state_witness_admission) const;
 
  private:
   ExactRegenerationExecutor(
@@ -375,8 +353,7 @@ class ExactRegenerationExecutor final {
       ExactProfileAdmissionRepository* admission_repository,
       ExactRegenerationExecutorConfig config,
       FreshWorkerProcessRunner worker_runner,
-      SessionConfig resolved_session_config,
-      ExactLiteRtProfile derived_profile)
+      SessionConfig resolved_session_config, ExactLiteRtProfile derived_profile)
       : engine_(engine),
         worker_runner_(std::move(worker_runner)),
         admission_repository_(admission_repository),
@@ -391,9 +368,7 @@ class ExactRegenerationExecutor final {
       const DPMCanonicalReplayRequest& request,
       const ExactRegenerationExecutionInput& input,
       bool capsule_free_convenience,
-      const CapsuleRestoreAdmissionBinding* capsule_restore_admission,
-      const CapsuleRestoreStateWitnessAdmissionBinding*
-          capsule_restore_state_witness_admission) const;
+      const CapsuleRestoreAdmissionBinding* capsule_restore_admission) const;
 
   const Engine* const engine_;
   const FreshWorkerProcessRunner worker_runner_;

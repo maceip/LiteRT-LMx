@@ -122,6 +122,9 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
       const ByteSource& serialized_state) override;
 
   absl::StatusOr<SessionHandoffRuntimeProfile>
+  GetLoadedRuntimeIdentityProfile() const override;
+
+  absl::StatusOr<SessionHandoffRuntimeProfile>
   GetSessionHandoffRuntimeProfile() const override;
 
   absl::StatusOr<ExactLiteRtLogitsFrameContract>

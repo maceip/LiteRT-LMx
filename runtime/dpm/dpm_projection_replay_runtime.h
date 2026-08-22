@@ -36,8 +36,8 @@
 
 namespace litert::lm {
 
-inline constexpr absl::string_view kDPMProjectionReplayContractVersion =
-    "litert-lmx-dpm-projection-v1";
+inline constexpr absl::string_view kDPMProjectionReplayContract =
+    "litert-lmx-dpm-projection";
 inline constexpr uint32_t kDPMProjectionExecutionRequestFormatVersion = 1;
 
 // Complete model-visible projection request carried inside the generic replay

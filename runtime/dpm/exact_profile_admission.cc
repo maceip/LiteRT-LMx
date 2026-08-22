@@ -37,18 +37,18 @@ namespace litert::lm {
 namespace {
 
 constexpr std::array<char, 8> kAdmissionMagic = {'D', 'P', 'M', 'A', 'D', 'M',
-                                                  '0', '3'};
-constexpr uint32_t kAdmissionEnvelopeVersion = 3;
+                                                  '0', '1'};
+constexpr uint32_t kAdmissionEnvelopeFormatVersion = 1;
 constexpr uint64_t kMaximumAdmissionEnvelopeBytes =
     kMaximumFreshWorkerEnvelopeBytes;
 constexpr uint64_t kAdmissionEnvelopeFixedBytes = 8 + 4 + 4 + 8 + 32;
 constexpr uint64_t kMaximumAdmissionKeyIdBytes = 256;
 constexpr absl::string_view kQualificationRequestDomain =
-    "LITERT_LMX_EXACT_PROFILE_QUALIFICATION_REQUEST_SHA256_V3";
+    "LITERT_LMX_EXACT_PROFILE_QUALIFICATION_REQUEST_SHA256";
 constexpr absl::string_view kAdmissionRecordDomain =
-    "LITERT_LMX_EXACT_PROFILE_ADMISSION_RECORD_SHA256_V3";
+    "LITERT_LMX_EXACT_PROFILE_ADMISSION_RECORD_SHA256";
 constexpr absl::string_view kAdmissionMacDomain =
-    "LITERT_LMX_EXACT_PROFILE_ADMISSION_HMAC_SHA256_V3";
+    "LITERT_LMX_EXACT_PROFILE_ADMISSION_HMAC_SHA256";
 
 bool IsZeroHash(const Hash256& hash) {
   uint8_t combined = 0;
@@ -654,7 +654,7 @@ absl::StatusOr<std::string> EncodeExactProfileAdmissionRecord(
   envelope.reserve(kAdmissionEnvelopeFixedBytes + authentication.key_id.size() +
                    body.size());
   envelope.append(kAdmissionMagic.data(), kAdmissionMagic.size());
-  AppendU32(kAdmissionEnvelopeVersion, &envelope);
+  AppendU32(kAdmissionEnvelopeFormatVersion, &envelope);
   AppendU32(static_cast<uint32_t>(authentication.key_id.size()), &envelope);
   AppendU64(body.size(), &envelope);
   envelope.append(authentication.key_id);
@@ -681,7 +681,7 @@ DecodeExactProfileAdmissionRecord(
   ABSL_ASSIGN_OR_RETURN(const uint32_t version, header.ReadU32());
   ABSL_ASSIGN_OR_RETURN(const uint32_t key_id_size, header.ReadU32());
   ABSL_ASSIGN_OR_RETURN(const uint64_t body_size, header.ReadU64());
-  if (version != kAdmissionEnvelopeVersion) {
+  if (version != kAdmissionEnvelopeFormatVersion) {
     return absl::FailedPreconditionError(
         "Exact-profile admission envelope version is unsupported.");
   }

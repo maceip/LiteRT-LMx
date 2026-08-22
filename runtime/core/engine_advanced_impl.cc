@@ -110,6 +110,8 @@ class EngineAdvancedImpl : public Engine {
                          loaded_exact_logits_frame_contract,
                      absl::StatusOr<Hash256>
                          loaded_complete_session_handoff_state_inventory_hash,
+                     absl::StatusOr<Hash256>
+                         loaded_strong_runtime_artifact_hash,
                      absl::StatusOr<LoadedRuntimeIdentity>
                          loaded_runtime_identity)
       : engine_settings_(std::move(engine_settings)),
@@ -128,6 +130,8 @@ class EngineAdvancedImpl : public Engine {
         loaded_complete_session_handoff_state_inventory_hash_(
             std::move(
                 loaded_complete_session_handoff_state_inventory_hash)),
+        loaded_strong_runtime_artifact_hash_(
+            std::move(loaded_strong_runtime_artifact_hash)),
         loaded_runtime_identity_(std::move(loaded_runtime_identity)) {}
 
   // Method to create the Session.
@@ -239,6 +243,22 @@ class EngineAdvancedImpl : public Engine {
     };
   }
 
+  absl::Status ValidateStrongRuntimeArtifactIdentity() const override {
+    if (!loaded_runtime_identity_.ok()) {
+      return loaded_runtime_identity_.status();
+    }
+    if (!loaded_strong_runtime_artifact_hash_.ok()) {
+      return loaded_strong_runtime_artifact_hash_.status();
+    }
+    if (*loaded_strong_runtime_artifact_hash_ == Hash256{} ||
+        *loaded_strong_runtime_artifact_hash_ !=
+            loaded_runtime_identity_->runtime_artifact_hash) {
+      return absl::DataLossError(
+          "Strong and reproducibility runtime-artifact identities disagree.");
+    }
+    return absl::OkStatus();
+  }
+
   ExactLiteRtProfileCapability GetExactLiteRtProfileCapability()
       const override {
     uint32_t engine_evidence = 0;
@@ -256,7 +276,8 @@ class EngineAdvancedImpl : public Engine {
           ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kTokenizerContract) |
           ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kLiteRtModelBytecode);
     }
-    if (loaded_runtime_identity_.ok()) {
+    if (loaded_runtime_identity_.ok() &&
+        ValidateStrongRuntimeArtifactIdentity().ok()) {
       const Backend configured_backend =
           engine_settings_.GetMainExecutorSettings().GetBackend();
       if (configured_backend == Backend::CPU &&
@@ -393,6 +414,9 @@ class EngineAdvancedImpl : public Engine {
         if (!loaded_runtime_identity_.ok()) {
           return loaded_runtime_identity_.status();
         }
+        if (!loaded_strong_runtime_artifact_hash_.ok()) {
+          return loaded_strong_runtime_artifact_hash_.status();
+        }
         return absl::FailedPreconditionError(
             "The loaded Engine lacks complete exact LiteRT evidence.");
       default:
@@ -419,6 +443,7 @@ class EngineAdvancedImpl : public Engine {
     if (!loaded_runtime_identity_.ok()) {
       return loaded_runtime_identity_.status();
     }
+    ABSL_RETURN_IF_ERROR(ValidateStrongRuntimeArtifactIdentity());
 
     SessionConfig resolved = session_config;
     ABSL_RETURN_IF_ERROR(resolved.MaybeUpdateAndValidate(engine_settings_));
@@ -608,6 +633,12 @@ class EngineAdvancedImpl : public Engine {
   // capsule-inventory problem rather than silently inheriting CPU support.
   const absl::StatusOr<Hash256>
       loaded_complete_session_handoff_state_inventory_hash_;
+
+  // Strong platform admission for the same runtime-artifact content hash.
+  // Ordinary deterministic-memory/WinnerReplay identity may use the
+  // reproducibility measurement, while ExactRegeneration and CapsuleRestore
+  // remain gated on this independent status.
+  const absl::StatusOr<Hash256> loaded_strong_runtime_artifact_hash_;
 
   // Measured runtime/delegate evidence and canonical concrete executor
   // profile. Unsupported platforms/backends retain the failure status so
@@ -873,11 +904,13 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
   absl::Status model_artifact_post_load_status =
       model_resources->VerifyModelArtifactHash();
 
+  absl::StatusOr<Hash256> loaded_strong_runtime_artifact_hash =
+      absl::UnknownError("Strong runtime artifact was not measured.");
   absl::StatusOr<LoadedRuntimeIdentity> loaded_runtime_identity = [&]()
       -> absl::StatusOr<LoadedRuntimeIdentity> {
     ABSL_ASSIGN_OR_RETURN(
         SessionHandoffRuntimeProfile runtime_profile,
-        executor->GetSessionHandoffRuntimeProfile());
+        executor->GetLoadedRuntimeIdentityProfile());
     if (runtime_profile.logits_vocabulary_size <= 0) {
       return absl::FailedPreconditionError(
           "Loaded executor has no measurable logits vocabulary.");
@@ -932,10 +965,15 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
           "Loaded decode logits vocabulary does not match the loaded "
           "tokenizer vocabulary.");
     }
-    ABSL_ASSIGN_OR_RETURN(
-        Hash256 runtime_artifact_hash,
-        MeasureLoadedRuntimeArtifact(runtime_profile));
-    if (runtime_artifact_hash == Hash256{}) {
+    absl::StatusOr<Hash256> runtime_artifact_hash =
+        MeasureLoadedRuntimeArtifact(runtime_profile);
+    loaded_strong_runtime_artifact_hash = runtime_artifact_hash;
+    if (!runtime_artifact_hash.ok()) {
+      runtime_artifact_hash =
+          MeasureLoadedRuntimeArtifactForReproducibility(runtime_profile);
+    }
+    if (!runtime_artifact_hash.ok()) return runtime_artifact_hash.status();
+    if (*runtime_artifact_hash == Hash256{}) {
       return absl::FailedPreconditionError(
           "Measured loaded runtime/delegate artifact hash is zero.");
     }
@@ -958,7 +996,7 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
     }
     return LoadedRuntimeIdentity{
         .runtime_class = runtime_profile.runtime_class,
-        .runtime_artifact_hash = runtime_artifact_hash,
+        .runtime_artifact_hash = *runtime_artifact_hash,
         .canonical_profile = std::move(runtime_profile.canonical_profile),
         .logits_frame =
             ExactLiteRtLogitsFrameContract{
@@ -1009,6 +1047,7 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
       std::move(loaded_exact_litert_evidence),
       std::move(loaded_exact_logits_frame_contract),
       std::move(loaded_complete_session_handoff_state_inventory_hash),
+      std::move(loaded_strong_runtime_artifact_hash),
       std::move(loaded_runtime_identity));
 
   return llm_impl;

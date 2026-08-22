@@ -28,8 +28,8 @@
 #include "runtime/dpm/capsule_restore_admission.h"
 #include "runtime/dpm/capsule_restore_evidence.h"
 #include "runtime/dpm/capsule_restore_evidence_codec.h"
-#include "runtime/dpm/dpm_event_log.h"
 #include "runtime/dpm/dpm_capabilities.h"
+#include "runtime/dpm/dpm_event_log.h"
 #include "runtime/dpm/dpm_prepared_prefill_plan.h"
 #include "runtime/dpm/dpm_projection_manifest.h"
 #include "runtime/dpm/dpm_replay_mode.h"
@@ -67,25 +67,32 @@ struct DPMProjectionOutcome {
   // digest invalidates a session checkpoint even when model/runtime identity
   // remains compatible.
   DPMProjectionManifest manifest;
+
+  // Optional compact semantic views for the model context. The authoritative
+  // projected memory and raw request remain in the durable receipt. These
+  // views are committed by canonical_agent_input, the logical agent request
+  // hash, and the transcript hash; they do not replace either authoritative
+  // value or its provenance.
+  std::optional<std::string> model_visible_memory;
+  std::optional<std::string> model_visible_input;
 };
 
-// Complete per-operation authorization for one Coverage V2 own-position
+// Complete per-operation authorization for one CapsuleRestore own-position
 // restore. The authenticated source capture proves the durable checkpoint's
 // provenance; current_authority must equal the authority freshly resolved from
 // the loaded Engine; target_state is derived by DPMEngine from the current
 // authoritative raw-log request; and the reauthentication evidence proves the
 // exact durable envelope was rewrapped into the transient envelope imported by
 // the live target. No individual hash in this object authorizes restoration.
-struct DPMAgentCapsuleRestoreOperationV3 {
+struct DPMAgentCapsuleRestoreOperation {
   static constexpr uint32_t kFormatVersion =
-      kCapsuleRestoreEvidenceV3FormatVersion;
+      kCapsuleRestoreEvidenceFormatVersion;
 
   uint32_t format_version = kFormatVersion;
-  CapsuleCaptureEvidenceV3 source_capture_evidence;
-  CapsuleRestoreAuthorityV2 current_authority;
-  CapsuleDPMRestoreTargetV2 target_state;
-  SessionHandoffReauthenticationEvidence
-      durable_to_transient_reauthentication;
+  CapsuleCaptureEvidence source_capture_evidence;
+  CapsuleRestoreAuthority current_authority;
+  CapsuleDPMRestoreTarget target_state;
+  SessionHandoffReauthenticationEvidence durable_to_transient_reauthentication;
 };
 
 // Projection is an explicit dependency. Production providers must treat the
@@ -149,11 +156,9 @@ struct DPMAgentGenerationRequest {
   // cannot authorize delta prefill.
   std::optional<Hash256> restore_checkpoint_id;
   std::optional<SessionContinuationStateWitness> restored_state_witness;
-  // Required exactly when a Coverage V2-bound runtime receives the restore
-  // fields above. It is forbidden for fresh generation and for Coverage V1 or
-  // generation-only runtimes.
-  std::optional<DPMAgentCapsuleRestoreOperationV3>
-      capsule_restore_operation_v3;
+  // Required exactly when a capsule-enabled runtime receives the restore
+  // fields above. It is forbidden for fresh or generation-only execution.
+  std::optional<DPMAgentCapsuleRestoreOperation> capsule_restore_operation;
   int max_output_tokens = 512;
 };
 
@@ -163,10 +168,10 @@ struct DPMAgentGenerationOutcome {
   // Present for a direct live-runtime generation. Catalog-only materialization
   // has no physical session and therefore no prepared plan.
   std::optional<DPMPreparedPrefillPlan> prepared_prefill_plan;
-  // Present exactly when this live invocation passed and executed a Coverage
-  // V2 own-position restore operation. This is the same complete canonical
+  // Present exactly when this live invocation passed and executed an
+  // own-position restore operation. This is the same complete canonical
   // evidence validated before prefill, not a reconstructed post-hoc label.
-  std::optional<CapsuleRestoreEvidenceV3> capsule_restore_evidence_v3;
+  std::optional<CapsuleRestoreEvidence> capsule_restore_evidence;
 };
 
 class DPMAgentRuntime {
@@ -189,36 +194,13 @@ class DPMAgentRuntime {
     return absl::UnimplementedError(
         "DPM agent runtime does not support exact session handoff.");
   }
-  // Coverage V1's mode-independent, currently reauthenticated CapsuleRestore
-  // authority. Generation-only and Coverage V2 runtimes return nullopt from
-  // these V1 accessors. They are read-only and never accept caller-supplied
-  // identity labels.
-  virtual absl::StatusOr<std::optional<Hash256>>
-  GetCapsuleRestoreAdmissionRecordId() const {
-    return std::optional<Hash256>();
-  }
-  virtual absl::StatusOr<std::optional<Hash256>>
-  GetSessionHandoffCapabilityId() const {
-    return std::optional<Hash256>();
-  }
-  virtual absl::StatusOr<std::optional<SessionHandoffCapability>>
-  GetSessionHandoffCapability() const {
-    return std::optional<SessionHandoffCapability>();
-  }
-  virtual absl::StatusOr<
-      std::optional<CapsuleRestoreOperationalCoverage>>
-  GetCapsuleRestoreOperationalCoverage() const {
-    return std::optional<CapsuleRestoreOperationalCoverage>();
-  }
-  // Coverage V2 is intentionally exposed as one complete authenticated object,
-  // not detachable record/capability/coverage hashes. Implementations must
-  // freshly derive and reauthenticate it at each call. Generation-only and V1
+  // Capsule authority is exposed as one complete authenticated object, not
+  // detachable record, capability, or coverage hashes. Implementations must
+  // freshly derive and reauthenticate it at each call. Generation-only
   // runtimes return nullopt.
-  virtual absl::StatusOr<std::optional<
-      AuthenticatedCapsuleRestoreStateWitnessAdmission>>
-  GetAuthenticatedCapsuleRestoreStateWitnessAdmission() const {
-    return std::optional<
-        AuthenticatedCapsuleRestoreStateWitnessAdmission>();
+  virtual absl::StatusOr<std::optional<AuthenticatedCapsuleRestoreAdmission>>
+  GetAuthenticatedCapsuleRestoreAdmission() const {
+    return std::optional<AuthenticatedCapsuleRestoreAdmission>();
   }
   virtual absl::StatusOr<std::unique_ptr<Engine::Session>> CreateSession() = 0;
   virtual absl::StatusOr<DPMAgentGenerationOutcome> Generate(
@@ -247,7 +229,7 @@ struct DPMEngineConfig {
   int max_decision_tokens = 512;
   std::string checkpoint_key_id;
   std::string checkpoint_authentication_key;
-  // Authenticates disposable V3 capture/restore evidence records. This key
+  // Authenticates disposable capture/restore evidence records. This key
   // and key ID must be distinct from the durable checkpoint and fixed
   // request-transient capsule domains.
   std::string operation_evidence_key_id;
@@ -270,13 +252,11 @@ struct DPMTurnResult {
   uint64_t input_event_index = 0;
   uint64_t response_event_index = 0;
   Hash256 projection_manifest_hash;
-  DPMReplayMode projection_replay_mode =
-      DPMReplayMode::kCanonicalWinnerReplay;
+  DPMReplayMode projection_replay_mode = DPMReplayMode::kCanonicalWinnerReplay;
   Hash256 projection_execution_evidence_hash;
   std::optional<Hash256> projection_exact_profile_id;
   std::optional<Hash256> projection_exact_profile_admission_record_id;
-  DPMReplayMode agent_replay_mode =
-      DPMReplayMode::kCanonicalWinnerReplay;
+  DPMReplayMode agent_replay_mode = DPMReplayMode::kCanonicalWinnerReplay;
   Hash256 agent_execution_evidence_hash;
   std::optional<Hash256> agent_exact_profile_id;
   std::optional<Hash256> agent_exact_profile_admission_record_id;
@@ -351,48 +331,44 @@ class DPMEngine {
 
  private:
   struct CapsuleRestoreRuntimeAuthority {
-    AuthenticatedCapsuleRestoreStateWitnessAdmission admission;
-    CapsuleRestoreAuthorityV2 authority;
+    AuthenticatedCapsuleRestoreAdmission admission;
+    CapsuleRestoreAuthority authority;
   };
 
   struct RestoreCandidate {
     DPMTurnReceipt receipt;
     DPMSessionCheckpointArtifact artifact;
-    CapsuleCaptureEvidenceV3 capture_evidence;
+    CapsuleCaptureEvidence capture_evidence;
   };
 
   struct CheckpointCapture {
     DPMSessionCheckpointArtifact artifact;
-    CapsuleCaptureEvidenceV3 capture_evidence;
+    CapsuleCaptureEvidence capture_evidence;
   };
 
   absl::StatusOr<std::optional<DPMTurnResult>> RecoverCommittedTurn(
       const DPMLogSnapshot& snapshot, const DPMTurnRequest& request) const;
   absl::StatusOr<std::optional<RestoreCandidate>> FindRestoreCandidate(
-      const DPMLogSnapshot& current,
-      const DPMProjectionOutcome& projection,
+      const DPMLogSnapshot& current, const DPMProjectionOutcome& projection,
       const CapsuleRestoreRuntimeAuthority& current_authority) const;
   absl::Status ValidateRestoreCandidate(
-      const DPMLogSnapshot& current,
-      const DPMProjectionOutcome& projection,
+      const DPMLogSnapshot& current, const DPMProjectionOutcome& projection,
       const RestoreCandidate& candidate,
       const CapsuleRestoreRuntimeAuthority& current_authority) const;
   absl::StatusOr<CapsuleRestoreRuntimeAuthority>
   RequireCurrentCapsuleRestoreAuthority() const;
   absl::StatusOr<std::vector<DPMAgentGenerationRequest::PrefillChunk>>
-  BuildFullTranscriptChunks(
-      const DPMLogSnapshot& snapshot,
+  BuildFullTranscriptChunks(const DPMLogSnapshot& snapshot,
       absl::string_view current_agent_input,
       const Hash256& current_correction_digest) const;
   absl::StatusOr<std::vector<DPMAgentGenerationRequest::PrefillChunk>>
-  BuildDeltaTranscriptChunks(
-      const DPMLogSnapshot& snapshot, uint64_t restored_response_event_index,
+  BuildDeltaTranscriptChunks(const DPMLogSnapshot& snapshot,
+                             uint64_t restored_response_event_index,
       absl::string_view current_agent_input,
       const Hash256& current_correction_digest) const;
   absl::StatusOr<std::string> BuildCanonicalAgentInput(
       const DPMTurnRequest& request, const DPMLogSnapshot& source_snapshot,
-      uint64_t input_event_index,
-      const DPMProjectionOutcome& projection) const;
+      uint64_t input_event_index, const DPMProjectionOutcome& projection) const;
   absl::StatusOr<Hash256> ComputeTranscriptHash(
       const DPMLogSnapshot& snapshot, absl::string_view current_agent_input,
       absl::string_view current_decision,
@@ -403,34 +379,28 @@ class DPMEngine {
       const Hash256& current_correction_digest) const;
   absl::StatusOr<CheckpointCapture> CaptureProducingSession(
       Engine::Session* session, const DPMLogSnapshot& source_snapshot,
-      uint64_t response_event_index,
-      const DPMProjectionOutcome& projection,
-      const Hash256& agent_request_hash,
-      const Hash256& transcript_prefix_hash,
+      uint64_t response_event_index, const DPMProjectionOutcome& projection,
+      const Hash256& agent_request_hash, const Hash256& transcript_prefix_hash,
       const Hash256& transcript_hash,
       const CapsuleRestoreRuntimeAuthority& capsule_restore_authority,
       const std::vector<DPMAgentGenerationRequest::PrefillChunk>&
           physical_prefill_chunks,
       const DPMPreparedPrefillPlan& prepared_prefill_plan,
       const Hash256& producing_output_evidence_hash,
-      uint32_t generated_token_count,
-      uint64_t prefill_event_range_start,
-      const std::optional<CapsuleRestoreEvidenceV3>& parent_restore_evidence,
-      absl::string_view operation_id,
-      int64_t created_unix_micros) const;
+      uint32_t generated_token_count, uint64_t prefill_event_range_start,
+      const std::optional<CapsuleRestoreEvidence>& parent_restore_evidence,
+      absl::string_view operation_id, int64_t created_unix_micros) const;
   absl::StatusOr<CheckpointCapture> BuildExactWorkerCheckpointCapture(
       absl::string_view authenticated_envelope,
       const ExactRegenerationDPMAgentPhysicalExecution& physical_execution,
       const DPMLogSnapshot& source_snapshot, uint64_t response_event_index,
-      const DPMProjectionOutcome& projection,
-      const Hash256& agent_request_hash,
-      const Hash256& transcript_prefix_hash,
-      const Hash256& transcript_hash,
+      const DPMProjectionOutcome& projection, const Hash256& agent_request_hash,
+      const Hash256& transcript_prefix_hash, const Hash256& transcript_hash,
       const CapsuleRestoreRuntimeAuthority& capsule_restore_authority,
       const std::vector<DPMAgentGenerationRequest::PrefillChunk>&
           physical_prefill_chunks,
       uint64_t prefill_event_range_start,
-      const std::optional<CapsuleRestoreEvidenceV3>& parent_restore_evidence,
+      const std::optional<CapsuleRestoreEvidence>& parent_restore_evidence,
       int64_t created_unix_micros) const;
 
   DPMEventLog* log_;

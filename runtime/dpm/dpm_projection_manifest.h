@@ -39,7 +39,7 @@ inline constexpr uint32_t kMaximumDPMProjectionExactLogitFrames = 65'536;
 // a disposable projection derived from an exact log prefix and an Engine-owned
 // runtime identity; it is never a replacement source of memory truth.
 struct DPMProjectionManifest {
-  static constexpr uint32_t kFormatVersion = 2;
+  static constexpr uint32_t kFormatVersion = 1;
 
   uint32_t format_version = kFormatVersion;
   std::string log_id;
@@ -83,12 +83,7 @@ struct DPMProjectionManifest {
   // count makes omitted or truncated frame sequences explicit in the receipt.
   std::optional<Hash256> exact_output_evidence_hash;
   uint32_t exact_logit_frame_count = 0;
-  // In WinnerReplay this distinguishes a newly published candidate from a
-  // catalog hit or lost publication race. ExactRegeneration never reuses a
-  // canonical winner and therefore requires false.
-  bool reused_canonical_winner = false;
-
-  // SHA-256 over every preceding field using the versioned canonical binary
+  // SHA-256 over every preceding field using the format-tagged canonical binary
   // encoding implemented by ComputeDPMProjectionManifestHash.
   Hash256 manifest_hash;
 };

@@ -105,7 +105,7 @@ Hash256 GetDPMRestrictedFeatureContractHash() {
     append_frame(restriction.stable_name);
   }
   Sha256Hasher hasher;
-  hasher.Update("LITERT_LMX_DPM_RESTRICTED_FEATURE_CONTRACT_SHA256_V1");
+  hasher.Update("LITERT_LMX_DPM_RESTRICTED_FEATURE_CONTRACT_SHA256");
   hasher.Update(canonical);
   return hasher.Finalize();
 }
