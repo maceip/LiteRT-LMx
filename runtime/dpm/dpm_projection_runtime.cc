@@ -310,8 +310,9 @@ absl::StatusOr<std::string> EngineDPMProjectionRuntime::GenerateFresh(
         "DPM projection Engine did not create a step-zero fresh context.");
   }
 
-  ABSL_RETURN_IF_ERROR(session->RunPrefill(
-      {InputText(std::string(canonical_prompt))}));
+  std::vector<InputData> prefill_inputs;
+  prefill_inputs.emplace_back(InputText(std::string(canonical_prompt)));
+  ABSL_RETURN_IF_ERROR(session->RunPrefill(std::move(prefill_inputs)));
   DecodeConfig decode_config = DecodeConfig::CreateDefault();
   decode_config.SetMaxOutputTokens(static_cast<int>(max_output_tokens_));
   ABSL_ASSIGN_OR_RETURN(Responses response,

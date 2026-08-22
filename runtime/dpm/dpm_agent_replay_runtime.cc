@@ -277,12 +277,13 @@ absl::Status ValidatePreparedPlanSourceBindings(
     Hash256 expected_hash;
     DPMPreparedPrefillSourceEncoding expected_encoding;
     switch (chunk.encoding) {
-      case DPMAgentGenerationRequest::PrefillChunk::Encoding::kUtf8Text:
+      case DPMAgentGenerationRequest::PrefillChunk::Encoding::kUtf8Text: {
         expected_encoding = DPMPreparedPrefillSourceEncoding::kUtf8Text;
         ABSL_ASSIGN_OR_RETURN(
             expected_hash,
             ComputeDPMPreparedPrefillUtf8SourceChunkHash(chunk.text));
         break;
+      }
       case DPMAgentGenerationRequest::PrefillChunk::Encoding::kTokenIds: {
         expected_encoding =
             DPMPreparedPrefillSourceEncoding::kExactTokenIds;

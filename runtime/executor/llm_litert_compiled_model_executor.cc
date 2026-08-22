@@ -47,6 +47,7 @@
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
 #include "litert/c/litert_common.h"  // from @litert
+#include "litert/c/litert_environment.h"  // from @litert
 #include "litert/c/litert_model.h"  // from @litert
 #include "litert/c/litert_op_code.h"  // from @litert
 #include "litert/cc/internal/litert_handle.h"  // from @litert
@@ -1873,10 +1874,10 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::BindTensorsAndRunDecode(
         kDecodeSignatureRunner, decode_input_buffers, decode_output_buffers,
         &run_options));
   } else {
-    constexpr bool kAsync = true;
+    bool async = true;
     LITERT_RETURN_IF_ERROR(compiled_model_->RunAsync(
         kDecodeSignatureRunner, decode_input_buffers, decode_output_buffers,
-        kAsync, &run_options));
+        async, &run_options));
   }
 
   if (post_graph_run_callback_) {
@@ -3960,12 +3961,11 @@ LlmLiteRtCompiledModelExecutorBase::GetSessionHandoffRuntimeProfile() const {
   AppendRuntimeBool(executor_metadata_ != nullptr, &profile);
 
   auto holder = env_.GetHolder();
-  if (holder.runtime == nullptr ||
-      holder.runtime->CompiledModelGetProfiler == nullptr) {
+  if (holder.runtime == nullptr || holder.handle == nullptr) {
     return absl::FailedPreconditionError(
-        "Loaded LiteRT runtime proxy has no measurable code anchor.");
+        "Loaded LiteRT runtime proxy is null.");
   }
-  const auto runtime_function = holder.runtime->CompiledModelGetProfiler;
+  const auto runtime_function = &LiteRtDestroyEnvironment;
   static_assert(sizeof(runtime_function) == sizeof(uintptr_t));
   uintptr_t runtime_code_anchor = 0;
   std::memcpy(&runtime_code_anchor, &runtime_function,

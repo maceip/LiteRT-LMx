@@ -29,6 +29,8 @@ target_include_directories(runtime_executor_litert_state
 
 target_link_libraries(runtime_executor_litert_state
   PUBLIC
+    LiteRTLM::Runtime::Platform::Hash
+    LiteRTLM::Runtime::Util::ByteStream
     LITERTLM_DEPS
 )
 

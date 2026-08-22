@@ -421,7 +421,7 @@ absl::StatusOr<FreshWorkerExecutionOutput> BuildStageOutput(
   output.token_bytes = evidence.token_bytes;
   output.logit_frames = std::move(evidence.logit_frames);
   switch (invocation.replay_request.stage) {
-    case DPMReplayStage::kProjection:
+    case DPMReplayStage::kProjection: {
       if (!invocation.projection.has_value() ||
           invocation.agent.has_value()) {
         return absl::InternalError(
@@ -436,6 +436,7 @@ absl::StatusOr<FreshWorkerExecutionOutput> BuildStageOutput(
               invocation.projection->source_event_count,
               invocation.projection->projection_config));
       break;
+    }
 
     case DPMReplayStage::kAgentDecision: {
       if (!invocation.agent.has_value() ||

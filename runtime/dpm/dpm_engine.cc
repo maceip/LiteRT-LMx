@@ -30,7 +30,7 @@
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
-#include "absl/strings/str_append.h"  // from @com_google_absl
+#include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "runtime/core/session_handoff_codec.h"
 #include "runtime/dpm/capsule_restore_evidence_binding.h"
@@ -241,19 +241,21 @@ absl::StatusOr<CapsulePrefillPlanV2> BuildCapsulePrefillPlanV2(
                         ToCapsuleCanonicalPrefillChunksV2(chunks));
   plan.prepared_plan = prepared_plan;
   switch (prepared_plan.start_kind) {
-    case DPMPreparedPrefillStartKind::kFreshSession:
+    case DPMPreparedPrefillStartKind::kFreshSession: {
       plan.mode = CapsulePrefillModeV2::kFullCanonicalPrefill;
       ABSL_ASSIGN_OR_RETURN(
           plan.canonical_full_prefill_chunks_hash,
           ComputeCapsuleCanonicalFullPrefillChunksHashV2(
               plan.canonical_chunks));
       break;
-    case DPMPreparedPrefillStartKind::kOwnPositionRestore:
+    }
+    case DPMPreparedPrefillStartKind::kOwnPositionRestore: {
       plan.mode = CapsulePrefillModeV2::kOwnPositionCapsuleDelta;
       ABSL_ASSIGN_OR_RETURN(
           plan.canonical_delta_chunks_hash,
           ComputeCapsuleCanonicalDeltaChunksHashV2(plan.canonical_chunks));
       break;
+    }
   }
   ABSL_RETURN_IF_ERROR(ValidateCapsulePrefillPlanV2(plan));
   return plan;

@@ -32,6 +32,7 @@ cc_library(
         "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/synchronization",
+        "//runtime/engine:exact_litert_profile",
         "//runtime/executor:llm_executor",
         "//runtime/executor:llm_executor_io_types",
         "//runtime/executor:llm_executor_settings",

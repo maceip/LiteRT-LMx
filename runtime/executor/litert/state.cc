@@ -297,11 +297,11 @@ absl::Status ValidateBufferByteRange(size_t packed_size, size_t size,
 
 absl::Status NullMappedAddress(TensorBuffer& buffer,
                                absl::string_view operation) {
-  const absl::Status unlock_status = buffer.Unlock();
-  if (!unlock_status.ok()) {
+  auto unlock_status = buffer.Unlock();
+  if (!unlock_status) {
     return absl::InternalError(absl::StrCat(
         "LiteRT tensor buffer returned a null mapped address during ",
-        operation, "; unlock also failed: ", unlock_status.message()));
+        operation, "; unlock also failed: ", unlock_status.Error().Message()));
   }
   return absl::InternalError(absl::StrCat(
       "LiteRT tensor buffer returned a null mapped address during ",
@@ -430,7 +430,8 @@ absl::Status WriteBufferBytes(TensorBuffer& buffer, absl::string_view bytes,
     std::memcpy(address, bytes.data(), bytes.size());
   }
   *bytes_written = true;
-  return buffer.Unlock();
+  LITERT_RETURN_IF_ERROR(buffer.Unlock());
+  return absl::OkStatus();
 }
 
 absl::Status WriteBufferFromSource(TensorBuffer& buffer,
@@ -456,9 +457,9 @@ absl::Status WriteBufferFromSource(TensorBuffer& buffer,
     read_status = source.ReadAt(
         source_offset, absl::Span<char>(static_cast<char*>(address), size));
   }
-  const absl::Status unlock_status = buffer.Unlock();
+  auto unlock_status = buffer.Unlock();
   if (!read_status.ok()) return read_status;
-  if (!unlock_status.ok()) return unlock_status;
+  LITERT_RETURN_IF_ERROR(unlock_status);
   *buffer_may_be_modified = size != 0;
   return absl::OkStatus();
 }
@@ -1223,7 +1224,7 @@ absl::Status LitertState::SerializeTo(ByteSink* sink) const {
       append_status = writer.Append(absl::string_view(
           static_cast<const char*>(address), packed_size));
     }
-    const absl::Status unlock_status = readable.Unlock();
+    auto unlock_status = readable.Unlock();
     if (!append_status.ok()) return append_status;
     LITERT_RETURN_IF_ERROR(unlock_status);
   }
@@ -1650,7 +1651,7 @@ absl::Status LitertState::LoadFrom(const ByteSource& source,
           parsed.payload_offset,
           absl::Span<char>(static_cast<char*>(address), parsed.payload_size));
     }
-    const absl::Status unlock_status = staged.Unlock();
+    auto unlock_status = staged.Unlock();
     if (!read_status.ok()) return read_status;
     LITERT_RETURN_IF_ERROR(unlock_status);
     staged_state_buffers.emplace(
