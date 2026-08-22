@@ -1,19 +1,24 @@
-# LiteRT-LM
+# litert-lm
 
-```
-   ╔════════════════════════════════════════════════╗
-   ║   ⚡ LiteRT-LM: Run LLMs Anywhere ⚡         ║
-   ║                                                ║
-   ║   🏃 High-Performance  🌍 Cross-Platform      ║
-   ║   📱 Mobile-Ready      🎯 Production-Ready    ║
-   ╚════════════════════════════════════════════════╝
-```
+litert-lm is an on-device inference framework for running language models on edge devices with litert. this repository implements deterministic projection memory, a technique for maintaining consistent model state across inference sessions without recomputation.
 
-LiteRT-LM is Google's **production-ready** orchestration layer to run LLMs with
-LiteRT, engineered for **high-performance**, **cross-platform** execution.
+## deterministic projection memory
 
-🔗 [Product Website](https://ai.google.dev/edge/litert-lm) | 🌐✨
-[Web Demo](https://google-ai-edge.github.io/LiteRT-LM/web_demos/chat/index.html)
+deterministic projection memory (dpm) enables stateful inference by preserving model state between calls. consider a multi-turn conversation: without dpm, the model must reprocess all previous messages before generating the next response. with dpm, the model state from earlier turns is preserved, allowing immediate continuation. similarly, in retrieval-augmented generation workflows, cached embeddings and attention states from document processing can be reused across queries, eliminating redundant computation.
+
+dpm is a technique for managing model execution state in a deterministic manner. the key insight is that model computations produce reproducible intermediate states—embeddings, activations, attention scores—that can be captured, stored, and restored. by recording these states at defined points in the computation graph and applying deterministic state transitions, inference engines can skip redundant work and maintain conversational coherence across sessions.
+
+## this repository
+
+this repository provides the backend-agnostic dpm implementation for litert-lm. the runtime consists of several interconnected components:
+
+- **runtime/dpm**: core deterministic projection memory engine, including state capture (dpm_engine), state restoration (dpm_projection_runtime), prompt encoding (dpm_projection_prompt), and checkpoint persistence (filesystem_session_checkpoint_repository).
+- **runtime/components**: model execution components including sampling (greedy_cpu_sampler, top_p_cpu_sampler), token processing (stop_token_detector), constrained decoding for tool use, and lora adapter management.
+- **runtime/core**: foundational inference utilities and data structures.
+- **runtime/conversation**: high-level conversation management apis.
+- **c, python, kotlin, js**: language bindings and apis for integration into applications.
+
+[documentation](./docs/) | [python api](https://ai.google.dev/edge/litert-lm/python)
 
 ## 🔥 What's New: `v0.16.0`
 
