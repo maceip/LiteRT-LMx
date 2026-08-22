@@ -26,8 +26,8 @@ namespace litert::lm {
 
 // Durable single-file implementation of the authoritative DPM event log.
 //
-// Every record contains a versioned canonical event/turn-receipt encoding and
-// the previous and resulting SHA-256 prefix digests. All readers perform a
+// Every record contains a format-tagged canonical event/turn-receipt encoding
+// and the previous and resulting SHA-256 prefix digests. All readers perform a
 // strict complete scan under a shared interprocess lock. An incomplete frame,
 // a non-contiguous index, a broken digest link, or non-canonical receipt bytes
 // is reported as data loss; this class never truncates or repairs the log.
@@ -37,8 +37,7 @@ class FilesystemDPMEventLog final : public DPMEventLog {
   // canonical log header together with `case_id`, so opening a directory with
   // either different identity fails closed.
   static absl::StatusOr<std::unique_ptr<FilesystemDPMEventLog>> Create(
-      std::filesystem::path directory, std::string log_id,
-      std::string case_id);
+      std::filesystem::path directory, std::string log_id, std::string case_id);
 
   absl::StatusOr<DPMLogSnapshot> Snapshot() const override;
   absl::StatusOr<std::unique_ptr<DPMEventLogOperationLease>>

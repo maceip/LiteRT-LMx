@@ -16,24 +16,40 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
-#include "absl/strings/match.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "runtime/platform/hash/sha256_hasher.h"
 
+#if defined(__linux__) || defined(__ANDROID__)
+#include <elf.h>
+#include <fcntl.h>
+#include <link.h>
+#include <sched.h>
+#include <sys/auxv.h>
+#include <sys/utsname.h>
+#include <unistd.h>
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
+#endif
+
 #if defined(__APPLE__)
+#include <dlfcn.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <mach/vm_statistics.h>
@@ -41,13 +57,14 @@
 #include <mach-o/loader.h>
 #include <mach/vm_prot.h>
 #include <sys/sysctl.h>
+#include "runtime/platform/apple_metal_identity.h"
 #endif
 
 namespace litert::lm {
 namespace {
 
 constexpr absl::string_view kRuntimeArtifactDomain =
-    "LITERT_LM_LOADED_RUNTIME_ARTIFACT_V2";
+    "LITERT_LM_LOADED_RUNTIME_ARTIFACT_V4";
 
 void HashU32(uint32_t value, Sha256Hasher* hasher) {
   std::array<char, 4> bytes;
@@ -492,19 +509,6 @@ absl::Status ValidateEmbeddedCodeSignature(const uint8_t* bytes, size_t size,
   return absl::OkStatus();
 }
 
-bool IsAppleSystemImagePath(absl::string_view path) {
-  constexpr std::array<absl::string_view, 4> kPrefixes = {
-      "/usr/lib/",
-      "/System/Library/",
-      "/System/Volumes/Preboot/Cryptexes/OS/usr/lib/",
-      "/System/Volumes/Preboot/Cryptexes/OS/System/Library/",
-  };
-  for (absl::string_view prefix : kPrefixes) {
-    if (absl::StartsWith(path, prefix)) return true;
-  }
-  return false;
-}
-
 absl::StatusOr<std::string> ReadSysctl(absl::string_view name) {
   const std::string nul_terminated_name(name);
   size_t size = 0;
@@ -539,7 +543,8 @@ struct MeasuredImage {
 
 absl::StatusOr<MeasuredImage> MeasureImage(const mach_header* image_header,
                                            uintptr_t runtime_anchor,
-                                           bool include_without_anchor) {
+                                           bool include_without_anchor,
+                                           bool require_kernel_validation) {
   if (image_header == nullptr) {
     return absl::FailedPreconditionError(
         "dyld returned a null loaded-image header.");
@@ -690,8 +695,16 @@ absl::StatusOr<MeasuredImage> MeasureImage(const mach_header* image_header,
     }
     command_offset += command.cmdsize;
   }
-  if (!found_base || command_offset != header->sizeofcmds ||
-      executable_segments.empty()) {
+  if (command_offset != header->sizeofcmds) {
+    return absl::FailedPreconditionError(
+        "Loaded Mach-O image lacks a complete executable layout.");
+  }
+  if ((!found_base || executable_segments.empty()) &&
+      !include_without_anchor) {
+    return MeasuredImage{.contains_runtime_anchor = false,
+                         .has_digest = false};
+  }
+  if (!found_base || executable_segments.empty()) {
     return absl::FailedPreconditionError(
         "Loaded Mach-O image lacks a complete executable layout.");
   }
@@ -811,24 +824,26 @@ absl::StatusOr<MeasuredImage> MeasureImage(const mach_header* image_header,
   // file-backed page in the covered range to have untainted kernel code-sign
   // validation evidence. Immutable loaded bytes are also hashed directly
   // below; mutable relocated process data is deliberately not hashed.
-  for (const SegmentEvidence& evidence : segments) {
-    const segment_command_64& segment = evidence.segment;
-    if (segment.filesize == 0 ||
-        segment.fileoff >= code_signature->dataoff) {
-      continue;
+  if (require_kernel_validation) {
+    for (const SegmentEvidence& evidence : segments) {
+      const segment_command_64& segment = evidence.segment;
+      if (segment.filesize == 0 ||
+          segment.fileoff >= code_signature->dataoff) {
+        continue;
+      }
+      if ((segment.flags & SG_PROTECTED_VERSION_1) != 0) {
+        return absl::UnimplementedError(
+            "Loaded image has protected file-backed pages whose signing "
+            "state cannot be measured safely.");
+      }
+      const uint64_t signed_size = std::min(
+          segment.filesize,
+          static_cast<uint64_t>(code_signature->dataoff) - segment.fileoff);
+      ABSL_ASSIGN_OR_RETURN(const uintptr_t address,
+                            segment_runtime_address(segment));
+      ABSL_RETURN_IF_ERROR(FaultAndValidateCodeSignedPages(
+          address, signed_size, "Loaded Mach-O file-backed segment"));
     }
-    if ((segment.flags & SG_PROTECTED_VERSION_1) != 0) {
-      return absl::UnimplementedError(
-          "Loaded image has protected file-backed pages whose signing state "
-          "cannot be measured safely.");
-    }
-    const uint64_t signed_size = std::min(
-        segment.filesize,
-        static_cast<uint64_t>(code_signature->dataoff) - segment.fileoff);
-    ABSL_ASSIGN_OR_RETURN(const uintptr_t address,
-                          segment_runtime_address(segment));
-    ABSL_RETURN_IF_ERROR(FaultAndValidateCodeSignedPages(
-        address, signed_size, "Loaded Mach-O file-backed segment"));
   }
 
   std::vector<size_t> immutable_segments;
@@ -902,75 +917,59 @@ absl::StatusOr<MeasuredImage> MeasureImage(const mach_header* image_header,
                        .has_digest = true};
 }
 
-absl::StatusOr<std::vector<Hash256>> MeasureRelevantImages(
-    uintptr_t runtime_anchor) {
+absl::StatusOr<Hash256> MeasureImageContainingAnchor(
+    uintptr_t code_anchor, bool require_kernel_validation) {
+  if (code_anchor == 0) {
+    return absl::FailedPreconditionError(
+        "Cannot measure a zero loaded-image code anchor.");
+  }
   for (int attempt = 0; attempt < 3; ++attempt) {
-    const uint32_t image_count = ::_dyld_image_count();
-    if (image_count == 0) {
+    Dl_info before{};
+    if (::dladdr(reinterpret_cast<const void*>(code_anchor), &before) == 0 ||
+        before.dli_fbase == nullptr || before.dli_fname == nullptr ||
+        before.dli_fname[0] == '\0') {
       return absl::FailedPreconditionError(
-          "dyld reported no loaded runtime images.");
+          "dyld could not resolve the loaded image containing the code "
+          "anchor.");
     }
-    std::vector<Hash256> digests;
-    digests.reserve(image_count);
-    std::vector<const mach_header*> image_headers;
-    image_headers.reserve(image_count);
-    std::vector<std::string> image_names;
-    image_names.reserve(image_count);
-    bool found_runtime_anchor = false;
-    for (uint32_t index = 0; index < image_count; ++index) {
-      const char* image_name = ::_dyld_get_image_name(index);
-      if (image_name == nullptr || image_name[0] == '\0') {
-        return absl::FailedPreconditionError(
-            "dyld reported a loaded image without a classification path.");
-      }
-      const mach_header* image_header = ::_dyld_get_image_header(index);
-      image_headers.push_back(image_header);
-      image_names.emplace_back(image_name);
-      ABSL_ASSIGN_OR_RETURN(
-          MeasuredImage measured,
-          MeasureImage(image_header, runtime_anchor,
-                       index == 0 ||
-                           !IsAppleSystemImagePath(image_names.back())));
-      found_runtime_anchor =
-          found_runtime_anchor || measured.contains_runtime_anchor;
-      if (measured.has_digest) {
-        digests.push_back(measured.digest);
-      }
-    }
-    if (::_dyld_image_count() != image_count) continue;
-    bool image_set_is_stable = true;
-    for (uint32_t index = 0; index < image_count; ++index) {
-      const char* image_name = ::_dyld_get_image_name(index);
-      if (::_dyld_get_image_header(index) != image_headers[index] ||
-          image_name == nullptr || image_names[index] != image_name) {
-        image_set_is_stable = false;
-        break;
-      }
-    }
-    if (!image_set_is_stable) continue;
-    if (!found_runtime_anchor) {
+    const auto* image_header =
+        reinterpret_cast<const mach_header*>(before.dli_fbase);
+    const std::string image_name(before.dli_fname);
+    ABSL_ASSIGN_OR_RETURN(
+        MeasuredImage measured,
+        MeasureImage(image_header, code_anchor,
+                     /*include_without_anchor=*/false,
+                     require_kernel_validation));
+    if (!measured.contains_runtime_anchor || !measured.has_digest) {
       return absl::FailedPreconditionError(
-          "No measured loaded image contains the LiteRT runtime code anchor.");
+          "Resolved Mach-O image does not contain its requested code anchor.");
     }
-    if (digests.empty()) {
-      return absl::FailedPreconditionError(
-          "No loaded runtime/delegate image evidence was measured.");
+    Dl_info after{};
+    if (::dladdr(reinterpret_cast<const void*>(code_anchor), &after) != 0 &&
+        after.dli_fbase == before.dli_fbase && after.dli_fname != nullptr &&
+        image_name == after.dli_fname) {
+      return measured.digest;
     }
-    std::sort(digests.begin(), digests.end());
-    return digests;
   }
   return absl::UnavailableError(
-      "Loaded runtime image set changed during identity measurement.");
+      "Loaded anchored image changed during identity measurement.");
 }
 
 absl::StatusOr<Hash256> MeasureAppleCpuRuntimeArtifact(
-    const SessionHandoffRuntimeProfile& profile) {
+    const SessionHandoffRuntimeProfile& profile,
+    bool require_kernel_validation) {
   if (profile.runtime_code_anchor == 0 || profile.canonical_profile.empty()) {
     return absl::FailedPreconditionError(
         "Loaded CPU runtime profile lacks measurable evidence.");
   }
-  ABSL_ASSIGN_OR_RETURN(std::vector<Hash256> image_digests,
-                        MeasureRelevantImages(profile.runtime_code_anchor));
+  // Bind only the image that owns the live LiteRT dispatch function. The host
+  // executable and unrelated application/plugin images are not inference
+  // artifacts and must not make an otherwise identical fresh worker derive a
+  // different profile.
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 runtime_image_digest,
+      MeasureImageContainingAnchor(profile.runtime_code_anchor,
+                                   require_kernel_validation));
 
   constexpr std::array<absl::string_view, 7> kPlatformEvidence = {
       "kern.osversion", "kern.osrelease", "hw.model",     "hw.machine",
@@ -978,14 +977,74 @@ absl::StatusOr<Hash256> MeasureAppleCpuRuntimeArtifact(
   };
   Sha256Hasher hasher;
   HashFrame(kRuntimeArtifactDomain, &hasher);
+  // V4 makes the executable-container class explicit so an ELF CPU image can
+  // never enter an admission created under the earlier Apple-only namespace.
+  HashFrame("APPLE_MACHO_CPU_V1", &hasher);
   HashU32(static_cast<uint32_t>(profile.runtime_class), &hasher);
   HashFrame(profile.canonical_profile, &hasher);
-  HashU32(static_cast<uint32_t>(image_digests.size()), &hasher);
-  for (const Hash256& image_digest : image_digests) {
-    hasher.Update(absl::string_view(
-        reinterpret_cast<const char*>(image_digest.bytes.data()),
-        image_digest.bytes.size()));
+  hasher.Update(absl::string_view(
+      reinterpret_cast<const char*>(runtime_image_digest.bytes.data()),
+      runtime_image_digest.bytes.size()));
+  for (absl::string_view name : kPlatformEvidence) {
+    ABSL_ASSIGN_OR_RETURN(std::string value, ReadSysctl(name));
+    HashFrame(name, &hasher);
+    HashFrame(value, &hasher);
   }
+  return hasher.Finalize();
+}
+
+absl::StatusOr<Hash256> MeasureAppleMetalRuntimeArtifact(
+    const SessionHandoffRuntimeProfile& profile) {
+  if (profile.runtime_code_anchor == 0 || profile.canonical_profile.empty() ||
+      !profile.metal_corun.has_value()) {
+    return absl::FailedPreconditionError(
+        "Loaded Metal runtime profile lacks measurable evidence.");
+  }
+  const MetalCoRunRuntimeEvidence& metal = *profile.metal_corun;
+  if (metal.metal_device == nullptr || metal.metal_command_queue == nullptr ||
+      metal.selected_accelerator_code_anchor == 0 ||
+      metal.canonical_policy.empty() ||
+      (metal.derived_evidence &
+       MetalCoRunEvidenceBit(MetalCoRunEvidence::kSelectedMetalDelegate)) ==
+          0) {
+    return absl::FailedPreconditionError(
+        "Loaded Metal runtime lacks selected accelerator, device, queue, or "
+        "policy evidence.");
+  }
+
+  // The runtime API table and the selected accelerator callback are separate
+  // live code anchors. Measuring both prevents a generic LiteRT runtime image
+  // plus a GPU label from impersonating the actually selected Metal plugin.
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 runtime_image_digest,
+      MeasureImageContainingAnchor(profile.runtime_code_anchor,
+                                   /*require_kernel_validation=*/true));
+  ABSL_ASSIGN_OR_RETURN(
+      const Hash256 accelerator_image_digest,
+      MeasureImageContainingAnchor(
+          metal.selected_accelerator_code_anchor,
+          /*require_kernel_validation=*/true));
+  ABSL_ASSIGN_OR_RETURN(
+      std::string metal_device_identity,
+      DeriveMacOsMetalDeviceIdentity(metal.metal_device,
+                                     metal.metal_command_queue));
+
+  constexpr std::array<absl::string_view, 7> kPlatformEvidence = {
+      "kern.osversion", "kern.osrelease", "hw.model",     "hw.machine",
+      "hw.cputype",     "hw.cpusubtype",  "hw.cpufamily",
+  };
+  Sha256Hasher hasher;
+  HashFrame("LITERT_LM_LOADED_METAL_RUNTIME_ARTIFACT_V2", &hasher);
+  HashU32(static_cast<uint32_t>(profile.runtime_class), &hasher);
+  HashFrame(profile.canonical_profile, &hasher);
+  HashFrame(metal.canonical_policy, &hasher);
+  HashFrame(metal_device_identity, &hasher);
+  hasher.Update(absl::string_view(
+      reinterpret_cast<const char*>(runtime_image_digest.bytes.data()),
+      runtime_image_digest.bytes.size()));
+  hasher.Update(absl::string_view(
+      reinterpret_cast<const char*>(accelerator_image_digest.bytes.data()),
+      accelerator_image_digest.bytes.size()));
   for (absl::string_view name : kPlatformEvidence) {
     ABSL_ASSIGN_OR_RETURN(std::string value, ReadSysctl(name));
     HashFrame(name, &hasher);
@@ -996,20 +1055,1216 @@ absl::StatusOr<Hash256> MeasureAppleCpuRuntimeArtifact(
 
 #endif  // defined(__APPLE__)
 
+#if defined(__linux__) || defined(__ANDROID__)
+
+constexpr size_t kMaximumProcEvidenceBytes = 32 * 1024 * 1024;
+constexpr size_t kMaximumPlatformEvidenceBytes = 1024 * 1024;
+constexpr uint64_t kMaximumElfExecutableBytes = uint64_t{8} * 1024 * 1024 *
+                                                1024;
+constexpr size_t kMaximumAuxiliaryStringBytes = 4096;
+
+absl::StatusOr<std::string> ReadBoundedFile(absl::string_view path,
+                                            size_t maximum_bytes) {
+  const std::string nul_terminated_path(path);
+  const int fd =
+      ::open(nul_terminated_path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return absl::ErrnoToStatus(
+        errno, absl::StrCat("Cannot open platform evidence ", path));
+  }
+
+  std::string contents;
+  std::array<char, 16 * 1024> buffer;
+  while (contents.size() <= maximum_bytes) {
+    const size_t remaining = maximum_bytes + 1 - contents.size();
+    const size_t request = std::min(remaining, buffer.size());
+    const ssize_t bytes_read = ::read(fd, buffer.data(), request);
+    if (bytes_read < 0) {
+      if (errno == EINTR) continue;
+      const int read_errno = errno;
+      (void)::close(fd);
+      return absl::ErrnoToStatus(
+          read_errno, absl::StrCat("Cannot read platform evidence ", path));
+    }
+    if (bytes_read == 0) break;
+    contents.append(buffer.data(), static_cast<size_t>(bytes_read));
+  }
+  if (::close(fd) != 0) {
+    return absl::ErrnoToStatus(
+        errno, absl::StrCat("Cannot close platform evidence ", path));
+  }
+  if (contents.size() > maximum_bytes) {
+    return absl::ResourceExhaustedError(
+        absl::StrCat("Platform evidence exceeds the supported bound: ",
+                     path));
+  }
+  return contents;
+}
+
+std::string NormalizeEvidenceText(absl::string_view value) {
+  std::string normalized;
+  normalized.reserve(value.size());
+  bool pending_space = false;
+  for (unsigned char character : value) {
+    if (character == '\0' || std::isspace(character)) {
+      pending_space = !normalized.empty();
+      continue;
+    }
+    if (pending_space) normalized.push_back(' ');
+    normalized.push_back(static_cast<char>(character));
+    pending_space = false;
+  }
+  return normalized;
+}
+
+std::string NormalizeCpuInfoKey(absl::string_view key) {
+  std::string normalized = NormalizeEvidenceText(key);
+  for (char& character : normalized) {
+    character = static_cast<char>(
+        std::tolower(static_cast<unsigned char>(character)));
+  }
+  return normalized;
+}
+
+bool IsStableCpuInfoKey(absl::string_view key) {
+  constexpr std::array<absl::string_view, 22> kStableKeys = {
+      "vendor_id",        "cpu family",       "model",
+      "model name",       "stepping",         "microcode",
+      "flags",            "bugs",             "cpu implementer",
+      "cpu architecture", "cpu variant",      "cpu part",
+      "cpu revision",     "features",         "isa",
+      "uarch",            "mmu",              "fpu",
+      "hardware",         "revision",         "platform",
+      "isa extensions",
+  };
+  return std::find(kStableKeys.begin(), kStableKeys.end(), key) !=
+         kStableKeys.end();
+}
+
+absl::StatusOr<std::string> CanonicalizeCpuInfo(
+    absl::string_view cpu_info) {
+  std::vector<std::string> records;
+  std::vector<std::string> fields;
+  size_t cursor = 0;
+  while (cursor <= cpu_info.size()) {
+    const size_t line_end = cpu_info.find('\n', cursor);
+    const size_t bounded_end =
+        line_end == absl::string_view::npos ? cpu_info.size() : line_end;
+    absl::string_view line = cpu_info.substr(cursor, bounded_end - cursor);
+    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+    if (NormalizeEvidenceText(line).empty()) {
+      if (!fields.empty()) {
+        std::sort(fields.begin(), fields.end());
+        std::string record;
+        for (const std::string& field : fields) {
+          record.append(field);
+          record.push_back('\n');
+        }
+        records.push_back(std::move(record));
+        fields.clear();
+      }
+    } else {
+      const size_t separator = line.find(':');
+      if (separator != absl::string_view::npos) {
+        const std::string key = NormalizeCpuInfoKey(line.substr(0, separator));
+        const std::string value =
+            NormalizeEvidenceText(line.substr(separator + 1));
+        if (IsStableCpuInfoKey(key) && !value.empty()) {
+          fields.push_back(absl::StrCat(key, "=", value));
+        }
+      }
+    }
+    if (line_end == absl::string_view::npos) break;
+    cursor = line_end + 1;
+  }
+  if (!fields.empty()) {
+    std::sort(fields.begin(), fields.end());
+    std::string record;
+    for (const std::string& field : fields) {
+      record.append(field);
+      record.push_back('\n');
+    }
+    records.push_back(std::move(record));
+  }
+  if (records.empty()) {
+    return absl::UnimplementedError(
+        "Linux CPU identity has no stable /proc/cpuinfo fields.");
+  }
+  std::sort(records.begin(), records.end());
+  std::string canonical;
+  Sha256Hasher canonical_hasher;
+  HashFrame("LITERT_LM_CANONICAL_CPUINFO_V1", &canonical_hasher);
+  HashU64(records.size(), &canonical_hasher);
+  for (const std::string& record : records) {
+    HashFrame(record, &canonical_hasher);
+  }
+  const Hash256 digest = canonical_hasher.Finalize();
+  canonical.assign(reinterpret_cast<const char*>(digest.bytes.data()),
+                   digest.bytes.size());
+  return canonical;
+}
+
+struct LinuxPlatformEvidence {
+  std::array<std::string, 4> uname_fields;
+  std::vector<uint32_t> effective_cpu_affinity;
+  uint64_t page_size = 0;
+  uint64_t hardware_capabilities = 0;
+  bool has_hardware_capabilities_2 = false;
+  uint64_t hardware_capabilities_2 = 0;
+  std::string auxiliary_platform;
+  std::string auxiliary_base_platform;
+  std::string canonical_cpu_info;
+  std::vector<std::pair<std::string, std::string>> named_evidence;
+
+  bool operator==(const LinuxPlatformEvidence& other) const {
+    return uname_fields == other.uname_fields &&
+           effective_cpu_affinity == other.effective_cpu_affinity &&
+           page_size == other.page_size &&
+           hardware_capabilities == other.hardware_capabilities &&
+           has_hardware_capabilities_2 ==
+               other.has_hardware_capabilities_2 &&
+           hardware_capabilities_2 == other.hardware_capabilities_2 &&
+           auxiliary_platform == other.auxiliary_platform &&
+           auxiliary_base_platform == other.auxiliary_base_platform &&
+           canonical_cpu_info == other.canonical_cpu_info &&
+           named_evidence == other.named_evidence;
+  }
+};
+
+absl::StatusOr<std::pair<bool, uint64_t>> ReadAuxiliaryValue(
+    unsigned long type) {
+  errno = 0;
+  const unsigned long value = ::getauxval(type);
+  if (value == 0 && errno != 0) {
+    if (errno == ENOENT) return std::pair<bool, uint64_t>{false, 0};
+    return absl::ErrnoToStatus(errno,
+                               "Cannot read Linux auxiliary-vector evidence");
+  }
+  return std::pair<bool, uint64_t>{true, static_cast<uint64_t>(value)};
+}
+
+absl::StatusOr<std::string> ReadAuxiliaryString(unsigned long type) {
+  ABSL_ASSIGN_OR_RETURN(const auto value, ReadAuxiliaryValue(type));
+  if (!value.first) return std::string();
+  if (value.second == 0 ||
+      value.second > std::numeric_limits<uintptr_t>::max()) {
+    return absl::FailedPreconditionError(
+        "Linux auxiliary-vector string pointer is invalid.");
+  }
+  const char* text = reinterpret_cast<const char*>(
+      static_cast<uintptr_t>(value.second));
+  const size_t size = ::strnlen(text, kMaximumAuxiliaryStringBytes + 1);
+  if (size == 0 || size > kMaximumAuxiliaryStringBytes) {
+    return absl::FailedPreconditionError(
+        "Linux auxiliary-vector string is empty or unterminated.");
+  }
+  return std::string(text, size);
+}
+
+absl::StatusOr<std::string> UtsField(const char* field, size_t capacity,
+                                     absl::string_view name) {
+  const size_t size = ::strnlen(field, capacity);
+  if (size == 0 || size == capacity) {
+    return absl::FailedPreconditionError(
+        absl::StrCat("uname returned an empty or unterminated ", name,
+                     " field."));
+  }
+  return std::string(field, size);
+}
+
+absl::StatusOr<LinuxPlatformEvidence> CaptureLinuxPlatformEvidence() {
+  utsname name = {};
+  if (::uname(&name) != 0) {
+    return absl::ErrnoToStatus(errno, "Cannot read Linux uname evidence");
+  }
+
+  LinuxPlatformEvidence evidence;
+  ABSL_ASSIGN_OR_RETURN(evidence.uname_fields[0],
+                        UtsField(name.sysname, sizeof(name.sysname),
+                                 "sysname"));
+  ABSL_ASSIGN_OR_RETURN(evidence.uname_fields[1],
+                        UtsField(name.release, sizeof(name.release),
+                                 "release"));
+  ABSL_ASSIGN_OR_RETURN(evidence.uname_fields[2],
+                        UtsField(name.version, sizeof(name.version),
+                                 "version"));
+  ABSL_ASSIGN_OR_RETURN(evidence.uname_fields[3],
+                        UtsField(name.machine, sizeof(name.machine),
+                                 "machine"));
+
+  // `sched_getaffinity` reports the effective mask after inherited, cgroup,
+  // and Android EngineFactory restrictions have all been applied. Requested
+  // thread counts or device labels cannot distinguish a successfully pinned
+  // exact worker from one whose affinity operation failed.
+  cpu_set_t affinity;
+  CPU_ZERO(&affinity);
+  if (::sched_getaffinity(0, sizeof(affinity), &affinity) != 0) {
+    return absl::ErrnoToStatus(
+        errno, "Cannot read effective Linux CPU affinity evidence");
+  }
+  for (uint32_t cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+    if (CPU_ISSET(static_cast<int>(cpu), &affinity)) {
+      evidence.effective_cpu_affinity.push_back(cpu);
+    }
+  }
+  if (evidence.effective_cpu_affinity.empty()) {
+    return absl::FailedPreconditionError(
+        "Linux reported an empty effective CPU affinity mask.");
+  }
+
+  const long configured_page_size = ::sysconf(_SC_PAGESIZE);
+  if (configured_page_size <= 0) {
+    return absl::FailedPreconditionError(
+        "Linux runtime identity cannot determine the page size.");
+  }
+  evidence.page_size = static_cast<uint64_t>(configured_page_size);
+  ABSL_ASSIGN_OR_RETURN(const auto auxiliary_page_size,
+                        ReadAuxiliaryValue(AT_PAGESZ));
+  if (!auxiliary_page_size.first ||
+      auxiliary_page_size.second != evidence.page_size) {
+    return absl::FailedPreconditionError(
+        "Linux page-size evidence is missing or inconsistent.");
+  }
+  ABSL_ASSIGN_OR_RETURN(const auto hardware_capabilities,
+                        ReadAuxiliaryValue(AT_HWCAP));
+  if (!hardware_capabilities.first) {
+    return absl::UnimplementedError(
+        "Linux CPU identity lacks AT_HWCAP evidence.");
+  }
+  evidence.hardware_capabilities = hardware_capabilities.second;
+#if defined(AT_HWCAP2)
+  ABSL_ASSIGN_OR_RETURN(const auto hardware_capabilities_2,
+                        ReadAuxiliaryValue(AT_HWCAP2));
+  evidence.has_hardware_capabilities_2 = hardware_capabilities_2.first;
+  evidence.hardware_capabilities_2 = hardware_capabilities_2.second;
+#endif
+#if defined(AT_PLATFORM)
+  ABSL_ASSIGN_OR_RETURN(evidence.auxiliary_platform,
+                        ReadAuxiliaryString(AT_PLATFORM));
+#endif
+#if defined(AT_BASE_PLATFORM)
+  ABSL_ASSIGN_OR_RETURN(evidence.auxiliary_base_platform,
+                        ReadAuxiliaryString(AT_BASE_PLATFORM));
+#endif
+
+  ABSL_ASSIGN_OR_RETURN(
+      const std::string cpu_info,
+      ReadBoundedFile("/proc/cpuinfo", kMaximumProcEvidenceBytes));
+  ABSL_ASSIGN_OR_RETURN(evidence.canonical_cpu_info,
+                        CanonicalizeCpuInfo(cpu_info));
+
+  constexpr std::array<absl::string_view, 8> kHardwareEvidencePaths = {
+      "/sys/devices/virtual/dmi/id/product_name",
+      "/sys/devices/virtual/dmi/id/product_version",
+      "/sys/devices/virtual/dmi/id/board_name",
+      "/sys/firmware/devicetree/base/model",
+      "/sys/devices/soc0/family",
+      "/sys/devices/soc0/machine",
+      "/sys/devices/soc0/soc_id",
+      "/sys/devices/soc0/revision",
+  };
+  for (absl::string_view path : kHardwareEvidencePaths) {
+    absl::StatusOr<std::string> value =
+        ReadBoundedFile(path, kMaximumPlatformEvidenceBytes);
+    if (!value.ok()) {
+      if (absl::IsNotFound(value.status()) ||
+          absl::IsPermissionDenied(value.status())) {
+        continue;
+      }
+      return value.status();
+    }
+    std::string normalized = NormalizeEvidenceText(*value);
+    if (!normalized.empty()) {
+      evidence.named_evidence.emplace_back(std::string(path),
+                                           std::move(normalized));
+    }
+  }
+
+#if defined(__ANDROID__)
+  constexpr std::array<const char*, 8> kAndroidProperties = {
+      "ro.build.fingerprint", "ro.build.version.incremental",
+      "ro.product.device",    "ro.product.board",
+      "ro.hardware",          "ro.board.platform",
+      "ro.soc.manufacturer",  "ro.soc.model",
+  };
+  bool has_build_fingerprint = false;
+  bool has_hardware_property = false;
+  for (const char* property : kAndroidProperties) {
+    std::array<char, PROP_VALUE_MAX> value = {};
+    const int size = ::__system_property_get(property, value.data());
+    if (size < 0 || static_cast<size_t>(size) >= value.size()) {
+      return absl::FailedPreconditionError(
+          "Android system-property evidence has invalid bounds.");
+    }
+    if (size == 0) continue;
+    evidence.named_evidence.emplace_back(
+        absl::StrCat("android-property:", property),
+        std::string(value.data(), static_cast<size_t>(size)));
+    has_build_fingerprint =
+        has_build_fingerprint || std::strcmp(property, "ro.build.fingerprint") == 0;
+    has_hardware_property =
+        has_hardware_property ||
+        std::strcmp(property, "ro.build.version.incremental") != 0 &&
+            std::strcmp(property, "ro.build.fingerprint") != 0;
+  }
+  if (!has_build_fingerprint || !has_hardware_property) {
+    return absl::UnimplementedError(
+        "Android exact CPU identity lacks build or hardware properties.");
+  }
+#else
+  absl::StatusOr<std::string> os_release =
+      ReadBoundedFile("/etc/os-release", kMaximumPlatformEvidenceBytes);
+  if (!os_release.ok() && absl::IsNotFound(os_release.status())) {
+    os_release = ReadBoundedFile("/usr/lib/os-release",
+                                 kMaximumPlatformEvidenceBytes);
+  }
+  if (os_release.ok()) {
+    evidence.named_evidence.emplace_back("linux-os-release",
+                                         std::move(*os_release));
+  } else if (!absl::IsNotFound(os_release.status()) &&
+             !absl::IsPermissionDenied(os_release.status())) {
+    return os_release.status();
+  }
+#endif
+  std::sort(evidence.named_evidence.begin(), evidence.named_evidence.end());
+  return evidence;
+}
+
+struct ProcMapEntry {
+  uintptr_t start = 0;
+  uintptr_t end = 0;
+  std::array<char, 4> permissions = {};
+  uint64_t file_offset = 0;
+  uint32_t device_major = 0;
+  uint32_t device_minor = 0;
+  uint64_t inode = 0;
+  std::string path;
+};
+
+absl::StatusOr<std::vector<ProcMapEntry>> ReadProcMaps() {
+  ABSL_ASSIGN_OR_RETURN(
+      const std::string contents,
+      ReadBoundedFile("/proc/self/maps", kMaximumProcEvidenceBytes));
+  std::vector<ProcMapEntry> mappings;
+  size_t cursor = 0;
+  while (cursor < contents.size()) {
+    const size_t line_end = contents.find('\n', cursor);
+    const size_t bounded_end =
+        line_end == std::string::npos ? contents.size() : line_end;
+    const std::string line = contents.substr(cursor, bounded_end - cursor);
+    unsigned long long start = 0;
+    unsigned long long end = 0;
+    unsigned long long file_offset = 0;
+    unsigned int device_major = 0;
+    unsigned int device_minor = 0;
+    unsigned long long inode = 0;
+    std::array<char, 5> permissions = {};
+    int path_offset = 0;
+    const int fields = std::sscanf(
+        line.c_str(), "%llx-%llx %4s %llx %x:%x %llu %n", &start, &end,
+        permissions.data(), &file_offset, &device_major, &device_minor, &inode,
+        &path_offset);
+    if (fields != 7 || path_offset < 0 ||
+        static_cast<size_t>(path_offset) > line.size() || start >= end ||
+        start > std::numeric_limits<uintptr_t>::max() ||
+        end > std::numeric_limits<uintptr_t>::max() ||
+        std::strlen(permissions.data()) != 4) {
+      return absl::FailedPreconditionError(
+          "Linux reported a malformed /proc/self/maps entry.");
+    }
+    std::string path = line.substr(static_cast<size_t>(path_offset));
+    while (!path.empty() && path.front() == ' ') path.erase(path.begin());
+    ProcMapEntry entry{
+        .start = static_cast<uintptr_t>(start),
+        .end = static_cast<uintptr_t>(end),
+        .permissions = {permissions[0], permissions[1], permissions[2],
+                        permissions[3]},
+        .file_offset = static_cast<uint64_t>(file_offset),
+        .device_major = device_major,
+        .device_minor = device_minor,
+        .inode = static_cast<uint64_t>(inode),
+        .path = std::move(path),
+    };
+    if (!mappings.empty() && mappings.back().end > entry.start) {
+      return absl::FailedPreconditionError(
+          "Linux reported overlapping process mappings.");
+    }
+    mappings.push_back(std::move(entry));
+    if (line_end == std::string::npos) break;
+    cursor = line_end + 1;
+  }
+  if (mappings.empty()) {
+    return absl::FailedPreconditionError(
+        "Linux reported an empty process map.");
+  }
+  return mappings;
+}
+
+bool IsAnonymousOrMutableImagePath(absl::string_view path) {
+  return path.empty() || path.front() != '/' || path.front() == '[' ||
+         path.starts_with("/memfd:") || path.find(" (deleted)") !=
+                                                absl::string_view::npos;
+}
+
+struct ElfBackingIdentity {
+  bool initialized = false;
+  uint32_t device_major = 0;
+  uint32_t device_minor = 0;
+  uint64_t inode = 0;
+  uint64_t container_offset_bias = 0;
+  std::string path;
+
+  bool operator==(const ElfBackingIdentity& other) const {
+    return initialized == other.initialized &&
+           device_major == other.device_major &&
+           device_minor == other.device_minor && inode == other.inode &&
+           container_offset_bias == other.container_offset_bias &&
+           path == other.path;
+  }
+};
+
+struct ElfMapSpan {
+  uintptr_t start = 0;
+  uintptr_t end = 0;
+  std::array<char, 4> permissions = {};
+  uint64_t file_offset = 0;
+
+  bool operator==(const ElfMapSpan& other) const {
+    return start == other.start && end == other.end &&
+           permissions == other.permissions &&
+           file_offset == other.file_offset;
+  }
+  bool operator<(const ElfMapSpan& other) const {
+    if (start != other.start) return start < other.start;
+    if (end != other.end) return end < other.end;
+    if (permissions != other.permissions) {
+      return permissions < other.permissions;
+    }
+    return file_offset < other.file_offset;
+  }
+};
+
+struct ElfRangeRequirement {
+  uintptr_t address = 0;
+  uint64_t size = 0;
+  uint64_t elf_file_offset = 0;
+  bool require_executable = false;
+  bool require_immutable = false;
+  const char* description = nullptr;
+};
+
+const ProcMapEntry* FindProcMap(const std::vector<ProcMapEntry>& mappings,
+                                uintptr_t address) {
+  auto next = std::upper_bound(
+      mappings.begin(), mappings.end(), address,
+      [](uintptr_t target, const ProcMapEntry& mapping) {
+        return target < mapping.start;
+      });
+  if (next == mappings.begin()) return nullptr;
+  --next;
+  return address >= next->start && address < next->end ? &*next : nullptr;
+}
+
+absl::Status ValidateMappedElfRange(
+    const std::vector<ProcMapEntry>& mappings,
+    const ElfRangeRequirement& requirement, ElfBackingIdentity* backing,
+    std::vector<ElfMapSpan>* spans) {
+  if (requirement.size == 0 || requirement.description == nullptr) {
+    return absl::FailedPreconditionError(
+        "Loaded ELF identity received an empty range requirement.");
+  }
+  if (requirement.elf_file_offset >
+      std::numeric_limits<uint64_t>::max() - (requirement.size - 1)) {
+    return absl::FailedPreconditionError(
+        absl::StrCat(requirement.description,
+                     " ELF file range overflows."));
+  }
+  if (requirement.size > std::numeric_limits<uintptr_t>::max() -
+                             requirement.address) {
+    return absl::FailedPreconditionError(
+        absl::StrCat(requirement.description, " range overflows."));
+  }
+  const uintptr_t end =
+      requirement.address + static_cast<uintptr_t>(requirement.size);
+  uintptr_t cursor = requirement.address;
+  while (cursor < end) {
+    const ProcMapEntry* mapping = FindProcMap(mappings, cursor);
+    if (mapping == nullptr) {
+      return absl::FailedPreconditionError(
+          absl::StrCat(requirement.description,
+                       " is not completely mapped."));
+    }
+    if (mapping->permissions[0] != 'r' ||
+        (requirement.require_executable &&
+         mapping->permissions[2] != 'x') ||
+        (requirement.require_immutable &&
+         mapping->permissions[1] == 'w') ||
+        mapping->permissions[3] != 'p') {
+      return absl::UnimplementedError(
+          absl::StrCat(requirement.description,
+                       " is unreadable, writable, non-executable, or shared."));
+    }
+    if (mapping->inode == 0 ||
+        (mapping->device_major == 0 && mapping->device_minor == 0) ||
+        IsAnonymousOrMutableImagePath(mapping->path)) {
+      return absl::UnimplementedError(
+          absl::StrCat(requirement.description,
+                       " is anonymous, deleted, or not file-backed."));
+    }
+    const uint64_t mapping_delta = cursor - mapping->start;
+    if (mapping->file_offset >
+        std::numeric_limits<uint64_t>::max() - mapping_delta) {
+      return absl::FailedPreconditionError(
+          absl::StrCat(requirement.description,
+                       " mapped file offset overflows."));
+    }
+    const uint64_t actual_file_offset =
+        mapping->file_offset + mapping_delta;
+    const uint64_t range_delta = cursor - requirement.address;
+    if (requirement.elf_file_offset >
+        std::numeric_limits<uint64_t>::max() - range_delta) {
+      return absl::FailedPreconditionError(
+          absl::StrCat(requirement.description,
+                       " ELF file offset overflows."));
+    }
+    const uint64_t expected_elf_offset =
+        requirement.elf_file_offset + range_delta;
+    if (!backing->initialized) {
+      if (actual_file_offset < expected_elf_offset) {
+        return absl::FailedPreconditionError(
+            absl::StrCat(requirement.description,
+                         " has an invalid container offset."));
+      }
+      backing->initialized = true;
+      backing->device_major = mapping->device_major;
+      backing->device_minor = mapping->device_minor;
+      backing->inode = mapping->inode;
+      backing->container_offset_bias =
+          actual_file_offset - expected_elf_offset;
+      backing->path = mapping->path;
+    }
+    if (mapping->device_major != backing->device_major ||
+        mapping->device_minor != backing->device_minor ||
+        mapping->inode != backing->inode || mapping->path != backing->path ||
+        expected_elf_offset >
+            std::numeric_limits<uint64_t>::max() -
+                backing->container_offset_bias ||
+        actual_file_offset !=
+            backing->container_offset_bias + expected_elf_offset) {
+      return absl::FailedPreconditionError(
+          absl::StrCat(requirement.description,
+                       " has ambiguous or inconsistent file backing."));
+    }
+    const uintptr_t span_end = std::min(end, mapping->end);
+    spans->push_back(ElfMapSpan{
+        .start = cursor,
+        .end = span_end,
+        .permissions = mapping->permissions,
+        .file_offset = actual_file_offset,
+    });
+    cursor = span_end;
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<uintptr_t> LoadedElfAddress(ElfW(Addr) load_bias,
+                                          ElfW(Addr) virtual_address) {
+  if (load_bias > std::numeric_limits<uintptr_t>::max() ||
+      virtual_address >
+          std::numeric_limits<uintptr_t>::max() -
+              static_cast<uintptr_t>(load_bias)) {
+    return absl::FailedPreconditionError(
+        "Loaded ELF virtual address overflows.");
+  }
+  return static_cast<uintptr_t>(load_bias) +
+         static_cast<uintptr_t>(virtual_address);
+}
+
+struct MeasuredElfImage {
+  Hash256 digest;
+  uintptr_t load_bias = 0;
+  std::string loader_name;
+  ElfBackingIdentity backing;
+  std::vector<ElfMapSpan> spans;
+  uint16_t machine = 0;
+  uint8_t elf_class = 0;
+  uint8_t elf_data = 0;
+
+  bool operator==(const MeasuredElfImage& other) const {
+    return digest == other.digest && load_bias == other.load_bias &&
+           loader_name == other.loader_name && backing == other.backing &&
+           spans == other.spans && machine == other.machine &&
+           elf_class == other.elf_class && elf_data == other.elf_data;
+  }
+};
+
+bool ElfImageContainsAnchor(const dl_phdr_info& image,
+                            uintptr_t code_anchor) {
+  if (image.dlpi_phdr == nullptr || image.dlpi_phnum == 0) return false;
+  for (ElfW(Half) index = 0; index < image.dlpi_phnum; ++index) {
+    const ElfW(Phdr)& segment = image.dlpi_phdr[index];
+    if (segment.p_type != PT_LOAD || (segment.p_flags & PF_X) == 0 ||
+        segment.p_memsz == 0) {
+      continue;
+    }
+    absl::StatusOr<uintptr_t> address =
+        LoadedElfAddress(image.dlpi_addr, segment.p_vaddr);
+    if (!address.ok() ||
+        segment.p_memsz > std::numeric_limits<uintptr_t>::max() - *address) {
+      continue;
+    }
+    const uintptr_t end =
+        *address + static_cast<uintptr_t>(segment.p_memsz);
+    if (code_anchor >= *address && code_anchor < end) return true;
+  }
+  return false;
+}
+
+absl::Status ValidateNoElfTextRelocations(
+    const dl_phdr_info& image,
+    const std::vector<ProcMapEntry>& mappings,
+    ElfBackingIdentity* backing, std::vector<ElfMapSpan>* spans,
+    std::vector<ElfRangeRequirement>* requirements) {
+  const ElfW(Phdr)* dynamic_segment = nullptr;
+  for (ElfW(Half) index = 0; index < image.dlpi_phnum; ++index) {
+    const ElfW(Phdr)& segment = image.dlpi_phdr[index];
+    if (segment.p_type != PT_DYNAMIC) continue;
+    if (dynamic_segment != nullptr) {
+      return absl::FailedPreconditionError(
+          "Loaded ELF image has ambiguous dynamic metadata.");
+    }
+    dynamic_segment = &segment;
+  }
+  if (dynamic_segment == nullptr) return absl::OkStatus();
+  if (dynamic_segment->p_filesz == 0 ||
+      dynamic_segment->p_filesz > 1024 * 1024 ||
+      dynamic_segment->p_filesz % sizeof(ElfW(Dyn)) != 0) {
+    return absl::FailedPreconditionError(
+        "Loaded ELF image has invalid dynamic metadata bounds.");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      const uintptr_t address,
+      LoadedElfAddress(image.dlpi_addr, dynamic_segment->p_vaddr));
+  const ElfRangeRequirement requirement{
+      .address = address,
+      .size = dynamic_segment->p_filesz,
+      .elf_file_offset = dynamic_segment->p_offset,
+      .require_executable = false,
+      .require_immutable = true,
+      .description = "Loaded ELF dynamic metadata",
+  };
+  ABSL_RETURN_IF_ERROR(
+      ValidateMappedElfRange(mappings, requirement, backing, spans));
+  requirements->push_back(requirement);
+
+  const auto* entries = reinterpret_cast<const ElfW(Dyn)*>(address);
+  const size_t entry_count =
+      static_cast<size_t>(dynamic_segment->p_filesz / sizeof(ElfW(Dyn)));
+  bool found_end = false;
+  for (size_t index = 0; index < entry_count; ++index) {
+    const auto tag = entries[index].d_tag;
+    if (tag == DT_NULL) {
+      found_end = true;
+      break;
+    }
+    if (tag == DT_TEXTREL ||
+        (tag == DT_FLAGS &&
+         (entries[index].d_un.d_val & DF_TEXTREL) != 0)) {
+      return absl::UnimplementedError(
+          "Loaded ELF image requires executable-text relocation.");
+    }
+  }
+  if (!found_end) {
+    return absl::FailedPreconditionError(
+        "Loaded ELF dynamic metadata lacks a terminator.");
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<std::string> ReadElfBuildId(
+    const dl_phdr_info& image,
+    const std::vector<ProcMapEntry>& mappings,
+    ElfBackingIdentity* backing, std::vector<ElfMapSpan>* spans,
+    std::vector<ElfRangeRequirement>* requirements) {
+  std::optional<std::string> build_id;
+  for (ElfW(Half) index = 0; index < image.dlpi_phnum; ++index) {
+    const ElfW(Phdr)& segment = image.dlpi_phdr[index];
+    if (segment.p_type != PT_NOTE || segment.p_filesz == 0) continue;
+    if (segment.p_filesz > 1024 * 1024 ||
+        segment.p_filesz > std::numeric_limits<size_t>::max()) {
+      return absl::FailedPreconditionError(
+          "Loaded ELF note segment has invalid bounds.");
+    }
+    ABSL_ASSIGN_OR_RETURN(
+        const uintptr_t address,
+        LoadedElfAddress(image.dlpi_addr, segment.p_vaddr));
+    const ElfRangeRequirement requirement{
+        .address = address,
+        .size = segment.p_filesz,
+        .elf_file_offset = segment.p_offset,
+        .require_executable = false,
+        .require_immutable = true,
+        .description = "Loaded ELF note segment",
+    };
+    ABSL_RETURN_IF_ERROR(
+        ValidateMappedElfRange(mappings, requirement, backing, spans));
+    requirements->push_back(requirement);
+
+    const auto* bytes = reinterpret_cast<const uint8_t*>(address);
+    const size_t size = static_cast<size_t>(segment.p_filesz);
+    size_t offset = 0;
+    while (offset < size) {
+      if (size - offset < sizeof(ElfW(Nhdr))) {
+        return absl::FailedPreconditionError(
+            "Loaded ELF note segment has a truncated note header.");
+      }
+      ElfW(Nhdr) note = {};
+      std::memcpy(&note, bytes + offset, sizeof(note));
+      offset += sizeof(note);
+      const auto align_note_size = [](uint64_t value)
+          -> absl::StatusOr<size_t> {
+        if (value > std::numeric_limits<size_t>::max() - 3) {
+          return absl::FailedPreconditionError(
+              "Loaded ELF note size overflows.");
+        }
+        return (static_cast<size_t>(value) + 3) & ~size_t{3};
+      };
+      ABSL_ASSIGN_OR_RETURN(const size_t name_size,
+                            align_note_size(note.n_namesz));
+      ABSL_ASSIGN_OR_RETURN(const size_t descriptor_size,
+                            align_note_size(note.n_descsz));
+      if (name_size > size - offset ||
+          descriptor_size > size - offset - name_size) {
+        return absl::FailedPreconditionError(
+            "Loaded ELF note payload is out of bounds.");
+      }
+      const uint8_t* name = bytes + offset;
+      const uint8_t* descriptor = bytes + offset + name_size;
+      if (note.n_type == NT_GNU_BUILD_ID && note.n_namesz == 4 &&
+          std::memcmp(name, "GNU\0", 4) == 0) {
+        // Exact profiles cannot use a short collision-prone label as the
+        // immutable linker commitment for load-bearing non-code content.
+        if (note.n_descsz < 16 || note.n_descsz > 64 ||
+            build_id.has_value()) {
+          return absl::FailedPreconditionError(
+              "Loaded ELF image has an invalid or ambiguous GNU build ID.");
+        }
+        build_id = std::string(
+            reinterpret_cast<const char*>(descriptor), note.n_descsz);
+      }
+      offset += name_size + descriptor_size;
+    }
+  }
+  if (!build_id.has_value()) {
+    return absl::UnimplementedError(
+        "Loaded ELF image lacks an immutable GNU build ID.");
+  }
+  return std::move(*build_id);
+}
+
+absl::StatusOr<MeasuredElfImage> MeasureElfImage(
+    const dl_phdr_info& image, uintptr_t code_anchor) {
+  if (image.dlpi_phdr == nullptr || image.dlpi_phnum == 0 ||
+      image.dlpi_name == nullptr) {
+    return absl::FailedPreconditionError(
+        "The ELF loader returned incomplete image evidence.");
+  }
+
+  struct ExecutableSegment {
+    ElfW(Phdr) header;
+    uintptr_t address;
+  };
+  std::vector<ExecutableSegment> executable_segments;
+  const ElfW(Phdr)* header_segment = nullptr;
+  size_t anchor_matches = 0;
+  uint64_t total_executable_bytes = 0;
+  for (ElfW(Half) index = 0; index < image.dlpi_phnum; ++index) {
+    const ElfW(Phdr)& segment = image.dlpi_phdr[index];
+    if (segment.p_type != PT_LOAD) continue;
+    if (segment.p_filesz > segment.p_memsz ||
+        segment.p_vaddr >
+            std::numeric_limits<ElfW(Addr)>::max() - segment.p_memsz ||
+        (segment.p_align > 1 &&
+         ((segment.p_align & (segment.p_align - 1)) != 0 ||
+          (segment.p_vaddr & (segment.p_align - 1)) !=
+              (segment.p_offset & (segment.p_align - 1))))) {
+      return absl::FailedPreconditionError(
+          "Loaded ELF image has invalid load-segment bounds.");
+    }
+    if (segment.p_offset == 0 && segment.p_filesz >= sizeof(ElfW(Ehdr))) {
+      if (header_segment != nullptr) {
+        return absl::FailedPreconditionError(
+            "Loaded ELF image has ambiguous header segments.");
+      }
+      header_segment = &segment;
+    }
+    if ((segment.p_flags & PF_X) == 0) continue;
+    // Treat the ELF program-header flags as the image's maximum declared
+    // segment permissions, then independently require the live VMA to be
+    // private RX below. A PF_W executable is never admitted even if the
+    // loader happened to remove write permission before this measurement.
+    if ((segment.p_flags & PF_R) == 0 || (segment.p_flags & PF_W) != 0 ||
+        segment.p_filesz == 0 || segment.p_filesz != segment.p_memsz ||
+        segment.p_memsz > kMaximumElfExecutableBytes) {
+      return absl::UnimplementedError(
+          "Loaded ELF image has unreadable, writable, anonymous-tail, or "
+          "oversized executable content.");
+    }
+    if (segment.p_memsz >
+        kMaximumElfExecutableBytes - total_executable_bytes) {
+      return absl::ResourceExhaustedError(
+          "Loaded ELF executable content exceeds the measurement bound.");
+    }
+    total_executable_bytes += segment.p_memsz;
+    ABSL_ASSIGN_OR_RETURN(
+        const uintptr_t address,
+        LoadedElfAddress(image.dlpi_addr, segment.p_vaddr));
+    if (segment.p_memsz >
+        std::numeric_limits<uintptr_t>::max() - address) {
+      return absl::FailedPreconditionError(
+          "Loaded ELF executable range overflows.");
+    }
+    const uintptr_t end = address + static_cast<uintptr_t>(segment.p_memsz);
+    if (code_anchor >= address && code_anchor < end) ++anchor_matches;
+    executable_segments.push_back(
+        ExecutableSegment{.header = segment, .address = address});
+  }
+  if (header_segment == nullptr || executable_segments.empty() ||
+      anchor_matches != 1) {
+    return absl::FailedPreconditionError(
+        "Loaded ELF image lacks an unambiguous header and anchored "
+        "executable segment.");
+  }
+  std::sort(executable_segments.begin(), executable_segments.end(),
+            [](const ExecutableSegment& left,
+               const ExecutableSegment& right) {
+              return left.address < right.address;
+            });
+  for (size_t index = 1; index < executable_segments.size(); ++index) {
+    const ExecutableSegment& previous = executable_segments[index - 1];
+    const ExecutableSegment& current = executable_segments[index];
+    if (previous.header.p_memsz > current.address - previous.address) {
+      return absl::FailedPreconditionError(
+          "Loaded ELF image has overlapping executable segments.");
+    }
+  }
+
+  ABSL_ASSIGN_OR_RETURN(const std::vector<ProcMapEntry> mappings,
+                        ReadProcMaps());
+  ElfBackingIdentity backing;
+  std::vector<ElfMapSpan> spans;
+  std::vector<ElfRangeRequirement> requirements;
+  requirements.reserve(executable_segments.size() + 3);
+  for (const ExecutableSegment& segment : executable_segments) {
+    requirements.push_back(ElfRangeRequirement{
+        .address = segment.address,
+        .size = segment.header.p_memsz,
+        .elf_file_offset = segment.header.p_offset,
+        .require_executable = true,
+        .require_immutable = true,
+        .description = "Loaded ELF executable segment",
+    });
+    ABSL_RETURN_IF_ERROR(ValidateMappedElfRange(
+        mappings, requirements.back(), &backing, &spans));
+  }
+
+  ABSL_ASSIGN_OR_RETURN(
+      const uintptr_t header_address,
+      LoadedElfAddress(image.dlpi_addr, header_segment->p_vaddr));
+  const ElfRangeRequirement elf_header_requirement{
+      .address = header_address,
+      .size = sizeof(ElfW(Ehdr)),
+      .elf_file_offset = 0,
+      .require_executable = false,
+      .require_immutable = true,
+      .description = "Loaded ELF header",
+  };
+  ABSL_RETURN_IF_ERROR(ValidateMappedElfRange(
+      mappings, elf_header_requirement, &backing, &spans));
+  requirements.push_back(elf_header_requirement);
+  const auto* header = reinterpret_cast<const ElfW(Ehdr)*>(header_address);
+  if (std::memcmp(header->e_ident, ELFMAG, SELFMAG) != 0 ||
+      header->e_ident[EI_VERSION] != EV_CURRENT ||
+      header->e_version != EV_CURRENT ||
+      (header->e_type != ET_DYN && header->e_type != ET_EXEC) ||
+      header->e_machine == EM_NONE ||
+      header->e_ehsize != sizeof(ElfW(Ehdr)) ||
+      header->e_phentsize != sizeof(ElfW(Phdr)) ||
+      header->e_phnum != image.dlpi_phnum) {
+    return absl::FailedPreconditionError(
+        "Loaded ELF header does not match native loader metadata.");
+  }
+#if __SIZEOF_POINTER__ == 8
+  constexpr uint8_t kNativeElfClass = ELFCLASS64;
+#else
+  constexpr uint8_t kNativeElfClass = ELFCLASS32;
+#endif
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  constexpr uint8_t kNativeElfData = ELFDATA2LSB;
+#elif __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+  constexpr uint8_t kNativeElfData = ELFDATA2MSB;
+#else
+#error Unsupported native byte order for exact ELF identity.
+#endif
+  if (header->e_ident[EI_CLASS] != kNativeElfClass ||
+      header->e_ident[EI_DATA] != kNativeElfData) {
+    return absl::UnimplementedError(
+        "Loaded ELF image class or byte order is unsupported.");
+  }
+  const uint64_t program_headers_size =
+      static_cast<uint64_t>(image.dlpi_phnum) * sizeof(ElfW(Phdr));
+  if (header->e_phoff >
+          std::numeric_limits<uint64_t>::max() - program_headers_size ||
+      header->e_phoff + program_headers_size > header_segment->p_filesz ||
+      header->e_phoff >
+          std::numeric_limits<uintptr_t>::max() - header_address ||
+      reinterpret_cast<uintptr_t>(image.dlpi_phdr) !=
+          header_address + static_cast<uintptr_t>(header->e_phoff)) {
+    return absl::FailedPreconditionError(
+        "Loaded ELF program-header table has invalid bounds or location.");
+  }
+  const ElfRangeRequirement program_headers_requirement{
+      .address = reinterpret_cast<uintptr_t>(image.dlpi_phdr),
+      .size = program_headers_size,
+      .elf_file_offset = header->e_phoff,
+      .require_executable = false,
+      .require_immutable = true,
+      .description = "Loaded ELF program headers",
+  };
+  ABSL_RETURN_IF_ERROR(ValidateMappedElfRange(
+      mappings, program_headers_requirement, &backing, &spans));
+  requirements.push_back(program_headers_requirement);
+  ABSL_RETURN_IF_ERROR(ValidateNoElfTextRelocations(
+      image, mappings, &backing, &spans, &requirements));
+  ABSL_ASSIGN_OR_RETURN(
+      const std::string build_id,
+      ReadElfBuildId(image, mappings, &backing, &spans, &requirements));
+
+  Sha256Hasher image_hasher;
+  HashFrame("LITERT_LM_LOADED_ELF_IMAGE_V1", &image_hasher);
+  HashFrame(build_id, &image_hasher);
+  HashFrame(absl::string_view(reinterpret_cast<const char*>(header),
+                              sizeof(*header)),
+            &image_hasher);
+  HashU64(image.dlpi_phnum, &image_hasher);
+  HashFrame(absl::string_view(
+                reinterpret_cast<const char*>(image.dlpi_phdr),
+                static_cast<size_t>(program_headers_size)),
+            &image_hasher);
+  HashU64(executable_segments.size(), &image_hasher);
+  for (const ExecutableSegment& segment : executable_segments) {
+    HashU64(segment.header.p_vaddr, &image_hasher);
+    HashU64(segment.header.p_offset, &image_hasher);
+    HashU64(segment.header.p_filesz, &image_hasher);
+    HashU64(segment.header.p_memsz, &image_hasher);
+    HashU32(segment.header.p_flags, &image_hasher);
+    HashU64(segment.header.p_align, &image_hasher);
+    image_hasher.Update(absl::string_view(
+        reinterpret_cast<const char*>(segment.address),
+        static_cast<size_t>(segment.header.p_memsz)));
+  }
+  const Hash256 digest = image_hasher.Finalize();
+
+  // Re-read mapping metadata after touching every executable byte. This makes
+  // concurrent unmap, remap, mprotect, deletion, and backing-file replacement
+  // a failed measurement instead of a potentially reusable identity.
+  ABSL_ASSIGN_OR_RETURN(const std::vector<ProcMapEntry> mappings_after,
+                        ReadProcMaps());
+  ElfBackingIdentity backing_after;
+  std::vector<ElfMapSpan> spans_after;
+  for (const ElfRangeRequirement& requirement : requirements) {
+    ABSL_RETURN_IF_ERROR(ValidateMappedElfRange(
+        mappings_after, requirement, &backing_after, &spans_after));
+  }
+  std::sort(spans.begin(), spans.end());
+  spans.erase(std::unique(spans.begin(), spans.end()), spans.end());
+  std::sort(spans_after.begin(), spans_after.end());
+  spans_after.erase(std::unique(spans_after.begin(), spans_after.end()),
+                    spans_after.end());
+  if (!(backing == backing_after) || spans != spans_after) {
+    return absl::UnavailableError(
+        "Loaded ELF mappings changed during identity measurement.");
+  }
+  return MeasuredElfImage{
+      .digest = digest,
+      .load_bias = static_cast<uintptr_t>(image.dlpi_addr),
+      .loader_name = image.dlpi_name,
+      .backing = std::move(backing),
+      .spans = std::move(spans),
+      .machine = header->e_machine,
+      .elf_class = header->e_ident[EI_CLASS],
+      .elf_data = header->e_ident[EI_DATA],
+  };
+}
+
+struct ElfMeasurementContext {
+  uintptr_t code_anchor = 0;
+  size_t anchored_images = 0;
+  absl::Status status;
+  std::optional<MeasuredElfImage> measured;
+};
+
+int MeasureAnchoredElfImageCallback(dl_phdr_info* image, size_t image_size,
+                                    void* opaque_context) {
+  auto* context = static_cast<ElfMeasurementContext*>(opaque_context);
+  if (!context->status.ok()) return 1;
+  if (image == nullptr ||
+      image_size < offsetof(dl_phdr_info, dlpi_phnum) +
+                       sizeof(image->dlpi_phnum)) {
+    context->status = absl::FailedPreconditionError(
+        "The ELF loader returned a truncated image descriptor.");
+    return 1;
+  }
+  if (!ElfImageContainsAnchor(*image, context->code_anchor)) return 0;
+  ++context->anchored_images;
+  if (context->anchored_images != 1) {
+    context->status = absl::FailedPreconditionError(
+        "Loaded code anchor has ambiguous ELF image ownership.");
+    return 1;
+  }
+  absl::StatusOr<MeasuredElfImage> measured =
+      MeasureElfImage(*image, context->code_anchor);
+  if (!measured.ok()) {
+    context->status = measured.status();
+    return 1;
+  }
+  context->measured = std::move(*measured);
+  return 0;
+}
+
+absl::StatusOr<MeasuredElfImage> MeasureElfImageContainingAnchorOnce(
+    uintptr_t code_anchor) {
+  if (code_anchor == 0) {
+    return absl::FailedPreconditionError(
+        "Cannot measure a zero loaded-image code anchor.");
+  }
+  ElfMeasurementContext context{
+      .code_anchor = code_anchor,
+      .status = absl::OkStatus(),
+  };
+  const int result =
+      ::dl_iterate_phdr(MeasureAnchoredElfImageCallback, &context);
+  if (!context.status.ok()) return context.status;
+  if (result != 0) {
+    return absl::UnavailableError(
+        "The ELF loader interrupted image measurement.");
+  }
+  if (context.anchored_images != 1 || !context.measured.has_value()) {
+    return absl::FailedPreconditionError(
+        "No loaded file-backed ELF image contains the requested code "
+        "anchor.");
+  }
+  return std::move(*context.measured);
+}
+
+void HashLinuxPlatformEvidence(const LinuxPlatformEvidence& evidence,
+                               Sha256Hasher* hasher) {
+  constexpr std::array<absl::string_view, 4> kUnameNames = {
+      "uname.sysname", "uname.release", "uname.version", "uname.machine"};
+  HashFrame("LITERT_LM_LINUX_PLATFORM_EVIDENCE_V1", hasher);
+  for (size_t index = 0; index < kUnameNames.size(); ++index) {
+    HashFrame(kUnameNames[index], hasher);
+    HashFrame(evidence.uname_fields[index], hasher);
+  }
+  HashU64(evidence.effective_cpu_affinity.size(), hasher);
+  for (uint32_t cpu : evidence.effective_cpu_affinity) {
+    HashU32(cpu, hasher);
+  }
+  HashU64(evidence.page_size, hasher);
+  HashU64(evidence.hardware_capabilities, hasher);
+  HashU32(evidence.has_hardware_capabilities_2 ? 1 : 0, hasher);
+  HashU64(evidence.hardware_capabilities_2, hasher);
+  HashFrame(evidence.auxiliary_platform, hasher);
+  HashFrame(evidence.auxiliary_base_platform, hasher);
+  HashFrame(evidence.canonical_cpu_info, hasher);
+  HashU64(evidence.named_evidence.size(), hasher);
+  for (const auto& [name, value] : evidence.named_evidence) {
+    HashFrame(name, hasher);
+    HashFrame(value, hasher);
+  }
+}
+
+absl::StatusOr<Hash256> MeasureLinuxCpuRuntimeArtifact(
+    const SessionHandoffRuntimeProfile& profile) {
+  if (profile.runtime_code_anchor == 0 || profile.canonical_profile.empty()) {
+    return absl::FailedPreconditionError(
+        "Loaded CPU runtime profile lacks measurable evidence.");
+  }
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    ABSL_ASSIGN_OR_RETURN(const LinuxPlatformEvidence first_platform,
+                          CaptureLinuxPlatformEvidence());
+    ABSL_ASSIGN_OR_RETURN(
+        const MeasuredElfImage first_image,
+        MeasureElfImageContainingAnchorOnce(profile.runtime_code_anchor));
+    ABSL_ASSIGN_OR_RETURN(
+        const MeasuredElfImage second_image,
+        MeasureElfImageContainingAnchorOnce(profile.runtime_code_anchor));
+    ABSL_ASSIGN_OR_RETURN(const LinuxPlatformEvidence second_platform,
+                          CaptureLinuxPlatformEvidence());
+    if (!(first_image == second_image) || !(first_platform == second_platform)) {
+      continue;
+    }
+
+    Sha256Hasher hasher;
+    HashFrame(kRuntimeArtifactDomain, &hasher);
+    HashFrame("LINUX_ANDROID_ELF_CPU_V1", &hasher);
+    HashU32(static_cast<uint32_t>(profile.runtime_class), &hasher);
+    HashFrame(profile.canonical_profile, &hasher);
+    hasher.Update(absl::string_view(
+        reinterpret_cast<const char*>(first_image.digest.bytes.data()),
+        first_image.digest.bytes.size()));
+    HashLinuxPlatformEvidence(first_platform, &hasher);
+    return hasher.Finalize();
+  }
+  return absl::UnavailableError(
+      "Loaded ELF image or Linux platform evidence changed during identity "
+      "measurement.");
+}
+
+#endif  // defined(__linux__) || defined(__ANDROID__)
+
 }  // namespace
 
 absl::StatusOr<Hash256> MeasureLoadedRuntimeArtifact(
     const SessionHandoffRuntimeProfile& profile) {
+#if defined(__APPLE__)
+  switch (profile.runtime_class) {
+    case SessionHandoffRuntimeClass::kLiteRtCpu:
+      return MeasureAppleCpuRuntimeArtifact(
+          profile, /*require_kernel_validation=*/true);
+    case SessionHandoffRuntimeClass::kLiteRtMetal:
+      return MeasureAppleMetalRuntimeArtifact(profile);
+    default:
+      return absl::UnimplementedError(
+          "Loaded runtime/delegate identity class is unsupported.");
+  }
+#elif defined(__linux__) || defined(__ANDROID__)
   if (profile.runtime_class != SessionHandoffRuntimeClass::kLiteRtCpu) {
     return absl::UnimplementedError(
         "Loaded runtime/delegate identity class is unsupported.");
   }
-#if defined(__APPLE__)
-  return MeasureAppleCpuRuntimeArtifact(profile);
+  return MeasureLinuxCpuRuntimeArtifact(profile);
 #else
+  if (profile.runtime_class != SessionHandoffRuntimeClass::kLiteRtCpu) {
+    return absl::UnimplementedError(
+        "Loaded runtime/delegate identity class is unsupported.");
+  }
   return absl::UnimplementedError(
       "Exact loaded LiteRT runtime artifact measurement is currently "
-      "implemented only for Apple CPU processes.");
+      "implemented only for Apple and ELF Linux/Android CPU processes.");
+#endif
+}
+
+absl::StatusOr<Hash256> MeasureLoadedRuntimeArtifactForReproducibility(
+    const SessionHandoffRuntimeProfile& profile) {
+#if defined(__APPLE__)
+  if (profile.runtime_class != SessionHandoffRuntimeClass::kLiteRtCpu) {
+    return MeasureLoadedRuntimeArtifact(profile);
+  }
+  return MeasureAppleCpuRuntimeArtifact(
+      profile, /*require_kernel_validation=*/false);
+#else
+  return MeasureLoadedRuntimeArtifact(profile);
 #endif
 }
 

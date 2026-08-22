@@ -719,7 +719,7 @@ absl::Status SessionConfig::MaybeUpdateAndValidate(
           "LiteRT CPU and GPU compiled-model executors.");
     }
     if (executor_settings.GetLoraRank() != 0 ||
-        scoped_lora_file_ != nullptr || audio_scoped_lora_file_ != nullptr) {
+        scoped_lora_file_ != nullptr || scoped_audio_lora_file_ != nullptr) {
       return absl::UnimplementedError(
           "Stateless deterministic projection does not support LoRA state.");
     }

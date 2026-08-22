@@ -22,17 +22,12 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "runtime/engine/session_handoff.h"
+#include "runtime/engine/session_handoff_codec_contract.h"
 #include "runtime/executor/llm_executor_io_types.h"
 #include "runtime/executor/state_interface.h"
 #include "runtime/util/byte_stream.h"
 
 namespace litert::lm {
-
-enum class SessionHandoffPhase : uint8_t {
-  kFresh = 0,
-  kPrefilled = 1,
-  kDecoded = 2,
-};
 
 struct SessionHandoffSnapshot {
   SessionHandoffPhase phase = SessionHandoffPhase::kFresh;
@@ -62,6 +57,32 @@ absl::StatusOr<DecodedSessionHandoff> DecodeSessionHandoffFrom(
     const ByteSource& envelope,
     const SessionHandoffIdentity& authoritative_identity,
     const SessionHandoffOptions& options);
+
+// Authenticates and canonically decodes the complete source before emitting
+// any destination bytes, then streams the exact serialized-state subrange
+// into an otherwise identical envelope authenticated by destination_options.
+// This performs no session creation, import, or executor mutation. `source`
+// must remain immutable and must not alias storage mutated by `destination`
+// for the duration of the call. As with other streaming encoders, callers
+// must discard destination bytes if a later source or destination I/O error
+// is returned; durable publication must be transactional around this call.
+absl::StatusOr<SessionHandoffReauthenticationEvidence>
+ReauthenticateSessionHandoffToWithEvidence(
+    const ByteSource& source,
+    const SessionHandoffIdentity& authoritative_identity,
+    const SessionHandoffOptions& source_options,
+    const SessionHandoffOptions& destination_options,
+    absl::string_view purpose, ByteSink* destination);
+
+// Compatibility adapter for callers that do not retain provenance. It uses a
+// stable generic purpose, delegates to the evidence-returning operation, and
+// discards only the resulting evidence after the complete operation succeeds.
+absl::Status ReauthenticateSessionHandoffTo(
+    const ByteSource& source,
+    const SessionHandoffIdentity& authoritative_identity,
+    const SessionHandoffOptions& source_options,
+    const SessionHandoffOptions& destination_options,
+    ByteSink* destination);
 
 // Produces a canonical versioned envelope authenticated with HMAC-SHA256.
 // The key itself is caller-owned and is never serialized.

@@ -145,6 +145,7 @@ cc_library(
         "//runtime/conversation/model_data_processor:model_data_processor_factory",
         "//runtime/engine:engine_interface",
         "//runtime/engine:engine_settings",
+        "//runtime/engine:exact_litert_decode",
         "//runtime/engine:io_types",
         "//runtime/proto:llm_metadata_cc_proto",
         "//runtime/proto:llm_model_type_cc_proto",

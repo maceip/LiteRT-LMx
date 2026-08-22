@@ -22,9 +22,21 @@
 namespace litert::lm {
 
 // Measures the code images and platform evidence that implement `profile` in
-// the current process. It hashes loaded memory, not caller-provided filenames
-// or version labels. Unsupported delegate/device classes fail closed.
+// the current process. Apple uses kernel-validated Mach-O state; Linux and
+// Android use the anchored file-backed ELF image and stable kernel, CPU, and
+// device evidence. It hashes loaded memory, not caller-provided filenames or
+// version labels. Unsupported delegate/device classes fail closed.
 absl::StatusOr<Hash256> MeasureLoadedRuntimeArtifact(
+    const SessionHandoffRuntimeProfile& profile);
+
+// Measures the same loaded CPU image and platform bytes as
+// MeasureLoadedRuntimeArtifact, but does not require Apple to report
+// kernel-validated code-signature pages. This is a reproducibility identity,
+// not signed-image or hostile-process evidence. When the strong measurement is
+// available both functions return the same content identity. Metal remains on
+// the strong path because its selected delegate and command policy require the
+// stronger admission evidence.
+absl::StatusOr<Hash256> MeasureLoadedRuntimeArtifactForReproducibility(
     const SessionHandoffRuntimeProfile& profile);
 
 }  // namespace litert::lm

@@ -132,19 +132,14 @@ TEST_F(LitertStateTest, CanCreateKVWithClearFlagFalse) {
   EXPECT_EQ(kv_cache_->GetNumEntries(), 128);
 }
 
-TEST_F(LitertStateTest, SerializeNotSupported) {
+TEST_F(LitertStateTest, CanSerializeAndLoad) {
   ASSERT_NO_FATAL_FAILURE(SetUpKV(kTestStaticModelPath,
                                   LitertState::AllocationPolicy::kInplace,
                                   /*batch_size=*/1));
-  EXPECT_THAT(kv_cache_->Serialize(),
-              StatusIs(absl::StatusCode::kUnimplemented));
-}
-
-TEST_F(LitertStateTest, LoadNotSupported) {
-  ASSERT_NO_FATAL_FAILURE(SetUpKV(kTestStaticModelPath,
-                                  LitertState::AllocationPolicy::kInplace,
-                                  /*batch_size=*/1));
-  EXPECT_THAT(kv_cache_->Load(""), StatusIs(absl::StatusCode::kUnimplemented));
+  auto serialized = kv_cache_->Serialize();
+  ASSERT_OK(serialized);
+  EXPECT_FALSE(serialized->empty());
+  EXPECT_OK(kv_cache_->Load(*serialized));
 }
 
 TEST_F(LitertStateTest, StaticKVNotResizeable) {

@@ -21,6 +21,7 @@
 
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
+#include "runtime/dpm/capsule_restore_admission.h"
 #include "runtime/dpm/dpm_engine.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_settings.h"
@@ -39,12 +40,20 @@ class EngineDPMAgentRuntime final : public DPMAgentRuntime {
   static absl::StatusOr<std::unique_ptr<EngineDPMAgentRuntime>> Create(
       Engine* engine, SessionConfig session_config,
       std::optional<SessionHandoffIdentity> expected_identity = std::nullopt);
-
+  // Enables the independent CapsuleRestore guarantee for the exact same
+  // resolved stateful SessionConfig used by this live parent runtime.
+  static absl::StatusOr<std::unique_ptr<EngineDPMAgentRuntime>> Create(
+      Engine* engine, SessionConfig session_config,
+      CapsuleRestoreAdmissionBinding capsule_restore_admission,
+      std::optional<SessionHandoffIdentity> expected_identity = std::nullopt);
   const SessionHandoffIdentity& GetSessionHandoffIdentity() const override {
     return session_handoff_identity_;
   }
 
+  absl::Status ValidateSupport() const override;
   absl::Status ValidateSessionHandoffSupport() const override;
+  absl::StatusOr<std::optional<AuthenticatedCapsuleRestoreAdmission>>
+  GetAuthenticatedCapsuleRestoreAdmission() const override;
 
   absl::StatusOr<std::unique_ptr<Engine::Session>> CreateSession() override;
 
@@ -53,18 +62,40 @@ class EngineDPMAgentRuntime final : public DPMAgentRuntime {
       const DPMAgentGenerationRequest& request) override;
 
  private:
-  EngineDPMAgentRuntime(Engine* engine, SessionConfig resolved_session_config,
-                        SessionHandoffIdentity session_handoff_identity)
+  static absl::StatusOr<std::unique_ptr<EngineDPMAgentRuntime>> CreateInternal(
+      Engine* engine, SessionConfig session_config,
+      std::optional<CapsuleRestoreAdmissionBinding> capsule_restore_admission,
+      std::optional<SessionHandoffIdentity> expected_identity);
+
+  EngineDPMAgentRuntime(
+      Engine* engine, SessionConfig resolved_session_config,
+      SessionHandoffIdentity session_handoff_identity,
+      std::optional<CapsuleRestoreAdmissionBinding> capsule_restore_admission,
+      std::optional<AuthenticatedCapsuleRestoreAdmission>
+          initial_capsule_restore_admission)
       : engine_(engine),
         resolved_session_config_(std::move(resolved_session_config)),
-        session_handoff_identity_(session_handoff_identity) {}
+        session_handoff_identity_(session_handoff_identity),
+        capsule_restore_admission_(std::move(capsule_restore_admission)),
+        initial_capsule_restore_admission_(
+            std::move(initial_capsule_restore_admission)) {}
 
   absl::Status ValidateSession(const Engine::Session& session) const;
+  // Generation/profile support is deliberately separate from capsule
+  // support. CanonicalWinnerReplay can generate and publish a winner even
+  // when the resolved session cannot export a complete handoff envelope.
+  absl::Status ValidateRuntimeSupport() const;
   absl::Status ProbeSessionHandoffSupport() const;
+  absl::StatusOr<AuthenticatedCapsuleRestoreAdmission>
+  ResolveCurrentCapsuleRestoreAdmission() const;
 
   Engine* const engine_;
   const SessionConfig resolved_session_config_;
   const SessionHandoffIdentity session_handoff_identity_;
+  const std::optional<CapsuleRestoreAdmissionBinding>
+      capsule_restore_admission_;
+  const std::optional<AuthenticatedCapsuleRestoreAdmission>
+      initial_capsule_restore_admission_;
 };
 
 }  // namespace litert::lm

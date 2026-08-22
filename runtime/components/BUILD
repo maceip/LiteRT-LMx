@@ -166,6 +166,26 @@ cc_test(
 )
 
 cc_library(
+    name = "greedy_cpu_sampler",
+    srcs = ["greedy_cpu_sampler.cc"],
+    hdrs = ["greedy_cpu_sampler.h"],
+    deps = [
+        ":sampler",
+        "//runtime/proto:sampler_params_cc_proto",
+        "//runtime/util:convert_tensor_buffer",
+        "@com_google_absl//absl/memory",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+        "@litert//litert/cc:litert_element_type",
+        "@litert//litert/cc:litert_macros",
+        "@litert//litert/cc:litert_tensor_buffer",
+        "@litert//tflite/types:half",
+    ],
+)
+
+cc_library(
     name = "top_p_cpu_sampler",
     srcs = ["top_p_cpu_sampler.cc"],
     hdrs = ["top_p_cpu_sampler.h"],
@@ -212,6 +232,7 @@ cc_library(
     srcs = ["sampler_factory.cc"],
     hdrs = ["sampler_factory.h"],
     deps = [
+        ":greedy_cpu_sampler",
         ":sampler",
         ":top_p_cpu_sampler",
         "@com_google_absl//absl/base:core_headers",
@@ -306,6 +327,7 @@ cc_library(
     name = "model_resources",
     hdrs = ["model_resources.h"],
     deps = [
+        "//runtime/platform/hash",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",

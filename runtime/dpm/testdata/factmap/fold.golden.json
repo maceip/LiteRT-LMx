@@ -1,0 +1,1 @@
+{"schema_id":"dpm.factmap","facts":[{"id":"customer.name","value":"Zoë","source_event":2,"valid_from":0,"retracted_at":2,"prev":null},{"id":"risk.level","value":"high","source_event":1,"valid_from":1,"retracted_at":null,"prev":null}]}

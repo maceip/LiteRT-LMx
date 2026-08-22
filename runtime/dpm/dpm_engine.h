@@ -25,14 +25,24 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
+#include "runtime/dpm/capsule_restore_admission.h"
+#include "runtime/dpm/capsule_restore_evidence.h"
+#include "runtime/dpm/capsule_restore_evidence_codec.h"
+#include "runtime/dpm/dpm_capabilities.h"
 #include "runtime/dpm/dpm_event_log.h"
+#include "runtime/dpm/dpm_prepared_prefill_plan.h"
 #include "runtime/dpm/dpm_projection_manifest.h"
+#include "runtime/dpm/dpm_replay_mode.h"
 #include "runtime/dpm/session_checkpoint.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/session_handoff.h"
+#include "runtime/engine/session_handoff_capability.h"
 #include "runtime/platform/hash/hasher.h"
 
 namespace litert::lm {
+
+class DPMAgentReplayRuntime;
+struct ExactRegenerationDPMAgentPhysicalExecution;
 
 class DPMClock {
  public:
@@ -57,6 +67,32 @@ struct DPMProjectionOutcome {
   // digest invalidates a session checkpoint even when model/runtime identity
   // remains compatible.
   DPMProjectionManifest manifest;
+
+  // Optional compact semantic views for the model context. The authoritative
+  // projected memory and raw request remain in the durable receipt. These
+  // views are committed by canonical_agent_input, the logical agent request
+  // hash, and the transcript hash; they do not replace either authoritative
+  // value or its provenance.
+  std::optional<std::string> model_visible_memory;
+  std::optional<std::string> model_visible_input;
+};
+
+// Complete per-operation authorization for one CapsuleRestore own-position
+// restore. The authenticated source capture proves the durable checkpoint's
+// provenance; current_authority must equal the authority freshly resolved from
+// the loaded Engine; target_state is derived by DPMEngine from the current
+// authoritative raw-log request; and the reauthentication evidence proves the
+// exact durable envelope was rewrapped into the transient envelope imported by
+// the live target. No individual hash in this object authorizes restoration.
+struct DPMAgentCapsuleRestoreOperation {
+  static constexpr uint32_t kFormatVersion =
+      kCapsuleRestoreEvidenceFormatVersion;
+
+  uint32_t format_version = kFormatVersion;
+  CapsuleCaptureEvidence source_capture_evidence;
+  CapsuleRestoreAuthority current_authority;
+  CapsuleDPMRestoreTarget target_state;
+  SessionHandoffReauthenticationEvidence durable_to_transient_reauthentication;
 };
 
 // Projection is an explicit dependency. Production providers must treat the
@@ -73,6 +109,19 @@ class DPMProjectionProvider {
   virtual absl::Status ValidateSupport() const {
     return absl::UnimplementedError(
         "DPM projection provider does not support preflight admission.");
+  }
+  // Returns the provider's immutable named replay guarantee without running
+  // projection. DPMEngine requires this to match the agent stage before it
+  // appends a recoverable input event; a provider that cannot disclose its
+  // mode fails closed through the default implementation.
+  virtual absl::StatusOr<DPMReplayMode> GetReplayMode() const {
+    absl::StatusOr<DPMStageCapabilities> capabilities = GetCapabilities();
+    if (!capabilities.ok()) return capabilities.status();
+    return capabilities->replay_mode;
+  }
+  virtual absl::StatusOr<DPMStageCapabilities> GetCapabilities() const {
+    return absl::UnimplementedError(
+        "DPM projection provider does not expose capabilities.");
   }
   virtual absl::StatusOr<DPMProjectionOutcome> Project(
       const DPMProjectionRequest& request) = 0;
@@ -98,12 +147,31 @@ struct DPMAgentGenerationRequest {
   // delta; on fallback it contains the full log-derived transcript followed
   // by the current input.
   std::vector<PrefillChunk> canonical_prefill_chunks;
+  // The logical request hash remains unchanged when a checkpoint replaces
+  // full prefill with an authenticated suffix. Low-level runtimes use it only
+  // as a binding for their runtime-derived physical plan.
+  Hash256 logical_agent_request_hash;
+  // Restore-only state. The witness must be the independently recomputed live
+  // target returned by ImportHandoffFromWithWitness; a checkpoint ID by itself
+  // cannot authorize delta prefill.
+  std::optional<Hash256> restore_checkpoint_id;
+  std::optional<SessionContinuationStateWitness> restored_state_witness;
+  // Required exactly when a capsule-enabled runtime receives the restore
+  // fields above. It is forbidden for fresh or generation-only execution.
+  std::optional<DPMAgentCapsuleRestoreOperation> capsule_restore_operation;
   int max_output_tokens = 512;
 };
 
 struct DPMAgentGenerationOutcome {
   std::string decision_output;
   std::vector<int> decision_token_ids;
+  // Present for a direct live-runtime generation. Catalog-only materialization
+  // has no physical session and therefore no prepared plan.
+  std::optional<DPMPreparedPrefillPlan> prepared_prefill_plan;
+  // Present exactly when this live invocation passed and executed an
+  // own-position restore operation. This is the same complete canonical
+  // evidence validated before prefill, not a reconstructed post-hoc label.
+  std::optional<CapsuleRestoreEvidence> capsule_restore_evidence;
 };
 
 class DPMAgentRuntime {
@@ -112,12 +180,27 @@ class DPMAgentRuntime {
 
   // This identity is owned by the loaded runtime, not supplied by DPM callers.
   virtual const SessionHandoffIdentity& GetSessionHandoffIdentity() const = 0;
+  // Read-only generation preflight. This is deliberately separate from
+  // capsule support so WinnerReplay capability discovery can revalidate the
+  // loaded Engine without requiring handoff support.
+  virtual absl::Status ValidateSupport() const {
+    return absl::UnimplementedError(
+        "DPM agent runtime does not expose generation support preflight.");
+  }
   // Must validate the fully resolved loaded session profile without creating
   // durable DPM input. A profile that cannot export and restore a complete
   // capsule fails here rather than trapping a milestone retry after inference.
   virtual absl::Status ValidateSessionHandoffSupport() const {
     return absl::UnimplementedError(
         "DPM agent runtime does not support exact session handoff.");
+  }
+  // Capsule authority is exposed as one complete authenticated object, not
+  // detachable record, capability, or coverage hashes. Implementations must
+  // freshly derive and reauthenticate it at each call. Generation-only
+  // runtimes return nullopt.
+  virtual absl::StatusOr<std::optional<AuthenticatedCapsuleRestoreAdmission>>
+  GetAuthenticatedCapsuleRestoreAdmission() const {
+    return std::optional<AuthenticatedCapsuleRestoreAdmission>();
   }
   virtual absl::StatusOr<std::unique_ptr<Engine::Session>> CreateSession() = 0;
   virtual absl::StatusOr<DPMAgentGenerationOutcome> Generate(
@@ -127,14 +210,30 @@ class DPMAgentRuntime {
 struct DPMEngineConfig {
   // Zero disables new automatic captures. Restore remains independently
   // controlled so an existing disposable checkpoint cache can still be used.
-  uint32_t checkpoint_interval_turns = 1;
-  bool restore_session_checkpoints = true;
-  bool require_checkpoint_at_milestone = true;
+  // Both default off: a default-constructed engine config therefore remains
+  // valid without a repository, transport keys, or CapsuleRestore admission.
+  // A captured milestone is an own-position prefill boundary: subsequent
+  // turns restore it and prefill only the exact response-event suffix. The
+  // interval therefore changes inference work, not merely checkpoint names.
+  uint32_t checkpoint_interval_turns = 0;
+  bool restore_session_checkpoints = false;
+  // Optional by default because CanonicalWinnerReplay may recover an
+  // authenticated catalog winner that its current backend cannot independently
+  // rematerialize byte-for-byte. Setting this true makes that condition and any
+  // capture/publication failure abort the turn instead of committing without a
+  // disposable checkpoint. It is invalid when automatic capture milestones
+  // are disabled.
+  bool require_checkpoint_at_milestone = false;
   // Product admission is capped by kMaximumDPMGenerationTokens; this is not
   // an unbounded backend integer knob.
   int max_decision_tokens = 512;
   std::string checkpoint_key_id;
   std::string checkpoint_authentication_key;
+  // Authenticates disposable capture/restore evidence records. This key
+  // and key ID must be distinct from the durable checkpoint and fixed
+  // request-transient capsule domains.
+  std::string operation_evidence_key_id;
+  std::string operation_evidence_authentication_key;
 };
 
 struct DPMTurnRequest {
@@ -153,7 +252,39 @@ struct DPMTurnResult {
   uint64_t input_event_index = 0;
   uint64_t response_event_index = 0;
   Hash256 projection_manifest_hash;
+  DPMReplayMode projection_replay_mode = DPMReplayMode::kCanonicalWinnerReplay;
+  Hash256 projection_execution_evidence_hash;
+  std::optional<Hash256> projection_exact_profile_id;
+  std::optional<Hash256> projection_exact_profile_admission_record_id;
+  DPMReplayMode agent_replay_mode = DPMReplayMode::kCanonicalWinnerReplay;
+  Hash256 agent_execution_evidence_hash;
+  std::optional<Hash256> agent_exact_profile_id;
+  std::optional<Hash256> agent_exact_profile_admission_record_id;
+  std::optional<Hash256> agent_exact_output_evidence_hash;
+  uint32_t agent_exact_logit_frame_count = 0;
+  bool agent_reused_canonical_winner = false;
+  bool agent_rematerialized_canonical_winner = false;
+  // This remains exclusively a live-parent WinnerReplay statement. Exact
+  // worker capsules use the separate authenticated provenance below.
+  bool agent_producing_session_matched_output = false;
+  bool agent_worker_capsule_matched_output = false;
   std::optional<Hash256> session_checkpoint_id;
+  std::optional<Hash256> restored_from_session_checkpoint_id;
+  DPMCheckpointCaptureOrigin checkpoint_capture_origin =
+      DPMCheckpointCaptureOrigin::kNone;
+  DPMCheckpointWorkerPrefillMode agent_worker_prefill_mode =
+      DPMCheckpointWorkerPrefillMode::kNone;
+  Hash256 agent_physical_execution_plan_hash;
+  std::optional<Hash256> agent_capsule_restore_admission_record_id;
+  std::optional<Hash256> agent_capsule_restore_capability_id;
+  std::optional<Hash256> agent_capsule_restore_coverage_id;
+  std::optional<DPMExactWorkerCheckpointProvenance>
+      agent_exact_worker_checkpoint_provenance;
+  std::optional<DPMPreparedPrefillWorkBinding> agent_prepared_prefill_work;
+  std::optional<DPMCheckpointCaptureEvidenceBinding>
+      published_checkpoint_capture;
+  std::optional<Hash256> restored_checkpoint_capture_evidence_id;
+  std::optional<Hash256> agent_capsule_restore_evidence_id;
   bool restored_session_checkpoint = false;
   bool recovered_committed_turn = false;
 };
@@ -180,59 +311,103 @@ struct DPMCorrectionResult {
 class DPMEngine {
  public:
   DPMEngine(DPMEventLog* log, DPMProjectionProvider* projection_provider,
-            DPMAgentRuntime* agent_runtime,
+            DPMAgentReplayRuntime* agent_runtime,
             DPMSessionCheckpointRepository* checkpoint_repository,
+            DPMEngineConfig config, DPMClock* clock = nullptr);
+  DPMEngine(DPMEventLog* log, DPMProjectionProvider* projection_provider,
+            DPMAgentReplayRuntime* agent_runtime,
+            DPMSessionCheckpointRepository* checkpoint_repository,
+            CapsuleRestoreEvidenceRepository* evidence_repository,
             DPMEngineConfig config, DPMClock* clock = nullptr);
 
   absl::Status ValidateConfiguration() const;
+  // Read-only, runtime-derived product contract. This reauthenticates current
+  // exact/CapsuleRestore admission and never exposes checkpoint keys or lets a
+  // caller select a derivative cache object.
+  absl::StatusOr<DPMCapabilities> GetCapabilities() const;
   absl::StatusOr<DPMTurnResult> RunTurn(const DPMTurnRequest& request);
   absl::StatusOr<DPMCorrectionResult> AppendCorrection(
       const DPMCorrectionRequest& request);
 
  private:
+  struct CapsuleRestoreRuntimeAuthority {
+    AuthenticatedCapsuleRestoreAdmission admission;
+    CapsuleRestoreAuthority authority;
+  };
+
   struct RestoreCandidate {
     DPMTurnReceipt receipt;
     DPMSessionCheckpointArtifact artifact;
+    CapsuleCaptureEvidence capture_evidence;
+  };
+
+  struct CheckpointCapture {
+    DPMSessionCheckpointArtifact artifact;
+    CapsuleCaptureEvidence capture_evidence;
   };
 
   absl::StatusOr<std::optional<DPMTurnResult>> RecoverCommittedTurn(
       const DPMLogSnapshot& snapshot, const DPMTurnRequest& request) const;
   absl::StatusOr<std::optional<RestoreCandidate>> FindRestoreCandidate(
-      const DPMLogSnapshot& current,
-      const DPMProjectionOutcome& projection) const;
+      const DPMLogSnapshot& current, const DPMProjectionOutcome& projection,
+      const CapsuleRestoreRuntimeAuthority& current_authority) const;
   absl::Status ValidateRestoreCandidate(
-      const DPMLogSnapshot& current,
-      const DPMProjectionOutcome& projection,
-      const RestoreCandidate& candidate) const;
+      const DPMLogSnapshot& current, const DPMProjectionOutcome& projection,
+      const RestoreCandidate& candidate,
+      const CapsuleRestoreRuntimeAuthority& current_authority) const;
+  absl::StatusOr<CapsuleRestoreRuntimeAuthority>
+  RequireCurrentCapsuleRestoreAuthority() const;
   absl::StatusOr<std::vector<DPMAgentGenerationRequest::PrefillChunk>>
-  BuildFullTranscriptChunks(
-      const DPMLogSnapshot& snapshot,
+  BuildFullTranscriptChunks(const DPMLogSnapshot& snapshot,
       absl::string_view current_agent_input,
       const Hash256& current_correction_digest) const;
   absl::StatusOr<std::vector<DPMAgentGenerationRequest::PrefillChunk>>
-  BuildDeltaTranscriptChunks(
-      const DPMLogSnapshot& snapshot, uint64_t restored_response_event_index,
-      absl::string_view current_agent_input) const;
+  BuildDeltaTranscriptChunks(const DPMLogSnapshot& snapshot,
+                             uint64_t restored_response_event_index,
+      absl::string_view current_agent_input,
+      const Hash256& current_correction_digest) const;
   absl::StatusOr<std::string> BuildCanonicalAgentInput(
       const DPMTurnRequest& request, const DPMLogSnapshot& source_snapshot,
-      uint64_t input_event_index,
-      const DPMProjectionOutcome& projection) const;
+      uint64_t input_event_index, const DPMProjectionOutcome& projection) const;
   absl::StatusOr<Hash256> ComputeTranscriptHash(
       const DPMLogSnapshot& snapshot, absl::string_view current_agent_input,
       absl::string_view current_decision,
       const std::vector<int>& current_decision_token_ids,
       const Hash256& current_correction_digest) const;
-  absl::StatusOr<DPMSessionCheckpointArtifact> CaptureProducingSession(
+  absl::StatusOr<Hash256> ComputeTranscriptPrefixHash(
+      const DPMLogSnapshot& snapshot, absl::string_view current_agent_input,
+      const Hash256& current_correction_digest) const;
+  absl::StatusOr<CheckpointCapture> CaptureProducingSession(
       Engine::Session* session, const DPMLogSnapshot& source_snapshot,
-      uint64_t response_event_index,
-      const DPMProjectionOutcome& projection,
-      const Hash256& agent_request_hash,
-      const Hash256& transcript_hash, int64_t created_unix_micros) const;
+      uint64_t response_event_index, const DPMProjectionOutcome& projection,
+      const Hash256& agent_request_hash, const Hash256& transcript_prefix_hash,
+      const Hash256& transcript_hash,
+      const CapsuleRestoreRuntimeAuthority& capsule_restore_authority,
+      const std::vector<DPMAgentGenerationRequest::PrefillChunk>&
+          physical_prefill_chunks,
+      const DPMPreparedPrefillPlan& prepared_prefill_plan,
+      const Hash256& producing_output_evidence_hash,
+      uint32_t generated_token_count, uint64_t prefill_event_range_start,
+      const std::optional<CapsuleRestoreEvidence>& parent_restore_evidence,
+      absl::string_view operation_id, int64_t created_unix_micros) const;
+  absl::StatusOr<CheckpointCapture> BuildExactWorkerCheckpointCapture(
+      absl::string_view authenticated_envelope,
+      const ExactRegenerationDPMAgentPhysicalExecution& physical_execution,
+      const DPMLogSnapshot& source_snapshot, uint64_t response_event_index,
+      const DPMProjectionOutcome& projection, const Hash256& agent_request_hash,
+      const Hash256& transcript_prefix_hash, const Hash256& transcript_hash,
+      const CapsuleRestoreRuntimeAuthority& capsule_restore_authority,
+      const std::vector<DPMAgentGenerationRequest::PrefillChunk>&
+          physical_prefill_chunks,
+      uint64_t prefill_event_range_start,
+      const std::optional<CapsuleRestoreEvidence>& parent_restore_evidence,
+      int64_t created_unix_micros) const;
 
   DPMEventLog* log_;
   DPMProjectionProvider* projection_provider_;
-  DPMAgentRuntime* agent_runtime_;
+  DPMAgentReplayRuntime* agent_runtime_;
   DPMSessionCheckpointRepository* checkpoint_repository_;
+  CapsuleRestoreEvidenceRepository* evidence_repository_;
   DPMEngineConfig config_;
   DPMClock* clock_;
   SystemDPMClock system_clock_;

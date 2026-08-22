@@ -1,0 +1,1975 @@
+// Copyright 2026 The ODML Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "runtime/dpm/dpm_replay_executor.h"
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <optional>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/status_macros.h"  // from @com_google_absl
+#include "absl/status/statusor.h"  // from @com_google_absl
+#include "absl/strings/string_view.h"  // from @com_google_absl
+#include "runtime/dpm/canonical_replay_catalog.h"
+#include "runtime/dpm/capsule_restore_evidence_binding.h"
+#include "runtime/dpm/dpm_event_log.h"
+#include "runtime/dpm/dpm_replay_mode.h"
+#include "runtime/dpm/engine_fresh_worker_contract.h"
+#include "runtime/dpm/exact_profile_admission.h"
+#include "runtime/dpm/fresh_worker_protocol.h"
+#include "runtime/platform/hash/sha256_hasher.h"
+
+namespace litert::lm {
+namespace {
+
+constexpr std::array<char, 8> kCanonicalRequestMagic = {'D', 'P', 'M', 'R',
+                                                        'E', 'Q', '0', '1'};
+constexpr uint64_t kMaximumEvidenceKeyIdBytes = 256;
+constexpr uint64_t kMaximumEvidenceAuthenticationKeyBytes = 4096;
+constexpr absl::string_view kExactRegenerationRunEvidenceDomain =
+    "LITERT_LMX_EXACT_REGENERATION_RUN_EVIDENCE_SHA256";
+constexpr absl::string_view kExactRegenerationRequestEvidenceDomain =
+    "LITERT_LMX_EXACT_REGENERATION_REQUEST_EVIDENCE_SHA256";
+
+bool IsZeroHash(const Hash256& hash) {
+  uint8_t combined = 0;
+  for (uint8_t byte : hash.bytes) combined |= byte;
+  return combined == 0;
+}
+
+bool HasControlByte(absl::string_view bytes) {
+  for (unsigned char byte : bytes) {
+    if (byte < 0x20 || byte == 0x7f) return true;
+  }
+  return false;
+}
+
+void AppendU32(uint32_t value, std::string* output) {
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    output->push_back(static_cast<char>((value >> shift) & 0xff));
+  }
+}
+
+void AppendU64(uint64_t value, std::string* output) {
+  for (int shift = 56; shift >= 0; shift -= 8) {
+    output->push_back(static_cast<char>((value >> shift) & 0xff));
+  }
+}
+
+void AppendHash(const Hash256& hash, std::string* output) {
+  output->append(reinterpret_cast<const char*>(hash.bytes.data()),
+                 hash.bytes.size());
+}
+
+void AppendIdentity(const SessionHandoffIdentity& identity,
+                    std::string* output) {
+  AppendHash(identity.model_artifact_hash, output);
+  AppendHash(identity.runtime_artifact_hash, output);
+  AppendHash(identity.inference_profile_hash, output);
+}
+
+void AppendString(absl::string_view value, std::string* output) {
+  AppendU32(static_cast<uint32_t>(value.size()), output);
+  output->append(value.data(), value.size());
+}
+
+void AppendOptionalHash(const std::optional<Hash256>& value,
+                        std::string* output) {
+  AppendU32(value.has_value() ? 1 : 0, output);
+  if (value.has_value()) AppendHash(*value, output);
+}
+
+bool IsCompleteIdentity(const SessionHandoffIdentity& identity) {
+  return !IsZeroHash(identity.model_artifact_hash) &&
+         !IsZeroHash(identity.runtime_artifact_hash) &&
+         !IsZeroHash(identity.inference_profile_hash);
+}
+
+void AppendContinuationWitness(const SessionContinuationStateWitness& witness,
+                               std::string* output) {
+  AppendU32(witness.format_version, output);
+  AppendHash(witness.witness_id, output);
+  AppendIdentity(witness.session_identity, output);
+  AppendU32(static_cast<uint32_t>(witness.phase), output);
+  AppendU32(static_cast<uint32_t>(witness.current_step), output);
+  AppendU32(witness.ran_decode ? 1 : 0, output);
+  AppendHash(witness.processed_history_token_bytes_hash, output);
+  AppendHash(witness.envelope_hash, output);
+  AppendU64(witness.envelope_size, output);
+  AppendString(witness.key_id, output);
+}
+
+void AppendReauthenticationEvidence(
+    const SessionHandoffReauthenticationEvidence& evidence,
+    std::string* output) {
+  AppendU32(evidence.format_version, output);
+  AppendHash(evidence.evidence_id, output);
+  AppendIdentity(evidence.session_identity, output);
+  AppendHash(evidence.canonical_continuation_state_hash, output);
+  AppendHash(evidence.source_envelope_hash, output);
+  AppendU64(evidence.source_envelope_size, output);
+  AppendString(evidence.source_key_id, output);
+  AppendHash(evidence.destination_envelope_hash, output);
+  AppendU64(evidence.destination_envelope_size, output);
+  AppendString(evidence.destination_key_id, output);
+  AppendHash(evidence.capsule_codec_contract_hash, output);
+  AppendHash(evidence.reauthentication_contract_hash, output);
+  AppendString(evidence.purpose, output);
+}
+
+absl::Status ValidateEvidenceKeyId(absl::string_view key_id) {
+  if (key_id.empty() || key_id.size() > kMaximumEvidenceKeyIdBytes ||
+      HasControlByte(key_id)) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration evidence authentication key ID is invalid.");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateHandoffOptionsForIdentity(
+    const SessionHandoffOptions& options,
+    const SessionHandoffIdentity& expected_identity) {
+  ABSL_RETURN_IF_ERROR(ValidateEvidenceKeyId(options.key_id));
+  if (options.authentication_key.size() < 32 ||
+      options.authentication_key.size() >
+          kMaximumEvidenceAuthenticationKeyBytes) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration handoff key must contain 32 to 4096 bytes.");
+  }
+  if (!options.expected_identity.has_value() ||
+      *options.expected_identity != expected_identity ||
+      !IsCompleteIdentity(*options.expected_identity)) {
+    return absl::FailedPreconditionError(
+        "Exact-regeneration handoff options do not assert the "
+        "Engine-derived session identity.");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateTransientCapsuleEvidence(
+    const FreshWorkerProducingCapsuleEvidence& evidence) {
+  if (!IsCompleteIdentity(evidence.session_identity) ||
+      evidence.transient_envelope_size == 0 ||
+      evidence.transient_envelope_size > kMaximumFreshWorkerCapsuleBytes ||
+      IsZeroHash(evidence.transient_envelope_hash) ||
+      IsZeroHash(evidence.output_evidence_hash)) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration transient capsule evidence is incomplete.");
+  }
+  ABSL_RETURN_IF_ERROR(
+      ValidateSessionContinuationStateWitness(evidence.producer_first_export));
+  ABSL_RETURN_IF_ERROR(
+      ValidateSessionContinuationStateWitness(evidence.producer_second_export));
+  ABSL_RETURN_IF_ERROR(
+      ValidateSessionContinuationStateWitness(evidence.fresh_import_target));
+  if (evidence.producer_first_export != evidence.producer_second_export ||
+      evidence.producer_first_export != evidence.fresh_import_target) {
+    return absl::DataLossError(
+        "Exact-regeneration producer/export/import witnesses disagree.");
+  }
+  const SessionContinuationStateWitness& witness =
+      evidence.producer_first_export;
+  if (witness.session_identity != evidence.session_identity ||
+      witness.phase != SessionHandoffPhase::kDecoded || !witness.ran_decode ||
+      witness.current_step <= 0 ||
+      witness.envelope_size != evidence.transient_envelope_size ||
+      witness.envelope_hash != evidence.transient_envelope_hash ||
+      witness.key_id != kFreshWorkerTransientProducingKeyId) {
+    return absl::DataLossError(
+        "Exact-regeneration producing witness does not bind the sealed "
+        "decoded capsule.");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateDurableCapsuleEvidence(
+    const FreshWorkerDurableProducingCapsuleEvidence& evidence) {
+  ABSL_RETURN_IF_ERROR(ValidateEvidenceKeyId(evidence.key_id));
+  if (!IsCompleteIdentity(evidence.session_identity) ||
+      evidence.envelope_size == 0 ||
+      evidence.envelope_size > kMaximumFreshWorkerCapsuleBytes ||
+      IsZeroHash(evidence.envelope_hash) ||
+      IsZeroHash(evidence.output_evidence_hash)) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration durable capsule evidence is incomplete.");
+  }
+  ABSL_RETURN_IF_ERROR(ValidateSessionHandoffReauthenticationEvidence(
+      evidence.reauthentication_evidence));
+  const SessionHandoffReauthenticationEvidence& reauthentication =
+      evidence.reauthentication_evidence;
+  if (reauthentication.session_identity != evidence.session_identity ||
+      reauthentication.purpose !=
+          kFreshWorkerTransientProducingToDurableReauthenticationPurpose ||
+      reauthentication.source_key_id != kFreshWorkerTransientProducingKeyId ||
+      reauthentication.destination_envelope_hash != evidence.envelope_hash ||
+      reauthentication.destination_envelope_size != evidence.envelope_size ||
+      reauthentication.destination_key_id != evidence.key_id) {
+    return absl::DataLossError(
+        "Exact-regeneration durable capsule evidence is not bound to its "
+        "authenticated transient-to-durable rewrap.");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateProducingCapsuleEvidencePair(
+    const FreshWorkerProducingCapsuleEvidence& transient,
+    const FreshWorkerDurableProducingCapsuleEvidence& durable) {
+  ABSL_RETURN_IF_ERROR(ValidateTransientCapsuleEvidence(transient));
+  ABSL_RETURN_IF_ERROR(ValidateDurableCapsuleEvidence(durable));
+  const SessionHandoffReauthenticationEvidence& reauthentication =
+      durable.reauthentication_evidence;
+  if (transient.session_identity != durable.session_identity ||
+      transient.output_evidence_hash != durable.output_evidence_hash ||
+      reauthentication.source_envelope_hash !=
+          transient.transient_envelope_hash ||
+      reauthentication.source_envelope_size !=
+          transient.transient_envelope_size ||
+      reauthentication.session_identity != transient.session_identity) {
+    return absl::DataLossError(
+        "Exact-regeneration transient capsule, durable capsule, and "
+        "reauthentication evidence disagree.");
+  }
+  return absl::OkStatus();
+}
+
+void AppendTransientCapsuleEvidence(
+    const FreshWorkerProducingCapsuleEvidence& evidence, std::string* output) {
+  AppendIdentity(evidence.session_identity, output);
+  AppendU64(evidence.transient_envelope_size, output);
+  AppendHash(evidence.transient_envelope_hash, output);
+  AppendHash(evidence.output_evidence_hash, output);
+  AppendContinuationWitness(evidence.producer_first_export, output);
+  AppendContinuationWitness(evidence.producer_second_export, output);
+  AppendContinuationWitness(evidence.fresh_import_target, output);
+}
+
+void AppendDurableCapsuleEvidence(
+    const FreshWorkerDurableProducingCapsuleEvidence& evidence,
+    std::string* output) {
+  AppendIdentity(evidence.session_identity, output);
+  AppendString(evidence.key_id, output);
+  AppendU64(evidence.envelope_size, output);
+  AppendHash(evidence.envelope_hash, output);
+  AppendHash(evidence.output_evidence_hash, output);
+  AppendReauthenticationEvidence(evidence.reauthentication_evidence, output);
+}
+
+std::string EncodeExactRegenerationRunEvidenceFields(
+    const ExactRegenerationRunEvidence& evidence) {
+  std::string encoded;
+  AppendU32(evidence.format_version, &encoded);
+  AppendU32(evidence.run_index, &encoded);
+  AppendU64(static_cast<uint64_t>(evidence.process_id), &encoded);
+  AppendHash(evidence.challenge_nonce, &encoded);
+  AppendHash(evidence.worker_instance_nonce, &encoded);
+  AppendHash(evidence.request_envelope_hash, &encoded);
+  AppendHash(evidence.result_envelope_hash, &encoded);
+  AppendHash(evidence.worker_certification_hash, &encoded);
+  AppendHash(evidence.launch_spec_hash, &encoded);
+  AppendHash(evidence.output_evidence_hash, &encoded);
+  AppendOptionalHash(evidence.restored_checkpoint_id, &encoded);
+  AppendU32(evidence.prepared_prefill_plan.has_value() ? 1 : 0, &encoded);
+  if (evidence.prepared_prefill_plan.has_value()) {
+    // The validated plan ID is the canonical content address for every plan
+    // field, including this run's restore witness ID when present.
+    AppendU32(evidence.prepared_prefill_plan->format_version, &encoded);
+    AppendHash(evidence.prepared_prefill_plan->plan_id, &encoded);
+  }
+  AppendU32(evidence.restored_state_witness.has_value() ? 1 : 0, &encoded);
+  if (evidence.restored_state_witness.has_value()) {
+    AppendContinuationWitness(*evidence.restored_state_witness, &encoded);
+  }
+  AppendU32(evidence.restore_reauthentication_evidence.has_value() ? 1 : 0,
+            &encoded);
+  if (evidence.restore_reauthentication_evidence.has_value()) {
+    AppendReauthenticationEvidence(*evidence.restore_reauthentication_evidence,
+                                   &encoded);
+  }
+  AppendU32(evidence.transient_producing_capsule_evidence.has_value() ? 1 : 0,
+            &encoded);
+  if (evidence.transient_producing_capsule_evidence.has_value()) {
+    AppendTransientCapsuleEvidence(
+        *evidence.transient_producing_capsule_evidence, &encoded);
+  }
+  AppendU32(evidence.durable_producing_capsule_evidence.has_value() ? 1 : 0,
+            &encoded);
+  if (evidence.durable_producing_capsule_evidence.has_value()) {
+    AppendDurableCapsuleEvidence(*evidence.durable_producing_capsule_evidence,
+                                 &encoded);
+  }
+  return encoded;
+}
+
+absl::Status ValidateExactRegenerationRunEvidenceFields(
+    const ExactRegenerationRunEvidence& evidence, bool require_evidence_id) {
+  if (evidence.format_version != ExactRegenerationRunEvidence::kFormatVersion) {
+    return absl::FailedPreconditionError(
+        "Exact-regeneration run-evidence version is unsupported.");
+  }
+  if (evidence.run_index >= kMaximumFreshWorkerRuns ||
+      evidence.process_id <= 0 || IsZeroHash(evidence.challenge_nonce) ||
+      IsZeroHash(evidence.worker_instance_nonce) ||
+      IsZeroHash(evidence.request_envelope_hash) ||
+      IsZeroHash(evidence.result_envelope_hash) ||
+      IsZeroHash(evidence.worker_certification_hash) ||
+      evidence.launch_spec_hash != ComputeFreshWorkerLaunchSpecHash(
+                                       evidence.worker_certification_hash) ||
+      IsZeroHash(evidence.output_evidence_hash) ||
+      (require_evidence_id && IsZeroHash(evidence.evidence_id))) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration run evidence is incomplete.");
+  }
+  if (evidence.restored_checkpoint_id.has_value() &&
+      IsZeroHash(*evidence.restored_checkpoint_id)) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration restored checkpoint ID must be nonzero.");
+  }
+  if (evidence.prepared_prefill_plan.has_value()) {
+    ABSL_RETURN_IF_ERROR(
+        ValidateDPMPreparedPrefillPlan(*evidence.prepared_prefill_plan));
+  }
+  if (evidence.restored_state_witness.has_value()) {
+    ABSL_RETURN_IF_ERROR(ValidateSessionContinuationStateWitness(
+        *evidence.restored_state_witness));
+  }
+  if (evidence.restore_reauthentication_evidence.has_value()) {
+    ABSL_RETURN_IF_ERROR(ValidateSessionHandoffReauthenticationEvidence(
+        *evidence.restore_reauthentication_evidence));
+  }
+  if (!evidence.prepared_prefill_plan.has_value()) {
+    if (evidence.restored_checkpoint_id.has_value() ||
+        evidence.restored_state_witness.has_value() ||
+        evidence.restore_reauthentication_evidence.has_value()) {
+      return absl::InvalidArgumentError(
+          "Exact-regeneration run without a prepared plan cannot claim a "
+          "restore.");
+    }
+  } else {
+    const DPMPreparedPrefillPlan& plan = *evidence.prepared_prefill_plan;
+    switch (plan.start_kind) {
+      case DPMPreparedPrefillStartKind::kFreshSession:
+        if (evidence.restored_checkpoint_id.has_value() ||
+            evidence.restored_state_witness.has_value() ||
+            evidence.restore_reauthentication_evidence.has_value()) {
+          return absl::DataLossError(
+              "Fresh exact-regeneration run carries restored-state evidence.");
+        }
+        break;
+      case DPMPreparedPrefillStartKind::kOwnPositionRestore: {
+        if (!evidence.restored_checkpoint_id.has_value() ||
+            !evidence.restored_state_witness.has_value() ||
+            !evidence.restore_reauthentication_evidence.has_value() ||
+            plan.restore_checkpoint_id != evidence.restored_checkpoint_id ||
+            plan.start_state_witness_id !=
+                evidence.restored_state_witness->witness_id ||
+            plan.session_identity !=
+                evidence.restored_state_witness->session_identity ||
+            evidence.restored_state_witness->phase !=
+                SessionHandoffPhase::kDecoded ||
+            !evidence.restored_state_witness->ran_decode ||
+            evidence.restored_state_witness->current_step <= 0 ||
+            evidence.restored_state_witness->key_id !=
+                kFreshWorkerTransientRestoreKeyId ||
+            static_cast<uint64_t>(
+                evidence.restored_state_witness->current_step) !=
+                plan.start_step ||
+            evidence.restored_state_witness
+                    ->processed_history_token_bytes_hash !=
+                plan.start_history_token_bytes_hash ||
+            evidence.restore_reauthentication_evidence->session_identity !=
+                plan.session_identity ||
+            evidence.restore_reauthentication_evidence->purpose !=
+                kFreshWorkerDurableRestoreToTransientReauthenticationPurpose ||
+            evidence.restore_reauthentication_evidence
+                    ->destination_envelope_hash !=
+                evidence.restored_state_witness->envelope_hash ||
+            evidence.restore_reauthentication_evidence
+                    ->destination_envelope_size !=
+                evidence.restored_state_witness->envelope_size ||
+            evidence.restore_reauthentication_evidence->destination_key_id !=
+                evidence.restored_state_witness->key_id) {
+          return absl::DataLossError(
+              "Restored exact-regeneration run has inconsistent checkpoint, "
+              "prepared-plan, live witness, or rewrap evidence.");
+        }
+        break;
+      }
+      default:
+        return absl::InternalError(
+            "Validated exact-regeneration prepared plan lost its start kind.");
+    }
+  }
+  if (evidence.transient_producing_capsule_evidence.has_value() !=
+      evidence.durable_producing_capsule_evidence.has_value()) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration capsule evidence requires both transient and "
+        "durable bindings.");
+  }
+  if (evidence.transient_producing_capsule_evidence.has_value()) {
+    const FreshWorkerProducingCapsuleEvidence& transient =
+        *evidence.transient_producing_capsule_evidence;
+    const FreshWorkerDurableProducingCapsuleEvidence& durable =
+        *evidence.durable_producing_capsule_evidence;
+    ABSL_RETURN_IF_ERROR(
+        ValidateProducingCapsuleEvidencePair(transient, durable));
+    if (!evidence.prepared_prefill_plan.has_value() ||
+        transient.session_identity !=
+            evidence.prepared_prefill_plan->session_identity ||
+        transient.session_identity != durable.session_identity ||
+        transient.output_evidence_hash != durable.output_evidence_hash) {
+      return absl::DataLossError(
+          "Transient and durable producing-capsule evidence disagree.");
+    }
+  }
+  return absl::OkStatus();
+}
+
+std::string EncodeExactRegenerationRequestEvidenceFields(
+    const ExactRegenerationRequestEvidence& evidence) {
+  std::string encoded;
+  AppendU32(evidence.format_version, &encoded);
+  AppendHash(evidence.exact_profile_id, &encoded);
+  AppendHash(evidence.worker_certification_hash, &encoded);
+  AppendHash(evidence.profile_admission_record_id, &encoded);
+  AppendIdentity(evidence.session_identity, &encoded);
+  AppendU32(static_cast<uint32_t>(evidence.stage), &encoded);
+  AppendHash(evidence.request_execution_id, &encoded);
+  AppendHash(evidence.canonical_request_hash, &encoded);
+  AppendHash(evidence.physical_execution_plan_hash, &encoded);
+  AppendU32(static_cast<uint32_t>(evidence.prefill_mode), &encoded);
+  AppendOptionalHash(evidence.restored_checkpoint_id, &encoded);
+  AppendU32(static_cast<uint32_t>(evidence.capture_run_policy), &encoded);
+  AppendU32(static_cast<uint32_t>(evidence.replay_isolation), &encoded);
+  AppendU32(evidence.run_count, &encoded);
+  AppendString(evidence.authentication_key_id, &encoded);
+  AppendHash(evidence.consensus_output_evidence_hash, &encoded);
+  AppendOptionalHash(evidence.agent_logical_request_hash, &encoded);
+  AppendOptionalHash(evidence.consensus_source_chunks_hash, &encoded);
+  AppendOptionalHash(evidence.consensus_resolved_token_plan_hash, &encoded);
+  AppendOptionalHash(evidence.consensus_shape_schedule_hash, &encoded);
+  AppendU32(static_cast<uint32_t>(evidence.runs.size()), &encoded);
+  for (const ExactRegenerationRunEvidence& run : evidence.runs) {
+    // The enclosing ID commits both the nested canonical ID and every nested
+    // field, so an implementation cannot substitute an unchecked digest.
+    AppendHash(run.evidence_id, &encoded);
+    encoded.append(EncodeExactRegenerationRunEvidenceFields(run));
+  }
+  return encoded;
+}
+
+absl::Status ValidateExactRegenerationRequestEvidenceFields(
+    const ExactRegenerationRequestEvidence& evidence,
+    bool require_evidence_id) {
+  if (evidence.format_version !=
+      ExactRegenerationRequestEvidence::kFormatVersion) {
+    return absl::FailedPreconditionError(
+        "Exact-regeneration request-evidence version is unsupported.");
+  }
+  if (IsZeroHash(evidence.exact_profile_id) ||
+      IsZeroHash(evidence.worker_certification_hash) ||
+      IsZeroHash(evidence.profile_admission_record_id) ||
+      !IsCompleteIdentity(evidence.session_identity) ||
+      IsZeroHash(evidence.request_execution_id) ||
+      IsZeroHash(evidence.canonical_request_hash) ||
+      IsZeroHash(evidence.physical_execution_plan_hash) ||
+      IsZeroHash(evidence.consensus_output_evidence_hash) ||
+      (require_evidence_id && IsZeroHash(evidence.evidence_id))) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration request evidence is incomplete.");
+  }
+  ABSL_RETURN_IF_ERROR(ValidateDPMReplayStage(evidence.stage));
+  ABSL_RETURN_IF_ERROR(ValidateEvidenceKeyId(evidence.authentication_key_id));
+  if (evidence.run_count < 2 || evidence.run_count > kMaximumFreshWorkerRuns ||
+      evidence.runs.size() != evidence.run_count) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration request evidence has an invalid run count.");
+  }
+  switch (evidence.prefill_mode) {
+    case FreshWorkerPrefillMode::kFullCanonicalPrefill:
+      if (evidence.restored_checkpoint_id.has_value()) {
+        return absl::InvalidArgumentError(
+            "Full-prefill request evidence cannot claim a restore.");
+      }
+      break;
+    case FreshWorkerPrefillMode::kOwnPositionCapsuleDelta:
+      if (!evidence.restored_checkpoint_id.has_value() ||
+          IsZeroHash(*evidence.restored_checkpoint_id)) {
+        return absl::InvalidArgumentError(
+            "Delta request evidence requires a restored checkpoint.");
+      }
+      break;
+    default:
+      return absl::InvalidArgumentError(
+          "Exact-regeneration request evidence has an unknown prefill mode.");
+  }
+  if (evidence.capture_run_policy !=
+          ExactRegenerationCaptureRunPolicy::kNoCapture &&
+      evidence.capture_run_policy !=
+          ExactRegenerationCaptureRunPolicy::kRunZeroOnly) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration request evidence has an unknown capture policy.");
+  }
+  if (evidence.replay_isolation != FreshWorkerReplayIsolation::kEmptyCatalogs) {
+    return absl::FailedPreconditionError(
+        "Exact-regeneration evidence lacks empty-catalog isolation.");
+  }
+
+  const bool has_agent_consensus =
+      evidence.agent_logical_request_hash.has_value() &&
+      evidence.consensus_source_chunks_hash.has_value() &&
+      evidence.consensus_resolved_token_plan_hash.has_value() &&
+      evidence.consensus_shape_schedule_hash.has_value();
+  const bool has_any_agent_consensus =
+      evidence.agent_logical_request_hash.has_value() ||
+      evidence.consensus_source_chunks_hash.has_value() ||
+      evidence.consensus_resolved_token_plan_hash.has_value() ||
+      evidence.consensus_shape_schedule_hash.has_value();
+  if (evidence.stage == DPMReplayStage::kProjection) {
+    if (evidence.prefill_mode !=
+            FreshWorkerPrefillMode::kFullCanonicalPrefill ||
+        evidence.restored_checkpoint_id.has_value() ||
+        has_any_agent_consensus ||
+        evidence.capture_run_policy !=
+            ExactRegenerationCaptureRunPolicy::kNoCapture) {
+      return absl::DataLossError(
+          "Projection exact-regeneration evidence carries agent prefill, "
+          "restore, or capsule-capture claims.");
+    }
+  } else if (!has_agent_consensus ||
+             IsZeroHash(*evidence.agent_logical_request_hash) ||
+             IsZeroHash(*evidence.consensus_source_chunks_hash) ||
+             IsZeroHash(*evidence.consensus_resolved_token_plan_hash) ||
+             IsZeroHash(*evidence.consensus_shape_schedule_hash)) {
+    return absl::InvalidArgumentError(
+        "Agent exact-regeneration evidence lacks complete prepared-prefill "
+        "consensus.");
+  }
+
+  std::set<int64_t> process_ids;
+  std::set<Hash256> physical_nonces = {evidence.request_execution_id};
+  std::set<Hash256> request_envelopes;
+  std::set<Hash256> result_envelopes;
+  std::set<Hash256> run_evidence_ids;
+  Hash256 common_launch_spec_hash;
+  std::optional<SessionHandoffReauthenticationEvidence>
+      common_restore_reauthentication;
+  for (uint32_t index = 0; index < evidence.run_count; ++index) {
+    const ExactRegenerationRunEvidence& run = evidence.runs[index];
+    ABSL_RETURN_IF_ERROR(ValidateExactRegenerationRunEvidence(run));
+    if (run.run_index != index ||
+        run.worker_certification_hash != evidence.worker_certification_hash ||
+        run.output_evidence_hash != evidence.consensus_output_evidence_hash ||
+        run.restored_checkpoint_id != evidence.restored_checkpoint_id) {
+      return absl::DataLossError(
+          "Exact-regeneration run evidence disagrees with its request.");
+    }
+    if (evidence.stage == DPMReplayStage::kProjection) {
+      if (run.prepared_prefill_plan.has_value() ||
+          run.restored_state_witness.has_value() ||
+          run.restore_reauthentication_evidence.has_value()) {
+        return absl::DataLossError(
+            "Projection exact-regeneration run carries agent prefill state.");
+      }
+    } else {
+      if (!run.prepared_prefill_plan.has_value()) {
+        return absl::DataLossError(
+            "Agent exact-regeneration run omitted its prepared prefill plan.");
+      }
+      const DPMPreparedPrefillPlan& plan = *run.prepared_prefill_plan;
+      if (plan.session_identity != evidence.session_identity ||
+          plan.logical_agent_request_hash !=
+              *evidence.agent_logical_request_hash ||
+          plan.canonical_source_chunks_hash !=
+              *evidence.consensus_source_chunks_hash ||
+          plan.resolved_token_plan_hash !=
+              *evidence.consensus_resolved_token_plan_hash ||
+          plan.shape_schedule_hash != *evidence.consensus_shape_schedule_hash) {
+        return absl::FailedPreconditionError(
+            "Independent agent runs disagree on runtime, logical request, "
+            "source chunks, resolved tokens, or shape schedule.");
+      }
+      if (evidence.prefill_mode ==
+          FreshWorkerPrefillMode::kFullCanonicalPrefill) {
+        if (plan.start_kind != DPMPreparedPrefillStartKind::kFreshSession ||
+            run.restored_state_witness.has_value() ||
+            run.restore_reauthentication_evidence.has_value()) {
+          return absl::DataLossError(
+              "Full-prefill exact agent run did not start from a fresh "
+              "session.");
+        }
+      } else if (plan.start_kind !=
+                     DPMPreparedPrefillStartKind::kOwnPositionRestore ||
+                 !run.restored_state_witness.has_value() ||
+                 !run.restore_reauthentication_evidence.has_value() ||
+                 plan.restore_checkpoint_id !=
+                     evidence.restored_checkpoint_id) {
+        return absl::DataLossError(
+            "Delta exact agent run lacks its checkpoint-bound decoded live "
+            "witness.");
+      }
+    }
+    if (evidence.prefill_mode ==
+        FreshWorkerPrefillMode::kOwnPositionCapsuleDelta) {
+      const SessionHandoffReauthenticationEvidence& reauthentication =
+          *run.restore_reauthentication_evidence;
+      if (index == 0) {
+        common_restore_reauthentication = reauthentication;
+      } else if (reauthentication.session_identity !=
+                     common_restore_reauthentication->session_identity ||
+                 reauthentication.canonical_continuation_state_hash !=
+                     common_restore_reauthentication
+                         ->canonical_continuation_state_hash ||
+                 reauthentication.source_envelope_hash !=
+                     common_restore_reauthentication->source_envelope_hash ||
+                 reauthentication.source_envelope_size !=
+                     common_restore_reauthentication->source_envelope_size ||
+                 reauthentication.source_key_id !=
+                     common_restore_reauthentication->source_key_id ||
+                 reauthentication.capsule_codec_contract_hash !=
+                     common_restore_reauthentication
+                         ->capsule_codec_contract_hash ||
+                 reauthentication.reauthentication_contract_hash !=
+                     common_restore_reauthentication
+                         ->reauthentication_contract_hash ||
+                 reauthentication.purpose !=
+                     common_restore_reauthentication->purpose) {
+        return absl::FailedPreconditionError(
+            "Independent restore workers disagree on the durable source or "
+            "canonical continuation-state commitment.");
+      }
+    }
+    if (!process_ids.insert(run.process_id).second ||
+        !physical_nonces.insert(run.challenge_nonce).second ||
+        !physical_nonces.insert(run.worker_instance_nonce).second ||
+        !request_envelopes.insert(run.request_envelope_hash).second ||
+        !result_envelopes.insert(run.result_envelope_hash).second ||
+        !run_evidence_ids.insert(run.evidence_id).second) {
+      return absl::FailedPreconditionError(
+          "Exact-regeneration evidence reused physical-run provenance.");
+    }
+    if (index == 0) {
+      common_launch_spec_hash = run.launch_spec_hash;
+    } else if (run.launch_spec_hash != common_launch_spec_hash) {
+      return absl::FailedPreconditionError(
+          "Exact-regeneration runs used different launch specifications.");
+    }
+    const bool should_capture =
+        index == 0 && evidence.capture_run_policy ==
+                          ExactRegenerationCaptureRunPolicy::kRunZeroOnly;
+    if (run.transient_producing_capsule_evidence.has_value() !=
+            should_capture ||
+        run.durable_producing_capsule_evidence.has_value() != should_capture) {
+      return absl::DataLossError(
+          "Exact-regeneration run evidence violates run-zero-only capture.");
+    }
+    if (should_capture) {
+      const FreshWorkerProducingCapsuleEvidence& transient =
+          *run.transient_producing_capsule_evidence;
+      const FreshWorkerDurableProducingCapsuleEvidence& durable =
+          *run.durable_producing_capsule_evidence;
+      if (transient.session_identity != evidence.session_identity ||
+          durable.session_identity != evidence.session_identity ||
+          transient.output_evidence_hash !=
+              evidence.consensus_output_evidence_hash ||
+          durable.output_evidence_hash !=
+              evidence.consensus_output_evidence_hash) {
+        return absl::DataLossError(
+            "Run-zero capsule does not bind the consensus output and "
+            "Engine-derived session identity.");
+      }
+    }
+  }
+  return absl::OkStatus();
+}
+
+class Reader {
+ public:
+  explicit Reader(absl::string_view bytes) : bytes_(bytes) {}
+
+  absl::StatusOr<uint32_t> ReadU32() {
+    if (remaining() < 4) return Truncated();
+    uint32_t value = 0;
+    for (int index = 0; index < 4; ++index) {
+      value = (value << 8) | static_cast<uint8_t>(bytes_[offset_ + index]);
+    }
+    offset_ += 4;
+    return value;
+  }
+
+  absl::StatusOr<uint64_t> ReadU64() {
+    if (remaining() < 8) return Truncated();
+    uint64_t value = 0;
+    for (int index = 0; index < 8; ++index) {
+      value = (value << 8) | static_cast<uint8_t>(bytes_[offset_ + index]);
+    }
+    offset_ += 8;
+    return value;
+  }
+
+  absl::StatusOr<absl::string_view> ReadBytes(uint64_t size) {
+    if (size > remaining() || size > std::string().max_size()) {
+      return Truncated();
+    }
+    const absl::string_view result =
+        bytes_.substr(offset_, static_cast<size_t>(size));
+    offset_ += static_cast<size_t>(size);
+    return result;
+  }
+
+  size_t remaining() const { return bytes_.size() - offset_; }
+
+ private:
+  absl::Status Truncated() const {
+    return absl::DataLossError("Truncated canonical DPM replay request.");
+  }
+
+  absl::string_view bytes_;
+  size_t offset_ = 0;
+};
+
+Hash256 Sha256(absl::string_view bytes) {
+  Sha256Hasher hasher;
+  hasher.Update(bytes);
+  return hasher.Finalize();
+}
+
+absl::Status ValidateWinnerForKey(const CanonicalReplayWinner& winner,
+                                  const CanonicalReplayKey& expected_key) {
+  ABSL_RETURN_IF_ERROR(ValidateCanonicalReplayKey(winner.key));
+  if (!(winner.key == expected_key)) {
+    return absl::DataLossError(
+        "Canonical replay catalog returned a winner for another request.");
+  }
+  if (winner.canonical_output.empty() ||
+      winner.canonical_output.size() > kMaximumCanonicalReplayOutputBytes ||
+      winner.canonical_output_hash != Sha256(winner.canonical_output) ||
+      IsZeroHash(winner.execution_evidence_hash) ||
+      winner.authentication_key_id.empty() ||
+      IsZeroHash(winner.authentication_tag)) {
+    return absl::DataLossError(
+        "Canonical replay catalog returned an incomplete winner.");
+  }
+  return absl::OkStatus();
+}
+
+}  // namespace
+
+absl::StatusOr<Hash256> ComputeExactRegenerationRunEvidenceId(
+    const ExactRegenerationRunEvidence& evidence) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactRegenerationRunEvidenceFields(evidence, false));
+  Sha256Hasher hasher;
+  hasher.Update(kExactRegenerationRunEvidenceDomain);
+  hasher.Update(EncodeExactRegenerationRunEvidenceFields(evidence));
+  return hasher.Finalize();
+}
+
+absl::Status ValidateExactRegenerationRunEvidence(
+    const ExactRegenerationRunEvidence& evidence) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactRegenerationRunEvidenceFields(evidence, true));
+  ABSL_ASSIGN_OR_RETURN(const Hash256 expected_id,
+                        ComputeExactRegenerationRunEvidenceId(evidence));
+  if (evidence.evidence_id != expected_id) {
+    return absl::DataLossError(
+        "Exact-regeneration run-evidence ID is not canonical.");
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<Hash256> ComputeExactRegenerationRequestEvidenceId(
+    const ExactRegenerationRequestEvidence& evidence) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactRegenerationRequestEvidenceFields(evidence, false));
+  Sha256Hasher hasher;
+  hasher.Update(kExactRegenerationRequestEvidenceDomain);
+  hasher.Update(EncodeExactRegenerationRequestEvidenceFields(evidence));
+  return hasher.Finalize();
+}
+
+absl::Status ValidateExactRegenerationRequestEvidence(
+    const ExactRegenerationRequestEvidence& evidence) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactRegenerationRequestEvidenceFields(evidence, true));
+  ABSL_ASSIGN_OR_RETURN(const Hash256 expected_id,
+                        ComputeExactRegenerationRequestEvidenceId(evidence));
+  if (evidence.evidence_id != expected_id) {
+    return absl::DataLossError(
+        "Exact-regeneration request-evidence ID is not canonical.");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateDPMCanonicalReplayRequest(
+    const DPMCanonicalReplayRequest& request) {
+  if (request.format_version != kDPMCanonicalReplayRequestFormatVersion) {
+    return absl::FailedPreconditionError(
+        "Canonical DPM replay request version is unsupported.");
+  }
+  ABSL_RETURN_IF_ERROR(ValidateDPMReplayStage(request.stage));
+  if (request.max_output_tokens == 0 ||
+      request.max_output_tokens > kMaximumDPMGenerationTokens) {
+    return absl::InvalidArgumentError(
+        "Canonical DPM replay request token limit is outside the product "
+        "bound.");
+  }
+  if (request.request_contract.empty() ||
+      request.request_contract.size() > kMaximumCanonicalReplayContractBytes ||
+      HasControlByte(request.request_contract)) {
+    return absl::InvalidArgumentError(
+        "Canonical DPM replay request contract is invalid.");
+  }
+  if (request.canonical_payload.empty() ||
+      request.canonical_payload.size() >
+          kMaximumFreshWorkerRequestPayloadBytes) {
+    return absl::InvalidArgumentError(
+        "Canonical DPM replay request payload is empty or oversized.");
+  }
+  const uint64_t available_after_framing =
+      kMaximumFreshWorkerRequestPayloadBytes -
+      kDPMCanonicalReplayRequestFramingBytes;
+  if (request.request_contract.size() > available_after_framing ||
+      request.canonical_payload.size() >
+          available_after_framing - request.request_contract.size()) {
+    return absl::ResourceExhaustedError(
+        "Canonical DPM replay request does not fit its worker payload "
+        "envelope.");
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<std::string> EncodeDPMCanonicalReplayRequest(
+    const DPMCanonicalReplayRequest& request) {
+  ABSL_RETURN_IF_ERROR(ValidateDPMCanonicalReplayRequest(request));
+  const uint64_t fixed_size = kDPMCanonicalReplayRequestFramingBytes;
+  const uint64_t encoded_size = fixed_size + request.request_contract.size() +
+      request.canonical_payload.size();
+  if (encoded_size > kMaximumFreshWorkerRequestPayloadBytes) {
+    return absl::ResourceExhaustedError(
+        "Encoded canonical DPM replay request exceeds the worker limit.");
+  }
+  std::string encoded;
+  encoded.reserve(static_cast<size_t>(encoded_size));
+  encoded.append(kCanonicalRequestMagic.data(), kCanonicalRequestMagic.size());
+  AppendU32(request.format_version, &encoded);
+  AppendU32(static_cast<uint32_t>(request.stage), &encoded);
+  AppendU32(request.max_output_tokens, &encoded);
+  AppendU32(static_cast<uint32_t>(request.request_contract.size()), &encoded);
+  AppendU64(request.canonical_payload.size(), &encoded);
+  encoded.append(request.request_contract);
+  encoded.append(request.canonical_payload);
+  return encoded;
+}
+
+absl::StatusOr<DPMCanonicalReplayRequest> DecodeDPMCanonicalReplayRequest(
+    absl::string_view bytes) {
+  if (bytes.size() < kDPMCanonicalReplayRequestFramingBytes ||
+      bytes.size() > kMaximumFreshWorkerRequestPayloadBytes ||
+      std::memcmp(bytes.data(), kCanonicalRequestMagic.data(),
+                  kCanonicalRequestMagic.size()) != 0) {
+    return absl::DataLossError(
+        "Canonical DPM replay request framing is invalid.");
+  }
+  Reader reader(bytes.substr(kCanonicalRequestMagic.size()));
+  DPMCanonicalReplayRequest request;
+  ABSL_ASSIGN_OR_RETURN(request.format_version, reader.ReadU32());
+  uint32_t stage;
+  ABSL_ASSIGN_OR_RETURN(stage, reader.ReadU32());
+  request.stage = static_cast<DPMReplayStage>(stage);
+  ABSL_ASSIGN_OR_RETURN(request.max_output_tokens, reader.ReadU32());
+  uint32_t contract_size;
+  ABSL_ASSIGN_OR_RETURN(contract_size, reader.ReadU32());
+  uint64_t payload_size;
+  ABSL_ASSIGN_OR_RETURN(payload_size, reader.ReadU64());
+  if (contract_size > kMaximumCanonicalReplayContractBytes ||
+      payload_size > kMaximumFreshWorkerRequestPayloadBytes) {
+    return absl::ResourceExhaustedError(
+        "Canonical DPM replay request declares an oversized field.");
+  }
+  absl::string_view contract;
+  ABSL_ASSIGN_OR_RETURN(contract, reader.ReadBytes(contract_size));
+  request.request_contract.assign(contract.data(), contract.size());
+  absl::string_view payload;
+  ABSL_ASSIGN_OR_RETURN(payload, reader.ReadBytes(payload_size));
+  request.canonical_payload.assign(payload.data(), payload.size());
+  if (reader.remaining() != 0) {
+    return absl::DataLossError(
+        "Canonical DPM replay request has trailing bytes.");
+  }
+  ABSL_RETURN_IF_ERROR(ValidateDPMCanonicalReplayRequest(request));
+  ABSL_ASSIGN_OR_RETURN(const std::string canonical,
+                        EncodeDPMCanonicalReplayRequest(request));
+  if (canonical != bytes) {
+    return absl::DataLossError(
+        "Canonical DPM replay request is not canonically encoded.");
+  }
+  return request;
+}
+
+absl::StatusOr<Hash256> ComputeDPMCanonicalReplayRequestHash(
+    const DPMCanonicalReplayRequest& request) {
+  ABSL_ASSIGN_OR_RETURN(const std::string encoded,
+                        EncodeDPMCanonicalReplayRequest(request));
+  return Sha256(encoded);
+}
+
+absl::Status CanonicalWinnerReplayExecutor::ValidateSupport(
+    CanonicalWinnerReplayGenerator* generator,
+    DPMReplayStage expected_stage) const {
+  ABSL_RETURN_IF_ERROR(ValidateDPMReplayStage(expected_stage));
+  if (generator == nullptr || catalog_ == nullptr) {
+    return absl::InvalidArgumentError(
+        "Canonical WinnerReplay requires a generator and catalog.");
+  }
+  return generator->ValidateSupport(expected_stage);
+}
+
+absl::StatusOr<CanonicalWinnerReplayExecution>
+CanonicalWinnerReplayExecutor::Run(const DPMCanonicalReplayRequest& request,
+    CanonicalWinnerReplayGenerator* generator) {
+  ABSL_RETURN_IF_ERROR(ValidateDPMCanonicalReplayRequest(request));
+  ABSL_RETURN_IF_ERROR(ValidateSupport(generator, request.stage));
+  const SessionHandoffIdentity runtime_identity =
+      generator->GetRuntimeIdentity();
+  ABSL_ASSIGN_OR_RETURN(const Hash256 request_hash,
+                        ComputeDPMCanonicalReplayRequestHash(request));
+  CanonicalReplayKey key{
+      .stage = request.stage,
+      .runtime_identity = runtime_identity,
+      .canonical_request_hash = request_hash,
+      .request_contract = request.request_contract,
+  };
+  ABSL_RETURN_IF_ERROR(ValidateCanonicalReplayKey(key));
+
+  absl::StatusOr<CanonicalReplayWinner> existing = catalog_->Get(key);
+  if (existing.ok()) {
+    ABSL_RETURN_IF_ERROR(ValidateWinnerForKey(*existing, key));
+    ABSL_RETURN_IF_ERROR(generator->ValidateSupport(request.stage));
+    if (generator->GetRuntimeIdentity() != runtime_identity) {
+      return absl::FailedPreconditionError(
+          "WinnerReplay runtime identity changed during catalog lookup.");
+    }
+    return CanonicalWinnerReplayExecution{
+        .resolution = CanonicalWinnerResolution::kReplayed,
+        .runtime_identity = runtime_identity,
+        .canonical_request_hash = request_hash,
+        .canonical_output = existing->canonical_output,
+        .canonical_output_hash = existing->canonical_output_hash,
+        .execution_evidence_hash = existing->execution_evidence_hash,
+        .producing_session_matches_output = false,
+    };
+  }
+  if (existing.status().code() != absl::StatusCode::kNotFound) {
+    return existing.status();
+  }
+
+  ABSL_ASSIGN_OR_RETURN(CanonicalWinnerGeneratedCandidate candidate,
+                        generator->Generate(request));
+  if (candidate.canonical_output.empty() ||
+      candidate.canonical_output.size() > kMaximumCanonicalReplayOutputBytes ||
+      IsZeroHash(candidate.execution_evidence_hash)) {
+    return absl::DataLossError(
+        "Canonical WinnerReplay generator returned an invalid candidate.");
+  }
+  ABSL_RETURN_IF_ERROR(generator->ValidateSupport(request.stage));
+  if (generator->GetRuntimeIdentity() != runtime_identity) {
+    return absl::FailedPreconditionError(
+        "WinnerReplay runtime identity changed during generation.");
+  }
+  CanonicalReplayCandidate catalog_candidate{
+      .key = key,
+      .canonical_output = candidate.canonical_output,
+      .execution_evidence_hash = candidate.execution_evidence_hash,
+  };
+  ABSL_ASSIGN_OR_RETURN(PublishCanonicalReplayResult published,
+                        catalog_->Publish(catalog_candidate));
+  ABSL_RETURN_IF_ERROR(ValidateWinnerForKey(published.winner, key));
+  ABSL_RETURN_IF_ERROR(generator->ValidateSupport(request.stage));
+  if (generator->GetRuntimeIdentity() != runtime_identity) {
+    return absl::FailedPreconditionError(
+        "WinnerReplay runtime identity changed during publication.");
+  }
+  if (published.published &&
+      (published.winner.canonical_output != candidate.canonical_output ||
+       published.winner.execution_evidence_hash !=
+           candidate.execution_evidence_hash)) {
+    return absl::DataLossError(
+        "Canonical replay catalog changed the publishing candidate.");
+  }
+  return CanonicalWinnerReplayExecution{
+      .resolution = published.published
+                        ? CanonicalWinnerResolution::kPublished
+                        : CanonicalWinnerResolution::kLostPublishRace,
+      .runtime_identity = runtime_identity,
+      .canonical_request_hash = request_hash,
+      .canonical_output = published.winner.canonical_output,
+      .canonical_output_hash = published.winner.canonical_output_hash,
+      .execution_evidence_hash = published.winner.execution_evidence_hash,
+      .producing_session_matches_output = published.published,
+  };
+}
+
+namespace {
+
+struct ResolvedExactExecutorProfile {
+  SessionConfig session_config;
+  ExactLiteRtProfile profile;
+};
+
+absl::Status ValidateLogitFramesMatchExactProfile(
+    const ExactLiteRtProfile& profile,
+    const std::vector<FreshWorkerLogitFrameEvidence>& frames) {
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(profile));
+  FreshWorkerLogitElementType expected_type =
+      FreshWorkerLogitElementType::kUnsupported;
+  uint32_t expected_width = 0;
+  switch (profile.logits_frame.element_type) {
+    case ExactLiteRtLogitsElementType::kFloat16:
+      expected_type = FreshWorkerLogitElementType::kFloat16;
+      expected_width = 2;
+      break;
+    case ExactLiteRtLogitsElementType::kFloat32:
+      expected_type = FreshWorkerLogitElementType::kFloat32;
+      expected_width = 4;
+      break;
+    case ExactLiteRtLogitsElementType::kUnsupported:
+      return absl::FailedPreconditionError(
+          "Engine-derived exact profile has unsupported logits.");
+    default:
+      return absl::FailedPreconditionError(
+          "Engine-derived exact profile has an unknown logits type.");
+  }
+  if (frames.empty()) {
+    return absl::FailedPreconditionError(
+        "Exact regeneration returned no logits evidence.");
+  }
+  for (const FreshWorkerLogitFrameEvidence& frame : frames) {
+    ABSL_RETURN_IF_ERROR(ValidateFreshWorkerLogitFrameEvidence(frame));
+    if (frame.element_type != expected_type ||
+        frame.element_byte_width != expected_width ||
+        frame.batch_size != profile.logits_frame.batch_size ||
+        frame.sequence_size != profile.logits_frame.sequence_size ||
+        frame.vocabulary_size != profile.logits_frame.vocabulary_size ||
+        frame.byte_count != profile.logits_frame.byte_count) {
+      return absl::FailedPreconditionError(
+          "Fresh-worker logits evidence differs from the Engine-derived "
+          "exact profile.");
+    }
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<Hash256> GenerateUniqueExecutionNonce(
+    std::set<Hash256>* allocated) {
+  if (allocated == nullptr) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration nonce set is missing.");
+  }
+  for (int attempt = 0; attempt < 16; ++attempt) {
+    ABSL_ASSIGN_OR_RETURN(const Hash256 nonce, GenerateFreshWorkerNonce());
+    if (allocated->insert(nonce).second) return nonce;
+  }
+  return absl::InternalError(
+      "The OS random source repeatedly returned a reused exact-run nonce.");
+}
+
+absl::Status ValidateExactExecutionInput(
+    const ExactRegenerationExecutionInput& input,
+    const Hash256& canonical_request_hash, const ExactLiteRtProfile& profile) {
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(profile));
+  ABSL_RETURN_IF_ERROR(ValidateFreshWorkerExecutionPlan(input.execution_plan));
+  if (input.execution_plan.logical_replay_request_hash !=
+      canonical_request_hash) {
+    return absl::FailedPreconditionError(
+        "Physical execution plan is not bound to the canonical request.");
+  }
+  const bool has_restore_source = input.durable_restore_source != nullptr;
+  const bool has_restore_options = input.durable_restore_options != nullptr;
+  const bool has_capture_destination =
+      input.staging_capture_destination != nullptr;
+  const bool has_capture_options = input.staging_capture_options != nullptr;
+  if (has_restore_source != has_restore_options ||
+      has_capture_destination != has_capture_options) {
+    return absl::InvalidArgumentError(
+        "Exact-regeneration handoff sources, sinks, and options require "
+        "complete pointer pairs.");
+  }
+  if (has_capture_destination !=
+      input.execution_plan.capture_producing_capsule) {
+    return absl::InvalidArgumentError(
+        "Physical execution capture transfer disagrees with its plan.");
+  }
+  switch (input.execution_plan.prefill_mode) {
+    case FreshWorkerPrefillMode::kFullCanonicalPrefill:
+      if (has_restore_source) {
+        return absl::InvalidArgumentError(
+            "Full-prefill exact regeneration cannot receive a restore "
+            "capsule.");
+      }
+      break;
+    case FreshWorkerPrefillMode::kOwnPositionCapsuleDelta:
+      if (!has_restore_source ||
+          input.execution_plan.session_identity != profile.session_identity) {
+        return absl::FailedPreconditionError(
+            "Delta exact regeneration requires a restore bound to the "
+            "Engine-derived session identity.");
+      }
+      if (input.durable_restore_source->Size() !=
+          input.execution_plan.restore_durable_envelope_size) {
+        return absl::DataLossError(
+            "Durable restore size differs from the physical plan.");
+      }
+      ABSL_RETURN_IF_ERROR(ValidateHandoffOptionsForIdentity(
+          *input.durable_restore_options, profile.session_identity));
+      break;
+    default:
+      return absl::InvalidArgumentError(
+          "Physical execution plan has an unknown prefill mode.");
+  }
+  if (has_capture_options) {
+    ABSL_RETURN_IF_ERROR(ValidateHandoffOptionsForIdentity(
+        *input.staging_capture_options, profile.session_identity));
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateExactExecutorConfig(
+    const Engine* engine,
+    const ExactProfileAdmissionRepository* admission_repository,
+    const ExactRegenerationExecutorConfig& config) {
+#ifdef LITERT_LM_DEBUGGER_ENABLED
+  return absl::UnimplementedError(
+      "ExactRegeneration does not support debugger-installed graph "
+      "callbacks.");
+#endif
+  if (engine == nullptr || admission_repository == nullptr) {
+    return absl::InvalidArgumentError(
+        "ExactRegeneration requires a loaded Engine and admission "
+        "repository.");
+  }
+  ABSL_RETURN_IF_ERROR(ValidateDPMReplayStage(config.stage));
+  if (config.independent_run_count < 2 ||
+      config.independent_run_count > kMaximumFreshWorkerRuns) {
+    return absl::InvalidArgumentError(
+        "ExactRegeneration requires 2 to 64 cold runs per request.");
+  }
+  ABSL_RETURN_IF_ERROR(
+      ValidateFreshWorkerAuthentication(config.authentication));
+  if (config.worker_process.executable_path.empty() ||
+      !config.worker_process.executable_path.is_absolute()) {
+    return absl::InvalidArgumentError(
+        "ExactRegeneration requires an absolute concrete worker executable "
+        "path.");
+  }
+  ABSL_ASSIGN_OR_RETURN(SessionConfig ignored,
+                        MakeEngineFreshWorkerSessionConfig(
+                            config.stage, config.max_output_tokens));
+  (void)ignored;
+  return absl::OkStatus();
+}
+
+absl::StatusOr<ResolvedExactExecutorProfile> ResolveExactExecutorProfile(
+    const Engine* engine, const ExactRegenerationExecutorConfig& config) {
+  ABSL_ASSIGN_OR_RETURN(SessionConfig session_config,
+                        MakeEngineFreshWorkerSessionConfig(
+                            config.stage, config.max_output_tokens));
+  ABSL_RETURN_IF_ERROR(
+      session_config.MaybeUpdateAndValidate(engine->GetEngineSettings()));
+  ABSL_ASSIGN_OR_RETURN(ExactLiteRtProfile profile,
+                        engine->ResolveExactLiteRtProfile(
+                            session_config, config.profile_assertion));
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(profile));
+  return ResolvedExactExecutorProfile{
+      .session_config = std::move(session_config),
+      .profile = std::move(profile),
+  };
+}
+
+absl::Status ValidateAdmissionForExactProfile(
+    const ExactProfileAdmissionRecord& admission,
+    const ExactLiteRtProfile& profile,
+    const FreshWorkerAuthentication& authentication,
+    const Hash256& worker_certification_hash) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactProfileAdmissionRecordForProfile(admission, profile));
+  if (admission.authentication_key_id != authentication.key_id ||
+      admission.worker_certification_hash != worker_certification_hash ||
+      IsZeroHash(worker_certification_hash) ||
+      admission.replay_isolation !=
+          FreshWorkerReplayIsolation::kEmptyCatalogs) {
+    return absl::FailedPreconditionError(
+        "Authenticated admission does not match the Engine-derived exact "
+        "profile, certified worker, and empty-catalog contract.");
+  }
+  return absl::OkStatus();
+}
+
+bool HasSameStateWitnessAdmissionAuthority(
+    const AuthenticatedCapsuleRestoreAdmission& lhs,
+    const AuthenticatedCapsuleRestoreAdmission& rhs) {
+  return lhs.record.record_id == rhs.record.record_id &&
+         lhs.profile == rhs.profile && lhs.capability == rhs.capability &&
+         lhs.operational_coverage == rhs.operational_coverage &&
+         lhs.record.operational_coverage == lhs.operational_coverage &&
+         rhs.record.operational_coverage == rhs.operational_coverage;
+}
+
+absl::Status ValidateStateWitnessAdmissionForExactProfile(
+    const AuthenticatedCapsuleRestoreAdmission& admission,
+    const ExactLiteRtProfile& expected_profile) {
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(expected_profile));
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(admission.profile));
+  ABSL_RETURN_IF_ERROR(ValidateSessionHandoffCapability(admission.capability));
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreAdmissionRecord(admission.record));
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreOperationalCoverage(
+          admission.operational_coverage));
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreOperationalContracts(
+          admission.operational_coverage));
+  ABSL_RETURN_IF_ERROR(ValidateCapsuleRestoreAdmissionRecordForRuntime(
+          admission.record, admission.profile, admission.capability,
+          admission.operational_coverage.coverage_id));
+  ABSL_ASSIGN_OR_RETURN(const CapsuleRestoreAuthority authority,
+                        BuildCapsuleRestoreAuthority(admission));
+  ABSL_RETURN_IF_ERROR(
+      ValidateCapsuleRestoreAuthorityForAdmission(authority, admission));
+  const CapsuleRestoreOperationalCoverage& coverage =
+      admission.operational_coverage;
+  const CapsuleRestoreStateWitnessOperationalDomain& domain =
+      coverage.operational_domain;
+  if (admission.profile != expected_profile ||
+      admission.record.operational_coverage != coverage ||
+      coverage.runtime_derived_profile != expected_profile ||
+      coverage.runtime_derived_capability != admission.capability ||
+      coverage.runtime_derived_session_identity !=
+          expected_profile.session_identity ||
+      admission.capability.exact_profile_id != expected_profile.profile_id ||
+      admission.capability.session_identity !=
+          expected_profile.session_identity ||
+      admission.capability.backend != expected_profile.backend ||
+      domain.admitted_backend != expected_profile.backend ||
+      domain.resolved_session_config_hash !=
+          expected_profile.session_identity.inference_profile_hash) {
+    return absl::FailedPreconditionError(
+        "CapsuleRestore authority does not agree with the exact "
+        "executor's immutable Engine-derived profile and operational "
+        "domain.");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateStateWitnessTransferDomain(
+    const ExactRegenerationExecutionInput& input,
+    const DPMCanonicalReplayRequest& request,
+    const AuthenticatedCapsuleRestoreAdmission& admission) {
+  const CapsuleRestoreStateWitnessOperationalDomain& domain =
+      admission.operational_coverage.operational_domain;
+  if (request.max_output_tokens == 0 ||
+      request.max_output_tokens > domain.maximum_output_tokens) {
+    return absl::FailedPreconditionError(
+        "Exact physical request exceeds the CapsuleRestore "
+        "output-token domain.");
+  }
+  if (input.execution_plan.prefill_mode ==
+      FreshWorkerPrefillMode::kOwnPositionCapsuleDelta) {
+    if (input.durable_restore_options == nullptr ||
+        input.durable_restore_source == nullptr ||
+        input.durable_restore_options->key_id !=
+            domain.checkpoint_authentication_key_id ||
+        input.durable_restore_source->Size() == 0 ||
+        input.durable_restore_source->Size() >
+            kMaximumCapsuleRestoreCheckpointBytes) {
+      return absl::FailedPreconditionError(
+          "Exact restore transport is outside the CapsuleRestore "
+          "durable checkpoint domain.");
+    }
+  }
+  if (input.execution_plan.capture_producing_capsule) {
+    if (input.staging_capture_options == nullptr ||
+        input.staging_capture_destination == nullptr ||
+        input.staging_capture_options->key_id !=
+            domain.checkpoint_authentication_key_id) {
+      return absl::FailedPreconditionError(
+          "Exact capture transport is outside the CapsuleRestore "
+          "durable checkpoint domain.");
+    }
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateRequestForExactExecutorConfig(
+    const DPMCanonicalReplayRequest& request,
+    const ExactRegenerationExecutorConfig& config) {
+  ABSL_RETURN_IF_ERROR(ValidateDPMCanonicalReplayRequest(request));
+  if (request.stage != config.stage ||
+      request.max_output_tokens != config.max_output_tokens) {
+    return absl::FailedPreconditionError(
+        "Canonical replay request stage or token limit differs from the "
+        "immutable exact-worker profile.");
+  }
+  return absl::OkStatus();
+}
+
+ExactProfileQualificationSpec MakeExactQualificationSpec(
+    const SessionConfig& session_config,
+    const ExactRegenerationExecutorConfig& config,
+    absl::string_view encoded_request) {
+  ExactProfileQualificationSpec spec;
+  spec.session_config = session_config;
+  spec.profile_assertion = config.profile_assertion;
+  spec.canonical_request_payload.assign(encoded_request.data(),
+                                        encoded_request.size());
+  spec.independent_run_count = config.independent_run_count;
+  return spec;
+}
+
+}  // namespace
+
+absl::StatusOr<ExactProfileAdmissionRecord>
+ExactRegenerationExecutor::QualifyAndAdmit(
+    const Engine* engine, ExactProfileAdmissionRepository* admission_repository,
+    const ExactRegenerationExecutorConfig& config,
+    const DPMCanonicalReplayRequest& qualification_request) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactExecutorConfig(engine, admission_repository, config));
+  ABSL_RETURN_IF_ERROR(
+      ValidateRequestForExactExecutorConfig(qualification_request, config));
+  ABSL_ASSIGN_OR_RETURN(ResolvedExactExecutorProfile resolved,
+                        ResolveExactExecutorProfile(engine, config));
+  ABSL_ASSIGN_OR_RETURN(const std::string encoded_request,
+      EncodeDPMCanonicalReplayRequest(qualification_request));
+  ABSL_ASSIGN_OR_RETURN(
+      FreshWorkerProcessRunner worker_runner,
+      FreshWorkerProcessRunner::Create(config.worker_process));
+  ExactProfileQualifier qualifier(engine, &worker_runner);
+  ABSL_ASSIGN_OR_RETURN(ExactProfileAdmissionRecord admission,
+      qualifier.QualifyAndAdmit(
+                            MakeExactQualificationSpec(resolved.session_config,
+                                                       config, encoded_request),
+          config.authentication, admission_repository));
+  ABSL_RETURN_IF_ERROR(ValidateAdmissionForExactProfile(
+      admission, resolved.profile, config.authentication,
+      worker_runner.certification().certification_hash()));
+  return admission;
+}
+
+absl::StatusOr<std::unique_ptr<ExactRegenerationExecutor>>
+ExactRegenerationExecutor::Create(
+    const Engine* engine, ExactProfileAdmissionRepository* admission_repository,
+    ExactRegenerationExecutorConfig config) {
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactExecutorConfig(engine, admission_repository, config));
+  ABSL_ASSIGN_OR_RETURN(ResolvedExactExecutorProfile resolved,
+                        ResolveExactExecutorProfile(engine, config));
+  ABSL_ASSIGN_OR_RETURN(
+      FreshWorkerProcessRunner worker_runner,
+      FreshWorkerProcessRunner::Create(config.worker_process));
+  ABSL_ASSIGN_OR_RETURN(
+      const ExactProfileAdmissionRecord admission,
+      admission_repository->Get(
+          resolved.profile, worker_runner.certification().certification_hash(),
+          config.authentication));
+  ABSL_RETURN_IF_ERROR(ValidateAdmissionForExactProfile(
+      admission, resolved.profile, config.authentication,
+      worker_runner.certification().certification_hash()));
+  return std::unique_ptr<ExactRegenerationExecutor>(
+      new ExactRegenerationExecutor(engine, admission_repository,
+                                    std::move(config), std::move(worker_runner),
+                                    std::move(resolved.session_config),
+                                    std::move(resolved.profile)));
+}
+
+absl::Status ExactRegenerationExecutor::ValidateBoundRequest(
+    const DPMCanonicalReplayRequest& request) const {
+  return ValidateRequestForExactExecutorConfig(request, config_);
+}
+
+absl::StatusOr<ExactLiteRtProfile>
+ExactRegenerationExecutor::ResolveCurrentProfile() const {
+  if (engine_ == nullptr) {
+    return absl::InvalidArgumentError(
+        "ExactRegeneration requires a loaded authoritative Engine.");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      ExactLiteRtProfile current,
+      engine_->ResolveExactLiteRtProfile(resolved_session_config_,
+                                         config_.profile_assertion));
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(current));
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(derived_profile_));
+  if (current != derived_profile_) {
+    return absl::FailedPreconditionError(
+        "Engine-derived exact profile changed after executor construction.");
+  }
+  return current;
+}
+
+absl::StatusOr<ExactLiteRtProfile>
+ExactRegenerationExecutor::GetDerivedProfile() const {
+  return ResolveCurrentProfile();
+}
+
+absl::StatusOr<Hash256> ExactRegenerationExecutor::GetProfileAdmissionRecordId()
+    const {
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  ABSL_ASSIGN_OR_RETURN(const ExactLiteRtProfile profile,
+                        ResolveCurrentProfile());
+  ABSL_ASSIGN_OR_RETURN(
+      const ExactProfileAdmissionRecord admission,
+      admission_repository_->Get(
+          profile, worker_runner_.certification().certification_hash(),
+          config_.authentication));
+  ABSL_RETURN_IF_ERROR(ValidateAdmissionForExactProfile(
+      admission, profile, config_.authentication,
+      worker_runner_.certification().certification_hash()));
+  return admission.record_id;
+}
+
+absl::StatusOr<AuthenticatedCapsuleRestoreAdmission>
+ExactRegenerationExecutor::GetAuthenticatedCapsuleRestoreAdmission(
+    const CapsuleRestoreAdmissionBinding& binding) const {
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  ABSL_ASSIGN_OR_RETURN(const ExactLiteRtProfile current_executor_profile,
+                        ResolveCurrentProfile());
+  ABSL_ASSIGN_OR_RETURN(AuthenticatedCapsuleRestoreAdmission admission,
+      ResolveAuthenticatedCapsuleRestoreAdmission(
+          engine_, resolved_session_config_, binding));
+  ABSL_RETURN_IF_ERROR(ValidateStateWitnessAdmissionForExactProfile(
+      admission, current_executor_profile));
+  if (current_executor_profile != derived_profile_) {
+    return absl::AbortedError(
+        "Engine-derived exact profile changed while resolving CapsuleRestore "
+        "CapsuleRestore authority.");
+  }
+  return admission;
+}
+
+absl::Status ExactRegenerationExecutor::ValidateSupport() const {
+  if (engine_ == nullptr || admission_repository_ == nullptr) {
+    return absl::InvalidArgumentError(
+        "ExactRegeneration requires a loaded Engine and admission "
+        "repository.");
+  }
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactExecutorConfig(engine_, admission_repository_, config_));
+  ABSL_RETURN_IF_ERROR(
+      worker_runner_.certification().ValidateExecutableImage());
+  ABSL_ASSIGN_OR_RETURN(const ExactLiteRtProfile profile,
+                        ResolveCurrentProfile());
+  ABSL_ASSIGN_OR_RETURN(
+      const ExactProfileAdmissionRecord admission,
+      admission_repository_->Get(
+          profile, worker_runner_.certification().certification_hash(),
+          config_.authentication));
+  return ValidateAdmissionForExactProfile(
+      admission, profile, config_.authentication,
+      worker_runner_.certification().certification_hash());
+}
+
+absl::StatusOr<ExactRegenerationExecution> ExactRegenerationExecutor::Run(
+    const DPMCanonicalReplayRequest& request) const {
+  // The convenience path is deliberately canonical full prefill with no
+  // capsule transfer. It still uses the request-scoped evidence path and N
+  // new processes; it does not reuse profile-admission output as execution.
+  ABSL_RETURN_IF_ERROR(ValidateBoundRequest(request));
+  ABSL_ASSIGN_OR_RETURN(const Hash256 request_hash,
+                        ComputeDPMCanonicalReplayRequestHash(request));
+  FreshWorkerExecutionPlan plan;
+  plan.logical_replay_request_hash = request_hash;
+  ABSL_ASSIGN_OR_RETURN(plan.plan_hash,
+                        ComputeFreshWorkerExecutionPlanHash(plan));
+  return RunWithExecutionInput(
+      request, ExactRegenerationExecutionInput{.execution_plan = plan}, true,
+      nullptr);
+}
+
+absl::StatusOr<ExactRegenerationExecution>
+ExactRegenerationExecutor::RunPhysical(
+    const DPMCanonicalReplayRequest& request,
+    const ExactRegenerationExecutionInput& input) const {
+  return RunWithExecutionInput(request, input, false, nullptr);
+}
+
+absl::StatusOr<ExactRegenerationExecution>
+ExactRegenerationExecutor::RunPhysical(
+    const DPMCanonicalReplayRequest& request,
+    const ExactRegenerationExecutionInput& input,
+    const CapsuleRestoreAdmissionBinding& capsule_restore_admission) const {
+  return RunWithExecutionInput(request, input, false,
+                               &capsule_restore_admission);
+}
+
+absl::StatusOr<ExactRegenerationExecution>
+ExactRegenerationExecutor::RunWithExecutionInput(
+    const DPMCanonicalReplayRequest& request,
+    const ExactRegenerationExecutionInput& input, bool capsule_free_convenience,
+    const CapsuleRestoreAdmissionBinding* capsule_restore_admission) const {
+  // Reject cross-stage and cross-limit requests before touching the
+  // repository and, critically, before any worker process is born.
+  ABSL_RETURN_IF_ERROR(ValidateBoundRequest(request));
+  ABSL_RETURN_IF_ERROR(ValidateSupport());
+  ABSL_ASSIGN_OR_RETURN(const ExactLiteRtProfile profile_before,
+                        ResolveCurrentProfile());
+  ABSL_ASSIGN_OR_RETURN(
+      const ExactProfileAdmissionRecord admission_before,
+      admission_repository_->Get(
+          profile_before, worker_runner_.certification().certification_hash(),
+          config_.authentication));
+  ABSL_RETURN_IF_ERROR(ValidateAdmissionForExactProfile(
+      admission_before, profile_before, config_.authentication,
+      worker_runner_.certification().certification_hash()));
+  ABSL_ASSIGN_OR_RETURN(const std::string encoded_request,
+                        EncodeDPMCanonicalReplayRequest(request));
+  ABSL_ASSIGN_OR_RETURN(const Hash256 request_hash,
+                        ComputeDPMCanonicalReplayRequestHash(request));
+  if (request_hash != Sha256(encoded_request)) {
+    return absl::InternalError(
+        "Canonical replay request hash disagrees with its encoded bytes.");
+  }
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactExecutionInput(input, request_hash, profile_before));
+  const bool transfers_capsule =
+      input.execution_plan.prefill_mode ==
+          FreshWorkerPrefillMode::kOwnPositionCapsuleDelta ||
+      input.execution_plan.capture_producing_capsule;
+  if (request.stage == DPMReplayStage::kProjection && transfers_capsule) {
+    return absl::InvalidArgumentError(
+        "Projection exact regeneration cannot restore or capture a session "
+        "capsule.");
+  }
+  if (transfers_capsule && capsule_restore_admission == nullptr) {
+    return absl::FailedPreconditionError(
+        "Exact capsule restore/capture requires authenticated "
+        "CapsuleRestore admission; physical transport alone is not "
+        "support.");
+  }
+  std::optional<AuthenticatedCapsuleRestoreAdmission> capsule_admission_before;
+  if (capsule_restore_admission != nullptr) {
+    ABSL_ASSIGN_OR_RETURN(
+        capsule_admission_before,
+        GetAuthenticatedCapsuleRestoreAdmission(*capsule_restore_admission));
+    if (transfers_capsule) {
+      ABSL_RETURN_IF_ERROR(ValidateStateWitnessTransferDomain(
+          input, request, *capsule_admission_before));
+    }
+  }
+  if (capsule_free_convenience &&
+      (input.execution_plan.prefill_mode !=
+           FreshWorkerPrefillMode::kFullCanonicalPrefill ||
+       input.execution_plan.capture_producing_capsule ||
+       input.durable_restore_source != nullptr ||
+       input.durable_restore_options != nullptr ||
+       input.staging_capture_destination != nullptr ||
+       input.staging_capture_options != nullptr)) {
+    return absl::InvalidArgumentError(
+        "Capsule-free exact execution accepts only full prefill without "
+        "capture.");
+  }
+
+  std::set<Hash256> allocated_nonces;
+  ABSL_ASSIGN_OR_RETURN(const Hash256 request_execution_id,
+                        GenerateUniqueExecutionNonce(&allocated_nonces));
+  std::set<int64_t> process_ids;
+  std::set<Hash256> request_envelope_hashes;
+  std::set<Hash256> result_envelope_hashes;
+  const Hash256 worker_certification_hash =
+      worker_runner_.certification().certification_hash();
+  Hash256 common_launch_spec_hash;
+  Hash256 consensus_output_hash;
+  std::string consensus_output;
+  std::string consensus_token_bytes;
+  std::vector<FreshWorkerLogitFrameEvidence> consensus_logit_frames;
+  std::optional<Hash256> consensus_agent_logical_request_hash;
+  std::optional<Hash256> consensus_source_chunks_hash;
+  std::optional<Hash256> consensus_resolved_token_plan_hash;
+  std::optional<Hash256> consensus_shape_schedule_hash;
+  std::optional<DPMPreparedPrefillPlan> representative_prepared_prefill_plan;
+  std::vector<ExactRegenerationRunEvidence> run_evidence;
+  run_evidence.reserve(config_.independent_run_count);
+  std::optional<FreshWorkerDurableProducingCapsuleEvidence>
+      successful_staged_capsule;
+
+  for (uint32_t run_index = 0; run_index < config_.independent_run_count;
+       ++run_index) {
+    ABSL_ASSIGN_OR_RETURN(const Hash256 challenge,
+                          GenerateUniqueExecutionNonce(&allocated_nonces));
+    const bool capture_this_run =
+        input.execution_plan.capture_producing_capsule && run_index == 0;
+    FreshWorkerExecutionPlan run_plan = input.execution_plan;
+    run_plan.capture_producing_capsule = capture_this_run;
+    // Capture is explicitly excluded from the model-affecting plan hash.
+    // Every run must otherwise consume the identical caller-validated plan.
+    ABSL_RETURN_IF_ERROR(ValidateFreshWorkerExecutionPlan(run_plan));
+    if (run_plan.plan_hash != input.execution_plan.plan_hash) {
+      return absl::InternalError(
+          "Run-zero capture changed the model-affecting execution plan.");
+    }
+    FreshWorkerRequest worker_request;
+    worker_request.exact_profile_hash = profile_before.profile_id;
+    worker_request.qualification_id = request_execution_id;
+    worker_request.run_index = run_index;
+    worker_request.run_count = config_.independent_run_count;
+    worker_request.challenge_nonce = challenge;
+    worker_request.request_payload = encoded_request;
+    worker_request.execution_plan = run_plan;
+    ABSL_RETURN_IF_ERROR(ValidateFreshWorkerRequest(worker_request));
+
+    FreshWorkerProcessObservation observation;
+    if (capsule_free_convenience) {
+      ABSL_ASSIGN_OR_RETURN(
+          observation,
+          worker_runner_.Run(worker_request, config_.authentication));
+    } else {
+      FreshWorkerSessionHandoffTransfer transfer;
+      transfer.durable_restore_source = input.durable_restore_source;
+      transfer.durable_restore_options = input.durable_restore_options;
+      if (capture_this_run) {
+        transfer.durable_capture_destination =
+            input.staging_capture_destination;
+        transfer.durable_capture_options = input.staging_capture_options;
+      }
+      ABSL_ASSIGN_OR_RETURN(
+          observation, worker_runner_.RunWithSessionHandoff(
+                           worker_request, config_.authentication, transfer));
+    }
+    ABSL_RETURN_IF_ERROR(ValidateFreshWorkerResultForRequest(observation.result,
+                                            worker_request));
+    if (observation.result.status_code != absl::StatusCode::kOk) {
+      return absl::Status(observation.result.status_code,
+                          observation.result.status_message);
+    }
+    const bool restore_this_run =
+        input.execution_plan.prefill_mode ==
+        FreshWorkerPrefillMode::kOwnPositionCapsuleDelta;
+    if (observation.restore_reauthentication_evidence.has_value() !=
+        restore_this_run) {
+      return absl::DataLossError(
+          "Physical exact execution omitted or invented restore "
+          "reauthentication provenance.");
+    }
+    if (observation.result.exact_profile_hash != profile_before.profile_id ||
+        observation.worker_certification_hash != worker_certification_hash ||
+        observation.result.qualification_id != request_execution_id ||
+        observation.result.run_index != run_index ||
+        observation.result.run_count != config_.independent_run_count ||
+        observation.result.challenge_nonce != challenge ||
+        observation.result.execution_plan_hash !=
+            input.execution_plan.plan_hash ||
+        observation.result.request_envelope_hash !=
+            observation.request_envelope_hash ||
+        observation.result.restored_checkpoint_id !=
+            input.execution_plan.restore_checkpoint_id) {
+      return absl::UnauthenticatedError(
+          "Fresh-worker observation is not bound to this physical exact "
+          "execution.");
+    }
+    if (observation.result.replay_isolation !=
+        FreshWorkerReplayIsolation::kEmptyCatalogs) {
+      return absl::FailedPreconditionError(
+          "Physical exact execution lacks empty-catalog isolation.");
+    }
+    ABSL_RETURN_IF_ERROR(ValidateLogitFramesMatchExactProfile(
+        profile_before, observation.result.logit_frames));
+    if (request.stage == DPMReplayStage::kProjection) {
+      if (observation.result.prepared_prefill_plan.has_value() ||
+          observation.result.restored_state_witness.has_value()) {
+        return absl::DataLossError(
+            "Projection fresh worker returned agent prepared-prefill state.");
+      }
+    } else {
+      if (!observation.result.prepared_prefill_plan.has_value()) {
+        return absl::DataLossError(
+            "Exact agent fresh worker omitted its prepared prefill plan.");
+      }
+      const DPMPreparedPrefillPlan& plan =
+          *observation.result.prepared_prefill_plan;
+      ABSL_RETURN_IF_ERROR(ValidateDPMPreparedPrefillPlan(plan));
+      if (plan.session_identity != profile_before.session_identity) {
+        return absl::FailedPreconditionError(
+            "Exact agent prepared plan belongs to another Engine profile.");
+      }
+      if (input.execution_plan.prefill_mode ==
+          FreshWorkerPrefillMode::kFullCanonicalPrefill) {
+        if (plan.start_kind != DPMPreparedPrefillStartKind::kFreshSession ||
+            plan.restore_checkpoint_id.has_value() ||
+            plan.start_state_witness_id.has_value() ||
+            observation.result.restored_state_witness.has_value()) {
+          return absl::DataLossError(
+              "Full-prefill exact agent worker did not derive a fresh plan.");
+        }
+      } else {
+        if (plan.start_kind !=
+                DPMPreparedPrefillStartKind::kOwnPositionRestore ||
+            plan.restore_checkpoint_id !=
+                input.execution_plan.restore_checkpoint_id ||
+            !observation.result.restored_state_witness.has_value()) {
+          return absl::DataLossError(
+              "Delta exact agent worker omitted its checkpoint-bound plan or "
+              "live witness.");
+        }
+        const SessionContinuationStateWitness& restored_witness =
+            *observation.result.restored_state_witness;
+        ABSL_RETURN_IF_ERROR(
+            ValidateSessionContinuationStateWitness(restored_witness));
+        if (restored_witness.session_identity !=
+                profile_before.session_identity ||
+            restored_witness.phase != SessionHandoffPhase::kDecoded ||
+            !restored_witness.ran_decode ||
+            restored_witness.current_step <= 0 ||
+            restored_witness.key_id != kFreshWorkerTransientRestoreKeyId ||
+            plan.start_state_witness_id != restored_witness.witness_id ||
+            static_cast<uint64_t>(restored_witness.current_step) !=
+                plan.start_step ||
+            restored_witness.processed_history_token_bytes_hash !=
+                plan.start_history_token_bytes_hash) {
+          return absl::DataLossError(
+              "Delta exact agent plan and independently recomputed live "
+              "restore witness disagree.");
+        }
+        const SessionHandoffReauthenticationEvidence& reauthentication =
+            *observation.restore_reauthentication_evidence;
+        ABSL_RETURN_IF_ERROR(
+            ValidateSessionHandoffReauthenticationEvidence(reauthentication));
+        if (reauthentication.session_identity !=
+                profile_before.session_identity ||
+            reauthentication.purpose !=
+                kFreshWorkerDurableRestoreToTransientReauthenticationPurpose ||
+            reauthentication.source_envelope_hash !=
+                input.execution_plan.restore_durable_envelope_hash ||
+            reauthentication.source_envelope_size !=
+                input.execution_plan.restore_durable_envelope_size ||
+            reauthentication.source_envelope_size !=
+                input.durable_restore_source->Size() ||
+            reauthentication.source_key_id !=
+                input.durable_restore_options->key_id ||
+            reauthentication.destination_envelope_hash !=
+                restored_witness.envelope_hash ||
+            reauthentication.destination_envelope_size !=
+                restored_witness.envelope_size ||
+            reauthentication.destination_key_id != restored_witness.key_id) {
+          return absl::DataLossError(
+              "Delta exact agent restore provenance does not bind the "
+              "selected durable input to the live transient witness.");
+        }
+      }
+
+      if (run_index == 0) {
+        consensus_agent_logical_request_hash = plan.logical_agent_request_hash;
+        consensus_source_chunks_hash = plan.canonical_source_chunks_hash;
+        consensus_resolved_token_plan_hash = plan.resolved_token_plan_hash;
+        consensus_shape_schedule_hash = plan.shape_schedule_hash;
+        representative_prepared_prefill_plan = plan;
+      } else if (plan.logical_agent_request_hash !=
+                     *consensus_agent_logical_request_hash ||
+                 plan.canonical_source_chunks_hash !=
+                     *consensus_source_chunks_hash ||
+                 plan.resolved_token_plan_hash !=
+                     *consensus_resolved_token_plan_hash ||
+                 plan.shape_schedule_hash != *consensus_shape_schedule_hash) {
+        return absl::FailedPreconditionError(
+            "Independent exact agent workers derived different logical, "
+            "source, token, or shape prefill commitments.");
+      }
+    }
+    if (observation.process_id <= 0 ||
+        !process_ids.insert(observation.process_id).second) {
+      return absl::FailedPreconditionError(
+          "Physical exact execution did not use unique fresh processes.");
+    }
+    if (!allocated_nonces.insert(observation.result.worker_instance_nonce)
+             .second ||
+        !request_envelope_hashes.insert(observation.request_envelope_hash)
+             .second ||
+        !result_envelope_hashes.insert(observation.result_envelope_hash)
+             .second) {
+      return absl::FailedPreconditionError(
+          "Physical exact execution reused authenticated run provenance.");
+    }
+    if (IsZeroHash(observation.request_envelope_hash) ||
+        IsZeroHash(observation.result_envelope_hash) ||
+        IsZeroHash(observation.worker_certification_hash) ||
+        observation.launch_spec_hash !=
+            ComputeFreshWorkerLaunchSpecHash(worker_certification_hash) ||
+        IsZeroHash(observation.result.worker_instance_nonce)) {
+      return absl::DataLossError(
+          "Physical exact execution omitted process provenance.");
+    }
+    if (run_index == 0) {
+      common_launch_spec_hash = observation.launch_spec_hash;
+    } else if (observation.launch_spec_hash != common_launch_spec_hash) {
+      return absl::FailedPreconditionError(
+          "Physical exact execution changed its worker launch "
+          "specification.");
+    }
+
+    const Hash256 output_hash = ComputeFreshWorkerOutputEvidenceHash(
+        observation.result.canonical_output, observation.result.token_bytes,
+        observation.result.logit_frames);
+    if (IsZeroHash(output_hash)) {
+      return absl::InternalError(
+          "Physical exact execution produced a zero output-evidence hash.");
+    }
+    if (run_index == 0) {
+      consensus_output_hash = output_hash;
+      consensus_output = observation.result.canonical_output;
+      consensus_token_bytes = observation.result.token_bytes;
+      consensus_logit_frames = observation.result.logit_frames;
+    } else if (observation.result.canonical_output != consensus_output ||
+               observation.result.token_bytes != consensus_token_bytes ||
+               observation.result.logit_frames != consensus_logit_frames ||
+               output_hash != consensus_output_hash) {
+      return absl::FailedPreconditionError(
+          "Independent physical runs produced different canonical output, "
+          "DPMTOK01 bytes, or ordered full-logits hashes.");
+    }
+
+    if (observation.result.producing_capsule_evidence.has_value() !=
+            capture_this_run ||
+        observation.durable_producing_capsule_evidence.has_value() !=
+            capture_this_run) {
+      return absl::DataLossError(
+          "Physical exact execution violated run-zero-only capsule capture.");
+    }
+    if (capture_this_run) {
+      const FreshWorkerProducingCapsuleEvidence& transient =
+          *observation.result.producing_capsule_evidence;
+      const FreshWorkerDurableProducingCapsuleEvidence& durable =
+          *observation.durable_producing_capsule_evidence;
+      ABSL_RETURN_IF_ERROR(
+          ValidateProducingCapsuleEvidencePair(transient, durable));
+      if (transient.session_identity != profile_before.session_identity ||
+          durable.session_identity != profile_before.session_identity ||
+          transient.output_evidence_hash != output_hash ||
+          durable.output_evidence_hash != output_hash ||
+          transient.session_identity != durable.session_identity ||
+          durable.key_id != input.staging_capture_options->key_id) {
+        return absl::DataLossError(
+            "Run-zero producing capsule does not bind the consensus output, "
+            "durable key, and Engine-derived session identity.");
+      }
+      successful_staged_capsule = durable;
+    }
+
+    ExactRegenerationRunEvidence evidence{
+        .run_index = run_index,
+        .process_id = observation.process_id,
+        .challenge_nonce = challenge,
+        .worker_instance_nonce = observation.result.worker_instance_nonce,
+        .request_envelope_hash = observation.request_envelope_hash,
+        .result_envelope_hash = observation.result_envelope_hash,
+        .worker_certification_hash = observation.worker_certification_hash,
+        .launch_spec_hash = observation.launch_spec_hash,
+        .output_evidence_hash = output_hash,
+        .restored_checkpoint_id = observation.result.restored_checkpoint_id,
+        .prepared_prefill_plan = observation.result.prepared_prefill_plan,
+        .restored_state_witness = observation.result.restored_state_witness,
+        .restore_reauthentication_evidence =
+            observation.restore_reauthentication_evidence,
+        .transient_producing_capsule_evidence =
+            observation.result.producing_capsule_evidence,
+        .durable_producing_capsule_evidence =
+            observation.durable_producing_capsule_evidence,
+    };
+    ABSL_ASSIGN_OR_RETURN(evidence.evidence_id,
+        ComputeExactRegenerationRunEvidenceId(evidence));
+    ABSL_RETURN_IF_ERROR(ValidateExactRegenerationRunEvidence(evidence));
+    run_evidence.push_back(std::move(evidence));
+  }
+
+  ABSL_ASSIGN_OR_RETURN(const ExactLiteRtProfile profile_after,
+                        ResolveCurrentProfile());
+  if (profile_after != profile_before) {
+    return absl::AbortedError(
+        "Engine-derived exact profile changed during physical "
+        "regeneration.");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      const ExactProfileAdmissionRecord admission_after,
+      admission_repository_->Get(
+          profile_after, worker_runner_.certification().certification_hash(),
+          config_.authentication));
+  ABSL_RETURN_IF_ERROR(ValidateAdmissionForExactProfile(
+      admission_after, profile_after, config_.authentication,
+      worker_runner_.certification().certification_hash()));
+  if (admission_after.record_id != admission_before.record_id) {
+    return absl::AbortedError(
+        "Exact-profile admission changed during physical regeneration.");
+  }
+  if (capsule_admission_before.has_value()) {
+    ABSL_ASSIGN_OR_RETURN(
+        const AuthenticatedCapsuleRestoreAdmission capsule_admission_after,
+        GetAuthenticatedCapsuleRestoreAdmission(*capsule_restore_admission));
+    if (!HasSameStateWitnessAdmissionAuthority(capsule_admission_after,
+                                               *capsule_admission_before)) {
+      return absl::AbortedError(
+          "CapsuleRestore admission or Engine-derived authority changed "
+          "during physical regeneration.");
+    }
+  }
+
+  ExactRegenerationRequestEvidence request_evidence{
+      .exact_profile_id = profile_before.profile_id,
+      .worker_certification_hash = worker_certification_hash,
+      .profile_admission_record_id = admission_before.record_id,
+      .session_identity = profile_before.session_identity,
+      .stage = request.stage,
+      .request_execution_id = request_execution_id,
+      .canonical_request_hash = request_hash,
+      .physical_execution_plan_hash = input.execution_plan.plan_hash,
+      .prefill_mode = input.execution_plan.prefill_mode,
+      .restored_checkpoint_id = input.execution_plan.restore_checkpoint_id,
+      .capture_run_policy =
+          input.execution_plan.capture_producing_capsule
+              ? ExactRegenerationCaptureRunPolicy::kRunZeroOnly
+              : ExactRegenerationCaptureRunPolicy::kNoCapture,
+      .replay_isolation = FreshWorkerReplayIsolation::kEmptyCatalogs,
+      .run_count = config_.independent_run_count,
+      .authentication_key_id = config_.authentication.key_id,
+      .consensus_output_evidence_hash = consensus_output_hash,
+      .agent_logical_request_hash = consensus_agent_logical_request_hash,
+      .consensus_source_chunks_hash = consensus_source_chunks_hash,
+      .consensus_resolved_token_plan_hash = consensus_resolved_token_plan_hash,
+      .consensus_shape_schedule_hash = consensus_shape_schedule_hash,
+      .runs = std::move(run_evidence),
+  };
+  ABSL_ASSIGN_OR_RETURN(
+      request_evidence.evidence_id,
+      ComputeExactRegenerationRequestEvidenceId(request_evidence));
+  ABSL_RETURN_IF_ERROR(
+      ValidateExactRegenerationRequestEvidence(request_evidence));
+
+  // A capture sink may already contain staging bytes, but neither their
+  // authenticated metadata nor a successful result escapes until every run
+  // and the post-run profile/admission checks have passed.
+  return ExactRegenerationExecution{
+      .derived_profile = profile_before,
+      .canonical_request_hash = request_hash,
+      .profile_admission_record_id = admission_before.record_id,
+      .request_evidence = std::move(request_evidence),
+      .canonical_output = std::move(consensus_output),
+      .token_bytes = std::move(consensus_token_bytes),
+      .logit_frames = std::move(consensus_logit_frames),
+      .prepared_prefill_plan = std::move(representative_prepared_prefill_plan),
+      .durable_producing_capsule_evidence =
+          std::move(successful_staged_capsule),
+  };
+}
+
+}  // namespace litert::lm

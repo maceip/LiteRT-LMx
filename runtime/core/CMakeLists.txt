@@ -13,6 +13,69 @@
 # limitations under the License.
 
 # ==============================================================================
+# Session Handoff Codec
+# ==============================================================================
+add_litertlm_library(runtime_core_session_handoff_codec STATIC
+  session_handoff_codec.cc
+)
+add_library(LiteRTLM::Runtime::Core::SessionHandoffCodec
+  ALIAS runtime_core_session_handoff_codec)
+
+target_include_directories(runtime_core_session_handoff_codec
+  PUBLIC
+    ${LITERTLM_GENERATED_SRC_DIR}
+    ${LITERTLM_INCLUDE_PATHS}
+)
+
+target_link_libraries(runtime_core_session_handoff_codec
+  PUBLIC
+    LiteRTLM::Runtime::Platform::Hash
+    LITERTLM_DEPS
+)
+
+# ==============================================================================
+# Session Handoff Identity
+# ==============================================================================
+add_litertlm_library(runtime_core_session_handoff_identity STATIC
+  session_handoff_identity.cc
+)
+add_library(LiteRTLM::Runtime::Core::SessionHandoffIdentity
+  ALIAS runtime_core_session_handoff_identity)
+
+target_include_directories(runtime_core_session_handoff_identity
+  PUBLIC
+    ${LITERTLM_GENERATED_SRC_DIR}
+    ${LITERTLM_INCLUDE_PATHS}
+)
+
+target_link_libraries(runtime_core_session_handoff_identity
+  PUBLIC
+    LiteRTLM::Runtime::Platform::Hash
+    LITERTLM_DEPS
+)
+
+# ==============================================================================
+# Exact LiteRT Profile Builder
+# ==============================================================================
+add_litertlm_library(runtime_core_exact_litert_profile_builder STATIC
+  exact_litert_profile_builder.cc
+)
+add_library(LiteRTLM::Runtime::Core::ExactLiteRtProfileBuilder
+  ALIAS runtime_core_exact_litert_profile_builder)
+
+target_include_directories(runtime_core_exact_litert_profile_builder
+  PUBLIC
+    ${LITERTLM_GENERATED_SRC_DIR}
+    ${LITERTLM_INCLUDE_PATHS}
+)
+
+target_link_libraries(runtime_core_exact_litert_profile_builder
+  PUBLIC
+    LiteRTLM::Runtime::Platform::Hash
+    LITERTLM_DEPS
+)
+
+# ==============================================================================
 #  Tasks
 # ==============================================================================
 add_litertlm_library(runtime_core_tasks STATIC
@@ -239,8 +302,11 @@ add_library(LiteRTLM::Runtime::Core ALIAS runtime_core_libs)
 target_link_libraries(runtime_core_libs INTERFACE
   LiteRTLM::Runtime::Core::EngineAdvancedImpl
   LiteRTLM::Runtime::Core::EmbeddingEngineImpl
+  LiteRTLM::Runtime::Core::ExactLiteRtProfileBuilder
   LiteRTLM::Runtime::Core::Pipeline
   LiteRTLM::Runtime::Core::SessionAdvanced
+  LiteRTLM::Runtime::Core::SessionHandoffCodec
+  LiteRTLM::Runtime::Core::SessionHandoffIdentity
   LiteRTLM::Runtime::Core::SessionUtils
   LiteRTLM::Runtime::Core::Tasks
   LiteRTLM::Runtime::Core::CachedSession

@@ -1,0 +1,541 @@
+// Copyright 2026 The ODML Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "runtime/core/exact_litert_profile_builder.h"
+
+#include <array>
+#include <bit>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <vector>
+
+#include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/status_macros.h"  // from @com_google_absl
+#include "absl/status/statusor.h"  // from @com_google_absl
+#include "absl/strings/string_view.h"  // from @com_google_absl
+#include "runtime/components/model_resources.h"
+#include "runtime/engine/engine_settings.h"
+#include "runtime/engine/exact_litert_profile.h"
+#include "runtime/executor/executor_settings_base.h"
+#include "runtime/executor/llm_executor_settings.h"
+#include "runtime/platform/hash/sha256_hasher.h"
+#include "runtime/proto/sampler_params.pb.h"
+#include "support/tokenizer/tokenizer.h"
+
+namespace litert::lm {
+namespace {
+
+bool IsZeroHash(const Hash256& hash) { return hash == Hash256{}; }
+
+void HashU32(uint32_t value, Sha256Hasher* hasher) {
+  std::array<char, 4> bytes;
+  for (size_t i = 0; i < bytes.size(); ++i) {
+    bytes[i] = static_cast<char>((value >> (24 - i * 8)) & 0xff);
+  }
+  hasher->Update(absl::string_view(bytes.data(), bytes.size()));
+}
+
+void HashU64(uint64_t value, Sha256Hasher* hasher) {
+  std::array<char, 8> bytes;
+  for (size_t i = 0; i < bytes.size(); ++i) {
+    bytes[i] = static_cast<char>((value >> (56 - i * 8)) & 0xff);
+  }
+  hasher->Update(absl::string_view(bytes.data(), bytes.size()));
+}
+
+void HashI32(int32_t value, Sha256Hasher* hasher) {
+  HashU32(std::bit_cast<uint32_t>(value), hasher);
+}
+
+void HashFrame(absl::string_view value, Sha256Hasher* hasher) {
+  HashU64(value.size(), hasher);
+  hasher->Update(value);
+}
+
+void HashDigest(const Hash256& value, Sha256Hasher* hasher) {
+  hasher->Update(absl::string_view(
+      reinterpret_cast<const char*>(value.bytes.data()), value.bytes.size()));
+}
+
+absl::Status ValidateLogitsFrameContract(
+    const ExactLiteRtLogitsFrameContract& logits_frame) {
+  if (logits_frame.batch_size != 1 || logits_frame.sequence_size != 1 ||
+      logits_frame.vocabulary_size == 0) {
+    return absl::FailedPreconditionError(
+        "Exact LiteRT logits require a non-empty batch-one, one-position "
+        "runtime frame.");
+  }
+  uint64_t element_byte_count = 0;
+  switch (logits_frame.element_type) {
+    case ExactLiteRtLogitsElementType::kFloat16:
+      element_byte_count = 2;
+      break;
+    case ExactLiteRtLogitsElementType::kFloat32:
+      element_byte_count = 4;
+      break;
+    default:
+      return absl::UnimplementedError(
+          "Exact LiteRT logits require loaded FP16 or FP32 element evidence.");
+  }
+  const uint64_t vocabulary_size = logits_frame.vocabulary_size;
+  if (vocabulary_size >
+      std::numeric_limits<uint64_t>::max() / element_byte_count) {
+    return absl::ResourceExhaustedError(
+        "Exact LiteRT logits frame byte count overflows uint64.");
+  }
+  if (logits_frame.byte_count != vocabulary_size * element_byte_count) {
+    return absl::FailedPreconditionError(
+        "Exact LiteRT logits frame byte count does not cover the complete "
+        "runtime-derived tensor.");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateCpuProfileInputs(
+    const EngineSettings& engine_settings,
+    const SessionConfig& resolved_session_config,
+    const LoadedExactLiteRtEvidence& loaded_exact_evidence,
+    SessionHandoffRuntimeClass loaded_runtime_class,
+    absl::string_view canonical_loaded_execution_profile,
+    const ExactLiteRtLogitsFrameContract& logits_frame,
+    uint32_t cpu_thread_count, int32_t prefill_chunk_size,
+    const Hash256& model_artifact_hash,
+    const Hash256& runtime_delegate_platform_hash,
+    const SessionHandoffIdentity& session_identity) {
+  if (engine_settings.GetMainExecutorSettings().GetBackend() != Backend::CPU ||
+      loaded_runtime_class != SessionHandoffRuntimeClass::kLiteRtCpu) {
+    return absl::UnimplementedError(
+        "Exact LiteRT CPU profile construction requires an executor-derived "
+        "LiteRT CPU runtime class.");
+  }
+  ABSL_RETURN_IF_ERROR(ValidateLogitsFrameContract(logits_frame));
+  if (cpu_thread_count == 0 ||
+      cpu_thread_count >
+          static_cast<uint32_t>(std::numeric_limits<int32_t>::max()) ||
+      prefill_chunk_size == 0 || prefill_chunk_size < -1) {
+    return absl::FailedPreconditionError(
+        "Exact LiteRT CPU profile has an invalid executor-derived threading "
+        "or prefill contract.");
+  }
+  if (canonical_loaded_execution_profile.empty() ||
+      IsZeroHash(model_artifact_hash) ||
+      IsZeroHash(loaded_exact_evidence.tokenizer_contract_hash) ||
+      IsZeroHash(loaded_exact_evidence.litert_model_bytecode_hash) ||
+      IsZeroHash(runtime_delegate_platform_hash) ||
+      IsZeroHash(session_identity.inference_profile_hash)) {
+    return absl::FailedPreconditionError(
+        "Exact LiteRT profile evidence is incomplete.");
+  }
+  if (session_identity.model_artifact_hash != model_artifact_hash ||
+      session_identity.runtime_artifact_hash !=
+          runtime_delegate_platform_hash) {
+    return absl::FailedPreconditionError(
+        "Exact LiteRT profile evidence disagrees with the Engine-derived "
+        "session identity.");
+  }
+  if (engine_settings.GetVisionExecutorSettings().has_value() ||
+      engine_settings.GetAudioExecutorSettings().has_value() ||
+      resolved_session_config.AudioModalityEnabled() ||
+      resolved_session_config.VisionModalityEnabled() ||
+      resolved_session_config.GetAudioEmbeddingsCallback() != nullptr) {
+    return absl::UnimplementedError(
+        "Exact LiteRT profile construction currently supports text-only "
+        "engines and sessions.");
+  }
+  if (resolved_session_config.GetScopedLoraFile() != nullptr ||
+      resolved_session_config.GetAudioScopedLoraFile() != nullptr) {
+    return absl::UnimplementedError(
+        "Exact LiteRT profile construction does not support LoRA state.");
+  }
+  if (resolved_session_config.UseExternalSampler() ||
+      resolved_session_config.GetSamplerBackend() != Backend::CPU ||
+      resolved_session_config.GetNumOutputCandidates() != 1 ||
+      resolved_session_config.GetSuppressTokensConfig().enabled() ||
+      resolved_session_config.GetApplyPromptTemplateInSession() ||
+      resolved_session_config.GetSamplerParams().type() !=
+          proto::SamplerParameters::GREEDY ||
+      resolved_session_config.GetSamplerParams().backend() !=
+          proto::SamplerParameters::CPU) {
+    return absl::UnimplementedError(
+        "Exact LiteRT profiles require one output, no hidden prompt template "
+        "or inherited token suppression, and the explicit stable CPU GREEDY "
+        "sampler.");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateMetalProfileInputs(
+    const EngineSettings& engine_settings,
+    const SessionConfig& resolved_session_config,
+    const LoadedExactLiteRtEvidence& loaded_exact_evidence,
+    SessionHandoffRuntimeClass loaded_runtime_class,
+    absl::string_view canonical_loaded_execution_profile,
+    uint32_t metal_corun_evidence,
+    absl::string_view canonical_metal_policy,
+    const ExactLiteRtLogitsFrameContract& logits_frame,
+    uint32_t cpu_thread_count, int32_t prefill_chunk_size,
+    const Hash256& model_artifact_hash,
+    const Hash256& runtime_delegate_platform_hash,
+    const SessionHandoffIdentity& session_identity) {
+  if (engine_settings.GetMainExecutorSettings().GetBackend() != Backend::GPU ||
+      loaded_runtime_class != SessionHandoffRuntimeClass::kLiteRtMetal) {
+    return absl::UnimplementedError(
+        "Exact LiteRT Metal profile construction requires an "
+        "executor-derived concrete Metal runtime class.");
+  }
+  ABSL_RETURN_IF_ERROR(ValidateLogitsFrameContract(logits_frame));
+  if (cpu_thread_count != 1 || prefill_chunk_size != -1) {
+    return absl::FailedPreconditionError(
+        "Exact LiteRT Metal requires a serial CPU argmax contract and the "
+        "executor-derived static prefill schedule sentinel.");
+  }
+  const uint32_t missing_corun =
+      RequiredMetalCoRunEvidence() & ~metal_corun_evidence;
+  if (missing_corun != 0 || canonical_metal_policy.empty()) {
+    return absl::UnimplementedError(
+        "Exact LiteRT Metal profile construction requires every concrete "
+        "CoRun policy bit, including effective kernel/pipeline identity, "
+        "Split-KV, quiescence, and complete GPU session/reset state "
+        "inventory.");
+  }
+  if (canonical_loaded_execution_profile.empty() ||
+      IsZeroHash(model_artifact_hash) ||
+      IsZeroHash(loaded_exact_evidence.tokenizer_contract_hash) ||
+      IsZeroHash(loaded_exact_evidence.litert_model_bytecode_hash) ||
+      IsZeroHash(runtime_delegate_platform_hash) ||
+      IsZeroHash(session_identity.inference_profile_hash)) {
+    return absl::FailedPreconditionError(
+        "Exact LiteRT Metal profile evidence is incomplete.");
+  }
+  if (session_identity.model_artifact_hash != model_artifact_hash ||
+      session_identity.runtime_artifact_hash !=
+          runtime_delegate_platform_hash) {
+    return absl::FailedPreconditionError(
+        "Exact LiteRT Metal evidence disagrees with the Engine-derived "
+        "session identity.");
+  }
+  if (engine_settings.GetVisionExecutorSettings().has_value() ||
+      engine_settings.GetAudioExecutorSettings().has_value() ||
+      resolved_session_config.AudioModalityEnabled() ||
+      resolved_session_config.VisionModalityEnabled() ||
+      resolved_session_config.GetAudioEmbeddingsCallback() != nullptr) {
+    return absl::UnimplementedError(
+        "Exact LiteRT Metal profile construction currently supports "
+        "text-only engines and sessions.");
+  }
+  if (resolved_session_config.GetScopedLoraFile() != nullptr ||
+      resolved_session_config.GetAudioScopedLoraFile() != nullptr) {
+    return absl::UnimplementedError(
+        "Exact LiteRT Metal profile construction does not support LoRA "
+        "state.");
+  }
+  if (resolved_session_config.UseExternalSampler() ||
+      resolved_session_config.GetSamplerBackend() != Backend::CPU ||
+      resolved_session_config.GetNumOutputCandidates() != 1 ||
+      resolved_session_config.GetSuppressTokensConfig().enabled() ||
+      resolved_session_config.GetApplyPromptTemplateInSession() ||
+      resolved_session_config.GetSamplerParams().type() !=
+          proto::SamplerParameters::GREEDY ||
+      resolved_session_config.GetSamplerParams().backend() !=
+          proto::SamplerParameters::CPU) {
+    return absl::UnimplementedError(
+        "Exact LiteRT Metal profiles require GPU logits to cross the "
+        "explicit stable CPU GREEDY argmax boundary with one output and no "
+        "hidden prompt template or inherited token suppression.");
+  }
+  const auto& main_settings = engine_settings.GetMainExecutorSettings();
+  if (!main_settings.GetAdvancedSettings().has_value() ||
+      main_settings.GetAdvancedSettings()->enable_speculative_decoding) {
+    return absl::UnimplementedError(
+        "Exact LiteRT Metal profiles reject speculative decode.");
+  }
+  return absl::OkStatus();
+}
+
+}  // namespace
+
+absl::StatusOr<LoadedExactLiteRtEvidence>
+DeriveLoadedExactLiteRtEvidence(const Hash256& model_artifact_hash,
+                                support::Tokenizer& tokenizer,
+                                ModelResources& model_resources) {
+  if (IsZeroHash(model_artifact_hash)) {
+    return absl::FailedPreconditionError(
+        "The retained model artifact digest is unavailable.");
+  }
+
+  const int vocabulary_size = tokenizer.GetVocabSize();
+  if (vocabulary_size <= 0) {
+    return absl::FailedPreconditionError(
+        "The loaded tokenizer has no positive vocabulary size.");
+  }
+  if (tokenizer.GetTokenizerType() !=
+          support::TokenizerType::kSentencePiece &&
+      tokenizer.GetTokenizerType() !=
+          support::TokenizerType::kHuggingFace) {
+    return absl::UnimplementedError(
+        "The loaded tokenizer type has no exact contract implementation.");
+  }
+  std::vector<std::string> tokens = tokenizer.GetTokens();
+  if (tokens.size() != static_cast<size_t>(vocabulary_size)) {
+    return absl::FailedPreconditionError(
+        "The loaded tokenizer token table does not match its vocabulary "
+        "size.");
+  }
+
+  Sha256Hasher tokenizer_hasher;
+  HashFrame("LITERT_LM_TOKENIZER_CONTRACT_V1", &tokenizer_hasher);
+  HashDigest(model_artifact_hash, &tokenizer_hasher);
+  HashI32(static_cast<int32_t>(tokenizer.GetTokenizerType()),
+          &tokenizer_hasher);
+  HashU64(tokens.size(), &tokenizer_hasher);
+  for (size_t token_id = 0; token_id < tokens.size(); ++token_id) {
+    ABSL_ASSIGN_OR_RETURN(const int resolved_token_id,
+                          tokenizer.TokenToId(tokens[token_id]));
+    if (resolved_token_id < 0 ||
+        static_cast<size_t>(resolved_token_id) != token_id) {
+      return absl::FailedPreconditionError(
+          "The loaded tokenizer token table is not an authoritative ordered "
+          "token-id contract.");
+    }
+    HashU64(token_id, &tokenizer_hasher);
+    HashFrame(tokens[token_id], &tokenizer_hasher);
+  }
+  const Hash256 tokenizer_contract_hash = tokenizer_hasher.Finalize();
+
+  ABSL_ASSIGN_OR_RETURN(
+      absl::string_view litert_model_bytecode,
+      model_resources.GetTFLiteModelBuffer(ModelType::kTfLitePrefillDecode));
+  if (litert_model_bytecode.empty()) {
+    return absl::FailedPreconditionError(
+        "The loaded prefill/decode LiteRT model bytecode is empty.");
+  }
+  Sha256Hasher bytecode_hasher;
+  HashFrame("LITERT_LM_PREFILL_DECODE_BYTECODE_V1", &bytecode_hasher);
+  HashFrame(litert_model_bytecode, &bytecode_hasher);
+  const Hash256 litert_model_bytecode_hash = bytecode_hasher.Finalize();
+
+  if (IsZeroHash(tokenizer_contract_hash) ||
+      IsZeroHash(litert_model_bytecode_hash)) {
+    return absl::FailedPreconditionError(
+        "Loaded exact LiteRT evidence produced a zero digest.");
+  }
+  return LoadedExactLiteRtEvidence{
+      .tokenizer_contract_hash = tokenizer_contract_hash,
+      .litert_model_bytecode_hash = litert_model_bytecode_hash,
+  };
+}
+
+ExactLiteRtProfileCapability DescribeExactLiteRtProfileCapability(
+    Backend configured_backend, uint32_t engine_derived_evidence) {
+  ExactLiteRtProfileCapability capability;
+  capability.engine_derived_evidence = engine_derived_evidence;
+  switch (configured_backend) {
+    case Backend::CPU: {
+      capability.backend = ExactLiteRtBackend::kCpu;
+      capability.required_evidence = ExactLiteRtCpuRequiredEvidenceMask();
+      const uint32_t session_scoped =
+          ExactLiteRtEvidenceBit(
+              ExactLiteRtEvidence::kStableCpuGreedySampler) |
+          ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kSessionIdentity);
+      const uint32_t required_engine_evidence =
+          capability.required_evidence & ~session_scoped;
+      capability.availability =
+          (engine_derived_evidence & required_engine_evidence) ==
+                  required_engine_evidence
+              ? ExactLiteRtProfileAvailability::
+                    kCandidateDerivationAvailable
+              : ExactLiteRtProfileAvailability::kRuntimeEvidenceUnavailable;
+      capability.missing_evidence =
+          capability.required_evidence & ~engine_derived_evidence;
+      return capability;
+    }
+    case Backend::GPU: {
+      capability.backend = ExactLiteRtBackend::kUnclassifiedGpu;
+      capability.required_evidence = ExactLiteRtMetalRequiredEvidenceMask();
+      capability.missing_evidence =
+          capability.required_evidence & ~engine_derived_evidence;
+      const uint32_t session_scoped =
+          ExactLiteRtEvidenceBit(
+              ExactLiteRtEvidence::kStableCpuGreedySampler) |
+          ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kSessionIdentity);
+      const uint32_t missing_engine_evidence =
+          capability.missing_evidence & ~session_scoped;
+      if ((engine_derived_evidence &
+           ExactLiteRtEvidenceBit(
+               ExactLiteRtEvidence::kSelectedMetalDelegate)) == 0) {
+        capability.availability =
+            ExactLiteRtProfileAvailability::kMetalEvidenceNotImplemented;
+      } else if (missing_engine_evidence != 0) {
+        capability.backend = ExactLiteRtBackend::kMetalGpu;
+        capability.availability = ExactLiteRtProfileAvailability::
+            kMetalPolicyEvidenceUnavailable;
+      } else {
+        capability.backend = ExactLiteRtBackend::kMetalGpu;
+        capability.availability = ExactLiteRtProfileAvailability::
+            kCandidateDerivationAvailable;
+      }
+      return capability;
+    }
+    case Backend::NPU:
+      capability.backend = ExactLiteRtBackend::kNpu;
+      // NPU runtime/plugin/topology evidence is deliberately not guessed. Its
+      // backend-specific evidence set remains unenumerated until a concrete
+      // backend is owned; the sentinel can never be bound by a profile.
+      capability.required_evidence =
+          ExactLiteRtCommonRequiredEvidenceMask() |
+          ExactLiteRtEvidenceBit(
+              ExactLiteRtEvidence::kBackendEvidenceUnenumerated);
+      capability.availability =
+          ExactLiteRtProfileAvailability::kNpuUnimplemented;
+      capability.missing_evidence =
+          capability.required_evidence & ~engine_derived_evidence;
+      return capability;
+    default:
+      capability.backend = ExactLiteRtBackend::kUnsupported;
+      capability.required_evidence = 0;
+      capability.availability = ExactLiteRtProfileAvailability::kUnsupported;
+      capability.missing_evidence = 0;
+      return capability;
+  }
+}
+
+absl::StatusOr<ExactLiteRtProfile> DeriveExactLiteRtCpuProfile(
+    const EngineSettings& engine_settings,
+    const SessionConfig& resolved_session_config,
+    const LoadedExactLiteRtEvidence& loaded_exact_evidence,
+    SessionHandoffRuntimeClass loaded_runtime_class,
+    absl::string_view canonical_loaded_execution_profile,
+    const ExactLiteRtLogitsFrameContract& logits_frame,
+    uint32_t cpu_thread_count, int32_t prefill_chunk_size,
+    const Hash256& model_artifact_hash,
+    const Hash256& runtime_delegate_platform_hash,
+    const SessionHandoffIdentity& session_identity) {
+  ABSL_RETURN_IF_ERROR(ValidateCpuProfileInputs(
+      engine_settings, resolved_session_config, loaded_exact_evidence,
+      loaded_runtime_class, canonical_loaded_execution_profile,
+      logits_frame, cpu_thread_count, prefill_chunk_size, model_artifact_hash,
+      runtime_delegate_platform_hash, session_identity));
+
+  Sha256Hasher loaded_profile_hasher;
+  HashFrame("LITERT_LM_LOADED_EXECUTION_PROFILE_V1", &loaded_profile_hasher);
+  HashFrame(canonical_loaded_execution_profile, &loaded_profile_hasher);
+  const Hash256 loaded_execution_profile_hash =
+      loaded_profile_hasher.Finalize();
+  if (IsZeroHash(loaded_execution_profile_hash)) {
+    return absl::FailedPreconditionError(
+        "Loaded exact LiteRT execution profile produced a zero digest.");
+  }
+
+  ExactLiteRtProfile profile{
+      .model_artifact_hash = model_artifact_hash,
+      .tokenizer_contract_hash =
+          loaded_exact_evidence.tokenizer_contract_hash,
+      .litert_model_bytecode_hash =
+          loaded_exact_evidence.litert_model_bytecode_hash,
+      .runtime_delegate_platform_hash = runtime_delegate_platform_hash,
+      .loaded_execution_profile_hash = loaded_execution_profile_hash,
+      .session_identity = session_identity,
+      .backend = ExactLiteRtBackend::kCpu,
+      .bound_evidence = ExactLiteRtCpuRequiredEvidenceMask(),
+      .qualification_requirement =
+          ExactLiteRtQualificationRequirement::
+              kIndependentColdProcessesTokensAndLogits,
+      .sampler_identity =
+          ExactLiteRtSamplerIdentity::kCpuGreedyArgmaxMinIndex,
+      .logits_frame = logits_frame,
+      .batch_size = 1,
+      .cpu_thread_count = cpu_thread_count,
+      .prefill_chunk_size = prefill_chunk_size,
+  };
+
+  ABSL_ASSIGN_OR_RETURN(profile.profile_id,
+                        ComputeExactLiteRtProfileId(profile));
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(profile));
+  return profile;
+}
+
+absl::StatusOr<ExactLiteRtProfile> DeriveExactLiteRtMetalProfile(
+    const EngineSettings& engine_settings,
+    const SessionConfig& resolved_session_config,
+    const LoadedExactLiteRtEvidence& loaded_exact_evidence,
+    SessionHandoffRuntimeClass loaded_runtime_class,
+    absl::string_view canonical_loaded_execution_profile,
+    uint32_t metal_corun_evidence,
+    absl::string_view canonical_metal_policy,
+    const ExactLiteRtLogitsFrameContract& logits_frame,
+    uint32_t cpu_thread_count, int32_t prefill_chunk_size,
+    const Hash256& model_artifact_hash,
+    const Hash256& runtime_delegate_platform_hash,
+    const SessionHandoffIdentity& session_identity) {
+  ABSL_RETURN_IF_ERROR(ValidateMetalProfileInputs(
+      engine_settings, resolved_session_config, loaded_exact_evidence,
+      loaded_runtime_class, canonical_loaded_execution_profile,
+      metal_corun_evidence, canonical_metal_policy, logits_frame,
+      cpu_thread_count, prefill_chunk_size, model_artifact_hash,
+      runtime_delegate_platform_hash, session_identity));
+
+  Sha256Hasher loaded_profile_hasher;
+  HashFrame("LITERT_LM_LOADED_EXECUTION_PROFILE_V2",
+            &loaded_profile_hasher);
+  HashFrame(canonical_loaded_execution_profile, &loaded_profile_hasher);
+  const Hash256 loaded_execution_profile_hash =
+      loaded_profile_hasher.Finalize();
+
+  Sha256Hasher policy_hasher;
+  HashFrame("LITERT_LM_METAL_EXECUTION_POLICY_V1", &policy_hasher);
+  HashU32(metal_corun_evidence, &policy_hasher);
+  HashFrame(canonical_metal_policy, &policy_hasher);
+  const Hash256 gpu_execution_policy_hash = policy_hasher.Finalize();
+  if (IsZeroHash(loaded_execution_profile_hash) ||
+      IsZeroHash(gpu_execution_policy_hash)) {
+    return absl::FailedPreconditionError(
+        "Exact LiteRT Metal execution evidence produced a zero digest.");
+  }
+
+  ExactLiteRtProfile profile{
+      .model_artifact_hash = model_artifact_hash,
+      .tokenizer_contract_hash =
+          loaded_exact_evidence.tokenizer_contract_hash,
+      .litert_model_bytecode_hash =
+          loaded_exact_evidence.litert_model_bytecode_hash,
+      .runtime_delegate_platform_hash = runtime_delegate_platform_hash,
+      .loaded_execution_profile_hash = loaded_execution_profile_hash,
+      .gpu_execution_policy_hash = gpu_execution_policy_hash,
+      .session_identity = session_identity,
+      .backend = ExactLiteRtBackend::kMetalGpu,
+      .bound_evidence = ExactLiteRtMetalRequiredEvidenceMask(),
+      .qualification_requirement =
+          ExactLiteRtQualificationRequirement::
+              kIndependentColdProcessesTokensAndLogits,
+      .sampler_identity =
+          ExactLiteRtSamplerIdentity::kCpuGreedyArgmaxMinIndex,
+      .logits_frame = logits_frame,
+      .batch_size = 1,
+      // GreedyCpuSampler is a single serial scan with a strict min-index tie
+      // rule. This is the sampler thread contract, not a GPU compile label.
+      .cpu_thread_count = cpu_thread_count,
+      // Metal uses the ordered static prefill signature schedule bound by
+      // gpu_execution_policy_hash, not the dynamic CPU chunk-size field.
+      .prefill_chunk_size = prefill_chunk_size,
+  };
+
+  ABSL_ASSIGN_OR_RETURN(profile.profile_id,
+                        ComputeExactLiteRtProfileId(profile));
+  ABSL_RETURN_IF_ERROR(ValidateExactLiteRtProfile(profile));
+  return profile;
+}
+
+}  // namespace litert::lm

@@ -22,13 +22,14 @@
 #include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "runtime/dpm/dpm_replay_mode.h"
 #include "runtime/platform/hash/sha256_hasher.h"
 
 namespace litert::lm {
 namespace {
 
 constexpr absl::string_view kManifestDomain =
-    "LITERT_LMX_DPM_PROJECTION_MANIFEST_SHA256_V1";
+    "LITERT_LMX_DPM_PROJECTION_MANIFEST_SHA256";
 
 bool IsZeroHash(const Hash256& hash) { return hash == Hash256{}; }
 
@@ -148,12 +149,43 @@ absl::Status ValidateManifestFields(const DPMProjectionManifest& manifest) {
       IsZeroHash(manifest.runtime_identity.runtime_artifact_hash) ||
       IsZeroHash(manifest.runtime_identity.inference_profile_hash) ||
       IsZeroHash(manifest.request_hash) || IsZeroHash(manifest.output_hash) ||
+      IsZeroHash(manifest.replay_request_hash) ||
+      IsZeroHash(manifest.execution_evidence_hash) ||
       (manifest.baseline_manifest_hash.has_value() &&
        IsZeroHash(*manifest.baseline_manifest_hash)) ||
       (manifest.baseline_output_hash.has_value() &&
        IsZeroHash(*manifest.baseline_output_hash))) {
     return absl::InvalidArgumentError(
         "DPM projection manifest contains an empty cryptographic identity.");
+  }
+  ABSL_RETURN_IF_ERROR(ValidateDPMReplayMode(manifest.replay_mode));
+  switch (manifest.replay_mode) {
+    case DPMReplayMode::kCanonicalWinnerReplay:
+      if (manifest.exact_profile_id.has_value() ||
+          manifest.exact_profile_admission_record_id.has_value() ||
+          manifest.exact_output_evidence_hash.has_value() ||
+          manifest.exact_logit_frame_count != 0) {
+        return absl::InvalidArgumentError(
+            "WinnerReplay projection manifest must not claim an exact "
+            "profile, admission record, or exact execution evidence.");
+      }
+      break;
+    case DPMReplayMode::kExactRegeneration:
+      if (!manifest.exact_profile_id.has_value() ||
+          IsZeroHash(*manifest.exact_profile_id) ||
+          !manifest.exact_profile_admission_record_id.has_value() ||
+          IsZeroHash(*manifest.exact_profile_admission_record_id) ||
+          !manifest.exact_output_evidence_hash.has_value() ||
+          IsZeroHash(*manifest.exact_output_evidence_hash) ||
+          manifest.exact_logit_frame_count == 0 ||
+          manifest.exact_logit_frame_count >
+              kMaximumDPMProjectionExactLogitFrames) {
+        return absl::InvalidArgumentError(
+            "ExactRegeneration projection manifest requires a non-empty "
+            "derived profile, admission record, and ordered execution "
+            "evidence.");
+      }
+      break;
   }
   return absl::OkStatus();
 }
@@ -185,6 +217,23 @@ absl::StatusOr<Hash256> ComputeDPMProjectionManifestHash(
   UpdateHash('I', manifest.runtime_identity.inference_profile_hash, &hasher);
   UpdateHash('Q', manifest.request_hash, &hasher);
   UpdateHash('O', manifest.output_hash, &hasher);
+  UpdateU8(static_cast<uint8_t>(manifest.replay_mode), &hasher);
+  UpdateHash('Y', manifest.replay_request_hash, &hasher);
+  UpdateHash('E', manifest.execution_evidence_hash, &hasher);
+  UpdateU8(manifest.exact_profile_id.has_value() ? 1 : 0, &hasher);
+  if (manifest.exact_profile_id.has_value()) {
+    UpdateHash('X', *manifest.exact_profile_id, &hasher);
+  }
+  UpdateU8(manifest.exact_profile_admission_record_id.has_value() ? 1 : 0,
+           &hasher);
+  if (manifest.exact_profile_admission_record_id.has_value()) {
+    UpdateHash('A', *manifest.exact_profile_admission_record_id, &hasher);
+  }
+  UpdateU8(manifest.exact_output_evidence_hash.has_value() ? 1 : 0, &hasher);
+  if (manifest.exact_output_evidence_hash.has_value()) {
+    UpdateHash('V', *manifest.exact_output_evidence_hash, &hasher);
+  }
+  UpdateU32(manifest.exact_logit_frame_count, &hasher);
   return hasher.Finalize();
 }
 

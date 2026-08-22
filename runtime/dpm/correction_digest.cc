@@ -20,15 +20,16 @@
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "absl/types/span.h"  // from @com_google_absl
 #include "runtime/platform/hash/sha256_hasher.h"
 
 namespace litert::lm {
 namespace {
 
 constexpr absl::string_view kCorrectionRootDomain =
-    "DPM_CORRECTION_LINEAGE_ROOT_SHA256_V1";
+    "DPM_CORRECTION_LINEAGE_ROOT_SHA256";
 constexpr absl::string_view kCorrectionStepDomain =
-    "DPM_CORRECTION_LINEAGE_STEP_SHA256_V1";
+    "DPM_CORRECTION_LINEAGE_STEP_SHA256";
 
 void UpdateU64(uint64_t value, Sha256Hasher* hasher) {
   std::array<char, 8> bytes{};
@@ -89,20 +90,23 @@ absl::StatusOr<Hash256> AdvanceDPMCorrectionDigest(
   return hasher.Finalize();
 }
 
-absl::StatusOr<Hash256> ComputeDPMCorrectionDigest(
-    const DPMLogSnapshot& snapshot) {
-  if (snapshot.log_id.empty() || snapshot.case_id.empty()) {
+absl::StatusOr<Hash256> ComputeDPMCorrectionDigestForPrefix(
+    absl::string_view log_id, absl::string_view case_id,
+    absl::Span<const DPMEvent> events, uint64_t event_count) {
+  if (log_id.empty() || case_id.empty()) {
     return absl::InvalidArgumentError(
         "A DPM correction digest requires immutable log and case ids.");
   }
-  if (snapshot.generation != snapshot.events.size()) {
-    return absl::DataLossError(
-        "DPM correction digest received an inconsistent log generation.");
+  if (event_count > events.size()) {
+    return absl::OutOfRangeError(
+        "DPM correction prefix exceeds the supplied authoritative events.");
   }
 
-  for (uint64_t i = 0; i < snapshot.events.size(); ++i) {
-    const DPMEvent& event = snapshot.events[i];
-    if (event.index != i || event.case_id != snapshot.case_id) {
+  ABSL_ASSIGN_OR_RETURN(Hash256 digest,
+                        InitialDPMCorrectionDigest(log_id, case_id));
+  for (uint64_t i = 0; i < event_count; ++i) {
+    const DPMEvent& event = events[static_cast<size_t>(i)];
+    if (event.index != i || event.case_id != case_id) {
       return absl::DataLossError(
           "DPM correction digest received a contaminated log snapshot.");
     }
@@ -112,17 +116,26 @@ absl::StatusOr<Hash256> ComputeDPMCorrectionDigest(
       return absl::DataLossError(
           "Authoritative DPM correction event is malformed.");
     }
-  }
-
-  ABSL_ASSIGN_OR_RETURN(
-      Hash256 digest,
-      InitialDPMCorrectionDigest(snapshot.log_id, snapshot.case_id));
-  for (const DPMEvent& event : snapshot.events) {
-    if (event.kind != DPMEvent::Kind::kCorrection) continue;
     ABSL_ASSIGN_OR_RETURN(digest,
                           AdvanceDPMCorrectionDigest(digest, event));
   }
   return digest;
+}
+
+absl::StatusOr<Hash256> ComputeDPMCorrectionDigestForPrefix(
+    const DPMLogSnapshot& snapshot, uint64_t event_count) {
+  if (snapshot.generation != snapshot.events.size()) {
+    return absl::DataLossError(
+        "DPM correction digest received an inconsistent log generation.");
+  }
+  return ComputeDPMCorrectionDigestForPrefix(
+      snapshot.log_id, snapshot.case_id, snapshot.events, event_count);
+}
+
+absl::StatusOr<Hash256> ComputeDPMCorrectionDigest(
+    const DPMLogSnapshot& snapshot) {
+  return ComputeDPMCorrectionDigestForPrefix(snapshot,
+                                              snapshot.events.size());
 }
 
 }  // namespace litert::lm

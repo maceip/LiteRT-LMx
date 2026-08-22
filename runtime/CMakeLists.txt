@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+add_subdirectory(platform)
 add_subdirectory(components)
 add_subdirectory(conversation)
 add_subdirectory(core)
@@ -19,6 +20,7 @@ add_subdirectory(engine)
 add_subdirectory(executor)
 add_subdirectory(framework)
 add_subdirectory(util)
+add_subdirectory(dpm)
 
 # ==============================================================================
 # Folder Facade
@@ -33,5 +35,7 @@ target_link_libraries(runtime_libs INTERFACE
   LiteRTLM::Runtime::Engine
   LiteRTLM::Runtime::Executor
   LiteRTLM::Runtime::Framework
+  LiteRTLM::Runtime::Platform
   LiteRTLM::Runtime::Util
+  LiteRTLM::Runtime::DPM
 )

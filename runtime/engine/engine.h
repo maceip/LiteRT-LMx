@@ -30,8 +30,11 @@
 #include "absl/time/time.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
 #include "runtime/engine/engine_settings.h"
+#include "runtime/engine/exact_litert_decode.h"
+#include "runtime/engine/exact_litert_profile.h"
 #include "runtime/engine/io_types.h"
 #include "runtime/engine/session_handoff.h"
+#include "runtime/engine/session_handoff_capability.h"
 #include "runtime/util/byte_stream.h"
 #include "support/tokenizer/tokenizer.h"
 
@@ -236,6 +239,19 @@ class SessionInterface {
   virtual absl::StatusOr<Responses> RunDecode(
       const DecodeConfig& decode_config) = 0;
 
+  // Runs the narrow, blocking exact-evidence path. The implementation accepts
+  // only a loaded compiled LiteRT executor with an Engine-derived exact
+  // logits contract, one explicit CPU GREEDY min-index sampler, and no logits
+  // modifiers, speculative decoding, benchmark/debug callbacks, or
+  // multimodal/LoRA state. Evidence includes stop/EOS IDs that ordinary
+  // Responses may filter from visible output. Backend-specific profile
+  // admission remains separate and may reject this evidence path.
+  virtual absl::StatusOr<ExactLiteRtDecodeResult> RunExactDecode(
+      int max_output_tokens) {
+    (void)max_output_tokens;
+    return absl::UnimplementedError("Exact LiteRT decode is not available.");
+  }
+
   // Startes the decoding process for the model to predict the response based
   // on the input prompt/query added after using RunPrefill* functions.
   // This is a not blocking call and the function will return right away. The
@@ -336,43 +352,71 @@ class SessionInterface {
   }
 
   // Exports a canonical authenticated snapshot for exact continuation by a
-  // fresh session with the same model, runtime build, and inference profile.
+  // fresh stateful session with the same model, runtime build, and inference
+  // profile. Stateless deterministic-projection sessions intentionally do not
+  // admit capsule handoff.
   virtual absl::StatusOr<std::string> ExportHandoff(
       const SessionHandoffOptions& options) {
-    return absl::UnimplementedError("ExportHandoff not implemented.");
+    std::string envelope;
+    StringByteSink sink(&envelope);
+    absl::StatusOr<SessionContinuationStateWitness> witness =
+        ExportHandoffToWithWitness(options, &sink);
+    if (!witness.ok()) return witness.status();
+    return envelope;
   }
 
-  // Streams the envelope without a second full KV-state allocation.
+  // Streams the envelope without a second full KV-state allocation and
+  // returns runtime-derived evidence over the exact bytes actually accepted
+  // by the sink. Implementations that cannot expose a complete live-state
+  // witness fail closed rather than synthesizing one from caller metadata.
+  virtual absl::StatusOr<SessionContinuationStateWitness>
+  ExportHandoffToWithWitness(const SessionHandoffOptions& options,
+                             ByteSink* sink) {
+    (void)options;
+    (void)sink;
+    return absl::UnimplementedError(
+        "Session handoff export witness is not available.");
+  }
+
+  // Compatibility adapter that discards the independently validated witness.
   virtual absl::Status ExportHandoffTo(const SessionHandoffOptions& options,
                                        ByteSink* sink) {
-    if (sink == nullptr) {
-      return absl::InvalidArgumentError(
-          "Session handoff output sink must not be null.");
-    }
-    absl::StatusOr<std::string> envelope = ExportHandoff(options);
-    if (!envelope.ok()) return envelope.status();
-    return sink->Append(*envelope);
+    absl::StatusOr<SessionContinuationStateWitness> witness =
+        ExportHandoffToWithWitness(options, sink);
+    return witness.ok() ? absl::OkStatus() : witness.status();
   }
 
-  // Imports into a fresh compatible session after authenticating and
+  // Imports into a fresh compatible stateful session after authenticating and
   // validating the complete envelope.
   virtual absl::Status ImportHandoff(absl::string_view envelope,
                                      const SessionHandoffOptions& expected) {
-    return absl::UnimplementedError("ImportHandoff not implemented.");
+    StringByteSource source(envelope);
+    absl::StatusOr<SessionContinuationStateWitness> witness =
+        ImportHandoffFromWithWitness(source, expected);
+    return witness.ok() ? absl::OkStatus() : witness.status();
   }
 
-  // Compatibility adapter for alternate session implementations. The native
-  // implementation authenticates and loads directly from the ByteSource.
+  // Authenticates and transactionally imports the source, then independently
+  // re-exports the committed live target into a digest-only sink. The returned
+  // witness therefore cannot be copied from or supplied by incoming bytes.
+  // Authentication, decoding, and state-load failures leave the fresh target
+  // unchanged. A failure of the post-commit live-state re-export is an
+  // integrity failure; callers must discard that target session.
+  virtual absl::StatusOr<SessionContinuationStateWitness>
+  ImportHandoffFromWithWitness(
+      const ByteSource& envelope, const SessionHandoffOptions& expected) {
+    (void)envelope;
+    (void)expected;
+    return absl::UnimplementedError(
+        "Session handoff import witness is not available.");
+  }
+
+  // Compatibility adapter that discards the independently recomputed witness.
   virtual absl::Status ImportHandoffFrom(
       const ByteSource& envelope, const SessionHandoffOptions& expected) {
-    if (envelope.Size() > std::numeric_limits<size_t>::max()) {
-      return absl::ResourceExhaustedError(
-          "Session handoff envelope exceeds addressable memory.");
-    }
-    std::string bytes(static_cast<size_t>(envelope.Size()), '\0');
-    absl::Status read = envelope.ReadAt(0, absl::MakeSpan(bytes));
-    if (!read.ok()) return read;
-    return ImportHandoff(bytes, expected);
+    absl::StatusOr<SessionContinuationStateWitness> witness =
+        ImportHandoffFromWithWitness(envelope, expected);
+    return witness.ok() ? absl::OkStatus() : witness.status();
   }
 
   // Get the reference to the session config for the session.
@@ -446,6 +490,50 @@ class EngineT {
     (void)session_config;
     return absl::UnimplementedError(
         "Engine-derived session handoff identity is not available.");
+  }
+
+  // Returns OK only when the runtime-artifact component of the loaded
+  // identity was also established with the platform's strongest supported
+  // loaded-image evidence (for example, untainted kernel-validated Mach-O
+  // pages). A content identity may still be available for reproducibility and
+  // WinnerReplay when this stronger admission is unavailable.
+  virtual absl::Status ValidateStrongRuntimeArtifactIdentity() const {
+    return absl::UnimplementedError(
+        "Strong loaded runtime-artifact identity is not available.");
+  }
+
+  // Reports whether this loaded Engine can derive an ExactLiteRtProfile.
+  // Candidate availability is not ExactRegeneration admission; admission
+  // requires a separate independent cold-process equality record.
+  virtual ExactLiteRtProfileCapability GetExactLiteRtProfileCapability()
+      const {
+    return {};
+  }
+
+  // Derives an exact-profile identity from the already-loaded Engine and a
+  // fully-resolved SessionConfig. `assertion` can only reject the derived
+  // result; it cannot supply model, backend, runtime, or profile identity.
+  virtual absl::StatusOr<ExactLiteRtProfile> ResolveExactLiteRtProfile(
+      const SessionConfig& session_config,
+      const ExactLiteRtProfileAssertion& assertion = {}) const {
+    (void)session_config;
+    (void)assertion;
+    return absl::UnimplementedError(
+        "Engine-derived exact LiteRT profile is not available.");
+  }
+
+  // Derives the complete session-capsule capability from the loaded Engine,
+  // a fully-resolved SessionConfig, the exact profile for that configuration,
+  // and executor-owned state inventory evidence. Assertions can only reject
+  // the result; they cannot supply or upgrade capability evidence.
+  virtual absl::StatusOr<SessionHandoffCapability>
+  ResolveSessionHandoffCapability(
+      const SessionConfig& session_config,
+      const SessionHandoffCapabilityAssertion& assertion = {}) const {
+    (void)session_config;
+    (void)assertion;
+    return absl::UnimplementedError(
+        "Engine-derived session handoff capability is not available.");
   }
 
   // Get the audio model properties for the session. This is only available

@@ -15,6 +15,23 @@
 set(PKG_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 
 # ==============================================================================
+# Byte Stream
+# ==============================================================================
+add_litertlm_library(runtime_util_byte_stream INTERFACE)
+add_library(LiteRTLM::Runtime::Util::ByteStream ALIAS runtime_util_byte_stream)
+
+target_include_directories(runtime_util_byte_stream
+  INTERFACE
+    ${LITERTLM_GENERATED_SRC_DIR}
+    ${LITERTLM_INCLUDE_PATHS}
+)
+
+target_link_libraries(runtime_util_byte_stream
+  INTERFACE
+    LITERTLM_DEPS
+)
+
+# ==============================================================================
 # Convert Tensor Buffer
 # ==============================================================================
 add_litertlm_library(runtime_util_convert_tensor_buffer INTERFACE)
@@ -467,6 +484,7 @@ add_library(runtime_util_libs INTERFACE)
 add_library(LiteRTLM::Runtime::Util ALIAS runtime_util_libs)
 
 target_link_libraries(runtime_util_libs INTERFACE
+  LiteRTLM::Runtime::Util::ByteStream
   LiteRTLM::Runtime::Util::ConvertTensorBuffer
   LiteRTLM::Runtime::Util::DataStream
   LiteRTLM::Runtime::Util::ExecutorDataUtil

@@ -138,6 +138,11 @@ class SerialExecutionManager : public ExecutionManager {
                                      const StateInterface&)>
           consumer) override;
 
+  absl::StatusOr<std::vector<std::vector<int>>>
+  GetExactProcessedTokenHistory(
+      SessionId session_id,
+      const absl::flat_hash_set<TaskId>& boundary_tasks) override;
+
   absl::Status ImportSessionSnapshot(
       SessionId session_id,
       const ExecutorSessionSnapshot& snapshot) override;
@@ -190,7 +195,9 @@ class SerialExecutionManager : public ExecutionManager {
       int max_output_tokens,
       std::optional<int> thinking_token_budget = std::nullopt,
       std::vector<int> thinking_start_token_ids = {},
-      std::vector<int> thinking_end_token_ids = {}) override;
+      std::vector<int> thinking_end_token_ids = {},
+      std::shared_ptr<ExactLiteRtDecodeCapture> exact_litert_decode_capture =
+          nullptr) override;
 
   // Adds a clone session task to the execution manager.
   // - session_id: The ID of the session that created the task.

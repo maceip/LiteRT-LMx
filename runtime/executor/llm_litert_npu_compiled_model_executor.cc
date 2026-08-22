@@ -790,6 +790,10 @@ LlmLiteRtNpuCompiledModelExecutor::Decode() {
 absl::StatusOr<std::vector<std::vector<int>>>
 LlmLiteRtNpuCompiledModelExecutor::Decode(
     const ExecutorDecodeParams& decode_params) {
+  if (decode_params.GetExactLiteRtDecodeCapture() != nullptr) {
+    return absl::UnimplementedError(
+        "Exact LiteRT logits capture is not implemented for NPU execution.");
+  }
   auto start = absl::Now();
 
   if (current_step_ >= executor_settings_.GetMaxNumTokens()) {

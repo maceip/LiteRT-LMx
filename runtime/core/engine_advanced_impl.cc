@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <atomic>
+#include <cstdint>
 #include <future>  // NOLINT(build/c++11)
 #include <memory>
 #include <optional>
@@ -23,11 +24,13 @@
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
+#include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/time/clock.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
 #include "litert/cc/litert_macros.h"  // from @litert
 #include "runtime/components/model_resources.h"
+#include "runtime/core/exact_litert_profile_builder.h"
 #include "runtime/core/session_handoff_identity.h"
 #include "runtime/core/session_advanced.h"
 #include "runtime/engine/engine.h"
@@ -61,8 +64,14 @@
 namespace litert::lm {
 
 struct LoadedRuntimeIdentity {
+  SessionHandoffRuntimeClass runtime_class;
   Hash256 runtime_artifact_hash;
   std::string canonical_profile;
+  ExactLiteRtLogitsFrameContract logits_frame;
+  uint32_t cpu_thread_count = 0;
+  int32_t prefill_chunk_size = 0;
+  uint32_t metal_corun_evidence = 0;
+  std::string canonical_metal_policy;
 };
 
 class EngineAdvancedImpl : public Engine {
@@ -95,6 +104,14 @@ class EngineAdvancedImpl : public Engine {
                      std::optional<BenchmarkInfo> benchmark_info,
                      Hash256 model_artifact_hash,
                      absl::Status model_artifact_post_load_status,
+                     absl::StatusOr<LoadedExactLiteRtEvidence>
+                         loaded_exact_litert_evidence,
+                     absl::StatusOr<ExactLiteRtLogitsFrameContract>
+                         loaded_exact_logits_frame_contract,
+                     absl::StatusOr<Hash256>
+                         loaded_complete_session_handoff_state_inventory_hash,
+                     absl::StatusOr<Hash256>
+                         loaded_strong_runtime_artifact_hash,
                      absl::StatusOr<LoadedRuntimeIdentity>
                          loaded_runtime_identity)
       : engine_settings_(std::move(engine_settings)),
@@ -106,6 +123,15 @@ class EngineAdvancedImpl : public Engine {
         model_artifact_hash_(model_artifact_hash),
         model_artifact_post_load_status_(
             std::move(model_artifact_post_load_status)),
+        loaded_exact_litert_evidence_(
+            std::move(loaded_exact_litert_evidence)),
+        loaded_exact_logits_frame_contract_(
+            std::move(loaded_exact_logits_frame_contract)),
+        loaded_complete_session_handoff_state_inventory_hash_(
+            std::move(
+                loaded_complete_session_handoff_state_inventory_hash)),
+        loaded_strong_runtime_artifact_hash_(
+            std::move(loaded_strong_runtime_artifact_hash)),
         loaded_runtime_identity_(std::move(loaded_runtime_identity)) {}
 
   // Method to create the Session.
@@ -131,6 +157,10 @@ class EngineAdvancedImpl : public Engine {
     if (identity.ok()) {
       session_handoff_identity = *identity;
     }
+    std::optional<ExactLiteRtLogitsFrameContract> exact_logits_frame_contract;
+    if (loaded_exact_logits_frame_contract_.ok()) {
+      exact_logits_frame_contract = *loaded_exact_logits_frame_contract_;
+    }
 
     if (litert_model_resources_ == nullptr) {
       return absl::FailedPreconditionError(
@@ -139,10 +169,11 @@ class EngineAdvancedImpl : public Engine {
 
     ABSL_ASSIGN_OR_RETURN(
         auto session,
-        SessionAdvanced::Create(execution_manager_, tokenizer_.get(), config,
-                                std::move(session_benchmark_info),
-                                &living_sessions_,
-                                std::move(session_handoff_identity)));
+        SessionAdvanced::CreateWithEngineOwnedIdentity(
+            execution_manager_, tokenizer_.get(), config,
+            std::move(session_benchmark_info), &living_sessions_,
+            std::move(session_handoff_identity),
+            std::move(exact_logits_frame_contract)));
 
     if (benchmark_info_.has_value()) {
       auto session_benchmark_info_or = session->GetMutableBenchmarkInfo();
@@ -212,6 +243,336 @@ class EngineAdvancedImpl : public Engine {
     };
   }
 
+  absl::Status ValidateStrongRuntimeArtifactIdentity() const override {
+    if (!loaded_runtime_identity_.ok()) {
+      return loaded_runtime_identity_.status();
+    }
+    if (!loaded_strong_runtime_artifact_hash_.ok()) {
+      return loaded_strong_runtime_artifact_hash_.status();
+    }
+    if (*loaded_strong_runtime_artifact_hash_ == Hash256{} ||
+        *loaded_strong_runtime_artifact_hash_ !=
+            loaded_runtime_identity_->runtime_artifact_hash) {
+      return absl::DataLossError(
+          "Strong and reproducibility runtime-artifact identities disagree.");
+    }
+    return absl::OkStatus();
+  }
+
+  ExactLiteRtProfileCapability GetExactLiteRtProfileCapability()
+      const override {
+    uint32_t engine_evidence = 0;
+    const bool retained_model_is_current =
+        model_artifact_hash_ != Hash256{} &&
+        model_artifact_post_load_status_.ok() &&
+        litert_model_resources_ != nullptr &&
+        litert_model_resources_->VerifyModelArtifactSize().ok();
+    if (retained_model_is_current) {
+      engine_evidence |=
+          ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kModelArtifact);
+    }
+    if (retained_model_is_current && loaded_exact_litert_evidence_.ok()) {
+      engine_evidence |=
+          ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kTokenizerContract) |
+          ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kLiteRtModelBytecode);
+    }
+    if (loaded_runtime_identity_.ok() &&
+        ValidateStrongRuntimeArtifactIdentity().ok()) {
+      const Backend configured_backend =
+          engine_settings_.GetMainExecutorSettings().GetBackend();
+      if (configured_backend == Backend::CPU &&
+          loaded_runtime_identity_->runtime_class ==
+              SessionHandoffRuntimeClass::kLiteRtCpu) {
+        engine_evidence |=
+            ExactLiteRtEvidenceBit(
+                ExactLiteRtEvidence::kRuntimeAndDelegateBinary) |
+            ExactLiteRtEvidenceBit(
+                ExactLiteRtEvidence::kOperatingSystemAndDevice) |
+            ExactLiteRtEvidenceBit(
+                ExactLiteRtEvidence::kCompilationPrecisionAndQuantization) |
+            ExactLiteRtEvidenceBit(
+                ExactLiteRtEvidence::kExecutionShapeThreadingAndChunking);
+      } else if (configured_backend == Backend::GPU &&
+                 loaded_runtime_identity_->runtime_class ==
+                     SessionHandoffRuntimeClass::kLiteRtMetal) {
+        engine_evidence |=
+            ExactLiteRtEvidenceBit(
+                ExactLiteRtEvidence::kRuntimeAndDelegateBinary) |
+            ExactLiteRtEvidenceBit(
+                ExactLiteRtEvidence::kOperatingSystemAndDevice) |
+            ExactLiteRtEvidenceBit(
+                ExactLiteRtEvidence::kMetalDeviceAndFamily) |
+            ExactLiteRtEvidenceBit(
+                ExactLiteRtEvidence::kSelectedMetalDelegate);
+        const uint32_t corun =
+            loaded_runtime_identity_->metal_corun_evidence;
+        if ((corun & MetalCoRunEvidenceBit(
+                         MetalCoRunEvidence::kFixedPrefillSchedule)) != 0) {
+          engine_evidence |= ExactLiteRtEvidenceBit(
+              ExactLiteRtEvidence::kFixedPrefillSchedule);
+        }
+        if ((corun & MetalCoRunEvidenceBit(
+                         MetalCoRunEvidence::kFixedShapeDecode)) != 0) {
+          engine_evidence |= ExactLiteRtEvidenceBit(
+              ExactLiteRtEvidence::kFixedShapeDecode);
+        }
+        if ((corun & MetalCoRunEvidenceBit(
+                         MetalCoRunEvidence::kFixedPrefillSchedule)) != 0 &&
+            (corun & MetalCoRunEvidenceBit(
+                         MetalCoRunEvidence::kFixedShapeDecode)) != 0) {
+          engine_evidence |= ExactLiteRtEvidenceBit(
+              ExactLiteRtEvidence::kExecutionShapeThreadingAndChunking);
+        }
+        if ((corun & MetalCoRunEvidenceBit(
+                         MetalCoRunEvidence::kAdaptiveSplitKvDisabled)) != 0) {
+          engine_evidence |= ExactLiteRtEvidenceBit(
+              ExactLiteRtEvidence::kAdaptiveSplitKvDisabled);
+        }
+        if ((corun & MetalCoRunEvidenceBit(
+                         MetalCoRunEvidence::kQuiescentExecution)) != 0) {
+          engine_evidence |= ExactLiteRtEvidenceBit(
+              ExactLiteRtEvidence::kQuiescentGpuExecution);
+        }
+        if ((corun & MetalCoRunEvidenceBit(
+                         MetalCoRunEvidence::kCompleteSessionAndResetState)) !=
+            0) {
+          engine_evidence |= ExactLiteRtEvidenceBit(
+              ExactLiteRtEvidence::kCompleteGpuSessionAndResetState);
+        }
+        if ((corun & MetalCoRunEvidenceBit(
+                         MetalCoRunEvidence::kSelectedKernelPipeline)) != 0) {
+          engine_evidence |= ExactLiteRtEvidenceBit(
+              ExactLiteRtEvidence::kSelectedMetalKernelPipeline);
+          // Effective precision/quantization/compilation flags are only proven
+          // together with the selected compiled pipeline. Requested GpuOptions
+          // can be downgraded by the Metal delegate and are not sufficient.
+          engine_evidence |= ExactLiteRtEvidenceBit(
+              ExactLiteRtEvidence::kCompilationPrecisionAndQuantization);
+        }
+      }
+    }
+    return DescribeExactLiteRtProfileCapability(
+        engine_settings_.GetMainExecutorSettings().GetBackend(),
+        engine_evidence);
+  }
+
+  absl::StatusOr<ExactLiteRtProfile> ResolveExactLiteRtProfile(
+      const SessionConfig& session_config,
+      const ExactLiteRtProfileAssertion& assertion) const override {
+    const ExactLiteRtProfileCapability capability =
+        GetExactLiteRtProfileCapability();
+    switch (capability.availability) {
+      case ExactLiteRtProfileAvailability::kCandidateDerivationAvailable:
+        break;
+      case ExactLiteRtProfileAvailability::kMetalEvidenceNotImplemented:
+        return absl::UnimplementedError(
+            "Exact LiteRT GPU profiles require executor-derived proof of the "
+            "selected Metal delegate/plugin binary, MTLDevice, Metal family, "
+            "OS build, and pinned GPU execution policy. A configured GPU "
+            "label is not sufficient.");
+      case ExactLiteRtProfileAvailability::kMetalPolicyEvidenceUnavailable: {
+        // Capability discovery intentionally leaves session identity and the
+        // concrete sampler contract unresolved. Report only engine-scoped
+        // Metal blockers here so callers see the hooks that actually prevent
+        // this loaded executor from becoming a candidate.
+        constexpr uint32_t kSessionScopedEvidence =
+            ExactLiteRtEvidenceBit(
+                ExactLiteRtEvidence::kStableCpuGreedySampler) |
+            ExactLiteRtEvidenceBit(ExactLiteRtEvidence::kSessionIdentity);
+        return absl::UnimplementedError(absl::StrCat(
+            "The loaded Metal executor is not an ExactRegeneration "
+            "candidate. Missing concrete CoRun evidence: ",
+            DescribeMissingExactLiteRtEvidence(
+                capability.missing_evidence & ~kSessionScopedEvidence),
+            ". Pinned LiteRT must expose the selected attention Split-KV "
+            "policy and effective compiled Metal pipeline/precision flags; "
+            "LiteRT-LM must enforce quiescent fixed-shape decode and inventory "
+            "the complete GPU session capsule before these bits can be "
+            "bound."));
+      }
+      case ExactLiteRtProfileAvailability::kNpuUnimplemented:
+        return absl::UnimplementedError(
+            "Exact LiteRT NPU profiles remain unimplemented until concrete "
+            "compiler-plugin, device, topology, and execution-state evidence "
+            "is enumerated.");
+      case ExactLiteRtProfileAvailability::kRuntimeEvidenceUnavailable:
+        if (litert_model_resources_ == nullptr) {
+          return absl::FailedPreconditionError(
+              "The retained model resources are unavailable.");
+        }
+        if (absl::Status status =
+                litert_model_resources_->VerifyModelArtifactSize();
+            !status.ok()) {
+          return status;
+        }
+        if (!model_artifact_post_load_status_.ok()) {
+          return model_artifact_post_load_status_;
+        }
+        if (!loaded_exact_litert_evidence_.ok()) {
+          return loaded_exact_litert_evidence_.status();
+        }
+        if (!loaded_runtime_identity_.ok()) {
+          return loaded_runtime_identity_.status();
+        }
+        if (!loaded_strong_runtime_artifact_hash_.ok()) {
+          return loaded_strong_runtime_artifact_hash_.status();
+        }
+        return absl::FailedPreconditionError(
+            "The loaded Engine lacks complete exact LiteRT evidence.");
+      default:
+        return absl::UnimplementedError(
+            "The loaded Engine backend cannot derive an exact LiteRT "
+            "profile.");
+    }
+
+    if (litert_model_resources_ == nullptr) {
+      return absl::FailedPreconditionError(
+          "The retained model resources are unavailable.");
+    }
+    // Exact-profile resolution is expected to happen once at worker/session
+    // admission, so pay the full retained-artifact rehash here. Later handoff
+    // checks use the cheaper size guard, but a same-size mutation must not be
+    // able to mint a new exact profile.
+    ABSL_RETURN_IF_ERROR(litert_model_resources_->VerifyModelArtifactHash());
+    if (!model_artifact_post_load_status_.ok()) {
+      return model_artifact_post_load_status_;
+    }
+    if (!loaded_exact_litert_evidence_.ok()) {
+      return loaded_exact_litert_evidence_.status();
+    }
+    if (!loaded_runtime_identity_.ok()) {
+      return loaded_runtime_identity_.status();
+    }
+    ABSL_RETURN_IF_ERROR(ValidateStrongRuntimeArtifactIdentity());
+
+    SessionConfig resolved = session_config;
+    ABSL_RETURN_IF_ERROR(resolved.MaybeUpdateAndValidate(engine_settings_));
+    ABSL_ASSIGN_OR_RETURN(const SessionHandoffIdentity session_identity,
+                          ResolveSessionHandoffIdentity(resolved));
+    absl::StatusOr<ExactLiteRtProfile> derived_profile =
+        engine_settings_.GetMainExecutorSettings().GetBackend() == Backend::GPU
+            ? DeriveExactLiteRtMetalProfile(
+                  engine_settings_, resolved, *loaded_exact_litert_evidence_,
+                  loaded_runtime_identity_->runtime_class,
+                  loaded_runtime_identity_->canonical_profile,
+                  loaded_runtime_identity_->metal_corun_evidence,
+                  loaded_runtime_identity_->canonical_metal_policy,
+                  loaded_runtime_identity_->logits_frame,
+                  loaded_runtime_identity_->cpu_thread_count,
+                  loaded_runtime_identity_->prefill_chunk_size,
+                  model_artifact_hash_,
+                  loaded_runtime_identity_->runtime_artifact_hash,
+                  session_identity)
+            : DeriveExactLiteRtCpuProfile(
+                  engine_settings_, resolved, *loaded_exact_litert_evidence_,
+                  loaded_runtime_identity_->runtime_class,
+                  loaded_runtime_identity_->canonical_profile,
+                  loaded_runtime_identity_->logits_frame,
+                  loaded_runtime_identity_->cpu_thread_count,
+                  loaded_runtime_identity_->prefill_chunk_size,
+                  model_artifact_hash_,
+                  loaded_runtime_identity_->runtime_artifact_hash,
+                  session_identity);
+    ABSL_ASSIGN_OR_RETURN(ExactLiteRtProfile profile,
+                          std::move(derived_profile));
+    ABSL_RETURN_IF_ERROR(
+        ValidateExactLiteRtProfileAssertion(profile, assertion));
+    return profile;
+  }
+
+  absl::StatusOr<SessionHandoffCapability>
+  ResolveSessionHandoffCapability(
+      const SessionConfig& session_config,
+      const SessionHandoffCapabilityAssertion& assertion) const override {
+    SessionConfig resolved = session_config;
+    ABSL_RETURN_IF_ERROR(resolved.MaybeUpdateAndValidate(engine_settings_));
+    switch (resolved.GetMemoryStrategy()) {
+      case SessionConfig::MemoryStrategy::kStateful:
+        break;
+      case SessionConfig::MemoryStrategy::kStatelessDeterministicProjection:
+        return absl::UnimplementedError(
+            "Session handoff capability is unavailable for stateless "
+            "deterministic-projection sessions; capsule capture and restore "
+            "require a stateful session.");
+      default:
+        return absl::InvalidArgumentError(
+            "Session handoff capability received an unknown memory "
+            "strategy.");
+    }
+
+    const Backend configured_backend =
+        engine_settings_.GetMainExecutorSettings().GetBackend();
+    if (configured_backend == Backend::NPU) {
+      return absl::UnimplementedError(
+          "Session handoff capability remains unimplemented for NPU until "
+          "the compiler plugin, device-native continuation state, sampler, "
+          "and all backend buffers are authoritatively inventoried.");
+    }
+    if (configured_backend != Backend::CPU &&
+        configured_backend != Backend::GPU) {
+      return absl::UnimplementedError(
+          "The loaded Engine backend has no session handoff capability.");
+    }
+    if (!loaded_complete_session_handoff_state_inventory_hash_.ok()) {
+      if (configured_backend == Backend::GPU) {
+        return absl::UnimplementedError(absl::StrCat(
+            "Session handoff capability is unavailable for Metal because "
+            "the loaded executor has no complete GPU/native continuation "
+            "state inventory: ",
+            loaded_complete_session_handoff_state_inventory_hash_.status()
+                .message()));
+      }
+      return loaded_complete_session_handoff_state_inventory_hash_.status();
+    }
+    if (*loaded_complete_session_handoff_state_inventory_hash_ == Hash256{}) {
+      return absl::FailedPreconditionError(
+          "The executor-derived complete session-state inventory hash is "
+          "zero.");
+    }
+
+    // Capability derivation depends on an exact profile, never the reverse.
+    // This keeps cold exact-profile identity available even for a runtime that
+    // cannot yet export a complete capsule.
+    ABSL_ASSIGN_OR_RETURN(
+        const ExactLiteRtProfile exact_profile,
+        ResolveExactLiteRtProfile(resolved, ExactLiteRtProfileAssertion{}));
+    ABSL_ASSIGN_OR_RETURN(const SessionHandoffIdentity session_identity,
+                          ResolveSessionHandoffIdentity(resolved));
+    if (exact_profile.session_identity != session_identity) {
+      return absl::FailedPreconditionError(
+          "Engine-derived exact profile and session handoff identity "
+          "disagree.");
+    }
+    if (configured_backend == Backend::CPU &&
+        exact_profile.backend != ExactLiteRtBackend::kCpu) {
+      return absl::FailedPreconditionError(
+          "Loaded CPU Engine derived a non-CPU exact profile.");
+    }
+    if (configured_backend == Backend::GPU &&
+        exact_profile.backend != ExactLiteRtBackend::kMetalGpu) {
+      return absl::FailedPreconditionError(
+          "Loaded GPU Engine did not derive a concrete Metal profile.");
+    }
+
+    SessionHandoffCapability capability{
+        .version = SessionHandoffCapability::kFormatVersion,
+        .session_identity = session_identity,
+        .exact_profile_id = exact_profile.profile_id,
+        .backend = exact_profile.backend,
+        .complete_state_inventory_hash =
+            *loaded_complete_session_handoff_state_inventory_hash_,
+        .capsule_codec_contract_hash =
+            GetSessionHandoffCapsuleCodecContractHash(),
+    };
+    ABSL_ASSIGN_OR_RETURN(
+        capability.capability_id,
+        ComputeSessionHandoffCapabilityId(capability));
+    ABSL_RETURN_IF_ERROR(ValidateSessionHandoffCapability(capability));
+    ABSL_RETURN_IF_ERROR(
+        ValidateSessionHandoffCapabilityAssertion(capability, assertion));
+    return capability;
+  }
+
   absl::StatusOr<AudioExecutorProperties> GetAudioExecutorProperties()
       const override {
     return GetAudioExecutorPropertiesFromModelResources(
@@ -255,6 +616,29 @@ class EngineAdvancedImpl : public Engine {
   // tokenizer loading. Failure disables exact handoff identity without
   // changing ordinary Engine creation or inference.
   const absl::Status model_artifact_post_load_status_;
+
+  // Ordered tokenizer and exact embedded LiteRT model bytes measured after
+  // the executor and tokenizer have both finished loading.
+  const absl::StatusOr<LoadedExactLiteRtEvidence>
+      loaded_exact_litert_evidence_;
+
+  // Narrow executor-owned capture contract. It is independent of session
+  // capsule eligibility and broader exact-profile admission.
+  const absl::StatusOr<ExactLiteRtLogitsFrameContract>
+      loaded_exact_logits_frame_contract_;
+
+  // Captured separately from loaded runtime/profile identity so failure to
+  // inventory a complete capsule cannot disable cold exact-profile
+  // derivation. In particular, Metal remains a profile-evidence problem and a
+  // capsule-inventory problem rather than silently inheriting CPU support.
+  const absl::StatusOr<Hash256>
+      loaded_complete_session_handoff_state_inventory_hash_;
+
+  // Strong platform admission for the same runtime-artifact content hash.
+  // Ordinary deterministic-memory/WinnerReplay identity may use the
+  // reproducibility measurement, while ExactRegeneration and CapsuleRestore
+  // remain gated on this independent status.
+  const absl::StatusOr<Hash256> loaded_strong_runtime_artifact_hash_;
 
   // Measured runtime/delegate evidence and canonical concrete executor
   // profile. Unsupported platforms/backends retain the failure status so
@@ -476,21 +860,100 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
         BenchmarkInfo::InitPhase::kTokenizer, tokenizer_duration));
   }
 
-  // Detect persistent drift across lazy model/tokenizer reads. This does not
-  // claim atomic protection from a concurrently mutable caller alias; exact
-  // handoff requires that retained source to remain unchanged for the Engine
-  // lifetime.
+  // Capture the narrow immutable logits contract separately from session
+  // capsule/runtime-profile evidence. Cold exact decode can collect evidence
+  // even when handoff is not supported, but the loaded tokenizer and logits
+  // vocabulary must still agree.
+  absl::StatusOr<ExactLiteRtLogitsFrameContract>
+      loaded_exact_logits_frame_contract =
+          executor->GetExactLiteRtLogitsFrameContract();
+  const int tokenizer_vocabulary_size = tokenizer->GetVocabSize();
+  if (tokenizer_vocabulary_size <= 0) {
+    loaded_exact_logits_frame_contract = absl::FailedPreconditionError(
+        "Loaded tokenizer has no positive exact-decode vocabulary.");
+  } else if (loaded_exact_logits_frame_contract.ok() &&
+             loaded_exact_logits_frame_contract->vocabulary_size !=
+                 static_cast<uint32_t>(tokenizer_vocabulary_size)) {
+    loaded_exact_logits_frame_contract = absl::FailedPreconditionError(
+        "Loaded decode logits vocabulary does not match the loaded "
+        "tokenizer vocabulary.");
+  }
+
+  // Capsule inventory is intentionally measured through a separate hook from
+  // exact-profile runtime evidence. Its dynamic-buffer schema is capacity
+  // invariant, so this load-time commitment remains authoritative after a
+  // supported KV-capacity growth; each LRTST001 capsule separately binds the
+  // resulting concrete extent. A failure is retained for fail-closed
+  // capability discovery without disabling ordinary or cold exact inference.
+  absl::StatusOr<Hash256>
+      loaded_complete_session_handoff_state_inventory_hash =
+          executor->GetCompleteSessionHandoffStateInventoryHash();
+
+  // Capture the ordered tokenizer contract and the exact embedded LiteRT
+  // prefill/decode bytecode after all lazy model/tokenizer reads have
+  // completed. Failure is retained as exact-profile capability evidence and
+  // does not disable ordinary inference.
+  absl::StatusOr<LoadedExactLiteRtEvidence> loaded_exact_litert_evidence =
+      DeriveLoadedExactLiteRtEvidence(model_artifact_hash, *tokenizer,
+                                      *model_resources);
+
+  // Detect persistent drift after every identity-related lazy model/tokenizer
+  // read. This does not claim atomic protection from a concurrently mutable
+  // caller alias; exact modes require that retained source to remain unchanged
+  // for the Engine lifetime.
   absl::Status model_artifact_post_load_status =
       model_resources->VerifyModelArtifactHash();
 
+  absl::StatusOr<Hash256> loaded_strong_runtime_artifact_hash =
+      absl::UnknownError("Strong runtime artifact was not measured.");
   absl::StatusOr<LoadedRuntimeIdentity> loaded_runtime_identity = [&]()
       -> absl::StatusOr<LoadedRuntimeIdentity> {
     ABSL_ASSIGN_OR_RETURN(
         SessionHandoffRuntimeProfile runtime_profile,
-        executor->GetSessionHandoffRuntimeProfile());
+        executor->GetLoadedRuntimeIdentityProfile());
     if (runtime_profile.logits_vocabulary_size <= 0) {
       return absl::FailedPreconditionError(
           "Loaded executor has no measurable logits vocabulary.");
+    }
+    if (runtime_profile.logits_batch_size != 1 ||
+        runtime_profile.logits_sequence_size != 1 ||
+        runtime_profile.logits_frame_byte_count == 0) {
+      return absl::FailedPreconditionError(
+          "Loaded executor has no exact batch-one, one-position logits frame "
+          "contract.");
+    }
+    if (runtime_profile.cpu_thread_count == 0 ||
+        runtime_profile.prefill_chunk_size == 0 ||
+        runtime_profile.prefill_chunk_size < -1) {
+      return absl::FailedPreconditionError(
+          "Loaded executor has no valid retained threading and prefill "
+          "contract.");
+    }
+    ExactLiteRtLogitsElementType exact_logits_element_type =
+        ExactLiteRtLogitsElementType::kUnsupported;
+    uint64_t logits_element_byte_count = 0;
+    switch (runtime_profile.logits_element_type) {
+      case SessionHandoffLogitsElementType::kFloat16:
+        exact_logits_element_type = ExactLiteRtLogitsElementType::kFloat16;
+        logits_element_byte_count = 2;
+        break;
+      case SessionHandoffLogitsElementType::kFloat32:
+        exact_logits_element_type = ExactLiteRtLogitsElementType::kFloat32;
+        logits_element_byte_count = 4;
+        break;
+      default:
+        return absl::UnimplementedError(
+            "Loaded executor logits element type has no exact frame "
+            "contract.");
+    }
+    const uint64_t expected_logits_frame_byte_count =
+        static_cast<uint64_t>(runtime_profile.logits_vocabulary_size) *
+        logits_element_byte_count;
+    if (runtime_profile.logits_frame_byte_count !=
+        expected_logits_frame_byte_count) {
+      return absl::FailedPreconditionError(
+          "Loaded executor logits frame byte count is inconsistent with its "
+          "runtime-derived shape and element type.");
     }
     const int tokenizer_vocabulary_size = tokenizer->GetVocabSize();
     if (tokenizer_vocabulary_size <= 0) {
@@ -502,16 +965,54 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
           "Loaded decode logits vocabulary does not match the loaded "
           "tokenizer vocabulary.");
     }
-    ABSL_ASSIGN_OR_RETURN(
-        Hash256 runtime_artifact_hash,
-        MeasureLoadedRuntimeArtifact(runtime_profile));
-    if (runtime_artifact_hash == Hash256{}) {
+    absl::StatusOr<Hash256> runtime_artifact_hash =
+        MeasureLoadedRuntimeArtifact(runtime_profile);
+    loaded_strong_runtime_artifact_hash = runtime_artifact_hash;
+    if (!runtime_artifact_hash.ok()) {
+      runtime_artifact_hash =
+          MeasureLoadedRuntimeArtifactForReproducibility(runtime_profile);
+    }
+    if (!runtime_artifact_hash.ok()) return runtime_artifact_hash.status();
+    if (*runtime_artifact_hash == Hash256{}) {
       return absl::FailedPreconditionError(
           "Measured loaded runtime/delegate artifact hash is zero.");
     }
+    uint32_t metal_corun_evidence = 0;
+    std::string canonical_metal_policy;
+    if (runtime_profile.runtime_class ==
+        SessionHandoffRuntimeClass::kLiteRtMetal) {
+      if (!runtime_profile.metal_corun.has_value() ||
+          runtime_profile.metal_corun->canonical_policy.empty()) {
+        return absl::FailedPreconditionError(
+            "Concrete Metal runtime class lacks CoRun evidence.");
+      }
+      metal_corun_evidence =
+          runtime_profile.metal_corun->derived_evidence;
+      canonical_metal_policy =
+          runtime_profile.metal_corun->canonical_policy;
+    } else if (runtime_profile.metal_corun.has_value()) {
+      return absl::FailedPreconditionError(
+          "Non-Metal runtime unexpectedly supplied Metal CoRun evidence.");
+    }
     return LoadedRuntimeIdentity{
-        .runtime_artifact_hash = runtime_artifact_hash,
+        .runtime_class = runtime_profile.runtime_class,
+        .runtime_artifact_hash = *runtime_artifact_hash,
         .canonical_profile = std::move(runtime_profile.canonical_profile),
+        .logits_frame =
+            ExactLiteRtLogitsFrameContract{
+                .element_type = exact_logits_element_type,
+                .batch_size = static_cast<uint32_t>(
+                    runtime_profile.logits_batch_size),
+                .sequence_size = static_cast<uint32_t>(
+                    runtime_profile.logits_sequence_size),
+                .vocabulary_size = static_cast<uint32_t>(
+                    runtime_profile.logits_vocabulary_size),
+                .byte_count = runtime_profile.logits_frame_byte_count,
+            },
+        .cpu_thread_count = runtime_profile.cpu_thread_count,
+        .prefill_chunk_size = runtime_profile.prefill_chunk_size,
+        .metal_corun_evidence = metal_corun_evidence,
+        .canonical_metal_policy = std::move(canonical_metal_policy),
     };
   }();
   std::unique_ptr<ExecutionManager> execution_manager;
@@ -543,6 +1044,10 @@ absl::StatusOr<std::unique_ptr<Engine>> EngineAdvancedImpl::Create(
       std::move(owned_env), std::move(tokenizer), std::move(execution_manager),
       std::move(benchmark_info), model_artifact_hash,
       std::move(model_artifact_post_load_status),
+      std::move(loaded_exact_litert_evidence),
+      std::move(loaded_exact_logits_frame_contract),
+      std::move(loaded_complete_session_handoff_state_inventory_hash),
+      std::move(loaded_strong_runtime_artifact_hash),
       std::move(loaded_runtime_identity));
 
   return llm_impl;

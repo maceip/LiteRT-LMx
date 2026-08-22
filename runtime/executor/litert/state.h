@@ -16,6 +16,7 @@
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_EXECUTOR_LITERT_STATE_H_
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -28,7 +29,9 @@
 #include "litert/cc/litert_compiled_model.h"  // from @litert
 #include "litert/cc/litert_environment.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
+#include "runtime/engine/session_handoff_codec_contract.h"
 #include "runtime/executor/state_interface.h"
+#include "runtime/platform/hash/hasher.h"
 #include "runtime/proto/executor_metadata.pb.h"
 
 namespace litert::lm {
@@ -72,15 +75,38 @@ class LitertState : public StateInterface {
   size_t StateBufferCount() const { return bank_1_state_buffers_.size(); }
 
   // Fails closed unless the allocation policy and every generalized state
-  // buffer type are admitted for exact session handoff. Heuristic KV discovery
-  // is deliberately insufficient proof of complete continuation state.
+  // buffer type are admitted for exact session handoff. GPU-optimized in-place
+  // state is admitted only when every authoritative buffer is live Metal
+  // memory and therefore participates in LRTST001's synchronized host staging
+  // and transactional in-place restore. Heuristic KV discovery is deliberately
+  // insufficient proof even of the caller-bound state inventory. This method
+  // does not prove that a Metal delegate has no hidden continuation state;
+  // complete capsule support additionally requires delegate-owned evidence.
   absl::Status ValidateSessionHandoffSupport() const;
+
+  // Returns a canonical digest of the complete, executor-metadata-backed
+  // LRTST001 state schema. Dynamic capacity is represented by its axis and
+  // tightly packed bytes-per-entry contract rather than a live extent, so
+  // resizing an otherwise identical state does not relabel its capability.
+  // LRTST001 still commits the concrete extent and byte layout of every
+  // individual capsule.
+  // Payload bytes and the mutable active-bank selector are deliberately
+  // excluded; both ping-pong banks and their layouts are included so the
+  // digest describes the full restorable structure.
+  absl::StatusOr<Hash256> GetSessionHandoffStateInventoryHash() const;
 
   // Fails closed unless every history-dependent buffer is authoritatively
   // inventoried and can be replaced as one reset transaction. Unlike session
   // handoff, backend-native GPU-optimized allocations are admitted here
   // because reset recreates them instead of serializing them.
   absl::Status ValidateDeterministicProjectionResetSupport() const;
+
+  // Stronger exact-profile check for a concrete Metal executor. Every
+  // authoritatively inventoried continuation buffer in every state bank must
+  // be backed by Metal memory. This proves the live backend allocation rather
+  // than trusting Backend::GPU, but remains necessary rather than sufficient:
+  // selected-pipeline policy and hidden delegate state are outside LitertState.
+  absl::Status ValidateMetalStateStorageForExactProfile() const;
 
   // Serializes the logical input bank into a canonical, versioned snapshot.
   // The snapshot binds the state structure and buffer layout and includes an

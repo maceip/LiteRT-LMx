@@ -89,7 +89,7 @@ struct CanonicalDPMProjectionRequest {
 
 absl::Status ValidateDPMProjectionConfig(const DPMProjectionConfig& config);
 
-// SHA-256 of the versioned canonical configuration encoding.
+// SHA-256 of the format-tagged canonical configuration encoding.
 absl::StatusOr<Hash256> ComputeDPMProjectionConfigHash(
     const DPMProjectionConfig& config);
 
@@ -102,7 +102,9 @@ absl::StatusOr<std::string> RenderCanonicalDPMEventRange(
 
 // Builds deterministic full-log or baseline-plus-delta prompt bytes. Baseline
 // compatibility with an authoritative earlier prefix is enforced by the
-// projector, which has access to DPMEventLog::PrefixHash.
+// projector using the immutable snapshot-bound prefix index. A baseline may
+// precede corrections only when its own lineage matches its covered prefix;
+// every intervening correction is then present in the absolute delta.
 absl::StatusOr<CanonicalDPMProjectionRequest>
 BuildCanonicalDPMProjectionRequest(
     const DPMLogSnapshot& snapshot, uint64_t input_event_index,

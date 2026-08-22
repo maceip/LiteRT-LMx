@@ -106,6 +106,9 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
 
   absl::Status ValidateSessionHandoffSupport() const override;
 
+  absl::StatusOr<Hash256>
+  GetCompleteSessionHandoffStateInventoryHash() const override;
+
   absl::Status ValidateDeterministicProjectionSupport() const override;
 
   absl::Status ResetForDeterministicProjection() override;
@@ -119,7 +122,13 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
       const ByteSource& serialized_state) override;
 
   absl::StatusOr<SessionHandoffRuntimeProfile>
+  GetLoadedRuntimeIdentityProfile() const override;
+
+  absl::StatusOr<SessionHandoffRuntimeProfile>
   GetSessionHandoffRuntimeProfile() const override;
+
+  absl::StatusOr<ExactLiteRtLogitsFrameContract>
+  GetExactLiteRtLogitsFrameContract() const override;
 
   absl::string_view ExecutorBackendName() const override {
     return "LiteRT Compiled Model";
@@ -242,6 +251,7 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
              (executor_settings.IsWeightCacheDisabled() &&
               executor_settings.IsProgramCacheDisabled()))),
         compiled_backend_(executor_settings.GetBackend()),
+        compiled_executor_settings_(executor_settings),
         executor_settings_(std::move(executor_settings)),
         env_(env),
         model_(*model),
@@ -325,11 +335,14 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
   // the transformer model when this function returns absl::OkStatus().
   virtual absl::Status DecodeInternal(
       const std::vector<std::shared_ptr<TokenData>>& token,
-      TensorBuffer& output_logits);
+      TensorBuffer& output_logits, bool require_synchronous_execution);
 
   // Helper function of DecodeInternal to bind input/output tensors for decode
-  // and run decode signature.
-  absl::Status BindTensorsAndRunDecode(TensorBuffer* output_logits);
+  // and run decode signature. Exact logits capture always requires the
+  // synchronous path so capture, CPU GREEDY selection, and later capsule
+  // export cannot race delegate work still mutating logits or Metal state.
+  absl::Status BindTensorsAndRunDecode(TensorBuffer* output_logits,
+                                      bool require_synchronous_execution);
   // Static version of BindTensorsAndRunDecode to be used as a callback for
   // sampler.
   static int BindTensorsAndRunDecodeStatic(void* arg);
@@ -406,6 +419,21 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
   // allocation, without consulting mutable executor settings.
   absl::StatusOr<int> GetLoadedVocabularySizeForSessionHandoff() const;
 
+  // Validates loaded, session-independent capsule inventory. Per-session
+  // sampler/runtime values are validated after a context is installed and by
+  // Engine exact-profile resolution; keeping this seam separate lets Engine
+  // measure structural evidence before its first Session exists.
+  absl::Status ValidateStaticSessionHandoffInventorySupport() const;
+
+  // Hashes the complete LiteRT-LM-owned capsule inventory (generalized state
+  // tensors plus continuation metadata) without claiming that a GPU delegate
+  // has no hidden state. The public complete-inventory method combines this
+  // with model-instance-scoped delegate evidence on Metal; runtime identity
+  // uses the local hash so an absent delegate evidence export does not by
+  // itself disable otherwise-compatible ordinary or WinnerReplay modes while
+  // exact capsule capability fails closed.
+  absl::StatusOr<Hash256> GetLocalSessionHandoffStateInventoryHash() const;
+
   // Gets the LiteRT run options based on the current executor settings.
   litert::Options GetRunOptions() const;
 
@@ -417,6 +445,11 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
   // Backend used to create compiled_model_. Runtime settings are mutable and
   // therefore cannot be authoritative continuation-state evidence.
   const Backend compiled_backend_;
+
+  // Immutable copy of the exact settings supplied to CreateCompilationOptions
+  // for `compiled_model_`. Mutable runtime settings are checked for drift but
+  // are never used as evidence of what was compiled.
+  const LlmExecutorSettings compiled_executor_settings_;
 
   mutable absl::Mutex executor_settings_mutex_;
   LlmExecutorSettings executor_settings_
@@ -513,6 +546,11 @@ class LlmLiteRtCompiledModelExecutorStatic
   absl::Status Prefill(const ExecutorInputs& inputs,
                        const ExecutorPrefillParams& params) override;
 
+  const SortedPrefillSignatureMap&
+  prefill_signature_map_for_exact_profile() const {
+    return prefill_signature_map_;
+  }
+
  private:
   LlmLiteRtCompiledModelExecutorStatic(
       LlmExecutorSettings executor_settings, Environment& env,
@@ -571,6 +609,13 @@ class LlmLiteRtCompiledModelExecutorDynamic
 
   using LlmLiteRtCompiledModelExecutorBase::Prefill;
 
+  int prefill_chunk_size_for_exact_profile() const {
+    return prefill_chunk_size_;
+  }
+  uint32_t kv_increment_size_for_exact_profile() const {
+    return kv_increament_size_;
+  }
+
   absl::Status Prefill(const ExecutorInputs& inputs,
                        const ExecutorPrefillParams& params) override;
 
@@ -609,7 +654,8 @@ class LlmLiteRtCompiledModelExecutorDynamic
   // Extends the base class DecodeInternal to handle KV cache buffers.
   absl::Status DecodeInternal(
       const std::vector<std::shared_ptr<TokenData>>& token,
-      TensorBuffer& output_logits) override;
+      TensorBuffer& output_logits,
+      bool require_synchronous_execution) override;
 
   int prefill_chunk_size_;
   uint32_t kv_increament_size_;

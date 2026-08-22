@@ -26,11 +26,88 @@ package(
 licenses(["notice"])
 
 cc_library(
+    name = "session_handoff",
+    hdrs = ["session_handoff.h"],
+    deps = [
+        "//runtime/platform/hash",
+    ],
+)
+
+cc_library(
+    name = "session_handoff_codec_contract",
+    hdrs = ["session_handoff_codec_contract.h"],
+    deps = [
+        ":session_handoff",
+        "//runtime/platform/hash",
+    ],
+)
+
+cc_library(
+    name = "exact_litert_profile",
+    srcs = ["exact_litert_profile.cc"],
+    hdrs = ["exact_litert_profile.h"],
+    deps = [
+        ":io_types",
+        ":session_handoff",
+        "//runtime/executor:executor_settings_base",
+        "//runtime/executor:session_handoff_runtime",
+        "//runtime/platform/hash",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+cc_library(
+    name = "session_handoff_capability",
+    srcs = ["session_handoff_capability.cc"],
+    hdrs = ["session_handoff_capability.h"],
+    deps = [
+        ":exact_litert_profile",
+        ":session_handoff",
+        ":session_handoff_codec_contract",
+        "//runtime/platform/hash",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+cc_library(
+    name = "exact_litert_decode",
+    srcs = ["exact_litert_decode.cc"],
+    hdrs = ["exact_litert_decode.h"],
+    deps = [
+        ":exact_litert_profile",
+        ":io_types",
+        "//runtime/platform/hash",
+        "//runtime/util:convert_tensor_buffer",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
+        "@litert//litert/cc:litert_element_type",
+        "@litert//litert/cc:litert_ranked_tensor_type",
+        "@litert//litert/cc:litert_tensor_buffer",
+        "@litert//tflite/types:half",
+    ],
+)
+
+cc_library(
     name = "engine_interface",
     hdrs = ["engine.h"],
     deps = [
         ":engine_settings",
         ":io_types",
+        ":session_handoff",
+        ":session_handoff_capability",
+        "//runtime/util:byte_stream",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/log:absl_log",

@@ -43,6 +43,8 @@
 
 namespace litert::lm {
 
+class EngineAdvancedImpl;
+
 // SessionAdvanced is an implementation of SessionInterface. The
 // underlying prefill/decode use the LLM Execution Manager's advanced resource
 // management to support efficient multi-sessions and session cloning features.
@@ -88,9 +90,7 @@ class SessionAdvanced : public SessionInterface {
       support::Tokenizer* absl_nonnull tokenizer,
       const SessionConfig& session_config,
       std::optional<BenchmarkInfo> benchmark_info,
-      std::atomic<int>* living_sessions_count = nullptr,
-      std::optional<SessionHandoffIdentity> session_handoff_identity =
-          std::nullopt);
+      std::atomic<int>* living_sessions_count = nullptr);
 
   // Destroys the SessionAdvanced object. It will wait for all tasks to be
   // done and release the session from the execution manager.
@@ -153,6 +153,9 @@ class SessionAdvanced : public SessionInterface {
   absl::StatusOr<Responses> RunDecode(
       const DecodeConfig& decode_config) override;
 
+  absl::StatusOr<ExactLiteRtDecodeResult> RunExactDecode(
+      int max_output_tokens) override;
+
   absl::StatusOr<std::unique_ptr<TaskController>> RunDecodeAsync(
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) override
       ABSL_LOCKS_EXCLUDED(mutex_);
@@ -189,11 +192,22 @@ class SessionAdvanced : public SessionInterface {
                                ByteSink* sink) override
       ABSL_LOCKS_EXCLUDED(mutex_);
 
+  absl::StatusOr<SessionContinuationStateWitness>
+  ExportHandoffToWithWitness(const SessionHandoffOptions& options,
+                             ByteSink* sink) override
+      ABSL_LOCKS_EXCLUDED(mutex_);
+
   absl::Status ImportHandoff(absl::string_view envelope,
                              const SessionHandoffOptions& expected) override
       ABSL_LOCKS_EXCLUDED(mutex_);
 
   absl::Status ImportHandoffFrom(
+      const ByteSource& envelope,
+      const SessionHandoffOptions& expected) override
+      ABSL_LOCKS_EXCLUDED(mutex_);
+
+  absl::StatusOr<SessionContinuationStateWitness>
+  ImportHandoffFromWithWitness(
       const ByteSource& envelope,
       const SessionHandoffOptions& expected) override
       ABSL_LOCKS_EXCLUDED(mutex_);
@@ -253,6 +267,32 @@ class SessionAdvanced : public SessionInterface {
       ABSL_LOCKS_EXCLUDED(mutex_);
 
  private:
+  friend class EngineAdvancedImpl;
+
+  // Creates a session with identity and logits-frame evidence derived by the
+  // loaded Engine. This factory is private so callers cannot mint an identity
+  // for a SessionAdvanced; EngineAdvancedImpl is the sole identity authority.
+  static absl::StatusOr<std::unique_ptr<SessionAdvanced>>
+  CreateWithEngineOwnedIdentity(
+      std::weak_ptr<ExecutionManager> execution_manager,
+      support::Tokenizer* absl_nonnull tokenizer,
+      const SessionConfig& session_config,
+      std::optional<BenchmarkInfo> benchmark_info,
+      std::atomic<int>* living_sessions_count,
+      std::optional<SessionHandoffIdentity> session_handoff_identity,
+      std::optional<ExactLiteRtLogitsFrameContract>
+          exact_litert_logits_frame_contract);
+
+  static absl::StatusOr<std::unique_ptr<SessionAdvanced>> CreateInternal(
+      std::weak_ptr<ExecutionManager> execution_manager,
+      support::Tokenizer* absl_nonnull tokenizer,
+      const SessionConfig& session_config,
+      std::optional<BenchmarkInfo> benchmark_info,
+      std::atomic<int>* living_sessions_count,
+      std::optional<SessionHandoffIdentity> session_handoff_identity,
+      std::optional<ExactLiteRtLogitsFrameContract>
+          exact_litert_logits_frame_contract);
+
   // The state of the session.
   // * `kFresh` means the session is just created and
   //   hasn't been prefilled yet.
@@ -274,7 +314,10 @@ class SessionAdvanced : public SessionInterface {
                            absl::flat_hash_set<TaskId> last_task_ids = {},
                            std::atomic<int>* living_sessions_count = nullptr,
                            std::optional<SessionHandoffIdentity>
-                               session_handoff_identity = std::nullopt)
+                               session_handoff_identity = std::nullopt,
+                           std::optional<ExactLiteRtLogitsFrameContract>
+                               exact_litert_logits_frame_contract =
+                                   std::nullopt)
       : session_id_(session_id),
         execution_manager_(execution_manager),
         tokenizer_(tokenizer),
@@ -282,7 +325,9 @@ class SessionAdvanced : public SessionInterface {
         session_state_(session_state),
         last_task_ids_(last_task_ids),
         living_sessions_count_(living_sessions_count),
-        session_handoff_identity_(std::move(session_handoff_identity)) {
+        session_handoff_identity_(std::move(session_handoff_identity)),
+        exact_litert_logits_frame_contract_(
+            std::move(exact_litert_logits_frame_contract)) {
     if (living_sessions_count_) {
       (*living_sessions_count_)++;
     }
@@ -292,6 +337,22 @@ class SessionAdvanced : public SessionInterface {
   absl::StatusOr<std::unique_ptr<SessionInterface>> CloneAsyncLocked(
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  absl::StatusOr<Responses> RunDecodeBlockingInternal(
+      const DecodeConfig& decode_config,
+      std::shared_ptr<ExactLiteRtDecodeCapture> exact_litert_decode_capture);
+
+  absl::StatusOr<std::unique_ptr<TaskController>> RunDecodeAsyncInternal(
+      absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback,
+      const DecodeConfig& decode_config,
+      std::shared_ptr<ExactLiteRtDecodeCapture> exact_litert_decode_capture)
+      ABSL_LOCKS_EXCLUDED(mutex_);
+
+  absl::StatusOr<SessionContinuationStateWitness>
+  ExportHandoffToWithWitnessLocked(
+      const std::shared_ptr<ExecutionManager>& execution_manager,
+      SessionHandoffPhase phase, const SessionHandoffOptions& options,
+      ByteSink* sink) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   // The session ID used for the session.
   SessionId session_id_;
@@ -331,6 +392,11 @@ class SessionAdvanced : public SessionInterface {
   // session's fully-resolved configuration. Sessions created through legacy
   // engines leave this absent and fail closed for handoff.
   const std::optional<SessionHandoffIdentity> session_handoff_identity_;
+
+  // Engine-owned contract measured from the loaded compiled logits buffer at
+  // Engine creation. Callers cannot provide or override this value.
+  const std::optional<ExactLiteRtLogitsFrameContract>
+      exact_litert_logits_frame_contract_;
 };
 
 }  // namespace litert::lm

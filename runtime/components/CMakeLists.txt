@@ -358,6 +358,28 @@ target_link_libraries(runtime_components_token_id_util
 )
 
 # ==============================================================================
+# Greedy CPU Sampler
+# ==============================================================================
+add_litertlm_library(runtime_components_greedy_cpu_sampler STATIC
+  greedy_cpu_sampler.cc
+)
+add_library(LiteRTLM::Runtime::Components::GreedyCpuSampler
+  ALIAS runtime_components_greedy_cpu_sampler)
+
+target_include_directories(runtime_components_greedy_cpu_sampler
+  PUBLIC
+    ${PKG_ROOT}
+    ${LITERTLM_INCLUDE_PATHS}
+)
+
+target_link_libraries(runtime_components_greedy_cpu_sampler
+  PUBLIC
+    LiteRTLM::Runtime::Components::SamplerInterface
+    LiteRTLM::Runtime::Util::ConvertTensorBuffer
+    LITERTLM_DEPS
+)
+
+# ==============================================================================
 # Top P CPU Sampler
 # ==============================================================================
 add_litertlm_library(runtime_components_top_p_cpu_sampler STATIC
@@ -403,6 +425,7 @@ target_link_libraries(runtime_components_libs INTERFACE
   LiteRTLM::Runtime::Components::ModelResourcesStreaming
   LiteRTLM::Runtime::Components::ModelResourcesTask
   LiteRTLM::Runtime::Components::PromptTemplate
+  LiteRTLM::Runtime::Components::GreedyCpuSampler
   LiteRTLM::Runtime::Components::SamplerFactory
   LiteRTLM::Runtime::Components::SamplingCpuUtil
   LiteRTLM::Runtime::Components::ScoringCpuUtil

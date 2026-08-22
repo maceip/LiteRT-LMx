@@ -151,6 +151,12 @@ class ThreadedExecutionManager : public ExecutionManager {
           consumer) override
       ABSL_LOCKS_EXCLUDED(session_and_task_lookup_mutex_);
 
+  absl::StatusOr<std::vector<std::vector<int>>>
+  GetExactProcessedTokenHistory(
+      SessionId session_id,
+      const absl::flat_hash_set<TaskId>& boundary_tasks) override
+      ABSL_LOCKS_EXCLUDED(session_and_task_lookup_mutex_);
+
   absl::Status ImportSessionSnapshot(
       SessionId session_id,
       const ExecutorSessionSnapshot& snapshot) override
@@ -208,7 +214,9 @@ class ThreadedExecutionManager : public ExecutionManager {
       int max_output_tokens,
       std::optional<int> thinking_token_budget = std::nullopt,
       std::vector<int> thinking_start_token_ids = {},
-      std::vector<int> thinking_end_token_ids = {}) override
+      std::vector<int> thinking_end_token_ids = {},
+      std::shared_ptr<ExactLiteRtDecodeCapture> exact_litert_decode_capture =
+          nullptr) override
       ABSL_LOCKS_EXCLUDED(session_and_task_lookup_mutex_);
 
   // Adds a clone session task to the execution manager.

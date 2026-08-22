@@ -46,6 +46,8 @@
 
 namespace litert::lm {
 
+class ExactLiteRtDecodeCapture;
+
 using SessionId = int;
 using TaskId = int;
 
@@ -188,6 +190,14 @@ class ExecutionManager {
                                      const StateInterface&)>
           consumer) = 0;
 
+  // Returns the executor-owned processed-token history while the session is
+  // quiescent. This is deliberately narrower than session handoff: it does not
+  // require or visit a backend execution-state capsule.
+  virtual absl::StatusOr<std::vector<std::vector<int>>>
+  GetExactProcessedTokenHistory(
+      SessionId session_id,
+      const absl::flat_hash_set<TaskId>& boundary_tasks) = 0;
+
   virtual absl::Status ImportSessionSnapshot(
       SessionId session_id, const ExecutorSessionSnapshot& snapshot) = 0;
 
@@ -240,7 +250,9 @@ class ExecutionManager {
       int max_output_tokens,
       std::optional<int> thinking_token_budget = std::nullopt,
       std::vector<int> thinking_start_token_ids = {},
-      std::vector<int> thinking_end_token_ids = {}) = 0;
+      std::vector<int> thinking_end_token_ids = {},
+      std::shared_ptr<ExactLiteRtDecodeCapture> exact_litert_decode_capture =
+          nullptr) = 0;
 
   // Adds a decode task to the execution manager with the maximum output tokens
   // set to infinity.
@@ -258,7 +270,8 @@ class ExecutionManager {
                          std::move(no_repeat_ngram_config),
                          std::move(suppress_tokens_config), constraint,
                          std::move(cancelled), std::move(callback),
-                         std::numeric_limits<int>::max(), std::nullopt, {}, {});
+                         std::numeric_limits<int>::max(), std::nullopt, {}, {},
+                         nullptr);
   }
 
   // Adds a clone session task to the execution manager.

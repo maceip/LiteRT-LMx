@@ -25,6 +25,16 @@ package(
 licenses(["notice"])
 
 cc_library(
+    name = "byte_stream",
+    hdrs = ["byte_stream.h"],
+    deps = [
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_library(
     name = "convert_tensor_buffer",
     hdrs = ["convert_tensor_buffer.h"],
     deps = [
@@ -397,6 +407,7 @@ cc_library(
         ":memory_mapped_file",
         ":scoped_file",
         ":zip_utils",
+        "//runtime/platform/hash",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/status",
@@ -526,6 +537,10 @@ cc_library(
         ":litert_status_util",
         ":memory_mapped_file",
         ":scoped_file",
+        "//runtime/components:model_resources",
+        "//runtime/platform/hash",
+        "//schema/core:litertlm_header_schema",
+        "//schema/core:litertlm_read",
         "@com_google_absl//absl/log:absl_check",
         "@com_google_absl//absl/log:absl_log",
         "@com_google_absl//absl/memory",
@@ -537,9 +552,6 @@ cc_library(
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/synchronization",
         "@litert//litert/cc:litert_buffer_ref",
-        "//runtime/components:model_resources",
-        "//schema/core:litertlm_header_schema",
-        "//schema/core:litertlm_read",
     ],
 )
 

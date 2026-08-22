@@ -33,6 +33,7 @@
 #include "runtime/executor/llm_executor_settings.h"
 #include "runtime/executor/session_handoff_runtime.h"
 #include "runtime/executor/state_interface.h"
+#include "runtime/engine/exact_litert_profile.h"
 #include "runtime/util/byte_stream.h"
 
 namespace litert::lm {
@@ -244,6 +245,18 @@ class LlmExecutorBase {
                      ExecutorBackendName()));
   }
 
+  // Returns an executor-derived digest of the complete mutable and
+  // reconstructible continuation-state inventory. Implementations must first
+  // validate actual handoff support; a backend/configuration label is not
+  // evidence that its capsule is complete.
+  virtual absl::StatusOr<Hash256>
+  GetCompleteSessionHandoffStateInventoryHash() const {
+    return absl::UnimplementedError(absl::StrCat(
+        "Complete session handoff state inventory is not implemented for "
+        "backend: ",
+        ExecutorBackendName()));
+  }
+
   // Provides synchronous access to active backend-native state while the
   // caller owns the executor lock. Implementations must not silently replace
   // accelerator state with a host clone.
@@ -264,13 +277,35 @@ class LlmExecutorBase {
         ExecutorBackendName()));
   }
 
-  // Returns an executor-owned canonical profile captured from the concrete
-  // compiled executor and its live allocation policy. The default fails
-  // closed so an unsupported executor cannot be relabeled by a caller.
+  // Returns an executor-owned canonical identity profile captured from the
+  // concrete compiled executor and its live allocation policy. This is
+  // intentionally independent of capsule serialization support: ordinary
+  // generation and cold exact execution still need a measured identity when
+  // a model contains stateful operations that cannot be exported. Older
+  // executors fall back to their handoff-specific implementation.
+  virtual absl::StatusOr<SessionHandoffRuntimeProfile>
+  GetLoadedRuntimeIdentityProfile() const {
+    return GetSessionHandoffRuntimeProfile();
+  }
+
+  // Compatibility surface for callers that specifically require a
+  // handoff-admitted runtime profile. Implementations may keep this stricter
+  // than GetLoadedRuntimeIdentityProfile().
   virtual absl::StatusOr<SessionHandoffRuntimeProfile>
   GetSessionHandoffRuntimeProfile() const {
     return absl::UnimplementedError(absl::StrCat(
         "Loaded runtime identity is not implemented for backend: ",
+        ExecutorBackendName()));
+  }
+
+  // Returns only the immutable packed decode-logits contract measured from
+  // the loaded executor. This is intentionally independent of session-capsule
+  // support and exact-profile admission so a cold worker can collect evidence
+  // without pretending it can export or restore execution state.
+  virtual absl::StatusOr<ExactLiteRtLogitsFrameContract>
+  GetExactLiteRtLogitsFrameContract() const {
+    return absl::UnimplementedError(absl::StrCat(
+        "Exact logits frame contract is not implemented for backend: ",
         ExecutorBackendName()));
   }
 

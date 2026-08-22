@@ -165,6 +165,70 @@ target_link_libraries(runtime_engine_shared_flags
 )
 
 # ==============================================================================
+# Exact LiteRT Profile
+# ==============================================================================
+add_litertlm_library(runtime_engine_exact_litert_profile STATIC
+  exact_litert_profile.cc
+)
+add_library(LiteRTLM::Runtime::Engine::ExactProfile ALIAS runtime_engine_exact_litert_profile)
+
+target_include_directories(runtime_engine_exact_litert_profile
+  PUBLIC
+    ${LITERTLM_GENERATED_SRC_DIR}
+    ${LITERTLM_INCLUDE_PATHS}
+)
+
+target_link_libraries(runtime_engine_exact_litert_profile
+  PUBLIC
+    LiteRTLM::Runtime::Platform::Hash
+    LITERTLM_DEPS
+)
+
+# ==============================================================================
+# Session Handoff Capability
+# ==============================================================================
+add_litertlm_library(runtime_engine_session_handoff_capability STATIC
+  session_handoff_capability.cc
+)
+add_library(LiteRTLM::Runtime::Engine::SessionHandoffCapability ALIAS runtime_engine_session_handoff_capability)
+
+target_include_directories(runtime_engine_session_handoff_capability
+  PUBLIC
+    ${LITERTLM_GENERATED_SRC_DIR}
+    ${LITERTLM_INCLUDE_PATHS}
+)
+
+target_link_libraries(runtime_engine_session_handoff_capability
+  PUBLIC
+    LiteRTLM::Runtime::Engine::ExactProfile
+    LiteRTLM::Runtime::Platform::Hash
+    LITERTLM_DEPS
+)
+
+# ==============================================================================
+# Exact LiteRT Decode
+# ==============================================================================
+add_litertlm_library(runtime_engine_exact_litert_decode STATIC
+  exact_litert_decode.cc
+)
+add_library(LiteRTLM::Runtime::Engine::ExactDecode ALIAS runtime_engine_exact_litert_decode)
+
+target_include_directories(runtime_engine_exact_litert_decode
+  PUBLIC
+    ${LITERTLM_GENERATED_SRC_DIR}
+    ${LITERTLM_INCLUDE_PATHS}
+)
+
+target_link_libraries(runtime_engine_exact_litert_decode
+  PUBLIC
+    LiteRTLM::Runtime::Engine::ExactProfile
+    LiteRTLM::Runtime::Engine::IoTypes
+    LiteRTLM::Runtime::Platform::Hash
+    LiteRTLM::Runtime::Util::ConvertTensorBuffer
+    LITERTLM_DEPS
+)
+
+# ==============================================================================
 # Folder Facade
 # ==============================================================================
 add_library(runtime_engine_libs INTERFACE)
@@ -173,6 +237,9 @@ add_library(LiteRTLM::Runtime::Engine ALIAS runtime_engine_libs)
 target_link_libraries(runtime_engine_libs INTERFACE
   LiteRTLM::Runtime::Engine::Interface
   LiteRTLM::Runtime::Engine::CpuAffinityUtils
+  LiteRTLM::Runtime::Engine::ExactProfile
+  LiteRTLM::Runtime::Engine::ExactDecode
+  LiteRTLM::Runtime::Engine::SessionHandoffCapability
   LiteRTLM::Runtime::Engine::Settings
   LiteRTLM::Runtime::Engine::EmbeddingEngineSettings
   LiteRTLM::Runtime::Engine::IoTypes

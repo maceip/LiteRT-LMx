@@ -76,6 +76,14 @@ bool IsValidUtf8(absl::string_view text) {
 absl::Status ValidateRequestedFeatures(const Engine& engine,
                                        const SessionConfig& config,
                                        uint32_t max_output_tokens) {
+#if defined(LITERT_LM_DEBUGGER_ENABLED)
+  // EngineAdvancedImpl installs graph-run debugger callbacks in this build.
+  // Projection reset rejects callback-bearing executors, so capability
+  // discovery must fail at the same boundary instead of claiming support and
+  // waiting for the first prefill to expose the mismatch.
+  return absl::UnimplementedError(
+      "DPM projection does not support debugger graph callbacks.");
+#endif
   switch (config.GetMemoryStrategy()) {
     case SessionConfig::MemoryStrategy::kStateful:
     case SessionConfig::MemoryStrategy::kStatelessDeterministicProjection:
@@ -113,6 +121,15 @@ absl::Status ValidateRequestedFeatures(const Engine& engine,
     return absl::UnimplementedError(
         "DPM projection does not support MTP or speculative decode.");
   }
+  if (executor.GetAdvancedSettings().has_value() &&
+      (executor.GetAdvancedSettings()->is_benchmark ||
+       executor.GetAdvancedSettings()->enable_profiling ||
+       executor.GetAdvancedSettings()->num_logits_to_print_after_decode !=
+           0)) {
+    return absl::UnimplementedError(
+        "DPM projection does not support benchmark, profiling, or logits "
+        "debug execution paths.");
+  }
   if (config.UseExternalSampler()) {
     return absl::UnimplementedError(
         "DPM projection does not support an external sampler.");
@@ -120,6 +137,11 @@ absl::Status ValidateRequestedFeatures(const Engine& engine,
   if (config.GetNumOutputCandidates() != 1) {
     return absl::InvalidArgumentError(
         "DPM projection requires exactly one output candidate.");
+  }
+  if (config.GetSuppressTokensConfig().enabled()) {
+    return absl::UnimplementedError(
+        "DPM projection does not support inherited or requested token "
+        "suppression.");
   }
   if (config.GetSamplerBackend() != Backend::UNSPECIFIED &&
       config.GetSamplerBackend() != Backend::CPU) {
@@ -214,6 +236,7 @@ absl::Status EngineDPMProjectionRuntime::ValidateResolvedConfig(
   if (config.GetNumOutputCandidates() != 1 ||
       config.GetSamplerBackend() != Backend::CPU ||
       config.GetMaxOutputTokens() != static_cast<int>(max_output_tokens_) ||
+      config.GetSuppressTokensConfig().enabled() ||
       config.GetApplyPromptTemplateInSession() ||
       config.GetMemoryStrategy() !=
           SessionConfig::MemoryStrategy::kStatelessDeterministicProjection) {
@@ -287,8 +310,9 @@ absl::StatusOr<std::string> EngineDPMProjectionRuntime::GenerateFresh(
         "DPM projection Engine did not create a step-zero fresh context.");
   }
 
-  ABSL_RETURN_IF_ERROR(session->RunPrefill(
-      {InputText(std::string(canonical_prompt))}));
+  std::vector<InputData> prefill_inputs;
+  prefill_inputs.emplace_back(InputText(std::string(canonical_prompt)));
+  ABSL_RETURN_IF_ERROR(session->RunPrefill(std::move(prefill_inputs)));
   DecodeConfig decode_config = DecodeConfig::CreateDefault();
   decode_config.SetMaxOutputTokens(static_cast<int>(max_output_tokens_));
   ABSL_ASSIGN_OR_RETURN(Responses response,

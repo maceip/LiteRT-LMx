@@ -186,6 +186,10 @@ absl::StatusOr<std::vector<std::vector<int>>> FakeLlmExecutor::Decode() {
 
 absl::StatusOr<std::vector<std::vector<int>>> FakeLlmExecutor::Decode(
     const ExecutorDecodeParams& decode_params) {
+  if (decode_params.GetExactLiteRtDecodeCapture() != nullptr) {
+    return absl::UnimplementedError(
+        "FakeLlmExecutor cannot produce exact LiteRT logits evidence.");
+  }
   TryDecodeDelay();
   ABSL_RETURN_IF_ERROR(decode_status_);
   if (last_op_ == LastOp::kNone) {
@@ -310,6 +314,11 @@ absl::Status FakeLlmExecutor::Reset() {
 
 absl::StatusOr<std::vector<std::vector<int>>>
 DiffusionLlmFakeLlmExecutor::Decode(const ExecutorDecodeParams& decode_params) {
+  if (decode_params.GetExactLiteRtDecodeCapture() != nullptr) {
+    return absl::UnimplementedError(
+        "Diffusion fake executor cannot produce exact LiteRT logits "
+        "evidence.");
+  }
   // Signal to the test thread that we have entered the Decode method.
   decode_started_.store(true);
 

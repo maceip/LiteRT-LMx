@@ -384,6 +384,43 @@ absl::Status SerialExecutionManager::ExportSessionSnapshotTo(
       consumer);
 }
 
+absl::StatusOr<std::vector<std::vector<int>>>
+SerialExecutionManager::GetExactProcessedTokenHistory(
+    SessionId session_id,
+    const absl::flat_hash_set<TaskId>& boundary_tasks) {
+  if (!session_lookup_.contains(session_id)) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Session ", session_id, " not found in session list."));
+  }
+  std::shared_ptr<SessionInfo> session_info = session_lookup_.at(session_id);
+  if (!session_info->active_tasks.empty() ||
+      session_info->handoff_in_progress ||
+      session_info->deterministic_projection_reset_owner.has_value()) {
+    return absl::FailedPreconditionError(
+        "Session must be quiescent before exact token-history capture.");
+  }
+  for (TaskId task_id : boundary_tasks) {
+    if (!task_lookup_.contains(task_id) ||
+        task_lookup_.at(task_id).session_id != session_id ||
+        (task_lookup_.at(task_id).task_state != TaskState::kDone &&
+         task_lookup_.at(task_id).task_state !=
+             TaskState::kMaxNumTokensReached)) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "Exact token-history boundary task did not complete successfully: ",
+          task_id));
+    }
+  }
+
+  // Reuse the session-wide quiescence guard so task creation and release
+  // cannot race the executor/context read. No handoff capability is queried.
+  session_info->handoff_in_progress = true;
+  absl::Cleanup clear_guard = [session_info] {
+    session_info->handoff_in_progress = false;
+  };
+  return resource_manager_->GetExactProcessedTokenHistory(
+      session_info->context_handler);
+}
+
 absl::Status SerialExecutionManager::ImportSessionSnapshot(
     SessionId session_id, const ExecutorSessionSnapshot& snapshot) {
   StringByteSource serialized_state(snapshot.serialized_state);
@@ -413,7 +450,9 @@ absl::Status SerialExecutionManager::ImportSessionSnapshotFrom(
   }
   if (session_info->session_config.GetMemoryStrategy() ==
       SessionConfig::MemoryStrategy::kStatelessDeterministicProjection) {
-    session_info->deterministic_projection_ready = false;
+    return absl::UnimplementedError(
+        "Stateless deterministic-projection sessions do not admit session "
+        "handoff; use a stateful session for authenticated capsule restore.");
   }
   session_info->handoff_in_progress = true;
   absl::Cleanup clear_handoff = [session_info] {
@@ -1220,7 +1259,14 @@ absl::Status SerialExecutionManager::AddDecodeTask(
     absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback,
     int max_output_tokens, std::optional<int> thinking_token_budget,
     std::vector<int> thinking_start_token_ids,
-    std::vector<int> thinking_end_token_ids) {
+    std::vector<int> thinking_end_token_ids,
+    std::shared_ptr<ExactLiteRtDecodeCapture> exact_litert_decode_capture) {
+#if defined(LITERT_LM_DEBUGGER_ENABLED)
+  if (exact_litert_decode_capture != nullptr && runtime_debugger_ != nullptr) {
+    return absl::UnimplementedError(
+        "Exact decode does not support runtime debugger callbacks.");
+  }
+#endif  // defined(LITERT_LM_DEBUGGER_ENABLED)
   if (callback == nullptr) {
     callback = [](absl::StatusOr<Responses>) {};
   }
@@ -1244,7 +1290,9 @@ absl::Status SerialExecutionManager::AddDecodeTask(
                constraint, max_output_tokens, thinking_token_budget,
                thinking_start_token_ids = std::move(thinking_start_token_ids),
                thinking_end_token_ids =
-                   std::move(thinking_end_token_ids)]() mutable {
+                   std::move(thinking_end_token_ids),
+               exact_litert_decode_capture =
+                   std::move(exact_litert_decode_capture)]() mutable {
     auto task_info_or = StartTask(task_id);
     if (!task_info_or.ok()) {
       FinishTaskAndLogErrors(task_id, task_info_or.status(),
@@ -1313,7 +1361,7 @@ absl::Status SerialExecutionManager::AddDecodeTask(
         std::move(suppress_tokens_config), constraint,
         std::move(decoded_ids_buffer), callback, cancelled.get(),
         max_output_tokens, thinking_token_budget, thinking_end_token_ids,
-        thinking_start_token_ids);
+        thinking_start_token_ids, std::move(exact_litert_decode_capture));
 
     if (!responses.ok() && absl::IsCancelled(responses.status())) {
       responses = Responses(TaskState::kCancelled);
