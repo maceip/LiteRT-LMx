@@ -1,12 +1,12 @@
 # LiteRT-LM
 
 ```
-   ╔═══════════════════════════════════════════╗
-   ║   ⚡ LiteRT-LM: Run LLMs Anywhere ⚡    ║
-   ║                                           ║
-   ║   🏃 High-Performance  🌍 Cross-Platform ║
-   ║   📱 Mobile-Ready      🎯 Production-Optimized ║
-   ╚═══════════════════════════════════════════╝
+   ╔════════════════════════════════════════════════╗
+   ║   ⚡ LiteRT-LM: Run LLMs Anywhere ⚡         ║
+   ║                                                ║
+   ║   🏃 High-Performance  🌍 Cross-Platform      ║
+   ║   📱 Mobile-Ready      🎯 Production-Ready    ║
+   ╚════════════════════════════════════════════════╝
 ```
 
 LiteRT-LM is Google's **production-ready** orchestration layer to run LLMs with
